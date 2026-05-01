@@ -6,7 +6,9 @@ The goal is to describe HDF5 on-disk structures as executable binary format defi
 
 This repository is a work in progress. The current pickles focus on core HDF5 metadata structures, including the superblock, B-trees, object headers, and related messages.
 
-## Repository Layout - Pickles
+## Repository Layout
+
+### Core Pickles
 
 - [`pickles/common.pk`](pickles/common.pk): shared helpers and common definitions
 - [`pickles/superblock.pk`](pickles/superblock.pk): HDF5 superblock definitions
@@ -18,6 +20,16 @@ This repository is a work in progress. The current pickles focus on core HDF5 me
 - [`pickles/farray.pk`](pickles/farray.pk): fixed array chunk index definitions
 - [`pickles/earray.pk`](pickles/earray.pk): extensible array chunk index definitions
 - [`pickles/lookup3.pk`](pickles/lookup3.pk): implementation of the lookup3 hash function used for checksums
+
+### Documentation
+
+- [`MARKERS.md`](MARKERS.md): list of known on-disk markers in HDF5 and Onion files
+- [`TOOLS.md`](TOOLS.md): documentation for tools included in this repository, including the marker scanner and interactive explorer
+- [`TUTORIAL.md`](TUTORIAL.md): step-by-step tutorial for using the pickles and tools in this repository
+
+### Examples
+
+- [`examples/`](examples/): example HDF5 files and GNU poke sessions demonstrating the use of the pickles and tools in this repository
 
 ## Acknowledgments
 
