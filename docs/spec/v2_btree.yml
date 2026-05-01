@@ -1,0 +1,340 @@
+pickle: v2_btree.pk
+section: "III.A.2. Disk Format: Level 1B – Version 2 B-tree Nodes"
+intro: |
+  Version 2 B-trees are a self-describing, checksummed replacement for
+  the version 1 B-tree used for new indexing needs introduced in HDF5
+  1.8. Three on-disk structures are defined:
+
+  - **Header** (signature 'BTHD') — one per B-tree; records the record
+    type, node geometry, depth, and root node address.
+  - **Leaf node** (signature 'BTLF') — stores up to the configured
+    maximum records with no child pointers.
+  - **Internal node** (signature 'BTIN') — stores records interleaved
+    with child pointers, each carrying the record count of the child
+    node and, for nodes deeper than level 1, the total record count of
+    the child's subtree.
+
+  Eleven record types are defined, covering: huge-object tracking
+  (types 1–4), indexed-group link names (types 5–6), shared object
+  header messages (type 7), indexed-attribute names and creation order
+  (types 8–9), and non-filtered and filtered dataset chunk addresses
+  (types 10–11).
+
+  The global variables `global_bt2_*` must be set correctly before
+  mapping any node. `print_v2_btree(addr#B)` handles this automatically
+  by reading the header first.
+
+types:
+
+  # ── Header ─────────────────────────────────────────────────────────────────
+
+  v2_btree_hdr:
+    desc: >-
+      Version 2 B-tree header (signature 'BTHD'). Describes the geometry
+      of the entire B-tree. Mapping this struct sets the global parameters
+      `global_bt2_type`, `global_bt2_record_size`, `global_bt2_node_size`,
+      and `global_bt2_depth` via constraint side-effects, so subsequent
+      node mappings require no additional setter calls.
+    fields:
+      signature:
+        desc: "4-byte signature: 'B' 'T' 'H' 'D'. Must match exactly."
+      version:
+        desc: "Header format version. Must be 0."
+      record_type:
+        desc: "Record type identifier (1–11). Determines which `bt2_rec_type*` struct to use for records."
+      node_size:
+        desc: "Size in bytes of each B-tree node (leaf or internal). All nodes have the same size."
+      record_size:
+        desc: "Size in bytes of each record within a node."
+      depth:
+        desc: "Tree depth. 0 means the root is a leaf node; > 0 means the root is an internal node."
+      split_percent:
+        desc: "Node occupancy percentage above which a node is split (typically 100)."
+      merge_percent:
+        desc: "Node occupancy percentage below which two sibling nodes are merged (typically 40)."
+      root_addr_raw:
+        desc: "File address of the root node (`sizeof_offsets` bytes)."
+      num_root_records:
+        desc: "Number of records currently stored in the root node."
+      total_nrec_raw:
+        desc: "Total number of records across all nodes in the B-tree (`sizeof_lengths` bytes)."
+      chksum:
+        desc: "Jenkins lookup3 checksum of all preceding header bytes."
+
+  # ── Record types 1–4: huge objects ─────────────────────────────────────────
+
+  bt2_rec_type1:
+    desc: >-
+      Record type 1 — indirectly accessed, non-filtered huge object.
+      The object is tracked in the fractal heap and carries a unique
+      object ID.
+    fields:
+      huge_obj_addr_raw:
+        desc: "File address of the huge object (`sizeof_offsets` bytes)."
+      huge_obj_len_raw:
+        desc: "Size in bytes of the huge object (`sizeof_lengths` bytes)."
+      huge_obj_id_raw:
+        desc: "Unique huge-object ID assigned by the heap (`sizeof_lengths` bytes)."
+
+  bt2_rec_type2:
+    desc: >-
+      Record type 2 — indirectly accessed, filtered huge object. Like
+      type 1 but the data has passed through the filter pipeline; carries
+      the unfiltered size and a filter skip mask.
+    fields:
+      huge_obj_addr_raw:
+        desc: "File address of the filtered huge object (`sizeof_offsets` bytes)."
+      huge_obj_len_raw:
+        desc: "On-disk (filtered) size in bytes (`sizeof_lengths` bytes)."
+      filter_mask:
+        desc: "Filter pipeline skip mask (same semantics as `bt1_key1.filter_mask`)."
+      huge_obj_mem_size_raw:
+        desc: "Unfiltered (in-memory) size in bytes (`sizeof_lengths` bytes)."
+      huge_obj_id_raw:
+        desc: "Unique huge-object ID (`sizeof_lengths` bytes)."
+
+  bt2_rec_type3:
+    desc: >-
+      Record type 3 — directly accessed, non-filtered huge object. The
+      object is accessed by file address without heap tracking, so there
+      is no unique ID field.
+    fields:
+      huge_obj_addr_raw:
+        desc: "File address of the huge object (`sizeof_offsets` bytes)."
+      huge_obj_len_raw:
+        desc: "Size in bytes of the huge object (`sizeof_lengths` bytes)."
+
+  bt2_rec_type4:
+    desc: >-
+      Record type 4 — directly accessed, filtered huge object. Like type
+      3 but includes filter metadata; no unique ID field.
+    fields:
+      huge_obj_addr_raw:
+        desc: "File address of the filtered huge object (`sizeof_offsets` bytes)."
+      huge_obj_len_raw:
+        desc: "On-disk (filtered) size in bytes (`sizeof_lengths` bytes)."
+      filter_mask:
+        desc: "Filter pipeline skip mask."
+      huge_obj_mem_size_raw:
+        desc: "Unfiltered (in-memory) size in bytes (`sizeof_lengths` bytes)."
+
+  # ── Record types 5–6: indexed-group link names ─────────────────────────────
+
+  bt2_rec_type5:
+    desc: >-
+      Record type 5 — link name in a creation-name-ordered indexed group.
+      Provides fast lookup of a link by the hash of its name.
+    fields:
+      name_hash:
+        desc: "Jenkins lookup3 hash of the link name (used as the B-tree key)."
+      heap_id_raw:
+        desc: "7-byte fractal heap object ID for the link record."
+
+  bt2_rec_type6:
+    desc: >-
+      Record type 6 — link name in a creation-order-indexed group.
+      Provides fast lookup of a link by its creation order value.
+    fields:
+      creation_order:
+        desc: "Link creation order value (B-tree key)."
+      heap_id_raw:
+        desc: "7-byte fractal heap object ID for the link record."
+
+  # ── Record type 7: shared object header messages ────────────────────────────
+
+  bt2_rec_type7_sub0:
+    desc: >-
+      Record type 7, sub-type 0 — shared message stored in the fractal
+      heap. Identified at runtime by reading the first byte of the record:
+      `message_location == 0` selects this sub-type.
+    fields:
+      message_location:
+        desc: "Storage location indicator. Must be 0 for this sub-type (message is in the fractal heap)."
+      hash:
+        desc: "Jenkins lookup3 hash of the shared message payload (B-tree key)."
+      reference_count:
+        desc: "Number of object headers that reference this shared message."
+      heap_id_raw:
+        desc: "8-byte fractal heap object ID for the shared message."
+
+  bt2_rec_type7_sub1:
+    desc: >-
+      Record type 7, sub-type 1 — shared message stored inline in an
+      object header. Identified by `message_location == 1`.
+    fields:
+      message_location:
+        desc: "Storage location indicator. Must be 1 for this sub-type (message is in an object header)."
+      hash:
+        desc: "Jenkins lookup3 hash of the shared message payload (B-tree key)."
+      message_type:
+        desc: "Object header message type of the shared message."
+      obj_hdr_index:
+        desc: "Index of the message within its containing object header."
+      obj_hdr_addr_raw:
+        desc: "File address of the object header containing the shared message (`sizeof_offsets` bytes)."
+
+  # ── Record types 8–9: indexed attributes ───────────────────────────────────
+
+  bt2_rec_type8:
+    desc: >-
+      Record type 8 — attribute name for name-ordered indexed attributes.
+      Provides fast lookup of an attribute by name hash and creation order.
+    fields:
+      heap_id_raw:
+        desc: "8-byte fractal heap object ID for the attribute record."
+      message_flags:
+        desc: "Object header message flags for this attribute (same bit definitions as `msg_prefix.msg_flags`)."
+      creation_order:
+        desc: "Attribute creation order value."
+      name_hash:
+        desc: "Jenkins lookup3 hash of the attribute name (primary B-tree key)."
+
+  bt2_rec_type9:
+    desc: >-
+      Record type 9 — attribute name for creation-order-indexed attributes.
+      Like type 8 but without the name hash; creation order is the key.
+    fields:
+      heap_id_raw:
+        desc: "8-byte fractal heap object ID for the attribute record."
+      message_flags:
+        desc: "Object header message flags for this attribute."
+      creation_order:
+        desc: "Attribute creation order value (B-tree key)."
+
+  # ── Record types 10–11: dataset chunk addresses ────────────────────────────
+
+  bt2_rec_type10:
+    desc: >-
+      Record type 10 — non-filtered dataset chunk address. Used as the
+      chunk index for datasets whose chunks pass through no filter
+      pipeline. The number of `scaled_offsets` entries equals the dataset
+      dimensionality; before mapping, set `global_bt2_ndims` accordingly
+      or call `print_v2_btree` which derives it automatically.
+    fields:
+      chunk_addr_raw:
+        desc: "File address of the chunk data payload (`sizeof_offsets` bytes)."
+      scaled_offsets:
+        desc: >-
+          Array of `global_bt2_ndims` uint64 scaled chunk position values.
+          Each entry is the logical dimension offset divided by the chunk
+          dimension size, giving the chunk's coordinates in chunk-index
+          space (B-tree key).
+
+  bt2_rec_type11:
+    desc: >-
+      Record type 11 — filtered dataset chunk address. Like type 10 but
+      includes the on-disk (filtered) chunk size and a filter skip mask.
+    fields:
+      chunk_addr_raw:
+        desc: "File address of the filtered chunk data payload (`sizeof_offsets` bytes)."
+      chunk_size_raw:
+        desc: "On-disk (filtered) chunk size in bytes (`sizeof_lengths` bytes)."
+      filter_mask:
+        desc: "Filter pipeline skip mask for this chunk."
+      scaled_offsets:
+        desc: "Array of `global_bt2_ndims` uint64 scaled chunk position values (B-tree key)."
+
+  # ── Fallback record ─────────────────────────────────────────────────────────
+
+  bt2_raw_record:
+    desc: >-
+      Generic fallback record used when the record type is unknown or
+      unhandled. Stores the raw bytes of the record so they can be
+      inspected without type-specific decoding.
+    fields:
+      data:
+        desc: "Raw record bytes (`global_bt2_record_size` bytes)."
+
+  # ── Child pointer sub-structures ───────────────────────────────────────────
+
+  bt2_child_ptr_d1:
+    desc: >-
+      Child pointer in a depth-1 internal node (one whose children are
+      leaf nodes). Contains the child's file address and the number of
+      records directly stored in that child. No subtree record count is
+      needed because the child is a leaf.
+    fields:
+      child_addr_raw:
+        desc: "File address of the child node (`sizeof_offsets` bytes)."
+      nrec_in_child_raw:
+        desc: >-
+          Number of records stored in the child node
+          (`global_bt2_nrec_in_node_bytes` bytes). Use
+          `set_bt2_nrec_size_from_hdr` to compute the correct byte
+          width from the header.
+
+  bt2_child_ptr_dn:
+    desc: >-
+      Child pointer in a depth > 1 internal node (one whose children
+      are themselves internal nodes). Adds a subtree record count field
+      that records the total number of records in the child's entire
+      subtree.
+    fields:
+      child_addr_raw:
+        desc: "File address of the child node (`sizeof_offsets` bytes)."
+      nrec_in_child_raw:
+        desc: "Number of records directly in the child node (`global_bt2_nrec_in_node_bytes` bytes)."
+      nrec_in_subtree_raw:
+        desc: >-
+          Total records in the child's subtree including all descendant
+          nodes (`global_bt2_nrec_in_subtree_bytes` bytes). Use
+          `set_bt2_nrec_subtree_size_from_hdr` to compute the correct
+          byte width.
+
+  # ── Leaf and internal nodes ─────────────────────────────────────────────────
+
+  v2_btree_leaf:
+    desc: >-
+      Version 2 B-tree leaf node (signature 'BTLF'). Contains up to the
+      configured maximum number of records and no child pointers. Before
+      mapping, set `global_bt2_nrec` to the record count for this node
+      (from `hdr.num_root_records` for the root, or from the parent's
+      `nrec_in_child_raw` for non-root nodes).
+    fields:
+      signature:
+        desc: "4-byte signature: 'B' 'T' 'L' 'F'. Must match exactly."
+      version:
+        desc: "Leaf node format version. Must be 0."
+      record_type:
+        desc: "Record type identifier (mirrors `v2_btree_hdr.record_type`)."
+      records:
+        desc: >-
+          Array of `global_bt2_nrec` raw records, each `global_bt2_record_size`
+          bytes. Use `print_v2_btree_record_at` to decode individual
+          records according to `record_type`.
+      chksum:
+        desc: "Jenkins lookup3 checksum of all preceding node bytes."
+
+  v2_btree_internal:
+    desc: >-
+      Version 2 B-tree internal node (signature 'BTIN'). Stores records
+      interleaved with `global_bt2_nrec + 1` child pointers. The child-
+      pointer layout depends on the node's depth: depth-1 nodes use
+      `bt2_child_ptr_d1`; deeper nodes use `bt2_child_ptr_dn`. Before
+      mapping, set `global_bt2_depth` and `global_bt2_nrec` to the
+      values for this node.
+    fields:
+      signature:
+        desc: "4-byte signature: 'B' 'T' 'I' 'N'. Must match exactly."
+      version:
+        desc: "Internal node format version. Must be 0."
+      record_type:
+        desc: "Record type identifier (mirrors `v2_btree_hdr.record_type`)."
+      records:
+        desc: "Array of `global_bt2_nrec` raw records in ascending key order."
+      children:
+        desc: "Union of `global_bt2_nrec + 1` child pointers; layout selected by tree depth."
+      chksum:
+        desc: "Jenkins lookup3 checksum of all preceding node bytes."
+    variants:
+      d1:
+        desc: >-
+          Child-pointer array for a depth-1 internal node (children are
+          leaves). Each pointer is a `bt2_child_ptr_d1` carrying the
+          child address and record count only.
+      dn:
+        desc: >-
+          Child-pointer array for a depth > 1 internal node (children
+          are internal nodes). Each pointer is a `bt2_child_ptr_dn`
+          carrying the child address, node record count, and subtree
+          record count.

@@ -1,0 +1,175 @@
+pickle: farray.pk
+section: "C.III. Fixed Array Chunk Index"
+intro: |
+  The Fixed Array (FA) is a chunk index used for datasets with a fixed
+  number of chunks — i.e. datasets whose every dimension is either fixed
+  in size or has at most one unlimited dimension that never grows beyond
+  a single chunk in that dimension.  It provides O(1) access to any chunk
+  by logical index.
+
+  Two on-disk structures are defined:
+
+  - **Header** (signature 'FAHD') — one per dataset; stores element
+    geometry and the address of the data block.
+  - **Data Block** (signature 'FADB') — holds the actual chunk addresses
+    (and, for filtered datasets, per-chunk metadata).
+
+  **Paging:** when the element count exceeds `2^max_dblk_page_nelmts_bits`
+  the data block is split into fixed-size pages stored consecutively after
+  the data block prefix in the file.  The prefix then records only the
+  page-initialisation bitmask; elements live in `fa_dblk_page` records.
+  When `max_dblk_page_nelmts_bits == 0` or the element count is small
+  enough, all elements are stored directly in the data block (`fa_dblock_nopaged`).
+
+  **Client IDs:**
+
+  | ID | Name                  | Element layout                                          |
+  |----|-----------------------|---------------------------------------------------------|
+  | 0  | H5FA_CLS_CHUNK_ID     | `sizeof_offsets`-byte chunk file address                |
+  | 1  | H5FA_CLS_FILT_CHUNK_ID| chunk address + filtered size + 4-byte filter mask     |
+
+  Use `print_fa(addr#B)` to map the header, print it, and recursively
+  print the data block and all pages.
+
+types:
+
+  # ── Element types ────────────────────────────────────────────────────────
+
+  fa_chunk_elem:
+    desc: "One element for a non-filtered chunk (client ID 0). Contains only the chunk's file address."
+    fields:
+      addr_raw:
+        desc: "File address of the chunk data (`sizeof_offsets` bytes). HADDR_UNDEF if the chunk has not been written."
+
+  fa_filt_chunk_elem:
+    desc: >-
+      One element for a filtered chunk (client ID 1). Stores the chunk
+      address, its on-disk (post-filter) size, and the filter pipeline
+      skip mask.
+    fields:
+      addr_raw:
+        desc: "File address of the filtered chunk data (`sizeof_offsets` bytes)."
+      chunk_size_raw:
+        desc: >-
+          On-disk (filtered) size of the chunk in bytes
+          (`global_fa_chunk_size_len` bytes =
+          `raw_elmt_size − sizeof_offsets − 4`).
+      filter_mask:
+        desc: "Filter pipeline skip mask. Bit i set means filter i was not applied to this chunk."
+
+  fa_element:
+    desc: >-
+      Dispatch union that resolves to the correct element layout based on
+      `global_fa_client_id` at mapping time. Both arms have the same
+      on-disk footprint (`raw_elmt_size` bytes) for a given header.
+    variants:
+      non_filtered:
+        desc: "Active when `global_fa_client_id == 0`. Wraps `fa_chunk_elem`."
+      filtered:
+        desc: "Active when `global_fa_client_id == 1`. Wraps `fa_filt_chunk_elem`."
+
+  # ── Header ───────────────────────────────────────────────────────────────
+
+  fa_hdr:
+    desc: >-
+      Fixed Array header (signature 'FAHD'). Describes the element type
+      and geometry of the entire fixed array. Mapping this struct
+      automatically sets all `global_fa_*` parameters via constraint
+      side-effects so that the data block and pages can be mapped
+      immediately afterwards.
+    fields:
+      signature:
+        desc: "4-byte signature: 'F' 'A' 'H' 'D'. Must match exactly."
+      version:
+        desc: "Header format version. Must be 0."
+      client_id:
+        desc: "Element class: 0 = non-filtered chunk addresses, 1 = filtered chunk addresses."
+      raw_elmt_size:
+        desc: >-
+          On-disk size in bytes of each array element. For client ID 0
+          this equals `sizeof_offsets`; for client ID 1 it equals
+          `sizeof_offsets + chunk_size_len + 4`.
+      max_dblk_page_nelmts_bits:
+        desc: >-
+          Log₂ of the maximum number of elements per data block page.
+          0 means paging is disabled and all elements are stored inline
+          in the data block.
+      nelmts_raw:
+        desc: "Total number of elements (chunks) indexed by this fixed array (`sizeof_lengths` bytes)."
+      dblk_addr_raw:
+        desc: "File address of the associated data block (`sizeof_offsets` bytes)."
+      chksum:
+        desc: "Jenkins lookup3 checksum of all preceding header bytes."
+
+  # ── Data Block Page ───────────────────────────────────────────────────────
+
+  fa_dblk_page:
+    desc: >-
+      Fixed Array data block page. Only present when paging is active
+      (`global_fa_npages > 0`). Pages have no on-disk signature; they
+      are stored consecutively immediately after the data block prefix.
+      All full pages hold `global_fa_dblk_page_nelmts` elements; the
+      final page may hold fewer (`global_fa_last_page_nelmts`). Override
+      `global_fa_page_nelmts` with `set_fa_page_nelmts(n)` before
+      mapping the last page, then restore it with `reset_fa_page_nelmts`.
+    fields:
+      elements:
+        desc: "Array of `global_fa_page_nelmts` elements (type `fa_element`)."
+      chksum:
+        desc: "Jenkins lookup3 checksum of all preceding page bytes."
+
+  # ── Data Block ────────────────────────────────────────────────────────────
+
+  fa_dblock_nopaged:
+    desc: >-
+      Fixed Array data block, non-paged layout (signature 'FADB').
+      Used when `global_fa_npages == 0`. All `global_fa_nelmts` elements
+      are stored inline in the `elements` array.
+    fields:
+      signature:
+        desc: "4-byte signature: 'F' 'A' 'D' 'B'. Must match exactly."
+      version:
+        desc: "Data block format version. Must be 0."
+      client_id:
+        desc: "Element class (mirrors `fa_hdr.client_id`)."
+      hdr_addr_raw:
+        desc: "Back-pointer: file address of the Fixed Array header (`sizeof_offsets` bytes)."
+      elements:
+        desc: "Array of `global_fa_nelmts` inline elements (type `fa_element`)."
+      chksum:
+        desc: "Jenkins lookup3 checksum of all preceding data block bytes."
+
+  fa_dblock_paged:
+    desc: >-
+      Fixed Array data block, paged layout (signature 'FADB'). Used when
+      `global_fa_npages > 0`. This struct captures only the prefix;
+      the actual elements are stored in `fa_dblk_page` records that
+      follow immediately in the file. The page-initialisation bitmask
+      tracks which pages have been written.
+    fields:
+      signature:
+        desc: "4-byte signature: 'F' 'A' 'D' 'B'. Must match exactly."
+      version:
+        desc: "Data block format version. Must be 0."
+      client_id:
+        desc: "Element class (mirrors `fa_hdr.client_id`)."
+      hdr_addr_raw:
+        desc: "Back-pointer: file address of the Fixed Array header (`sizeof_offsets` bytes)."
+      page_init_flags:
+        desc: >-
+          Page-initialisation bitmask (`global_fa_dblk_page_init_size`
+          bytes = ⌈npages / 8⌉). Bit i is set when page i has been
+          written to disk.
+      chksum:
+        desc: "Jenkins lookup3 checksum of all bytes from `signature` through `page_init_flags`."
+
+  fa_dblock:
+    desc: >-
+      Top-level Fixed Array data block dispatch union (signature 'FADB').
+      Selects `fa_dblock_paged` when `global_fa_npages > 0`, otherwise
+      `fa_dblock_nopaged`. Map with `var db = fa_dblock @ bytes_to_off(hdr.dblk_addr_raw)`.
+    variants:
+      paged:
+        desc: "Paged prefix layout. Active when `global_fa_npages > 0`."
+      nopaged:
+        desc: "Inline element layout. Active when `global_fa_npages == 0`."
