@@ -24,6 +24,7 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(PKDOC_SPECS
     earray
     farray
+    fheap
     messages
     ohdr
     superblock
