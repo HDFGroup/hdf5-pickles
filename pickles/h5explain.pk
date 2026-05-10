@@ -22,6 +22,7 @@ load "ohdr.pk";
 load "btree.pk";
 load "farray.pk";
 load "earray.pk";
+load "fheap.pk";
 load "lookup3.pk";
 
 var h5explain_non_strict = 0;
@@ -62,6 +63,11 @@ var h5explain_link_addr = 0UL#B;
 var h5explain_stab_found = 0;
 var h5explain_stab_btree_addr = 0UL#B;
 var h5explain_stab_heap_addr = 0UL#B;
+
+var h5explain_linfo_found = 0;
+var h5explain_linfo_fheap_addr = 0UL#B;
+var h5explain_linfo_name_bt2_addr = 0UL#B;
+var h5explain_linfo_corder_bt2_addr = 0UL#B;
 
 var h5explain_prev_off = 0UL#B;
 var h5explain_prev_kind = H5EX_KIND_RAW;
@@ -213,10 +219,22 @@ fun h5explain_map_link = (offset<uint<64>,B> off) H5O_msg_link:
     return H5O_msg_link @ off;
 }
 
+fun h5explain_map_linfo = (offset<uint<64>,B> off) H5O_msg_linfo:
+{
+    if (h5explain_non_strict) return H5O_msg_linfo @! off;
+    return H5O_msg_linfo @ off;
+}
+
 fun h5explain_map_stab = (offset<uint<64>,B> off) H5O_msg_stab:
 {
     if (h5explain_non_strict) return H5O_msg_stab @! off;
     return H5O_msg_stab @ off;
+}
+
+fun h5explain_map_frhp_hdr = (offset<uint<64>,B> off) frhp_hdr:
+{
+    if (h5explain_non_strict) return frhp_hdr @! off;
+    return frhp_hdr @ off;
 }
 
 fun h5explain_map_cont = (offset<uint<64>,B> off) H5O_msg_cont:
@@ -282,13 +300,25 @@ fun h5explain_find_super = offset<uint<64>,B>:
     return 0UL#B;
 }
 
-/* Walk ohdr message chunks (following continuations) to learn chunked-dataset
-   ndims before a v1 B-tree is decoded. */
-fun h5explain_scan_layouts_in_chunk = (uint<8> version, int prefix_bytes,
-                                       offset<uint<64>,B> chunk_off,
-                                       uint<64> chunk_size) void:
+/* Per-message callback used by h5explain_walk_msg_chunk.  Receives the
+   message type, the offset of its payload, and its declared payload size;
+   returns a count that the walker accumulates (callers that don't need a
+   count return 0). */
+type h5explain_msg_cb = (uint<64>, offset<uint<64>,B>, uint<64>) uint<64>;
+
+/* Generic ohdr message-chunk walker.  Decodes one prefix at a time and
+   invokes `cb` for each non-continuation message, transparently
+   descending through 0x10 (Object Header Continuation) messages so the
+   callback never sees them.  Replaces the four near-identical chunk
+   walkers that previously each open-coded the prefix decode and the
+   continuation recursion.                                              */
+fun h5explain_walk_msg_chunk = (uint<8> version, int prefix_bytes,
+                                offset<uint<64>,B> chunk_off,
+                                uint<64> chunk_size,
+                                h5explain_msg_cb cb) uint<64>:
 {
     var i = 0UL;
+    var total = 0UL;
 
     global_version = version;
 
@@ -306,40 +336,63 @@ fun h5explain_scan_layouts_in_chunk = (uint<8> version, int prefix_bytes,
         }
 
         var payload_off = chunk_off + i#B + prefix_bytes#B;
-        if (m_type == 0x08UL) {
-            var layout_version = h5explain_map_byte(payload_off);
-            if (layout_version < 3UB) {
-                var ndims = h5explain_map_byte(payload_off + 1#B);
-                var layout_class = h5explain_map_byte(payload_off + 2#B);
-                if (layout_class == CHUNKED) {
-                    set_bt1_ndims(ndims);
-                    printf("[context] v1 raw chunk B-tree ndims set to %v from layout message\n",
-                           global_bt1_ndims);
-                }
-            } else if (layout_version == 3UB) {
-                var layout_class = h5explain_map_byte(payload_off + 1#B);
-                if (layout_class == CHUNKED) {
-                    var ndims = h5explain_map_byte(payload_off + 2#B);
-                    set_bt1_ndims(ndims);
-                    printf("[context] v1 raw chunk B-tree ndims set to %v from layout message\n",
-                           global_bt1_ndims);
-                }
-            }
-        } else if (m_type == 0x10UL) {
+        if (m_type == 0x10UL) {
             var cont = h5explain_map_cont(payload_off);
             var cont_off = bytes_to_off(cont.addr_raw);
             var cont_size = bytes_to_u64_le(cont.size_raw);
             if (version == 2UB)
-                h5explain_scan_layouts_in_chunk(version, prefix_bytes,
-                                                cont_off + 4#B,
-                                                cont_size - 4UL);
+                total = total + h5explain_walk_msg_chunk(version, prefix_bytes,
+                                                        cont_off + 4#B,
+                                                        cont_size - 4UL, cb);
             else
-                h5explain_scan_layouts_in_chunk(version, prefix_bytes,
-                                                cont_off, cont_size);
+                total = total + h5explain_walk_msg_chunk(version, prefix_bytes,
+                                                        cont_off, cont_size, cb);
+        } else {
+            total = total + cb(m_type, payload_off, m_size);
         }
 
         i = i + prefix_bytes + m_size;
     }
+
+    return total;
+}
+
+/* Layout callback: discover chunked-dataset ndims so the v1 raw-chunk
+   B-tree can be decoded later.                                         */
+fun h5explain_cb_layout = (uint<64> m_type,
+                           offset<uint<64>,B> payload_off,
+                           uint<64> m_size) uint<64>:
+{
+    if (m_type != 0x08UL) return 0UL;
+
+    var layout_version = h5explain_map_byte(payload_off);
+    if (layout_version < 3UB) {
+        var ndims = h5explain_map_byte(payload_off + 1#B);
+        var layout_class = h5explain_map_byte(payload_off + 2#B);
+        if (layout_class == CHUNKED) {
+            set_bt1_ndims(ndims);
+            printf("[context] v1 raw chunk B-tree ndims set to %v from layout message\n",
+                   global_bt1_ndims);
+        }
+    } else if (layout_version == 3UB) {
+        var layout_class = h5explain_map_byte(payload_off + 1#B);
+        if (layout_class == CHUNKED) {
+            var ndims = h5explain_map_byte(payload_off + 2#B);
+            set_bt1_ndims(ndims);
+            printf("[context] v1 raw chunk B-tree ndims set to %v from layout message\n",
+                   global_bt1_ndims);
+        }
+    }
+    return 0UL;
+}
+
+fun h5explain_scan_layouts_in_chunk = (uint<8> version, int prefix_bytes,
+                                       offset<uint<64>,B> chunk_off,
+                                       uint<64> chunk_size) void:
+{
+    var ignored = h5explain_walk_msg_chunk(version, prefix_bytes,
+                                           chunk_off, chunk_size,
+                                           h5explain_cb_layout);
 }
 
 /* Parse the ohdr header once and stash version/prefix/chunk bounds in scratch
@@ -608,6 +661,72 @@ fun h5explain_heap_cstring = (offset<uint<64>,B> heap_addr,
     return result;
 }
 
+fun h5explain_addr_is_undef = (byte[] raw) int:
+{
+    var n = 0UL;
+
+    while (n < raw'length) {
+        if (raw[n] != 0xffUB) return 0;
+        n = n + 1UL;
+    }
+
+    return 1;
+}
+
+fun h5explain_bytes_for_bits = (uint<64> nbits) uint<64>:
+{
+    return (nbits + 7UL) / 8UL;
+}
+
+fun h5explain_bytes_for_limit = (uint<64> limit) uint<64>:
+{
+    var nbytes = 1UL;
+    var max = 0xffUL;
+
+    while (nbytes < 8UL && limit > max) {
+        nbytes = nbytes + 1UL;
+        max = (max <<. 8UL) | 0xffUL;
+    }
+
+    return nbytes;
+}
+
+fun h5explain_min_u64 = (uint<64> a, uint<64> b) uint<64>:
+{
+    return a < b ? a : b;
+}
+
+/* floor(log2(value)).  Returns 0 for value == 0 (callers should never
+   pass zero; the dtable lookup path special-cases that range).  Behaves
+   identically to ceil(log2) for power-of-two inputs, which is all the
+   doubling-table sizes ever are.                                        */
+fun h5explain_floor_log2 = (uint<64> value) uint<64>:
+{
+    var v = value;
+    var n = 0UL;
+
+    while ((v .>> 1UL) > 0UL) {
+        v = v .>> 1UL;
+        n = n + 1UL;
+    }
+
+    return n;
+}
+
+fun h5explain_u64_from_slice = (byte[] raw, uint<64> start,
+                                uint<64> nbytes) uint<64>:
+{
+    var n = 0UL;
+    var v = 0UL;
+
+    while (n < nbytes) {
+        v = v | ((raw[start + n] as uint<64>) <<. (n * 8UL));
+        n = n + 1UL;
+    }
+
+    return v;
+}
+
 fun h5explain_reset_stab = void:
 {
     h5explain_stab_found = 0;
@@ -615,50 +734,80 @@ fun h5explain_reset_stab = void:
     h5explain_stab_heap_addr = 0UL#B;
 }
 
-/* Scan ohdr message chunks (following continuations) for a symbol table message;
-   result lands in the h5explain_stab_* globals. */
+fun h5explain_reset_linfo = void:
+{
+    h5explain_linfo_found = 0;
+    h5explain_linfo_fheap_addr = 0UL#B;
+    h5explain_linfo_name_bt2_addr = 0UL#B;
+    h5explain_linfo_corder_bt2_addr = 0UL#B;
+}
+
+/* Link Info callback: capture fheap + (when defined) name-bt2 and
+   corder-bt2 addresses for dense links into the h5explain_linfo_*
+   globals.  linfo_found means "fheap is defined"; the two B-tree
+   address globals carry 0UL#B when their index is not present so
+   callers can pick which index to use. */
+fun h5explain_cb_linfo = (uint<64> m_type,
+                          offset<uint<64>,B> payload_off,
+                          uint<64> m_size) uint<64>:
+{
+    if (m_type != 0x02UL) return 0UL;
+
+    var linfo = h5explain_map_linfo(payload_off);
+    if (h5explain_addr_is_undef(linfo.fheap_addr_raw)) return 0UL;
+
+    h5explain_linfo_found = 1;
+    h5explain_linfo_fheap_addr = bytes_to_off(linfo.fheap_addr_raw);
+    if (!h5explain_addr_is_undef(linfo.name_bt2_addr_raw))
+        h5explain_linfo_name_bt2_addr = bytes_to_off(linfo.name_bt2_addr_raw);
+    /* corder bt2 is only present in the message when bit 1 of flags
+       is set ("creation order indexed"). */
+    if ((linfo.flags & 2U) != 0U
+        && !h5explain_addr_is_undef(linfo.corder_bt2_addr_raw))
+        h5explain_linfo_corder_bt2_addr = bytes_to_off(linfo.corder_bt2_addr_raw);
+    return 0UL;
+}
+
+fun h5explain_find_linfo_in_chunk = (uint<8> version, int prefix_bytes,
+                                     offset<uint<64>,B> chunk_off,
+                                     uint<64> chunk_size) void:
+{
+    var ignored = h5explain_walk_msg_chunk(version, prefix_bytes,
+                                           chunk_off, chunk_size,
+                                           h5explain_cb_linfo);
+}
+
+fun h5explain_find_dense_linfo = (uint<8> version, int prefix_bytes,
+                                  offset<uint<64>,B> chunk_off,
+                                  uint<64> chunk_size) int:
+{
+    h5explain_reset_linfo;
+    h5explain_find_linfo_in_chunk(version, prefix_bytes, chunk_off, chunk_size);
+    return h5explain_linfo_found;
+}
+
+/* Symbol-table callback: capture v1 B-tree + local-heap addresses for
+   the old-style group representation into the h5explain_stab_* globals. */
+fun h5explain_cb_stab = (uint<64> m_type,
+                         offset<uint<64>,B> payload_off,
+                         uint<64> m_size) uint<64>:
+{
+    if (m_type != 0x11UL) return 0UL;
+
+    var stab = h5explain_map_stab(payload_off);
+    h5explain_stab_found = 1;
+    h5explain_stab_btree_addr = bytes_to_off(stab.btree_addr_raw);
+    h5explain_stab_heap_addr = bytes_to_off(stab.heap_addr_raw);
+    return 0UL;
+}
+
 fun h5explain_find_stab_in_chunk = (uint<8> version, int prefix_bytes,
                                     offset<uint<64>,B> chunk_off,
                                     uint<64> chunk_size) void:
 {
-    var i = 0UL;
-
-    global_version = version;
-
-    while ((i + prefix_bytes) < chunk_size) {
-        var m_type = 0UL;
-        var m_size = 0UL;
-        var prefix = h5explain_map_msg_prefix(chunk_off + i#B);
-
-        if (version == 1UB) {
-            m_type = prefix.v1_msg_prefix.msg_type as uint<64>;
-            m_size = prefix.v1_msg_prefix.msg_size as uint<64>;
-        } else {
-            m_type = prefix.v2_msg_prefix.msg_type as uint<64>;
-            m_size = prefix.v2_msg_prefix.msg_size as uint<64>;
-        }
-
-        var payload_off = chunk_off + i#B + prefix_bytes#B;
-        if (m_type == 0x11UL) {
-            var stab = h5explain_map_stab(payload_off);
-            h5explain_stab_found = 1;
-            h5explain_stab_btree_addr = bytes_to_off(stab.btree_addr_raw);
-            h5explain_stab_heap_addr = bytes_to_off(stab.heap_addr_raw);
-        } else if (m_type == 0x10UL) {
-            var cont = h5explain_map_cont(payload_off);
-            var cont_off = bytes_to_off(cont.addr_raw);
-            var cont_size = bytes_to_u64_le(cont.size_raw);
-            if (version == 2UB)
-                h5explain_find_stab_in_chunk(version, prefix_bytes,
-                                             cont_off + 4#B,
-                                             cont_size - 4UL);
-            else
-                h5explain_find_stab_in_chunk(version, prefix_bytes,
-                                             cont_off, cont_size);
-        }
-
-        i = i + prefix_bytes + m_size;
-    }
+    var ignored = h5explain_walk_msg_chunk(version, prefix_bytes,
+                                           chunk_off, chunk_size,
+                                           h5explain_cb_stab);
 }
 
 /* Find the old-style (v1 B-tree + local heap) group symbol table; falls back to
@@ -742,64 +891,328 @@ fun h5explain_links_in_v1_btree = (offset<uint<64>,B> btree_addr,
     return count;
 }
 
+fun h5explain_fheap_heap_off_size = (frhp_hdr hdr) uint<64>:
+{
+    return h5explain_bytes_for_bits(hdr.dtable.max_heap_size_bits as uint<64>);
+}
+
+fun h5explain_fheap_heap_len_size = (frhp_hdr hdr) uint<64>:
+{
+    return h5explain_min_u64(h5explain_fheap_heap_off_size(hdr),
+                             h5explain_bytes_for_limit(hdr.max_man_size as uint<64>));
+}
+
+fun h5explain_fheap_max_direct_rows = (frhp_hdr hdr) uint<64>:
+{
+    var start_size = bytes_to_u64_le(hdr.dtable.start_block_size_raw);
+    var max_direct_size = bytes_to_u64_le(hdr.dtable.max_direct_size_raw);
+
+    return h5explain_floor_log2(max_direct_size)
+           - h5explain_floor_log2(start_size) + 2UL;
+}
+
+/* Locate the file address of a managed-object payload, descending into
+   child indirect blocks as needed.  Mirrors H5HF__man_dblock_locate +
+   the obj-off-to-blk-off arithmetic in H5HF__man_op_real, but iteratively.
+   Returns 0UL#B when the entry is undefined or the lookup escapes the
+   iblock geometry (corruption / heap-id from a different heap).         */
+fun h5explain_fheap_locate_managed = (frhp_hdr hdr,
+                                      offset<uint<64>,B> iblock_addr,
+                                      uint<64> nrows,
+                                      uint<64> heap_obj_off) offset<uint<64>,B>:
+{
+    var start_size = bytes_to_u64_le(hdr.dtable.start_block_size_raw);
+    var width = hdr.dtable.table_width as uint<64>;
+    var first_row_bits = h5explain_floor_log2(start_size)
+                         + h5explain_floor_log2(width);
+    var max_direct_rows = h5explain_fheap_max_direct_rows(hdr);
+    var prefix_size = 5UL + (global_sizeof_offsets as uint<64>)
+                      + h5explain_fheap_heap_off_size(hdr);
+    var entry_size = global_sizeof_offsets as uint<64>;
+    var cur_addr = iblock_addr;
+    var cur_nrows = nrows;
+    var cur_block_off = 0UL;
+
+    while (1) {
+        var local_off = heap_obj_off - cur_block_off;
+        var row = 0UL;
+        var col = 0UL;
+        var row_block_size = start_size;
+        var row_block_off = 0UL;
+
+        if (local_off < start_size * width) {
+            row = 0UL;
+            col = local_off / start_size;
+            row_block_off = 0UL;
+            row_block_size = start_size;
+        } else {
+            var high_bit = h5explain_floor_log2(local_off);
+            var off_mask = 1UL <<. high_bit;
+
+            row = (high_bit - first_row_bits) + 1UL;
+            row_block_size = start_size <<. (row - 1UL);
+            row_block_off = off_mask;     /* == 2^(row-1) * start * width */
+            col = (local_off - off_mask) / row_block_size;
+        }
+
+        if (row >= cur_nrows) return 0UL#B;
+        if (col >= width)     return 0UL#B;
+
+        var entry_off = cur_addr + (prefix_size
+                                    + ((row * width + col) * entry_size))#B;
+        var addr_raw = byte[global_sizeof_offsets] @ entry_off;
+        if (h5explain_non_strict)
+            addr_raw = byte[global_sizeof_offsets] @! entry_off;
+        if (h5explain_addr_is_undef(addr_raw)) return 0UL#B;
+
+        var child_addr = bytes_to_off(addr_raw);
+        var child_block_off = cur_block_off + row_block_off + col * row_block_size;
+
+        if (row < max_direct_rows)
+            return child_addr + (heap_obj_off - child_block_off)#B;
+
+        /* Indirect: descend.  child_nrows derivation matches
+           H5HF__man_dblock_locate: log2(row_block_size) - first_row_bits + 1. */
+        cur_addr = child_addr;
+        cur_nrows = row - h5explain_floor_log2(width);
+        cur_block_off = child_block_off;
+    }
+
+    return 0UL#B;
+}
+
+fun h5explain_fheap_managed_object_off = (offset<uint<64>,B> fheap_addr,
+                                          byte[] heap_id_raw) offset<uint<64>,B>:
+{
+    var hdr = h5explain_map_frhp_hdr(fheap_addr);
+    var heap_id_type = ((heap_id_raw[0] .>> 4) & 3U) as uint<64>;
+    var off_size = h5explain_fheap_heap_off_size(hdr);
+    var len_size = h5explain_fheap_heap_len_size(hdr);
+    var root_addr = 0UL#B;
+    var heap_obj_off = 0UL;
+    var heap_obj_len = 0UL;
+
+    if (heap_id_type != 0UL)
+        return 0UL#B;
+
+    if (hdr.filter_len != 0UH)
+        return 0UL#B;
+
+    if (heap_id_raw'length < (1UL + off_size + len_size))
+        return 0UL#B;
+
+    heap_obj_off = h5explain_u64_from_slice(heap_id_raw, 1UL, off_size);
+    heap_obj_len = h5explain_u64_from_slice(heap_id_raw, 1UL + off_size, len_size);
+    root_addr = bytes_to_off(hdr.dtable.root_addr_raw);
+
+    if (heap_obj_len == 0UL || root_addr == 0UL#B)
+        return 0UL#B;
+
+    if (hdr.dtable.curr_root_rows == 0UH)
+        return root_addr + heap_obj_off#B;
+
+    return h5explain_fheap_locate_managed(hdr, root_addr,
+                                          hdr.dtable.curr_root_rows as uint<64>,
+                                          heap_obj_off);
+}
+
+fun h5explain_dense_link_from_heap_id = (offset<uint<64>,B> fheap_addr,
+                                         byte[] heap_id_raw,
+                                         string wanted = "",
+                                         int emit = 1) uint<64>:
+{
+    var payload_off = h5explain_fheap_managed_object_off(fheap_addr, heap_id_raw);
+
+    if (payload_off == 0UL#B)
+        return 0UL;
+
+    var link = h5explain_map_link(payload_off);
+    if ((link.flags & 8U) == 0U) {
+        var name = char_array_to_string(link.lnk_name);
+        var addr = bytes_to_off(link.ohdr_addr_raw);
+
+        if (emit) printf("  %s -> %v\n", name, addr);
+
+        if (wanted != "" && name == wanted) {
+            h5explain_link_found = 1;
+            h5explain_link_addr = addr;
+        }
+
+        return 1UL;
+    }
+
+    return 0UL;
+}
+
+fun h5explain_map_bt2_rec_type5 = (offset<uint<64>,B> rec_off) bt2_rec_type5:
+{
+    if (h5explain_non_strict) return bt2_rec_type5 @! rec_off;
+    return bt2_rec_type5 @ rec_off;
+}
+
+fun h5explain_map_bt2_rec_type6 = (offset<uint<64>,B> rec_off) bt2_rec_type6:
+{
+    if (h5explain_non_strict) return bt2_rec_type6 @! rec_off;
+    return bt2_rec_type6 @ rec_off;
+}
+
+/* Decode one v2 B-tree record into a dense link.  Type 5 is the
+   name-indexed B-tree; type 6 is the creation-order-indexed B-tree.
+   Both record types embed the same 7-byte fractal-heap object ID, just
+   at different offsets within the record.                             */
+fun h5explain_dense_record_at = (offset<uint<64>,B> rec_off,
+                                 uint<8> rec_type,
+                                 offset<uint<64>,B> fheap_addr,
+                                 string wanted = "",
+                                 int emit = 1) uint<64>:
+{
+    if (rec_type == 6UB) {
+        var rec = h5explain_map_bt2_rec_type6(rec_off);
+        return h5explain_dense_link_from_heap_id(fheap_addr, rec.heap_id_raw,
+                                                 wanted, emit);
+    }
+
+    var rec = h5explain_map_bt2_rec_type5(rec_off);
+    return h5explain_dense_link_from_heap_id(fheap_addr, rec.heap_id_raw,
+                                             wanted, emit);
+}
+
+fun h5explain_dense_links_in_v2_node = (offset<uint<64>,B> node_addr,
+                                        uint<16> depth,
+                                        uint<16> nrec,
+                                        uint<8> rec_type,
+                                        offset<uint<64>,B> fheap_addr,
+                                        string wanted = "",
+                                        int emit = 1) uint<64>:
+{
+    var count = 0UL;
+
+    set_bt2_depth(depth);
+    set_bt2_nrec(nrec);
+
+    if (depth == 0UH) {
+        var leaf = h5explain_map_v2_btree_leaf(node_addr);
+        var n = 0UL;
+
+        while (n < nrec as uint<64>) {
+            count = count + h5explain_dense_record_at(
+                leaf.records[n]'offset as offset<uint<64>,B>,
+                rec_type, fheap_addr, wanted, emit);
+            n = n + 1UL;
+        }
+    } else {
+        var inode = h5explain_map_v2_btree_internal(node_addr);
+        var n = 0UL;
+
+        while (n < nrec as uint<64>) {
+            count = count + h5explain_dense_record_at(
+                inode.records[n]'offset as offset<uint<64>,B>,
+                rec_type, fheap_addr, wanted, emit);
+            n = n + 1UL;
+        }
+
+        n = 0UL;
+        while (n < (nrec as uint<64>) + 1UL) {
+            var child_addr = 0UL#B;
+            var child_nrec = 0UH;
+
+            if (depth == 1UH) {
+                child_addr = bytes_to_off(inode.children.d1[n].child_addr_raw);
+                child_nrec = bytes_to_u64_le(inode.children.d1[n].nrec_in_child_raw) as uint<16>;
+            } else {
+                child_addr = bytes_to_off(inode.children.dn[n].child_addr_raw);
+                child_nrec = bytes_to_u64_le(inode.children.dn[n].nrec_in_child_raw) as uint<16>;
+            }
+
+            count = count + h5explain_dense_links_in_v2_node(child_addr, depth - 1,
+                                                             child_nrec, rec_type,
+                                                             fheap_addr, wanted, emit);
+            set_bt2_depth(depth);
+            set_bt2_nrec(nrec);
+            n = n + 1UL;
+        }
+    }
+
+    return count;
+}
+
+/* Walk a dense-link v2 B-tree.  Accepts either a name-indexed (record
+   type 5) or creation-order-indexed (record type 6) B-tree; the record
+   type is read from the header so callers don't need to know which
+   index they were handed.                                              */
+fun h5explain_links_in_dense_btree = (offset<uint<64>,B> bt2_addr,
+                                      offset<uint<64>,B> fheap_addr,
+                                      string wanted = "",
+                                      int emit = 1) uint<64>:
+{
+    var hdr = h5explain_map_v2_btree_hdr(bt2_addr);
+
+    if (hdr.record_type != 5UB && hdr.record_type != 6UB)
+        return 0UL;
+
+    set_bt2_nrec_size_from_hdr(hdr.node_size, hdr.record_size);
+    set_bt2_nrec_subtree_size_from_hdr(hdr.node_size, hdr.record_size, hdr.depth);
+    set_bt2_nrec(hdr.num_root_records);
+
+    return h5explain_dense_links_in_v2_node(bytes_to_off(hdr.root_addr_raw),
+                                            hdr.depth, hdr.num_root_records,
+                                            hdr.record_type, fheap_addr,
+                                            wanted, emit);
+}
+
+/* Pick whichever dense-link index the Link Info message advertised:
+   prefer the name-indexed B-tree (faster name lookup), fall back to the
+   creation-order-indexed B-tree if name indexing is absent.  Returns
+   0UL#B when no usable index is available.                             */
+fun h5explain_dense_bt2_addr = offset<uint<64>,B>:
+{
+    if (h5explain_linfo_name_bt2_addr != 0UL#B)
+        return h5explain_linfo_name_bt2_addr;
+    return h5explain_linfo_corder_bt2_addr;
+}
+
+/* Hard-link callback parameters: set by h5explain_links_in_chunk before
+   delegating to the generic walker.  Globals (rather than callback
+   closures, which Poke does not support) carry the per-walk wanted/emit
+   state.                                                                */
+var h5explain_links_walk_wanted = "";
+var h5explain_links_walk_emit = 1;
+
+/* Hard-link callback: count + (optionally) print + (optionally) match
+   against a wanted name.  Skips messages whose flags indicate a
+   non-hard-link entry.                                                  */
+fun h5explain_cb_links = (uint<64> m_type,
+                          offset<uint<64>,B> payload_off,
+                          uint<64> m_size) uint<64>:
+{
+    if (m_type != 0x06UL) return 0UL;
+
+    var link = h5explain_map_link(payload_off);
+    if ((link.flags & 8U) != 0U) return 0UL;
+
+    var name = char_array_to_string(link.lnk_name);
+    var addr = bytes_to_off(link.ohdr_addr_raw);
+    if (h5explain_links_walk_emit) printf("  %s -> %v\n", name, addr);
+    if (h5explain_links_walk_wanted != "" && name == h5explain_links_walk_wanted) {
+        h5explain_link_found = 1;
+        h5explain_link_addr = addr;
+    }
+    return 1UL;
+}
+
 /* Walk ohdr message chunks (following continuations) collecting hard-link
-   messages; dense links stored in a v2 B-tree are not decoded here. */
+   messages; dense links are decoded separately from the Link Info message. */
 fun h5explain_links_in_chunk = (uint<8> version, int prefix_bytes,
                                 offset<uint<64>,B> chunk_off,
                                 uint<64> chunk_size,
                                 string wanted = "",
                                 int emit = 1) uint<64>:
 {
-    var i = 0UL;
-    var count = 0UL;
-
-    global_version = version;
-
-    while ((i + prefix_bytes) < chunk_size) {
-        var m_type = 0UL;
-        var m_size = 0UL;
-        var prefix = h5explain_map_msg_prefix(chunk_off + i#B);
-
-        if (version == 1UB) {
-            m_type = prefix.v1_msg_prefix.msg_type as uint<64>;
-            m_size = prefix.v1_msg_prefix.msg_size as uint<64>;
-        } else {
-            m_type = prefix.v2_msg_prefix.msg_type as uint<64>;
-            m_size = prefix.v2_msg_prefix.msg_size as uint<64>;
-        }
-
-        var payload_off = chunk_off + i#B + prefix_bytes#B;
-        if (m_type == 0x06UL) {
-            var link = h5explain_map_link(payload_off);
-            if ((link.flags & 8U) == 0U) {
-                var name = char_array_to_string(link.lnk_name);
-                var addr = bytes_to_off(link.ohdr_addr_raw);
-                if (emit) printf("  %s -> %v\n", name, addr);
-                count = count + 1UL;
-                if (wanted != "" && name == wanted) {
-                    h5explain_link_found = 1;
-                    h5explain_link_addr = addr;
-                }
-            }
-        } else if (m_type == 0x10UL) {
-            var cont = h5explain_map_cont(payload_off);
-            var cont_off = bytes_to_off(cont.addr_raw);
-            var cont_size = bytes_to_u64_le(cont.size_raw);
-            if (version == 2UB)
-                count = count + h5explain_links_in_chunk(version, prefix_bytes,
-                                                         cont_off + 4#B,
-                                                         cont_size - 4UL,
-                                                         wanted, emit);
-            else
-                count = count + h5explain_links_in_chunk(version, prefix_bytes,
-                                                         cont_off, cont_size,
-                                                         wanted, emit);
-        }
-
-        i = i + prefix_bytes + m_size;
-    }
-
-    return count;
+    h5explain_links_walk_wanted = wanted;
+    h5explain_links_walk_emit = emit;
+    return h5explain_walk_msg_chunk(version, prefix_bytes,
+                                    chunk_off, chunk_size,
+                                    h5explain_cb_links);
 }
 
 fun links = void:
@@ -814,12 +1227,19 @@ fun links = void:
     printf("Hard links:\n");
     var count = h5explain_links_in_chunk(h5explain_ctx_version, h5explain_ctx_pfx,
                                          h5explain_ctx_chunk_off, h5explain_ctx_chunk_size);
+    if (h5explain_find_dense_linfo(h5explain_ctx_version, h5explain_ctx_pfx,
+                                   h5explain_ctx_chunk_off, h5explain_ctx_chunk_size)) {
+        var bt2_addr = h5explain_dense_bt2_addr;
+        if (bt2_addr != 0UL#B)
+            count = count + h5explain_links_in_dense_btree(bt2_addr,
+                                                           h5explain_linfo_fheap_addr);
+    }
     if (h5explain_find_old_group_stab(h5explain_ctx_version, h5explain_ctx_pfx,
                                       h5explain_ctx_chunk_off, h5explain_ctx_chunk_size))
         count = count + h5explain_links_in_v1_btree(h5explain_stab_btree_addr,
                                                     h5explain_stab_heap_addr);
     if (count == 0UL)
-        printf("  (none found; dense links are not decoded here)\n");
+        printf("  (none found)\n");
 }
 
 fun ls = void:
@@ -852,6 +1272,15 @@ fun cd = (string name) void:
     var ignored = h5explain_links_in_chunk(h5explain_ctx_version, h5explain_ctx_pfx,
                                            h5explain_ctx_chunk_off, h5explain_ctx_chunk_size,
                                            name, 0);
+    if (!h5explain_link_found
+        && h5explain_find_dense_linfo(h5explain_ctx_version, h5explain_ctx_pfx,
+                                      h5explain_ctx_chunk_off, h5explain_ctx_chunk_size)) {
+        var bt2_addr = h5explain_dense_bt2_addr;
+        if (bt2_addr != 0UL#B)
+            ignored = ignored + h5explain_links_in_dense_btree(bt2_addr,
+                                                               h5explain_linfo_fheap_addr,
+                                                               name, 0);
+    }
     if (!h5explain_link_found
         && h5explain_find_old_group_stab(h5explain_ctx_version, h5explain_ctx_pfx,
                                          h5explain_ctx_chunk_off, h5explain_ctx_chunk_size))
