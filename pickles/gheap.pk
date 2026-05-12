@@ -1,0 +1,216 @@
+/* gheap.pk - HDF5 Global Heap (section III.E, Level 1E).  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   - Global Heap Collection header (signature "GCOL", Sec. III.E / Level 1E
+ *                                    of the HDF5 format spec v3)
+ *   - Global Heap Object entries within the collection
+ *   - Object 0 (free-space sentinel)
+ *
+ * The global heap stores variable-length data referenced by object headers
+ * (VL strings, VL datatypes, object and region references).  Each file may
+ * have multiple collections; every collection is self-contained.
+ *
+ * Load order:
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk   <- sets global_sizeof_offsets and
+ *                                                global_sizeof_lengths
+ *   (poke) .load pickles/gheap.pk
+ *
+ * Quick start:
+ *   print_global_heap(<addr>#B);
+ *     Prints the collection header followed by each heap object in file order,
+ *     ending with the free-space sentinel (object 0).
+ *
+ *   Example — testfiles/ntypes.h5 has a collection at byte offset 3628256:
+ *     (poke) print_global_heap(3628256#B);
+ *
+ *   OR manually:
+ *     var h = gheap_hdr @ <addr>#B;     <- maps only the collection header
+ *
+ *   To inspect an individual object header at a known position within the
+ *   collection (pos is the byte offset from the start of the collection):
+ *     var oh = gheap_obj_hdr @ (<addr> + <pos>)#B;
+ *
+ * On-disk layout (Section III.E):
+ *
+ *   Collection header (H5HG_SIZEOF_HDR = align8(8+L) bytes; always 16 for
+ *   the typical L=4 and L=8 cases):
+ *   [signature   : 4]    <- "GCOL"
+ *   [version     : 1]    <- must be 1
+ *   [reserved    : 3]    <- must be 0
+ *   [coll_size   : L]    <- total byte count of this collection
+ *   [padding     : P]    <- zero-fill to next 8-byte boundary
+ *                          (P = align8(8+L)-(8+L); 0 for L=8, 4 for L=4)
+ *
+ *   Followed by heap objects in file order:
+ *
+ *   Object header (H5HG_SIZEOF_OBJHDR = align8(8+L) bytes; always 16):
+ *   [obj_idx     : 2]    <- object index (uint16 LE); 0 = free-space sentinel
+ *   [ref_cnt     : 2]    <- reference count (uint16 LE)
+ *   [reserved    : 4]    <- zeros
+ *   [data_size   : L]    <- for idx>0: byte count of following data field;
+ *                           for idx=0: total span of the free region INCLUDING
+ *                                      this object header
+ *
+ *   Object data (idx>0 only):
+ *   [data        : data_size bytes, zero-padded to 8-byte boundary]
+ *
+ *   Total space consumed per object:
+ *     idx > 0: align8(8+L) + align8(data_size)
+ *     idx = 0: data_size bytes (measured from the start of object 0's header)
+ *
+ *   Any trailing bytes at the end of the collection that are shorter than
+ *   one object header are padding (zeros).
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Size of the collection header and of each object header on disk.
+ *
+ * Both equal align8(8 + global_sizeof_lengths).  For the common cases:
+ *   L=4  -> align8(12) = 16 bytes
+ *   L=8  -> align8(16) = 16 bytes
+ * ----------------------------------------------------------------------- */
+
+fun gheap_sizeof_hdr = uint<64>:
+{
+    return align8(8UL + global_sizeof_lengths as uint<64>);
+};
+
+fun gheap_sizeof_objhdr = uint<64>:
+{
+    return align8(8UL + global_sizeof_lengths as uint<64>);
+};
+
+/* ----------------------------------------------------------------------- *
+ * Global Heap ID  (HDF5 spec Sec. III.E / "Global Heap Object Identifier")
+ *
+ * A GHEAP ID is embedded in an object header message (e.g. VL datatype) to
+ * reference one object inside a specific global heap collection:
+ *
+ *   [collection_addr : sizeof_offsets bytes]  <- file address of the GCOL
+ *   [obj_idx         : 4 bytes, uint32 LE]    <- 1-based object index
+ *
+ * Total size: global_sizeof_offsets + 4 bytes.
+ * ----------------------------------------------------------------------- */
+
+type gheap_id = struct {
+    byte[global_sizeof_offsets] collection_addr_raw;
+    byte[4]                     obj_idx_raw;
+};
+
+fun print_gheap_id = (gheap_id id) void:
+{
+    var addr = bytes_to_u64_le(id.collection_addr_raw);
+    var idx  = bytes_to_u64_le(id.obj_idx_raw);
+    printf("gheap_id { collection_addr=0x%u64x obj_idx=%u64d }\n", addr, idx);
+};
+
+/* ----------------------------------------------------------------------- *
+ * Global Heap Collection header  (signature "GCOL")
+ * ----------------------------------------------------------------------- */
+
+type gheap_hdr = struct {
+    byte[4]  signature == ['G', 'C', 'O', 'L'];
+    byte     version   == 1;
+    byte[3]  reserved  == [0UB, 0UB, 0UB];
+    byte[global_sizeof_lengths] coll_size_raw;   /* total collection byte count */
+};
+
+/* ----------------------------------------------------------------------- *
+ * Per-object header within the collection.
+ *
+ * Note: for object 0 (idx_raw == 0), data_size_raw holds the total span of
+ * the free-space region INCLUDING this header (not just the data bytes).
+ * ----------------------------------------------------------------------- */
+
+type gheap_obj_hdr = struct {
+    byte[2] idx_raw;       /* object index (uint16 LE); 0 = free space */
+    byte[2] ref_cnt_raw;   /* reference count (uint16 LE)              */
+    byte[4] reserved;      /* must be 0                                */
+    byte[global_sizeof_lengths] data_size_raw;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Top-level print function
+ *
+ * Maps the collection at OFF, then iterates through every heap object
+ * printing its index, reference count, data size, and raw data bytes.
+ * Object 0 (free-space sentinel) is printed last in file order.
+ * ----------------------------------------------------------------------- */
+
+fun print_global_heap = (offset<uint<64>,B> off) void:
+{
+    var h          = gheap_hdr @ off;
+    var coll_sz    = bytes_to_u64_le(h.coll_size_raw);
+    var hdr_sz     = gheap_sizeof_hdr;
+    var obj_hdr_sz = gheap_sizeof_objhdr;
+
+    printf("global_heap {\n");
+    printf("  signature=%v\n", h.signature);
+    printf("  version=%u8d\n", h.version);
+    printf("  coll_size=%u64d\n", coll_sz);
+
+    var pos   = hdr_sz;
+    var obj_n = 0UL;   /* count of non-free objects seen so far */
+
+    while (pos < coll_sz) {
+        /* Trailing bytes too small for an object header: padding only. */
+        if (coll_sz - pos < obj_hdr_sz) {
+            var frag_sz = coll_sz - pos;
+            printf("  /* trailing fragment: %u64d byte(s) of padding */\n",
+                   frag_sz);
+            pos = coll_sz;
+        } else {
+            var oh      = gheap_obj_hdr @ (off + pos#B);
+            var idx     = bytes_to_u64_le(oh.idx_raw);
+            var ref_cnt = bytes_to_u64_le(oh.ref_cnt_raw);
+            var data_sz = bytes_to_u64_le(oh.data_size_raw);
+
+            if (idx == 0UL) {
+                /* Free-space sentinel.  data_sz is the total span from the
+                 * start of this object header to the end of the free region,
+                 * so actual free data = data_sz - obj_hdr_sz.              */
+                printf("  obj[0] /* free space */ {\n");
+                printf("    ref_cnt=%u64d\n", ref_cnt);
+                printf("    free_space_total=%u64d\n", data_sz);
+                var free_data_sz = 0UL;
+                if (data_sz > obj_hdr_sz)
+                    free_data_sz = data_sz - obj_hdr_sz;
+                printf("    free_data_bytes=%u64d\n", free_data_sz);
+                printf("  }\n");
+                pos = pos + data_sz;
+            } else {
+                printf("  obj[%u64d] {\n", idx);
+                printf("    ref_cnt=%u64d\n", ref_cnt);
+                printf("    data_size=%u64d\n", data_sz);
+                if (data_sz > 0UL) {
+                    var data = byte[data_sz] @ (off + (pos + obj_hdr_sz)#B);
+                    printf("    data=%v\n", data);
+                }
+                printf("  }\n");
+                pos = pos + obj_hdr_sz + align8(data_sz);
+                obj_n = obj_n + 1UL;
+            }
+        }
+    }
+
+    printf("  /* total non-free objects: %u64d */\n", obj_n);
+    printf("}\n");
+};
