@@ -1,0 +1,235 @@
+/* lheap.pk - HDF5 Local Heap (section III.D, Level 1D).  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   - Local Heap header  (signature "HEAP", Sec. III.D / Level 1D of the
+ *                         HDF5 format spec v3)
+ *   - Local Heap data segment (variable-length byte array at the address
+ *                         stored in the header; contains null-terminated
+ *                         name strings aligned to 8-byte boundaries, with
+ *                         unused regions forming a singly-linked free list)
+ *
+ * Load order:
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk   <- sets global_sizeof_offsets and
+ *                                                global_sizeof_lengths
+ *   (poke) .load pickles/lheap.pk
+ *
+ * Quick start:
+ *   print_local_heap(<addr>#B);
+ *     Prints the heap header, the raw data segment bytes, the free-list
+ *     (if any), and a string table listing all printable null-terminated
+ *     entries.
+ *
+ *   OR manually:
+ *     var h = local_heap @ <addr>#B;     <- maps only the header
+ *
+ *   To look up the string stored at a specific offset within the heap:
+ *     lheap_str_at(<data_seg_addr>#B, <name_offset>)
+ *     e.g. lheap_str_at(712#B, 8)       <- string at heap offset 8
+ *
+ * On-disk layout (Section III.D):
+ *   [signature        : 4]   <- "HEAP"
+ *   [version          : 1]   <- must be 0
+ *   [reserved         : 3]   <- must be 0
+ *   [data_seg_size    : L]   <- total bytes allocated for the data segment
+ *   [free_list_head   : L]   <- byte offset within the data segment of the
+ *                               first free block; all-FF (UNDEF_LEN) or 1
+ *                               (H5HL_FREE_NULL) when no free blocks exist
+ *   [data_seg_addr    : O]   <- file address of the data segment
+ *   Total header size: 8 + 2*L + O bytes
+ *
+ * Data segment layout:
+ *   Byte 0 of the data segment is always a null byte (empty-string sentinel).
+ *   Remaining bytes are null-terminated strings, each padded with trailing
+ *   zeros to an 8-byte boundary.  Unused regions form a singly-linked list:
+ *     [next_off : L]   <- offset of next free block within data segment,
+ *                         or 1 to signal the end of the free list
+ *     [blk_size : L]   <- size of this free block in bytes
+ *   Minimum free block size is 2*L bytes.
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Free block entry within the data segment
+ * ----------------------------------------------------------------------- */
+
+type lheap_free_blk = struct {
+    byte[global_sizeof_lengths] next_off_raw;   /* next free-block offset, or 1 = end */
+    byte[global_sizeof_lengths] blk_size_raw;   /* size of this free block in bytes   */
+};
+
+/* ----------------------------------------------------------------------- *
+ * Local Heap header  (signature "HEAP")
+ * ----------------------------------------------------------------------- */
+
+type local_heap = struct {
+    byte[4]  signature       == ['H', 'E', 'A', 'P'];
+    byte     version         == 0;
+    byte[3]  reserved        == [0UB, 0UB, 0UB];
+    byte[global_sizeof_lengths] data_seg_size_raw;   /* total data segment bytes    */
+    byte[global_sizeof_lengths] free_list_head_raw;  /* offset to first free block  */
+    byte[global_sizeof_offsets] data_seg_addr_raw;   /* file address of data segment */
+};
+
+/* ----------------------------------------------------------------------- *
+ * Helper functions
+ * ----------------------------------------------------------------------- */
+
+/* Return 1 if an L-byte length raw field holds the UNDEF_LEN sentinel
+ * (all-FF bytes), meaning "no free blocks / no next block".             */
+fun lheap_len_is_undef = (byte[] raw) int:
+{
+    for (b in raw) {
+        if (b != 0xFFUB) return 0;
+    }
+    return 1;
+};
+
+/* Return 1 if the free_list_head field indicates an empty free list.
+ * HDF5 uses two sentinels: all-FF (UNDEF_LEN per spec) and 1
+ * (H5HL_FREE_NULL, used when the list is empty but the segment is not
+ * fully undefined).                                                      */
+fun lheap_fl_is_empty = (byte[] raw) int:
+{
+    if (lheap_len_is_undef(raw)) return 1;
+    return bytes_to_u64_le(raw) == 1UL;
+};
+
+/* Print the null-terminated string stored at byte offset STR_OFF within
+ * the data segment whose first byte is at file address DATA_ADDR.       */
+fun lheap_str_at = (offset<uint<64>,B> data_addr, uint<64> str_off) void:
+{
+    var addr = data_addr + str_off#B;
+    var b = byte @ addr;
+    while (b != 0UB) {
+        printf("%c", b as char);
+        addr = addr + 1#B;
+        b = byte @ addr;
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Top-level print function
+ *
+ * Maps the local heap header at OFF, then maps and prints the data segment
+ * and free list, followed by a string table.
+ * ----------------------------------------------------------------------- */
+
+fun print_local_heap = (offset<uint<64>,B> off) void:
+{
+    var h   = local_heap @ off;
+    var dss = bytes_to_u64_le(h.data_seg_size_raw);
+    var flh = bytes_to_u64_le(h.free_list_head_raw);
+    var dsa = bytes_to_u64_le(h.data_seg_addr_raw);
+    var dsa_off = dsa#B;
+
+    printf("local_heap {\n");
+    printf("  signature=%v\n", h.signature);
+    printf("  version=%u8d\n", h.version);
+    printf("  data_seg_size=%u64d\n", dss);
+    printf("  free_list_head=");
+    if (lheap_fl_is_empty(h.free_list_head_raw))
+        printf("UNDEF (no free blocks)\n");
+    else
+        printf("%u64d\n", flh);
+    printf("  data_seg_addr=%u64d\n", dsa);
+
+    /* --- data segment raw bytes --- */
+    printf("  data_segment {\n");
+    var data = byte[dss] @ dsa_off;
+    printf("    raw=%v\n", data);
+
+    /* --- free-list traversal ---
+     * HDF5 maintains the local-heap free list sorted by ascending offset,
+     * so we can traverse it once while printing and again during string scan.
+     */
+    if (!lheap_fl_is_empty(h.free_list_head_raw)) {
+        printf("    free_list {\n");
+        var fl_cur = flh;
+        var fl_idx = 0UL;
+        var fl_done = 0;
+        while (!fl_done) {
+            var fl_fb   = lheap_free_blk @ (dsa_off + fl_cur#B);
+            var fl_next = bytes_to_u64_le(fl_fb.next_off_raw);
+            var fl_bsz  = bytes_to_u64_le(fl_fb.blk_size_raw);
+            printf("      free_blk[%u64d]: offset=%u64d  size=%u64d  next=",
+                   fl_idx, fl_cur, fl_bsz);
+            if (fl_next == 1UL)
+                printf("(end)\n");
+            else
+                printf("%u64d\n", fl_next);
+            fl_idx = fl_idx + 1UL;
+            if (fl_next == 1UL) fl_done = 1;
+            else fl_cur = fl_next;
+        }
+        printf("    }\n");
+    }
+
+    /* --- string table: scan used regions only, skipping free blocks ---
+     *
+     * The free list is sorted by ascending data-segment offset, so we keep
+     * a single "next free block" cursor (sc_fb_start / sc_fb_end / sc_fb_next)
+     * and advance it as the scan position moves forward.
+     *
+     * sc_fb_start == dss means "no more free blocks ahead".
+     */
+    var sc_fb_start = dss;
+    var sc_fb_end   = dss;
+    var sc_fb_next  = 1UL;
+
+    if (!lheap_fl_is_empty(h.free_list_head_raw)) {
+        var sc_first = lheap_free_blk @ (dsa_off + flh#B);
+        sc_fb_start = flh;
+        sc_fb_end   = flh + bytes_to_u64_le(sc_first.blk_size_raw);
+        sc_fb_next  = bytes_to_u64_le(sc_first.next_off_raw);
+    }
+
+    printf("    string_table {\n");
+    var pos = 0UL;
+    var str_idx = 0UL;
+    while (pos < dss) {
+        if (pos >= sc_fb_start) {
+            /* pos has entered a free block region; jump past it */
+            pos = sc_fb_end;
+            if (sc_fb_next != 1UL) {
+                var sc_nfb  = lheap_free_blk @ (dsa_off + sc_fb_next#B);
+                sc_fb_start = sc_fb_next;
+                sc_fb_end   = sc_fb_next + bytes_to_u64_le(sc_nfb.blk_size_raw);
+                sc_fb_next  = bytes_to_u64_le(sc_nfb.next_off_raw);
+            } else {
+                sc_fb_start = dss;
+                sc_fb_end   = dss;
+            }
+        } else if (data[pos] == 0UB) {
+            pos = pos + 1UL;
+        } else {
+            printf("      [%u64d] offset=%u64d  \"", str_idx, pos);
+            lheap_str_at(dsa_off, pos);
+            printf("\"\n");
+            str_idx = str_idx + 1UL;
+            while (pos < dss && data[pos] != 0UB)
+                pos = pos + 1UL;
+            pos = pos + 1UL;
+        }
+    }
+    printf("    }\n");
+
+    printf("  }\n");
+    printf("}\n");
+};
