@@ -1,0 +1,195 @@
+/* drv_info.pk - HDF5 Driver Information Block (section II.B).  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   - Driver Information Block (Section II.B of the HDF5 format spec v3),
+ *     present only in files that use superblock versions 0 or 1 and whose
+ *     superblock drv_info_addr field is not HADDR_UNDEF.
+ *     (In superblock v2+, driver info moved to the Superblock Extension.)
+ *
+ *   Driver-specific info formats parsed:
+ *     "NCSAmult"  Multi-file driver  (6-byte member mapping, address pairs,
+ *                                     null-terminated padded name strings)
+ *     "NCSAfami"  Family driver      (8-byte member-file size, uint64 LE)
+ *     anything else  raw byte dump
+ *
+ * Load order:
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk   <- sets global_sizeof_offsets /
+ *                                                global_sizeof_lengths, and
+ *                                                automatically loads drv_info.pk
+ *
+ * Quick start:
+ *   After loading the superblock (which sets global_sizeof_*), obtain the
+ *   driver information block address from the v0/v1 superblock field:
+ *
+ *     var sb  = superblock @ 0#B;
+ *     var off = bytes_to_off(sb.super.v0_v1.drv_info_addr_raw);
+ *
+ *   Then map and print:
+ *     var dib = drv_info_blk @ off;
+       did
+ *
+ * On-disk layout (Section II.B):
+ *   [version : 1]
+ *   [reserved : 3]
+ *   [drv_info_size : 4]          <- uint32 LE; size of Driver Information only
+ *                                   (does NOT count the 8-byte Driver Identification)
+ *   [drv_id : 8]                 <- ASCII, no null termination
+ *   [driver-specific data : drv_info_size]
+ *   Total = 16 + drv_info_size bytes
+ *
+ * Multi-file driver info (buf written by H5FD_multi_sb_encode):
+ *   [member_mapping : 6]         <- one byte per usage type:
+ *                                   [0] superblock, [1] B-tree, [2] raw data,
+ *                                   [3] global heap, [4] local heap, [5] obj hdr
+ *                                   values 1-6 select the member file index
+ *   [reserved : 2]               <- must be 0
+ *   [start_addr : 8] * N         <- uint64 LE virtual start of each member file
+ *   [eoa_addr   : 8] * N         <- uint64 LE end-of-allocation of each member file
+ *   [names]                      <- N null-terminated strings, each padded to a
+ *                                   multiple of 8 bytes
+ *   where N = number of distinct values in member_mapping
+ *
+ * Family driver info (buf written by H5FD__family_sb_encode):
+ *   [member_size : 8]            <- uint64 LE size of each member file
+ */
+
+/* Bytes occupied by the null-terminated padded name strings:
+ * = drv_info_size - 8 (mapping + reserved) - n_members * 16 (address pairs) */
+fun multi_drv_names_size = (uint<32> sz, uint<64> n) uint<64>:
+{
+    var addr_bytes = n * 16UL;
+    if ((sz as uint<64>) > 8UL + addr_bytes)
+        return (sz as uint<64>) - 8UL - addr_bytes;
+    return 0UL;
+};
+
+
+/* Identify the driver: "NCSAmult" -> 1, "NCSAfami" -> 2, other -> 0. */
+fun drv_type = (char[8] id) int:
+{
+    if (id[0] == 'N' && id[1] == 'C' && id[2] == 'S' && id[3] == 'A' &&
+        id[4] == 'm' && id[5] == 'u' && id[6] == 'l' && id[7] == 't')
+        return(1);
+    else if (id[0] == 'N' && id[1] == 'C' && id[2] == 'S' && id[3] == 'A' &&
+             id[4] == 'f' && id[5] == 'a' && id[6] == 'm' && id[7] == 'i')
+        return(2);
+    else
+        return(0);
+}
+
+/* Count distinct non-zero values in the 6-byte multi-driver member mapping. */
+fun count_unique = (byte[6] m) uint<64>:
+{
+    var seen_1 = 0; var seen_2 = 0; var seen_3 = 0;
+    var seen_4 = 0; var seen_5 = 0; var seen_6 = 0;
+    var n = 0UL;
+    for (mm in m) {
+        var idx = mm as int;
+        if (idx == 1 && seen_1 == 0) { seen_1 = 1; n = n + 1UL; }
+        if (idx == 2 && seen_2 == 0) { seen_2 = 1; n = n + 1UL; }
+        if (idx == 3 && seen_3 == 0) { seen_3 = 1; n = n + 1UL; }
+        if (idx == 4 && seen_4 == 0) { seen_4 = 1; n = n + 1UL; }
+        if (idx == 5 && seen_5 == 0) { seen_5 = 1; n = n + 1UL; }
+        if (idx == 6 && seen_6 == 0) { seen_6 = 1; n = n + 1UL; }
+    }
+    return n;
+}
+
+/* Address pair for one member file in the multi driver.
+ * Shared by drv_info_blk (Section II.B) and H5O_msg_drvinfo (0x0014). */
+type multi_drv_member_addr = struct {
+    uint<64> start_addr;
+    uint<64> eoa_addr;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Driver Information Block  (Section II.B)
+ *
+ * Only appears when the superblock version is 0 or 1 and the
+ * drv_info_addr_raw field in the superblock is not HADDR_UNDEF.
+ * ----------------------------------------------------------------------- */
+
+type drv_info_blk = struct {
+    byte     version          == 0;                   /* must be 0 */
+    byte[3]  reserved         == [0UB, 0UB, 0UB];    /* must be 0 */
+    uint<32> drv_info_size;
+    char[8]  drv_id;
+
+    var dtype = drv_type(drv_id);
+
+    union {
+        struct {
+            byte[6] member_mapping;
+            byte[2] reserved       == [0UB, 0UB];
+            var n_members = count_unique(member_mapping);
+            multi_drv_member_addr[n_members] member_addrs;
+            byte[multi_drv_names_size(drv_info_size, n_members)] member_names_raw;
+        } multi : (dtype == 1);
+
+        struct {
+            uint<64> member_size;    /* size of each member file in the family */
+        } fami : (dtype == 2);
+
+        struct {
+            byte[drv_info_size] data;
+        } raw;
+    } drv_info;
+
+    method _print = void:
+    {
+        printf("drv_info_blk {\n");
+        printf("  version=%v\n", version);
+        printf("  drv_info_size=%u32d\n", drv_info_size);
+        printf("  drv_id=\"");
+        for (c in drv_id) { printf("%c", c); }
+        printf("\"\n");
+        printf("  drv_type=%i32d (0=unknown 1=NCSAmult 2=NCSAfami)\n", dtype);
+        if (dtype == 1) {
+            printf("  multi_drv_info {\n");
+            printf("    member_mapping [1=super 2=btree 3=raw 4=gheap 5=lheap 6=ohdr]:\n");
+            printf("      super=%v  btree=%v  raw=%v  gheap=%v  lheap=%v  ohdr=%v\n",
+                   drv_info.multi.member_mapping[0], drv_info.multi.member_mapping[1],
+                   drv_info.multi.member_mapping[2], drv_info.multi.member_mapping[3],
+                   drv_info.multi.member_mapping[4], drv_info.multi.member_mapping[5]);
+            var n_members = count_unique(drv_info.multi.member_mapping);
+            printf("    [derived] n_unique_members=%u64d\n", n_members);
+            var i = 0UL;
+            while (i < n_members) {
+                printf("    member[%u64d]: start=%u64d  eoa=%u64d\n",
+                       i, drv_info.multi.member_addrs[i].start_addr,
+                       drv_info.multi.member_addrs[i].eoa_addr);
+                i = i + 1UL;
+            }
+            printf("    member_names_raw=%v\n", drv_info.multi.member_names_raw);
+            printf("    [string format] member_names=%v\n", char_array_to_string(drv_info.multi.member_names_raw));
+            printf("  }\n");
+        } else if (dtype == 2) {
+            printf("  fami_drv_info {\n");
+            printf("    member_size=%u64d\n", drv_info.fami.member_size);
+            printf("  }\n");
+        } else {
+            printf("  raw_drv_info {\n");
+            printf("    data=%v\n", drv_info.raw.data);
+            printf("  }\n");
+        }
+        printf("}\n");
+    }
+};
