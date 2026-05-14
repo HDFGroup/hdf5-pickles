@@ -22,6 +22,7 @@ target_link_libraries(h5markers PRIVATE Threads::Threads)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(PKDOC_SPECS
+    drv_info
     earray
     farray
     fheap
