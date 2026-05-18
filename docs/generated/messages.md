@@ -676,14 +676,43 @@ Version 1 B-tree K values message (type 0x0013). Overrides the file-global B-tre
 
 ## `H5O_msg_drvinfo`
 
-Driver information message (type 0x0014). Stores a driver-specific opaque information block identified by an 8-byte ASCII name. Written only by drivers that need to persist private metadata (e.g. multi or family virtual file drivers).
+Driver information message (type 0x0014). Stores virtual file driver metadata in an object header, most commonly in the superblock extension. The payload layout is selected by the 8-byte driver identifier.
 
 | Field | Description |
 |-------|-------------|
 | `version` | Format version. Must be 0. |
-| `name` | 8-byte ASCII driver name (not NUL-terminated). Identifies the driver and the format of `info_buf`. |
-| `info_len` | Byte size of `info_buf`. |
-| `info_buf` | Driver-specific information bytes of length `info_len`. |
+| `drv_id` | 8-byte ASCII driver identifier. Known values handled here are `NCSAmult` for the multi-file driver and `NCSAfami` for the family driver. |
+| `drv_info_size` | Size in bytes of the driver-specific payload. |
+| `dtype` | Derived driver type used for dispatch: 1 = `NCSAmult`, 2 = `NCSAfami`, 0 = unknown. |
+| `drv_info` | Driver-specific payload selected from the `drv_id` value. |
+
+### `multi`
+
+Payload for the multi-file driver (`NCSAmult`). It maps each HDF5 usage class to a member file and stores the corresponding virtual address ranges and padded member file names.
+
+| Field | Description |
+|-------|-------------|
+| `member_mapping` | Six-byte mapping from usage class to member file index: superblock, B-tree, raw data, global heap, local heap, and object header. |
+| `reserved` | Reserved two-byte field. Must be zero. |
+| `n_members` | Derived count of distinct non-zero member file indices in `member_mapping`. |
+| `member_addrs` | Array of `multi_drv_member_addr` records, one for each distinct mapped member file. |
+| `member_names_raw` | Raw member file name bytes. Names are NUL-terminated and each encoded name is padded to an 8-byte boundary. |
+
+### `fami`
+
+Payload for the family driver (`NCSAfami`).
+
+| Field | Description |
+|-------|-------------|
+| `member_size` | Size in bytes of each family member file. |
+
+### `raw`
+
+Fallback payload for unrecognized driver identifiers. The bytes are retained without interpretation.
+
+| Field | Description |
+|-------|-------------|
+| `data` | Raw driver-specific payload bytes. |
 
 
 ## `H5O_msg_ainfo`
