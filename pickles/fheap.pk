@@ -1,4 +1,4 @@
-/* fheap.pk - HDF5 Fractal Heap header (signature "FRHP").  */
+/* fheap.pk - HDF5 Fractal Heap: header, indirect block, direct block, IDs. */
 
 /* Copyright (C) 2026 The HDF Group.  */
 
@@ -17,50 +17,585 @@
  */
 
 /*
- * Covers the Fractal Heap Header (Appendix C.IV of the HDF5 format spec
- * v3).  Direct/indirect block bodies are not yet typed -- callers walk
- * them with explicit offset arithmetic using the doubling-table
- * parameters exposed here.
+ * Covers:
+ *   - Fractal Heap Header         (signature "FRHP", Appendix C.V)
+ *   - Fractal Heap Indirect Block (signature "FHIB")
+ *   - Fractal Heap Direct Block   (signature "FHDB")
+ *   - Fractal Heap IDs            (managed, huge, tiny)
  *
  * Load order:
- *   common.pk        <- bytes_to_u64_le, sizeof_offsets/lengths
- *   superblock.pk    <- sets the size globals
+ *   common.pk        <- bytes_to_u64_le, bytes_to_u64_le_at, bytes_to_off, sizeof_offsets/lengths
+ *   superblock.pk    <- sets global_sizeof_offsets, global_sizeof_lengths
  *   fheap.pk
+ *
+ * Quick start:
+ *
+ *   print_frhp(<addr>#B);
+ *     Maps and prints the Fractal Heap header, then:
+ *       - If root is direct (curr_root_rows==0): prints the root direct block.
+ *       - If root is indirect: prints the root indirect block and all
+ *         allocated direct block children (skips HADDR_UNDEF entries).
+ *         Child indirect blocks have their addresses noted but are not
+ *         recursed into.
+ *
+ *   OR -- manual step-by-step:
+ *
+ *   1. Map the header (sets all global_frhp_* via constraint side-effects):
+ *        var hdr = frhp_hdr @ <addr>#B;
+ *
+ *   2a. Root direct block (hdr.dtable.curr_root_rows == 0):
+ *        set_frhp_dblock(global_frhp_start_block_size);
+ *        var db = frhp_dblock @ bytes_to_off(hdr.dtable.root_addr_raw);
+ *
+ *   2b. Root indirect block (hdr.dtable.curr_root_rows > 0):
+ *        set_frhp_iblock(hdr.dtable.curr_root_rows as uint<64>);
+ *        var ib = frhp_iblock @ bytes_to_off(hdr.dtable.root_addr_raw);
+ *
+ *   3. Direct block child of an indirect block (row r, total size S):
+ *        var S = frhp_row_block_size(r);
+ *        set_frhp_dblock(S);
+ *        var db = frhp_dblock @ <child_addr>#B;
+ *
+ *   4. Heap ID (id_len bytes stored at some address):
+ *        var id = frhp_heap_id @ <addr>#B;
+ *        id._print;
+ *
+ * Fractal heap structure overview:
+ *
+ *   Header -> root direct block   (curr_root_rows == 0)
+ *          -> root indirect block (curr_root_rows > 0)
+ *               -> direct block children   (rows 0 .. max_direct_rows - 1)
+ *               -> indirect block children (rows max_direct_rows and above)
+ *
+ *   Direct block sizes by row r:
+ *     r == 0, 1  : start_block_size
+ *     r >= 2     : start_block_size << (r - 1)
+ *
+ *   Derived values (computed from the header and stored as globals):
+ *     heap_off_size  = ceil(max_heap_size_bits / 8)
+ *     max_direct_rows = log2(max_direct_size) - log2(start_block_size) + 2
+ *     heap_len_size  = min(ceil(log2(max_direct_size) / 8),
+ *                          floor(log2(max_man_size)) / 8 + 1)
+ *     huge_ids_direct, huge_id_size    (H5HFhuge.c H5HF__huge_init)
+ *     tiny_len_extended, tiny_max_len  (H5HFtiny.c H5HF__tiny_init)
+ *
+ * Heap ID byte 0 layout:
+ *   bits [7:6] = version (0 = current)
+ *   bits [5:4] = type:
+ *     0x00 = managed  : flags(1) + heap_offset(heap_off_size) + length(heap_len_size)
+ *     0x10 = huge     : flags(1) + addr+size  (direct)  or btree_key (indirect)
+ *     0x20 = tiny     : flags+len(1) [+len_ext(1)] + inline object data + zeros
+ *     0x30 = reserved
+ *   bits [3:0] = reserved (managed/huge) or encoded length low bits (tiny)
  */
+
+/* ----------------------------------------------------------------------- *
+ * Global fractal heap parameters
+ * Set automatically when frhp_hdr is mapped via constraint side-effects.
+ * ----------------------------------------------------------------------- */
+
+var global_frhp_heap_off_size     = 0UB;   /* Bytes per heap offset              */
+var global_frhp_heap_len_size     = 0UB;   /* Bytes per managed-object length    */
+var global_frhp_id_len            = 0UH;   /* Heap ID length in bytes            */
+var global_frhp_checksum_dblocks  = 0UB;   /* 1 = direct blocks are checksummed  */
+var global_frhp_filter_len        = 0UH;   /* Encoded I/O filter pipeline length */
+var global_frhp_table_width       = 0UH;   /* Direct blocks per row              */
+var global_frhp_max_direct_rows   = 0UL;   /* Max direct rows in any iblock      */
+var global_frhp_start_block_size  = 0UL;   /* Row-0/1 direct block size          */
+var global_frhp_max_man_size      = 0UL;   /* Max size of a managed object       */
+var global_frhp_huge_ids_direct   = 0UB;   /* 1 = huge IDs store addr inline     */
+var global_frhp_huge_id_size      = 0UB;   /* Bytes of payload after flags byte  */
+var global_frhp_tiny_len_extended = 0UB;   /* 1 = tiny length uses 2 bytes       */
+var global_frhp_tiny_max_len      = 0UL;   /* Max bytes in a tiny object         */
+
+/* Internal intermediates -- set during header mapping, used by setters */
+var global_frhp_start_bits        = 0UL;
+var global_frhp_max_direct_bits   = 0UL;
+
+/* Per-indirect-block globals -- call set_frhp_iblock() before mapping */
+var global_frhp_iblock_nrows          = 0UL;
+var global_frhp_iblock_ndir_entries   = 0UL;
+var global_frhp_iblock_nindir_entries = 0UL;
+
+/* Per-direct-block globals -- call set_frhp_dblock() before mapping */
+var global_frhp_dblock_data_size = 0UL;
+
+/* Root block location -- set automatically when frhp_hdr is mapped */
+var global_frhp_root_addr      = 0UL;   /* Root block file address (bytes)    */
+var global_frhp_curr_root_rows = 0UL;   /* 0 = root direct; >0 = root indirect */
+
+/* ----------------------------------------------------------------------- *
+ * Helper: floor(log2(n)) for n > 1; returns 0 for n <= 1
+ * Works for any positive integer (not just powers of two).
+ * ----------------------------------------------------------------------- */
+
+fun frhp_log2 = (uint<64> n) uint<64>:
+{
+    if (n <= 1UL) return 0UL;
+    var bits = 0UL;
+    var v    = n;
+    while (v > 1UL) {
+        v    = v .>> 1UL;
+        bits = bits + 1UL;
+    }
+    return bits;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Helper: decode n little-endian bytes starting at byte offset 'off'
+ * in byte array 'b' into a uint<64>.
+ * ----------------------------------------------------------------------- */
+
+/* ----------------------------------------------------------------------- *
+ * Helper: return 1 if every byte of 'raw' is 0xFF (HADDR_UNDEF)
+ * ----------------------------------------------------------------------- */
+
+fun frhp_is_undef_addr = (byte[] raw) int:
+{
+    for (b in raw) {
+        if (b != 0xFFUB) return 0;
+    }
+    return 1;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Helper: on-disk direct block size for doubling-table row r
+ *   row 0, 1 -> start_block_size
+ *   row r>=2 -> start_block_size << (r-1)
+ * ----------------------------------------------------------------------- */
+
+fun frhp_row_block_size = (uint<64> row) uint<64>:
+{
+    if (row <= 1UL)
+        return global_frhp_start_block_size;
+    return global_frhp_start_block_size <<. (row - 1UL);
+};
+
+/* ----------------------------------------------------------------------- *
+ * Helper: cumulative heap offset at the start of row r within an indirect
+ * block (relative to that block's own block_off).
+ *
+ * Mirrors H5HFdtable_init row_block_off[]:
+ *   row == 0 → 0
+ *   row >= 1 → table_width * start_block_size * 2^(row-1)
+ * ----------------------------------------------------------------------- */
+
+fun frhp_row_block_off = (uint<64> row) uint<64>:
+{
+    if (row == 0UL) return 0UL;
+    return ((global_frhp_table_width as uint<64>) * global_frhp_start_block_size) <<. (row - 1UL);
+};
+
+/* ----------------------------------------------------------------------- *
+ * Direct block overhead
+ *
+ *   4(sig) + 1(ver) + O(hdr_addr) + heap_off_size(block_off)
+ *   + [4(chksum) if checksum_dblocks]
+ *
+ * Corresponds to H5HF_MAN_ABS_DIRECT_OVERHEAD(hdr).
+ * ----------------------------------------------------------------------- */
+
+fun frhp_dblock_overhead = uint<64>:
+{
+    return 4UL + 1UL
+           + (global_sizeof_offsets     as uint<64>)
+           + (global_frhp_heap_off_size as uint<64>)
+           + (global_frhp_checksum_dblocks != 0UB ? 4UL : 0UL);
+};
+
+/* ----------------------------------------------------------------------- *
+ * set_frhp_iblock -- configure per-indirect-block globals
+ *
+ * Call before mapping frhp_iblock.
+ * nrows: number of rows in this indirect block.
+ *   For the root indirect block: hdr.dtable.curr_root_rows as uint<64>.
+ *   For child indirect blocks: consult H5HFiblock.c / H5HF_MAN_INDIRECT_SIZE
+ *   to determine nrows from the block size and table parameters.
+ * ----------------------------------------------------------------------- */
+
+fun set_frhp_iblock = (uint<64> nrows) void:
+{
+    global_frhp_iblock_nrows = nrows;
+    var max_dir = global_frhp_max_direct_rows;
+    var tw      = global_frhp_table_width as uint<64>;
+    if (nrows <= max_dir) {
+        global_frhp_iblock_ndir_entries   = nrows * tw;
+        global_frhp_iblock_nindir_entries = 0UL;
+    } else {
+        global_frhp_iblock_ndir_entries   = max_dir * tw;
+        global_frhp_iblock_nindir_entries = (nrows - max_dir) * tw;
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Indirect block child-entry types
+ *
+ * Each of the nrows * table_width entries in an indirect block is one of:
+ *   - A direct block entry  (rows 0 .. max_direct_rows-1)
+ *   - An indirect block entry (rows max_direct_rows and above)
+ *
+ * For filtered heaps, direct entries carry filtered_size and filter_mask;
+ * indirect entries are always just an address.
+ * ----------------------------------------------------------------------- */
+
+/* Direct block entry -- unfiltered heap */
+type frhp_dir_entry = struct {
+    byte[global_sizeof_offsets] addr_raw;
+};
+
+/* Direct block entry -- filtered heap */
+type frhp_dir_entry_filt = struct {
+    byte[global_sizeof_offsets] addr_raw;
+    byte[global_sizeof_lengths] filtered_size_raw;
+    uint<32>                    filter_mask;
+};
+
+/* Union: filtered variant selected when global_frhp_filter_len > 0 */
+type frhp_iblock_dir_entry = union {
+    frhp_dir_entry_filt filtered   : (global_frhp_filter_len > 0UH);
+    frhp_dir_entry      unfiltered;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Fractal Heap Indirect Block  (signature "FHIB")
+ *
+ * Call set_frhp_iblock(nrows) before mapping.
+ *
+ * On-disk layout (H5HFcache.c H5HF__cache_iblock_serialize):
+ *   [sig:4][ver:1][hdr_addr:O][block_off:heap_off_size]
+ *   [dir_entries:   ndir_entries  * dir_entry_size]
+ *   [indir_addrs:   nindir_entries * O]
+ *   [chksum:4]
+ *
+ * dir_entry_size (per entry):
+ *   without filters : O
+ *   with    filters : O + L + 4   (addr + filtered_size + filter_mask)
+ * ----------------------------------------------------------------------- */
+
+type frhp_iblock = struct {
+    byte[4] signature == ['F', 'H', 'I', 'B'];
+    byte    version   == 0;
+    byte[global_sizeof_offsets]     hdr_addr_raw;
+    byte[global_frhp_heap_off_size] block_off_raw;
+    frhp_iblock_dir_entry[global_frhp_iblock_ndir_entries]         dir_entries;
+    byte[global_sizeof_offsets][global_frhp_iblock_nindir_entries]  indir_addrs;
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("frhp_iblock {\n");
+        printf("  signature=%v\n",    signature);
+        printf("  version=%u8d\n",     version);
+        printf("  hdr_addr=%u64d\n", bytes_to_u64_le(hdr_addr_raw));
+        printf("  block_off=%u64d\n",bytes_to_u64_le(block_off_raw));
+        printf("  [nrows=%u64d ndir_entries=%u64d nindir_entries=%u64d]\n",
+               global_frhp_iblock_nrows,
+               global_frhp_iblock_ndir_entries,
+               global_frhp_iblock_nindir_entries);
+        var tw = global_frhp_table_width as uint<64>;
+        var i  = 0UL;
+        while (i < global_frhp_iblock_ndir_entries) {
+            var row = i / tw;
+            var col = i % tw;
+            var entry_off = dir_entries[i]'offset as offset<uint<64>,B>;
+            if (global_frhp_filter_len > 0UH) {
+                var e = frhp_dir_entry_filt @ entry_off;
+                printf("  dir_entries[%u64d] (row=%u64d col=%u64d): addr=%u64d filtered_size=%u64d filter_mask=0x%u32x\n",
+                       i, row, col,
+                       bytes_to_u64_le(e.addr_raw),
+                       bytes_to_u64_le(e.filtered_size_raw),
+                       e.filter_mask);
+            } else {
+                var e = frhp_dir_entry @ entry_off;
+                printf("  dir_entries[%u64d] (row=%u64d col=%u64d): addr=%u64d\n",
+                       i, row, col,
+                       bytes_to_u64_le(e.addr_raw));
+            }
+            i = i + 1UL;
+        }
+        var j = 0UL;
+        while (j < global_frhp_iblock_nindir_entries) {
+            var row = global_frhp_max_direct_rows + j / tw;
+            var col = j % tw;
+            printf("  indir_addrs[%u64d] (row=%u64d col=%u64d): addr=%u64d\n",
+                   j, row, col,
+                   bytes_to_u64_le(indir_addrs[j]));
+            j = j + 1UL;
+        }
+        printf("  chksum=%u32d\n", chksum);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * frhp_managed_id_to_addr -- map managed heap_offset → file byte address
+ *
+ * Given the heap_offset decoded from a managed fractal heap ID (bytes 1
+ * through heap_off_size of the raw ID), returns the file address of the
+ * first byte of the stored object.
+ *
+ * Requires frhp_hdr to have been mapped first (sets global_frhp_root_addr,
+ * global_frhp_curr_root_rows, and all related globals).
+ *
+ * Formula (H5HFman.c H5HF__man_op_real):
+ *   file_addr = dblock_file_addr + (heap_off - dblock_block_off)
+ *
+ * Note: heap_off encodes the block-relative byte offset from the START of
+ * the FHDB block (including its own header), so the overhead must NOT be
+ * added again.  The minimum heap_off for any object in a block is
+ * frhp_dblock_overhead(), which is where the first object is placed.
+ *
+ * where dblock_block_off = iblock->block_off + row_block_off[row] + col * row_block_size[row]
+ *
+ * Handles:
+ *   - root is a direct block (curr_root_rows == 0)
+ *   - root is an indirect block; object is in a direct block child
+ *
+ * Returns 0xFFFF...FF (HADDR_UNDEF) if the target direct block entry is
+ * unallocated or if heap_off falls inside an indirect-block child subtree
+ * (deeper traversal not yet implemented).
+ *
+ * Usage:
+ *   var id       = frhp_heap_id @ <id_addr>#B;
+ *   var off_sz   = global_frhp_heap_off_size as uint<64>;
+ *   var heap_off = bytes_to_u64_le_at(id.raw, 1UL, off_sz);
+ *   var addr     = frhp_managed_id_to_addr(heap_off);
+ * ----------------------------------------------------------------------- */
+
+fun frhp_managed_id_to_addr = (uint<64> heap_off) uint<64>:
+{
+    var root_addr = global_frhp_root_addr;
+    var root_rows = global_frhp_curr_root_rows;
+
+    if (root_rows == 0UL) {
+        /* Root is a direct block; its block_off is 0 */
+        return root_addr + heap_off;
+    }
+
+    /* Root is an indirect block -- find which direct block child contains heap_off */
+    set_frhp_iblock(root_rows);
+    var ib     = frhp_iblock @ (root_addr#B);
+    var ib_off = bytes_to_u64_le(ib.block_off_raw);   /* 0 for root */
+    var tw     = global_frhp_table_width as uint<64>;
+    var ndir   = global_frhp_iblock_ndir_entries;
+
+    var i = 0UL;
+    while (i < ndir) {
+        var row      = i / tw;
+        var col      = i % tw;
+        var blk_size = frhp_row_block_size(row);
+        var blk_start = ib_off + frhp_row_block_off(row) + col * blk_size;
+
+        if (heap_off >= blk_start && heap_off < blk_start + blk_size) {
+            var entry_off = ib.dir_entries[i]'offset as offset<uint<64>,B>;
+            if (global_frhp_filter_len > 0UH) {
+                var e = frhp_dir_entry_filt @ entry_off;
+                if (frhp_is_undef_addr(e.addr_raw))
+                    return 0xFFFFFFFFFFFFFFFFUL;
+                return bytes_to_u64_le(e.addr_raw) + (heap_off - blk_start);
+            } else {
+                var e = frhp_dir_entry @ entry_off;
+                if (frhp_is_undef_addr(e.addr_raw))
+                    return 0xFFFFFFFFFFFFFFFFUL;
+                return bytes_to_u64_le(e.addr_raw) + (heap_off - blk_start);
+            }
+        }
+        i = i + 1UL;
+    }
+
+    printf("frhp_managed_id_to_addr: heap_off=%u64d not in a direct child of root iblock\n",
+           heap_off);
+    return 0xFFFFFFFFFFFFFFFFUL;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Setter functions -- called via field constraints when frhp_hdr is mapped.
+ * Each returns 1 so the constraint always passes.
+ * ----------------------------------------------------------------------- */
+
+fun set_frhp_id_len = (uint<16> id_len) int:
+{
+    global_frhp_id_len = id_len;
+    return 1;
+};
+
+fun set_frhp_filter_len = (uint<16> fl) int:
+{
+    global_frhp_filter_len = fl;
+    return 1;
+};
+
+fun set_frhp_flags = (uint<8> f) int:
+{
+    /* Bit 1: H5HF_HDR_FLAGS_CHECKSUM_DBLOCKS */
+    global_frhp_checksum_dblocks = ((f & 0x02UB) != 0UB) as uint<8>;
+    return 1;
+};
+
+fun set_frhp_max_man_size = (uint<32> mms) int:
+{
+    global_frhp_max_man_size = mms as uint<64>;
+    return 1;
+};
+
+fun set_frhp_table_width = (uint<16> tw) int:
+{
+    global_frhp_table_width = tw;
+    return 1;
+};
+
+fun set_frhp_start_block_size = (byte[] raw) int:
+{
+    global_frhp_start_block_size = bytes_to_u64_le(raw);
+    global_frhp_start_bits       = frhp_log2(global_frhp_start_block_size);
+    return 1;
+};
+
+fun set_frhp_max_direct_size = (byte[] raw) int:
+{
+    global_frhp_max_direct_bits = frhp_log2(bytes_to_u64_le(raw));
+    return 1;
+};
+
+fun set_frhp_root_addr = (byte[] raw) int:
+{
+    global_frhp_root_addr = bytes_to_u64_le(raw);
+    return 1;
+};
+
+fun set_frhp_max_heap_size_bits = (uint<16> bits) int:
+{
+    /* heap_off_size = ceil(max_heap_size_bits / 8)  [H5HF_SIZEOF_OFFSET_BITS] */
+    global_frhp_heap_off_size = ((bits as uint<64> + 7UL) / 8UL) as uint<8>;
+    return 1;
+};
+
+/* Called from the last field of frhp_dtable; by then all prior setter
+ * globals are populated.  Computes the remaining derived values.        */
+fun set_frhp_curr_root_rows = (uint<16> rows) int:
+{
+    global_frhp_curr_root_rows = rows as uint<64>;
+
+    /* max_direct_rows = (log2(max_direct_size) - log2(start_block_size)) + 2
+     *   [H5HFdtable.c: max_direct_rows = (max_direct_bits - start_bits) + 2] */
+    global_frhp_max_direct_rows =
+        global_frhp_max_direct_bits - global_frhp_start_bits + 2UL;
+
+    /* heap_len_size = min(ceil(max_direct_bits / 8),            max_dir_blk_off_size
+     *                     floor(log2(max_man_size)) / 8 + 1)   H5VM_limit_enc_size  */
+    var max_dir_off = (global_frhp_max_direct_bits + 7UL) / 8UL;
+    var limit_enc   = frhp_log2(global_frhp_max_man_size) / 8UL + 1UL;
+    global_frhp_heap_len_size =
+        (max_dir_off < limit_enc ? max_dir_off : limit_enc) as uint<8>;
+
+    /* ---- Huge ID parameters  (H5HFhuge.c: H5HF__huge_init) ------------ */
+    var id_len  = global_frhp_id_len  as uint<64>;
+    var addr_sz = global_sizeof_offsets as uint<64>;
+    var size_sz = global_sizeof_lengths as uint<64>;
+
+    if (global_frhp_filter_len > 0UH) {
+        /* Filtered: direct if ID can hold addr + filtered_size + mask + obj_size */
+        if (id_len > 0UL && id_len - 1UL >= addr_sz + size_sz + 4UL + size_sz) {
+            global_frhp_huge_ids_direct = 1UB;
+            global_frhp_huge_id_size    = (addr_sz + size_sz + size_sz) as uint<8>;
+        } else {
+            global_frhp_huge_ids_direct = 0UB;
+        }
+    } else {
+        /* Unfiltered: direct if ID can hold addr + obj_size                    */
+        if (id_len > 0UL && addr_sz + size_sz <= id_len - 1UL) {
+            global_frhp_huge_ids_direct = 1UB;
+            global_frhp_huge_id_size    = (addr_sz + size_sz) as uint<8>;
+        } else {
+            global_frhp_huge_ids_direct = 0UB;
+        }
+    }
+    if (global_frhp_huge_ids_direct == 0UB) {
+        /* Indirect: key is min(id_len - 1, 8) bytes                           */
+        if (id_len > 0UL && id_len - 1UL < 8UL)
+            global_frhp_huge_id_size = (id_len - 1UL) as uint<8>;
+        else
+            global_frhp_huge_id_size = 8UB;
+    }
+
+    /* ---- Tiny ID parameters  (H5HFtiny.c: H5HF__tiny_init) ----------- */
+    if (id_len == 0UL) {
+        global_frhp_tiny_max_len      = 0UL;
+        global_frhp_tiny_len_extended = 0UB;
+    } else if (id_len - 1UL <= 16UL) {
+        /* Short form: encoded length fits in low 4 bits of byte 0              */
+        global_frhp_tiny_max_len      = id_len - 1UL;
+        global_frhp_tiny_len_extended = 0UB;
+    } else if (id_len - 1UL == 17UL) {
+        /* Boundary: using extended would give same capacity, skip it           */
+        global_frhp_tiny_max_len      = 16UL;
+        global_frhp_tiny_len_extended = 0UB;
+    } else {
+        /* Extended form: 12-bit length across bytes 0 and 1                   */
+        global_frhp_tiny_max_len      = id_len - 2UL;
+        global_frhp_tiny_len_extended = 1UB;
+    }
+
+    return 1;
+};
 
 /* ----------------------------------------------------------------------- *
  * Doubling Table
  *
- * Sub-structure embedded in every fractal-heap header; describes the
- * geometry of the heap's direct/indirect block tree.
+ * Sub-structure embedded in frhp_hdr; describes the geometry of the heap's
+ * direct/indirect block tree.  Each field that contributes to derived
+ * globals carries a constraint side-effect.
  * ----------------------------------------------------------------------- */
 
 type frhp_dtable = struct {
-    uint<16> table_width;                            /* Direct blocks per row    */
-    byte[global_sizeof_lengths] start_block_size_raw;  /* Row 0/1 block size     */
-    byte[global_sizeof_lengths] max_direct_size_raw;   /* Last direct-row size   */
-    /* Number of bits needed to hold a heap offset; the spec calls this
-       field "Maximum Heap Size" and stores log2(max bytes) here.        */
-    uint<16> max_heap_size_bits;
-    uint<16> starting_root_rows;                     /* Initial root iblock rows */
-    byte[global_sizeof_offsets] root_addr_raw;       /* Root direct/indirect blk */
-    uint<16> curr_root_rows;                         /* 0 => root is a direct blk*/
+    uint<16> table_width
+        : set_frhp_table_width(table_width);
+    byte[global_sizeof_lengths] start_block_size_raw
+        : set_frhp_start_block_size(start_block_size_raw);
+    byte[global_sizeof_lengths] max_direct_size_raw
+        : set_frhp_max_direct_size(max_direct_size_raw);
+    /* Stored as log2(max heap bytes); used to derive heap_off_size.       */
+    uint<16> max_heap_size_bits
+        : set_frhp_max_heap_size_bits(max_heap_size_bits);
+    uint<16> starting_root_rows;
+    byte[global_sizeof_offsets] root_addr_raw
+        : set_frhp_root_addr(root_addr_raw);
+    /* Last dtable field: triggers computation of all remaining globals.   */
+    uint<16> curr_root_rows
+        : set_frhp_curr_root_rows(curr_root_rows);
 };
 
 /* ----------------------------------------------------------------------- *
  * Fractal Heap Header  (signature "FRHP")
  *
- * The trailing filtered-root and I/O-filter fields are present only when
- * filter_len > 0 (i.e. a filter pipeline applies to root direct blocks).
+ * Mapping this type automatically updates all global_frhp_* parameters via
+ * constraint side-effects, so subsequent structure mappings use correct
+ * values without additional setup calls.
+ *
+ * On-disk layout (H5HFcache.c H5HF__cache_hdr_serialize):
+ *   [sig:4][ver:1][heap_id_len:2][filter_len:2][flags:1][max_man_size:4]
+ *   [next_huge_id:L][huge_btree_addr:O][free_managed_space:L]
+ *   [free_space_mgr_addr:O][managed_space:L][alloc_managed_space:L]
+ *   [managed_alloc_iter:L][managed_obj_count:L]
+ *   [huge_size:L][huge_count:L][tiny_size:L][tiny_count:L]
+ *   [doubling-table: 2+L+L+2+2+O+2 bytes]
+ *   [filtered_root_dblock_size:L][io_filter_mask:4][io_filter_info:filter_len]
+ *                                                   (only when filter_len > 0)
+ *   [chksum:4]
+ * where L = sizeof_lengths, O = sizeof_offsets.
  * ----------------------------------------------------------------------- */
 
 type frhp_hdr = struct {
-    byte[4]  signature   == ['F', 'R', 'H', 'P'];
-    byte     version     == 0;
-    uint<16> heap_id_length;       /* Heap ID size in bytes                  */
-    uint<16> filter_len;            /* I/O filters' encoded length            */
-    byte     flags;                 /* Bit 0: huge IDs are direct; bit 1: chk */
-    uint<32> max_man_size;          /* Max size of a managed object           */
+    byte[4]  signature  == ['F', 'R', 'H', 'P'];
+    byte     version    == 0;
+    uint<16> heap_id_length
+        : set_frhp_id_len(heap_id_length);
+    uint<16> filter_len
+        : set_frhp_filter_len(filter_len);
+    byte     flags
+        : set_frhp_flags(flags);
+    uint<32> max_man_size
+        : set_frhp_max_man_size(max_man_size);
 
     byte[global_sizeof_lengths] next_huge_id_raw;
     byte[global_sizeof_offsets] huge_btree_addr_raw;
@@ -77,11 +612,322 @@ type frhp_hdr = struct {
 
     frhp_dtable dtable;
 
-    /* Filtered-root metadata: present when an I/O filter pipeline is
-       attached to the root direct block.                                */
+    /* Present only when I/O filters are attached to root direct blocks.   */
     byte[global_sizeof_lengths] filtered_root_dblock_size_raw if filter_len != 0;
-    uint<32> io_filter_mask if filter_len != 0;
-    byte[filter_len] io_filter_info if filter_len != 0;
+    uint<32>                    io_filter_mask                 if filter_len != 0;
+    byte[filter_len]            io_filter_info                 if filter_len != 0;
 
     uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("frhp_hdr {\n");
+        printf("  signature=%v\n",                  signature);
+        printf("  version=%u8d\n",                   version);
+        printf("  heap_id_length=%u16d\n",            heap_id_length);
+        printf("  filter_len=%u16d\n",               filter_len);
+        printf("  flags=0x%u8x\n",                   flags);
+        printf("  max_man_size=%u32d\n",              max_man_size);
+        printf("  next_huge_id=%u64d\n",              bytes_to_u64_le(next_huge_id_raw));
+        printf("  huge_btree_addr=%u64d\n",           bytes_to_u64_le(huge_btree_addr_raw));
+        printf("  free_managed_space=%u64d\n",        bytes_to_u64_le(free_managed_space_raw));
+        printf("  free_space_mgr_addr=%u64d\n",       bytes_to_u64_le(free_space_mgr_addr_raw));
+        printf("  managed_space=%u64d\n",             bytes_to_u64_le(managed_space_raw));
+        printf("  alloc_managed_space=%u64d\n",       bytes_to_u64_le(alloc_managed_space_raw));
+        printf("  managed_alloc_iter=%u64d\n",        bytes_to_u64_le(managed_alloc_iter_raw));
+        printf("  managed_obj_count=%u64d\n",         bytes_to_u64_le(managed_obj_count_raw));
+        printf("  huge_size=%u64d\n",                 bytes_to_u64_le(huge_size_raw));
+        printf("  huge_count=%u64d\n",                bytes_to_u64_le(huge_count_raw));
+        printf("  tiny_size=%u64d\n",                 bytes_to_u64_le(tiny_size_raw));
+        printf("  tiny_count=%u64d\n",                bytes_to_u64_le(tiny_count_raw));
+        printf("  dtable.table_width=%u16d\n",        dtable.table_width);
+        printf("  dtable.start_block_size=%u64d\n",   bytes_to_u64_le(dtable.start_block_size_raw));
+        printf("  dtable.max_direct_size=%u64d\n",    bytes_to_u64_le(dtable.max_direct_size_raw));
+        printf("  dtable.max_heap_size_bits=%u16d\n", dtable.max_heap_size_bits);
+        printf("  dtable.starting_root_rows=%u16d\n", dtable.starting_root_rows);
+        printf("  dtable.root_addr=%u64d\n",          bytes_to_u64_le(dtable.root_addr_raw));
+        printf("  dtable.curr_root_rows=%u16d\n",     dtable.curr_root_rows);
+        if (filter_len != 0) {
+            printf("  filtered_root_dblock_size=%u64d\n",
+                   bytes_to_u64_le(filtered_root_dblock_size_raw));
+            printf("  io_filter_mask=0x%u32x\n", io_filter_mask);
+        }
+        printf("  chksum=%u32d\n",                  chksum);
+        printf("  [derived] heap_off_size=%u8d\n",       global_frhp_heap_off_size);
+        printf("  [derived] heap_len_size=%u8d\n",       global_frhp_heap_len_size);
+        printf("  [derived] max_direct_rows=%u64d\n",    global_frhp_max_direct_rows);
+        printf("  [derived] huge_ids_direct=%u8d\n",     global_frhp_huge_ids_direct);
+        printf("  [derived] huge_id_size=%u8d\n",        global_frhp_huge_id_size);
+        printf("  [derived] tiny_len_extended=%u8d\n",   global_frhp_tiny_len_extended);
+        printf("  [derived] tiny_max_len=%u64d\n",       global_frhp_tiny_max_len);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * set_frhp_dblock -- configure per-direct-block globals
+ *
+ * Call before mapping frhp_dblock.
+ * block_size: total on-disk size of the direct block (from doubling table).
+ *   Use frhp_row_block_size(row) to compute it from the row index.
+ * ----------------------------------------------------------------------- */
+
+fun set_frhp_dblock = (uint<64> block_size) void:
+{
+    global_frhp_dblock_data_size = block_size - frhp_dblock_overhead();
+};
+
+/* ----------------------------------------------------------------------- *
+ * Fractal Heap Direct Block  (signature "FHDB")
+ *
+ * Call set_frhp_dblock(block_size) before mapping.
+ *
+ * On-disk layout (H5HFcache.c H5HF__cache_dblock_pre_serialize):
+ *   [sig:4][ver:1][hdr_addr:O][block_off:heap_off_size]
+ *   [chksum:4  -- only when checksum_dblocks flag is set in the header]
+ *   [data: block_size - overhead bytes]
+ *
+ * Note: the checksum covers the ENTIRE block (including data), computed
+ * with the checksum field zeroed.  It sits in the block prefix, not at
+ * the end.
+ * ----------------------------------------------------------------------- */
+
+type frhp_dblock = struct {
+    byte[4] signature == ['F', 'H', 'D', 'B'];
+    byte    version   == 0;
+    byte[global_sizeof_offsets]        hdr_addr_raw;
+    byte[global_frhp_heap_off_size]    block_off_raw;
+    uint<32>                           chksum
+        if (global_frhp_checksum_dblocks != 0UB);
+    byte[global_frhp_dblock_data_size] data;
+
+    method _print = void:
+    {
+        printf("frhp_dblock {\n");
+        printf("  signature=%v\n",    signature);
+        printf("  version=%u8d\n",     version);
+        printf("  hdr_addr=%u64d\n", bytes_to_u64_le(hdr_addr_raw));
+        printf("  block_off=%u64d\n",bytes_to_u64_le(block_off_raw));
+        if (global_frhp_checksum_dblocks != 0UB)
+            printf("  chksum=%u32d\n", chksum);
+        printf("  data[%u64d bytes, overhead=%u64d]:\n",
+               global_frhp_dblock_data_size, frhp_dblock_overhead());
+        var i = 0UL;
+        while (i < global_frhp_dblock_data_size) {
+            printf("  %u64x:", i);
+            var j = 0UL;
+            while (j < 16UL && (i + j) < global_frhp_dblock_data_size) {
+                printf(" %u8x", data[i + j]);
+                j = j + 1UL;
+            }
+            /* pad short last row so ASCII column lines up */
+            while (j < 16UL) {
+                printf("   ");
+                j = j + 1UL;
+            }
+            printf("  |");
+            j = 0UL;
+            while (j < 16UL && (i + j) < global_frhp_dblock_data_size) {
+                var b = data[i + j];
+                if (b >= 0x20UB && b <= 0x7eUB)
+                    printf("%c", b as char);
+                else
+                    printf(".");
+                j = j + 1UL;
+            }
+            printf("|\n");
+            i = i + 16UL;
+        }
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Fractal Heap ID  (global_frhp_id_len bytes total)
+ *
+ * Must map frhp_hdr first so that global_frhp_id_len and the derived
+ * globals (heap_off_size, heap_len_size, huge_ids_direct, etc.) are set.
+ *
+ * The _print method decodes the ID type from byte 0 and prints the
+ * relevant fields.
+ * ----------------------------------------------------------------------- */
+
+type frhp_heap_id = struct {
+    byte[global_frhp_id_len] raw;
+
+    method _print = void:
+    {
+        var type_bits = raw[0] & 0x30UB;
+        var id_len    = global_frhp_id_len as uint<64>;
+        printf("frhp_heap_id {\n");
+        printf("  flags=0x%u8x (version=%u8d type=0x%u8x)\n",
+               raw[0],
+               ((raw[0] .>> 6UB) & 0x03UB),
+               type_bits);
+
+        if (type_bits == 0x00UB) {
+            /* ---- Managed -------------------------------------------- */
+            var off_sz   = global_frhp_heap_off_size as uint<64>;
+            var len_sz   = global_frhp_heap_len_size  as uint<64>;
+            var heap_off = bytes_to_u64_le_at(raw, 1UL, off_sz);
+            var heap_len = bytes_to_u64_le_at(raw, 1UL + off_sz, len_sz);
+            var file_addr = frhp_managed_id_to_addr(heap_off);
+            printf("  [managed] heap_offset=%u64d object_length=%u64d file_addr=%u64d\n",
+                   heap_off, heap_len, file_addr);
+
+        } else if (type_bits == 0x10UB) {
+            /* ---- Huge ----------------------------------------------- */
+            var addr_sz = global_sizeof_offsets as uint<64>;
+            var size_sz = global_sizeof_lengths  as uint<64>;
+            if (global_frhp_huge_ids_direct != 0UB) {
+                var addr = bytes_to_u64_le_at(raw, 1UL, addr_sz);
+                if (global_frhp_filter_len > 0UH) {
+                    /* direct + filtered: addr + filtered_size + mask + obj_size */
+                    var filt_off  = 1UL + addr_sz;
+                    var filt_size = bytes_to_u64_le_at(raw, filt_off, size_sz);
+                    var mask_off  = filt_off + size_sz;
+                    var fmask     = bytes_to_u64_le_at(raw, mask_off, 4UL) as uint<32>;
+                    var obj_size  = bytes_to_u64_le_at(raw, mask_off + 4UL, size_sz);
+                    printf("  [huge-direct-filtered] addr=%u64d filtered_size=%u64d filter_mask=0x%u32x obj_size=%u64d\n",
+                           addr, filt_size, fmask, obj_size);
+                } else {
+                    /* direct + unfiltered: addr + obj_size                     */
+                    var obj_size = bytes_to_u64_le_at(raw, 1UL + addr_sz, size_sz);
+                    printf("  [huge-direct] addr=%u64d obj_size=%u64d\n",
+                           addr, obj_size);
+                }
+            } else {
+                /* indirect: v2 B-tree key                                     */
+                var key = bytes_to_u64_le_at(raw, 1UL,
+                                            global_frhp_huge_id_size as uint<64>);
+                printf("  [huge-indirect] btree_key=%u64d\n", key);
+            }
+
+        } else if (type_bits == 0x20UB) {
+            /* ---- Tiny ----------------------------------------------- */
+            var obj_size = 0UL;
+            var data_off = 0UL;
+            if (global_frhp_tiny_len_extended != 0UB) {
+                /* 12-bit encoded length: high 4 bits in raw[0], low 8 bits in raw[1] */
+                obj_size = (((raw[0] & 0x0FUB) as uint<64>) <<. 8UL)
+                           | (raw[1] as uint<64>);
+                obj_size = obj_size + 1UL;
+                data_off = 2UL;
+            } else {
+                /* 4-bit encoded length in low nibble of raw[0]                */
+                obj_size = ((raw[0] & 0x0FUB) as uint<64>) + 1UL;
+                data_off = 1UL;
+            }
+            printf("  [tiny] obj_size=%u64d data=", obj_size);
+            var k = 0UL;
+            while (k < obj_size) {
+                printf("%u8x", raw[data_off + k]);
+                if (k < obj_size - 1UL) printf(":");
+                k = k + 1UL;
+            }
+            printf("\n");
+
+        } else {
+            printf("  [reserved]\n");
+        }
+
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_frhp_dblock_at -- map and print a direct block
+ *
+ * off:        file offset of the direct block
+ * block_size: total on-disk size (use frhp_row_block_size(row) or
+ *             global_frhp_start_block_size for the root direct block)
+ * ----------------------------------------------------------------------- */
+
+fun print_frhp_dblock_at = (offset<uint<64>,B> off, uint<64> block_size) void:
+{
+    set_frhp_dblock(block_size);
+    var db = frhp_dblock @ off;
+    db._print;
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_frhp -- convenience wrapper
+ *
+ * Maps the Fractal Heap header at the given file offset, prints it, then:
+ *   - Empty heap (root_addr == HADDR_UNDEF): notes empty heap.
+ *   - Root direct block (curr_root_rows == 0): maps and prints it.
+ *   - Root indirect block (curr_root_rows > 0): maps and prints it, then
+ *     maps and prints every allocated direct block child (skips entries
+ *     where addr == HADDR_UNDEF).  Child indirect blocks are reported by
+ *     address but not recursed into; call set_frhp_iblock(nrows) +
+ *     frhp_iblock @ addr manually for deeper traversal.
+ *
+ * Usage:
+ *   print_frhp(<heap_hdr_addr>#B);
+ * ----------------------------------------------------------------------- */
+
+fun print_frhp = (offset<uint<64>,B> off) void:
+{
+    /* --- Header --------------------------------------------------------- */
+    var hdr = frhp_hdr @ off;
+    hdr._print;
+
+    /* Empty heap */
+    if (frhp_is_undef_addr(hdr.dtable.root_addr_raw)) {
+        printf("  [heap is empty -- no root block allocated]\n");
+        return;
+    }
+
+    var root_addr = bytes_to_u64_le(hdr.dtable.root_addr_raw);
+    var curr_rows = hdr.dtable.curr_root_rows as uint<64>;
+
+    if (curr_rows == 0UL) {
+        /* --- Root is a single direct block ----------------------------- */
+        var blk_size = global_frhp_start_block_size;
+        printf("--- frhp_dblock (root direct, size=%u64d) ---\n", blk_size);
+        print_frhp_dblock_at(root_addr#B, blk_size);
+
+    } else {
+        /* --- Root is an indirect block --------------------------------- */
+        printf("--- frhp_iblock (root, nrows=%u64d) ---\n", curr_rows);
+        set_frhp_iblock(curr_rows);
+        var ib = frhp_iblock @ (root_addr#B);
+        ib._print;
+
+        /* Walk direct block children */
+        var tw = global_frhp_table_width as uint<64>;
+        var i  = 0UL;
+        while (i < global_frhp_iblock_ndir_entries) {
+            var row      = i / tw;
+            var col      = i % tw;
+            var blk_size = frhp_row_block_size(row);
+            var entry_off = ib.dir_entries[i]'offset as offset<uint<64>,B>;
+            /* Read address bytes at the start of the entry */
+            var child_addr_raw = 0UL;
+            var is_undef       = 0;
+            if (global_frhp_filter_len > 0UH) {
+                var e = frhp_dir_entry_filt @ entry_off;
+                is_undef = frhp_is_undef_addr(e.addr_raw);
+                if (!is_undef)
+                    child_addr_raw = bytes_to_u64_le(e.addr_raw);
+            } else {
+                var e = frhp_dir_entry @ entry_off;
+                is_undef = frhp_is_undef_addr(e.addr_raw);
+                if (!is_undef)
+                    child_addr_raw = bytes_to_u64_le(e.addr_raw);
+            }
+            if (!is_undef) {
+                printf("--- frhp_dblock (row=%u64d col=%u64d size=%u64d) ---\n",
+                       row, col, blk_size);
+                print_frhp_dblock_at(child_addr_raw#B, blk_size);
+            }
+            i = i + 1UL;
+        }
+
+        /* Note indirect children without recursing */
+        if (global_frhp_iblock_nindir_entries > 0UL) {
+            printf("  [%u64d indirect block child(ren) -- call set_frhp_iblock(nrows) + frhp_iblock @ addr for each]\n",
+                   global_frhp_iblock_nindir_entries);
+        }
+    }
 };
