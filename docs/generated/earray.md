@@ -1,4 +1,4 @@
-# C.IV. Extensible Array Chunk Index
+# VII.D: The Extensible Array Index
 
 The Extensible Array (EA) is a chunk index used for datasets with
 exactly one unlimited dimension.  Unlike the Fixed Array it can grow

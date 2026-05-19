@@ -1,4 +1,4 @@
-# III.A.2. Disk Format: Level 1B – Version 2 B-tree Nodes
+# III.A.2. Disk Format: Level 1A2 – Version 2 B-trees
 
 Version 2 B-trees are a self-describing, checksummed replacement for
 the version 1 B-tree used for new indexing needs introduced in HDF5

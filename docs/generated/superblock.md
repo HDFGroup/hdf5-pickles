@@ -1,4 +1,4 @@
-# IV.A.1. Disk Format: Level 0A – File Signatures and Superblock
+# II.A. Disk Format: Level 0A – File Signatures and Superblock
 
 The superblock contains the information needed to access all other
 HDF5 data structures. It must begin at address 0 within the HDF5 file,

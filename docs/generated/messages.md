@@ -1,4 +1,4 @@
-# IV.A.2. Disk Format: Level 1A – Object Header Messages
+# IV.A.2. Disk Format: Level 2A2 – Data Object Header Messages
 
 Object header messages carry all the metadata associated with an HDF5
 object. Each message occupies one slot in an object header chunk and
