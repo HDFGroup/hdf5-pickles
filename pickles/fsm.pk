@@ -1,0 +1,420 @@
+/* fsm.pk - HDF5 Free-space Manager: header (FSHD) and section info (FSSE). */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   - Free-space Manager Header      (signature "FSHD", Section III.H)
+ *   - Free-space Manager Section Info (signature "FSSE", Section III.H)
+ *
+ * Load order:
+ *   common.pk     <- bytes_to_u64_le, bytes_to_u64_le_at, bytes_to_off,
+ *                    global_sizeof_offsets, global_sizeof_lengths
+ *   superblock.pk <- sets global_sizeof_offsets, global_sizeof_lengths
+ *   fsm.pk
+ *
+ * Quick start:
+ *
+ *   print_fsm(<fshd_addr>#B);
+ *     Maps and prints the Free-space Manager header (FSHD), then, if
+ *     section info (FSSE) exists on disk, maps and prints it too.
+ *
+ *   OR -- manual step-by-step:
+ *
+ *   1. Map the header (sets all global_fshd_* via constraint side-effects):
+ *        var hdr = fshd_hdr @ <addr>#B;
+ *        hdr._print;
+ *
+ *   2. Map the section info (uses globals from step 1):
+ *        var si = fsse_raw @ (global_fshd_sect_addr#B);
+ *        si._print;
+ *
+ * Free-space Manager structure overview:
+ *
+ *   FSHD (header) → FSSE (serialized section list)
+ *
+ *   FSHD on-disk layout (H5FScache.c H5FS__cache_hdr_serialize):
+ *     [sig:4][ver:1][client_id:1][tot_space:L][tot_sect_count:L]
+ *     [serial_sect_count:L][ghost_sect_count:L][nclasses:2]
+ *     [shrink_percent:2][expand_percent:2][max_sect_addr:2]
+ *     [max_sect_size:L][sect_addr:O][sect_size:L][alloc_sect_size:L]
+ *     [chksum:4]
+ *   where L = sizeof_lengths, O = sizeof_offsets.
+ *
+ *   FSSE on-disk layout (H5FScache.c H5FS__cache_sinfo_serialize):
+ *     [sig:4][ver:1][fspace_hdr_addr:O]
+ *     [section groups...]
+ *     [padding zeros if needed]
+ *     [chksum:4]  <- last 4 bytes of the sect_size allocation
+ *
+ *   Each section group:
+ *     [node_count:sect_cnt_size][sect_size_val:sect_len_size]
+ *     For each section in group:
+ *       [sect_addr:sect_off_size][sect_type:1]
+ *       [class serial data: 0 bytes for H5HF and H5MF clients]
+ *
+ * Derived FSSE field widths (computed from FSHD fields):
+ *   sect_off_size = (max_sect_addr + 7) / 8
+ *   sect_len_size = H5VM_limit_enc_size(max_sect_size)
+ *                 = floor(log2(max_sect_size)) / 8 + 1
+ *   sect_cnt_size = H5VM_limit_enc_size(serial_sect_count)
+ *                 = floor(log2(serial_sect_count)) / 8 + 1
+ *
+ * Client IDs (H5FS_client_t):
+ *   0 = H5FS_CLIENT_FHEAP_ID -- Fractal Heap sections
+ *   1 = H5FS_CLIENT_FILE_ID  -- File space sections
+ *
+ * H5HF section types (serial_size = 0 for all):
+ *   0 = SINGLE     -- range of bytes within a direct block
+ *   1 = FIRST_ROW  -- first range in an indirect block row
+ *   2 = NORMAL_ROW -- ghost; not serialized
+ *   3 = INDIRECT   -- ghost; not serialized
+ *
+ * H5MF section types (serial_size = 0 for all):
+ *   0 = SIMPLE -- contiguous free space in regular file space
+ *   1 = SMALL  -- free space in paged file space (size < page)
+ *   2 = LARGE  -- free space in paged file space (size >= page)
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Global free-space manager parameters
+ * Set automatically when fshd_hdr is mapped via constraint side-effects.
+ * ----------------------------------------------------------------------- */
+
+var global_fshd_client_id         = 0UB;  /* Client ID (H5FS_client_t)           */
+var global_fshd_serial_sect_count = 0UL;  /* # of serializable sections tracked  */
+var global_fshd_max_sect_addr     = 0UH;  /* log2(address space size)            */
+var global_fshd_max_sect_size_val = 0UL;  /* Max size of section to track        */
+var global_fshd_sect_addr         = 0UL;  /* File address of FSSE                */
+var global_fshd_sect_size         = 0UL;  /* Total byte size of FSSE             */
+
+/* Derived: set by setters when fshd_hdr is mapped */
+var global_fshd_sect_off_size     = 0UL;  /* (max_sect_addr+7)/8                 */
+var global_fshd_sect_len_size     = 0UL;  /* limit_enc_size(max_sect_size)       */
+var global_fshd_sect_cnt_size     = 0UL;  /* limit_enc_size(serial_sect_count)   */
+
+/* ----------------------------------------------------------------------- *
+ * Helper: floor(log2(n)) for n > 1; returns 0 for n <= 1
+ * Matches H5VM_log2_gen behavior for relevant ranges.
+ * ----------------------------------------------------------------------- */
+
+fun fshd_log2 = (uint<64> n) uint<64>:
+{
+    if (n <= 1UL) return 0UL;
+    var bits = 0UL;
+    var v    = n;
+    while (v > 1UL) {
+        v    = v .>> 1UL;
+        bits = bits + 1UL;
+    }
+    return bits;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Helper: H5VM_limit_enc_size(limit) = floor(log2(limit)) / 8 + 1
+ * Returns the minimum number of bytes needed to encode a value in [0, limit].
+ * ----------------------------------------------------------------------- */
+
+fun fshd_limit_enc_size = (uint<64> limit) uint<64>:
+{
+    if (limit == 0UL) return 1UL;
+    return fshd_log2(limit) / 8UL + 1UL;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Helper: return 1 if addr is HADDR_UNDEF (all sizeof_offsets bytes 0xFF)
+ * ----------------------------------------------------------------------- */
+
+fun fshd_is_undef_addr = (uint<64> addr) int:
+{
+    var n    = global_sizeof_offsets as uint<64>;
+    var mask = 0UL;
+    var i    = 0UL;
+    while (i < n) {
+        mask = mask | (0xFFUL <<. (i * 8UL));
+        i    = i + 1UL;
+    }
+    if (addr == mask) return 1;
+    return 0;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Setter functions -- called via field constraints when fshd_hdr is mapped.
+ * Each returns 1 so the constraint always passes.
+ * ----------------------------------------------------------------------- */
+
+fun set_fshd_client_id = (byte c) int:
+{
+    global_fshd_client_id = c;
+    return 1;
+};
+
+fun set_fshd_serial_sect_count = (byte[] raw) int:
+{
+    global_fshd_serial_sect_count = bytes_to_u64_le(raw);
+    global_fshd_sect_cnt_size     = fshd_limit_enc_size(global_fshd_serial_sect_count);
+    return 1;
+};
+
+fun set_fshd_max_sect_addr = (uint<16> a) int:
+{
+    global_fshd_max_sect_addr = a;
+    global_fshd_sect_off_size = (a as uint<64> + 7UL) / 8UL;
+    return 1;
+};
+
+fun set_fshd_max_sect_size = (byte[] raw) int:
+{
+    global_fshd_max_sect_size_val = bytes_to_u64_le(raw);
+    global_fshd_sect_len_size     = fshd_limit_enc_size(global_fshd_max_sect_size_val);
+    return 1;
+};
+
+fun set_fshd_sect_addr = (byte[] raw) int:
+{
+    global_fshd_sect_addr = bytes_to_u64_le(raw);
+    return 1;
+};
+
+fun set_fshd_sect_size = (byte[] raw) int:
+{
+    global_fshd_sect_size = bytes_to_u64_le(raw);
+    return 1;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Free-space Manager Header  (signature "FSHD")
+ *
+ * Mapping this type automatically updates all global_fshd_* parameters via
+ * constraint side-effects, so subsequent fsse_raw mappings use correct
+ * values without additional setup calls.
+ *
+ * On-disk layout (H5FScache.c H5FS__cache_hdr_serialize):
+ *   [sig:4][ver:1][client_id:1]
+ *   [tot_space:L][tot_sect_count:L][serial_sect_count:L][ghost_sect_count:L]
+ *   [nclasses:2][shrink_percent:2][expand_percent:2][max_sect_addr:2]
+ *   [max_sect_size:L][sect_addr:O][sect_size:L][alloc_sect_size:L]
+ *   [chksum:4]
+ * where L = sizeof_lengths, O = sizeof_offsets.
+ * ----------------------------------------------------------------------- */
+
+type fshd_hdr = struct {
+    byte[4]  signature  == ['F', 'S', 'H', 'D'];
+    byte     version    == 0;
+    byte     client_id
+        : set_fshd_client_id(client_id);
+    byte[global_sizeof_lengths] tot_space_raw;
+    byte[global_sizeof_lengths] tot_sect_count_raw;
+    /* serial_sect_count must be set before max_sect_addr so sect_cnt_size
+     * is available when the FSSE is decoded; the on-disk order is correct. */
+    byte[global_sizeof_lengths] serial_sect_count_raw
+        : set_fshd_serial_sect_count(serial_sect_count_raw);
+    byte[global_sizeof_lengths] ghost_sect_count_raw;
+    uint<16> nclasses;
+    uint<16> shrink_percent;
+    uint<16> expand_percent;
+    uint<16> max_sect_addr
+        : set_fshd_max_sect_addr(max_sect_addr);
+    byte[global_sizeof_lengths] max_sect_size_raw
+        : set_fshd_max_sect_size(max_sect_size_raw);
+    byte[global_sizeof_offsets] sect_addr_raw
+        : set_fshd_sect_addr(sect_addr_raw);
+    byte[global_sizeof_lengths] sect_size_raw
+        : set_fshd_sect_size(sect_size_raw);
+    byte[global_sizeof_lengths] alloc_sect_size_raw;
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("fshd_hdr {\n");
+        printf("  signature=%v\n",              signature);
+        printf("  version=%u8d\n",              version);
+        printf("  client_id=%u8d",              client_id);
+        if      (client_id == 0UB) printf(" (Fractal Heap)");
+        else if (client_id == 1UB) printf(" (File)");
+        else                       printf(" (unknown)");
+        printf("\n");
+        printf("  tot_space=%u64d\n",           bytes_to_u64_le(tot_space_raw));
+        printf("  tot_sect_count=%u64d\n",      bytes_to_u64_le(tot_sect_count_raw));
+        printf("  serial_sect_count=%u64d\n",   bytes_to_u64_le(serial_sect_count_raw));
+        printf("  ghost_sect_count=%u64d\n",    bytes_to_u64_le(ghost_sect_count_raw));
+        printf("  nclasses=%u16d\n",            nclasses);
+        printf("  shrink_percent=%u16d\n",      shrink_percent);
+        printf("  expand_percent=%u16d\n",      expand_percent);
+        printf("  max_sect_addr=%u16d\n",       max_sect_addr);
+        printf("  max_sect_size=%u64d\n",       bytes_to_u64_le(max_sect_size_raw));
+        printf("  sect_addr=%u64d\n",           bytes_to_u64_le(sect_addr_raw));
+        printf("  sect_size=%u64d\n",           bytes_to_u64_le(sect_size_raw));
+        printf("  alloc_sect_size=%u64d\n",     bytes_to_u64_le(alloc_sect_size_raw));
+        printf("  chksum=%u32d\n",              chksum);
+        printf("  [derived] sect_off_size=%u64d\n", global_fshd_sect_off_size);
+        printf("  [derived] sect_len_size=%u64d\n", global_fshd_sect_len_size);
+        printf("  [derived] sect_cnt_size=%u64d\n", global_fshd_sect_cnt_size);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Free-space Manager Section Info  (signature "FSSE")
+ *
+ * Must map fshd_hdr first so that global_fshd_sect_size, global_fshd_sect_off_size,
+ * global_fshd_sect_len_size, and global_fshd_sect_cnt_size are set.
+ *
+ * The entire FSSE allocation (sect_size bytes) is read as a raw byte array
+ * and the variable-width section group records are decoded in _print.
+ *
+ * On-disk layout (H5FScache.c H5FS__cache_sinfo_serialize):
+ *   [sig:4][ver:1][fspace_hdr_addr:O]
+ *   --- repeating section groups ---
+ *   [node_count:sect_cnt_size][sect_size_val:sect_len_size]
+ *     [sect_addr:sect_off_size][sect_type:1]  (repeated node_count times)
+ *   --- end of section groups ---
+ *   [padding zeros (if any)]
+ *   [chksum:4]   <- always at byte offset sect_size-4
+ * ----------------------------------------------------------------------- */
+
+type fsse_raw = struct {
+    byte[global_fshd_sect_size] data;
+
+    method _print = void:
+    {
+        if (global_fshd_sect_size < 9UL) {
+            printf("fsse_raw: sect_size=%u64d is too small\n",
+                   global_fshd_sect_size);
+            return;
+        }
+        /* Verify signature "FSSE" */
+        if (data[0] != 0x46UB || data[1] != 0x53UB ||
+            data[2] != 0x53UB || data[3] != 0x45UB) {
+            printf("fsse_raw: bad signature (expected FSSE, got %u8x%u8x%u8x%u8x)\n",
+                   data[0], data[1], data[2], data[3]);
+            return;
+        }
+
+        var off_sz      = global_sizeof_offsets  as uint<64>;
+        var fhdr_addr   = bytes_to_u64_le_at(data, 5UL, off_sz);
+        var prefix_size = 5UL + off_sz;
+        var end_pos     = global_fshd_sect_size - 4UL;  /* checksum at last 4 bytes */
+        var pos         = prefix_size;
+        var nsects      = global_fshd_serial_sect_count;
+        var off_size    = global_fshd_sect_off_size;
+        var len_size    = global_fshd_sect_len_size;
+        var cnt_size    = global_fshd_sect_cnt_size;
+        var client      = global_fshd_client_id;
+
+        printf("fsse_raw {\n");
+        printf("  signature=FSSE\n");
+        printf("  version=%u8d\n",          data[4]);
+        printf("  fspace_hdr_addr=%u64d\n", fhdr_addr);
+
+        if (nsects == 0UL) {
+            printf("  [no serializable sections]\n");
+        } else {
+            var sections_read = 0UL;
+            var grp           = 0UL;
+            while (sections_read < nsects
+                   && pos + cnt_size + len_size <= end_pos) {
+                var node_count    = bytes_to_u64_le_at(data, pos, cnt_size);
+                pos               = pos + cnt_size;
+                var sect_size_val = bytes_to_u64_le_at(data, pos, len_size);
+                pos               = pos + len_size;
+                printf("  section_group[%u64d]: count=%u64d sect_size=%u64d {\n",
+                       grp, node_count, sect_size_val);
+                var k = 0UL;
+                while (k < node_count
+                       && sections_read < nsects
+                       && pos + off_size + 1UL <= end_pos) {
+                    var sa = bytes_to_u64_le_at(data, pos, off_size);
+                    pos    = pos + off_size;
+                    var st = data[pos] as uint<64>;
+                    pos    = pos + 1UL;
+                    printf("    section[%u64d]: addr=%u64d type=%u64d",
+                           k, sa, st);
+                    if (client == 0UB) {
+                        /* H5FS_CLIENT_FHEAP_ID */
+                        if      (st == 0UL) printf(" (fheap/single)");
+                        else if (st == 1UL) printf(" (fheap/first_row)");
+                        else if (st == 2UL) printf(" (fheap/normal_row)");
+                        else if (st == 3UL) printf(" (fheap/indirect)");
+                        else                printf(" (fheap/unknown)");
+                    } else if (client == 1UB) {
+                        /* H5FS_CLIENT_FILE_ID */
+                        if      (st == 0UL) printf(" (file/simple)");
+                        else if (st == 1UL) printf(" (file/small)");
+                        else if (st == 2UL) printf(" (file/large)");
+                        else                printf(" (file/unknown)");
+                    }
+                    printf("\n");
+                    k             = k + 1UL;
+                    sections_read = sections_read + 1UL;
+                }
+                printf("  }\n");
+                grp = grp + 1UL;
+            }
+        }
+
+        var ck = bytes_to_u64_le_at(data, global_fshd_sect_size - 4UL, 4UL)
+                 as uint<32>;
+        printf("  chksum=%u32d\n", ck);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_fshd -- print only the Free-space Manager header
+ *
+ * Usage:
+ *   print_fshd(<fshd_addr>#B);
+ * ----------------------------------------------------------------------- */
+
+fun print_fshd = (offset<uint<64>,B> off) void:
+{
+    var hdr = fshd_hdr @ off;
+    hdr._print;
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_fsm -- print Free-space Manager header and section info
+ *
+ * Maps and prints the FSHD header at the given offset, then, if the section
+ * info is stored on disk (sect_size > 0 and sect_addr != HADDR_UNDEF),
+ * maps and prints the FSSE section info.
+ *
+ * Usage:
+ *   print_fsm(<fshd_addr>#B);
+ *
+ * Common call from the fractal heap layer:
+ *   var hdr = frhp_hdr @ <frhp_addr>#B;
+ *   print_fsm(bytes_to_u64_le(hdr.free_space_mgr_addr_raw)#B);
+ * ----------------------------------------------------------------------- */
+
+fun print_fsm = (offset<uint<64>,B> off) void:
+{
+    var hdr = fshd_hdr @ off;
+    hdr._print;
+
+    if (global_fshd_sect_size == 0UL
+        || fshd_is_undef_addr(global_fshd_sect_addr)) {
+        printf("  [no section info on disk]\n");
+        return;
+    }
+
+    printf("--- fsse_raw (addr=%u64d size=%u64d) ---\n",
+           global_fshd_sect_addr, global_fshd_sect_size);
+    var sinfo = fsse_raw @ (global_fshd_sect_addr#B);
+    sinfo._print;
+};
