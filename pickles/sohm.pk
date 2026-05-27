@@ -1,0 +1,509 @@
+/* sohm.pk - HDF5 Shared Object Header Message Table (SMTB) and List (SMLI). */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   - Shared Object Header Message Table  (signature "SMTB", Section III.I)
+ *   - Shared Message Record List          (signature "SMLI", Section III.I)
+ *   - SOHM list entry types               (sohm_heap_body, sohm_oh_body, sohm_entry)
+ *
+ * Load order:
+ *   common.pk     <- bytes_to_u64_le, bytes_to_u64_le_at,
+ *                    global_sizeof_offsets
+ *   superblock.pk <- sets global_sizeof_offsets
+ *   sohm.pk
+ *
+ * Quick start:
+ *
+ *   1. Set the number of SOHM indexes (from h5debug or superblock extension):
+ *        sohm_set_num_indexes(2);   <- or however many the file has
+ *
+ *   2. Map and print the master table:
+ *        print_sohm_table(<smtb_addr>#B);
+ *
+ *   3. Map and print a message list using the index number (0-based):
+ *        print_sohm_list(<smli_addr>#B, 0);
+ *
+ *   OR -- single convenience call that prints table + all list indexes:
+ *        print_sohm(<smtb_addr>#B);
+ *
+ * Structure overview:
+ *
+ *   SMTB (master table) → per-index: SMLI list  or  v2 B-tree
+ *
+ *   SMTB on-disk layout (H5SMcache.c H5SM__cache_table_serialize):
+ *     [sig:4]
+ *     For each index (N = global_sohm_num_indexes):
+ *       [version:1][index_type:1][mesg_types:2][min_mesg_size:4]
+ *       [list_max:2][btree_min:2][num_messages:2]
+ *       [index_addr:O][heap_addr:O]
+ *     [chksum:4]
+ *   Total size: H5SM_TABLE_SIZE = 8 + N * (14 + 2*O)
+ *
+ *   SMLI on-disk layout (H5SMcache.c H5SM__cache_list_serialize):
+ *     [sig:4]
+ *     Exactly num_messages record entries, each H5SM_SOHM_ENTRY_SIZE bytes,
+ *     mapped as sohm_entry (H5SM_sohm_t):
+ *       [location:1][hash:4]
+ *       if location == 0 (H5SM_IN_HEAP):  → sohm_heap_body
+ *         [ref_count:4][fheap_id:8]
+ *       if location == 1 (H5SM_IN_OH):    → sohm_oh_body
+ *         [reserved:1][msg_type_id:1][creation_index:2][oh_addr:O]
+ *     [chksum:4]  <- immediately after last entry
+ *   Mapped size: 8 + num_messages * H5SM_SOHM_ENTRY_SIZE
+ *
+ * Derived sizes:
+ *   H5SM_SOHM_ENTRY_SIZE = 5 + MAX(12, 4 + O)
+ *     where 12 = H5SM_HEAP_LOC_SIZE = ref_count(4) + fheap_id(8)
+ *       and  4 + O = H5SM_OH_LOC_SIZE = reserved(1)+msg_type(1)+creat_idx(2)+oh_addr(O)
+ *   For typical O=4 or O=8: MAX(12, 4+O) = 12 → entry_size = 17 bytes.
+ *
+ * Index type values (H5SM_index_type_t):
+ *   0 = H5SM_LIST  -- unsorted list (SMLI)
+ *   1 = H5SM_BTREE -- v2 B-tree
+ *
+ * Message type flags (mesg_types field); bit position = message type ID:
+ *   bit  1 (0x0002) = Dataspace       (H5O_SHMESG_SDSPACE_FLAG = 1 << 1)
+ *   bit  3 (0x0008) = Datatype        (H5O_SHMESG_DTYPE_FLAG   = 1 << 3)
+ *   bit  5 (0x0020) = Fill Value      (H5O_SHMESG_FILL_FLAG    = 1 << 5)
+ *   bit 11 (0x0800) = Filter Pipeline (H5O_SHMESG_PLINE_FLAG   = 1 << 11)
+ *   bit 12 (0x1000) = Attribute       (H5O_SHMESG_ATTR_FLAG    = 1 << 12)
+ *
+ * Record location values (per SMLI entry):
+ *   0 = H5SM_IN_HEAP -- message stored in fractal heap
+ *   1 = H5SM_IN_OH   -- message stored in object header
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Global SOHM parameters
+ * Set via sohm_set_num_indexes() before mapping sohm_table_raw.
+ * ----------------------------------------------------------------------- */
+
+var global_sohm_num_indexes       = 0UL;   /* Number of indexes in master table         */
+var global_sohm_entry_size        = 0UL;   /* H5SM_SOHM_ENTRY_SIZE = 5 + MAX(12, 4+O)  */
+var global_sohm_table_size        = 0UL;   /* H5SM_TABLE_SIZE = 8 + N*(14+2*O)          */
+
+/* Per-index data (up to H5O_SHMESG_MAX_NINDEXES = 8);
+ * populated by sohm_table_raw._print via sohm_save_idx().             */
+
+var global_sohm_0_idx_type  = 0UB;  var global_sohm_0_list_max  = 0UL;
+var global_sohm_0_num_mesg  = 0UL;  var global_sohm_0_index_addr = 0UL;
+
+var global_sohm_1_idx_type  = 0UB;  var global_sohm_1_list_max  = 0UL;
+var global_sohm_1_num_mesg  = 0UL;  var global_sohm_1_index_addr = 0UL;
+
+var global_sohm_2_idx_type  = 0UB;  var global_sohm_2_list_max  = 0UL;
+var global_sohm_2_num_mesg  = 0UL;  var global_sohm_2_index_addr = 0UL;
+
+var global_sohm_3_idx_type  = 0UB;  var global_sohm_3_list_max  = 0UL;
+var global_sohm_3_num_mesg  = 0UL;  var global_sohm_3_index_addr = 0UL;
+
+var global_sohm_4_idx_type  = 0UB;  var global_sohm_4_list_max  = 0UL;
+var global_sohm_4_num_mesg  = 0UL;  var global_sohm_4_index_addr = 0UL;
+
+var global_sohm_5_idx_type  = 0UB;  var global_sohm_5_list_max  = 0UL;
+var global_sohm_5_num_mesg  = 0UL;  var global_sohm_5_index_addr = 0UL;
+
+var global_sohm_6_idx_type  = 0UB;  var global_sohm_6_list_max  = 0UL;
+var global_sohm_6_num_mesg  = 0UL;  var global_sohm_6_index_addr = 0UL;
+
+var global_sohm_7_idx_type  = 0UB;  var global_sohm_7_list_max  = 0UL;
+var global_sohm_7_num_mesg  = 0UL;  var global_sohm_7_index_addr = 0UL;
+
+/* List context; set by sohm_set_list() before mapping sohm_list_raw. */
+
+var global_sohm_list_size  = 0UL;   /* 8 + num_messages * entry_size */
+var global_sohm_num_mesg   = 0UL;   /* num_messages for current list */
+
+/* ----------------------------------------------------------------------- *
+ * sohm_set_num_indexes -- set num_indexes and recompute derived sizes.
+ * Must be called before mapping sohm_table_raw.
+ * ----------------------------------------------------------------------- */
+
+fun sohm_set_num_indexes = (uint<64> n) void:
+{
+    var o   = global_sizeof_offsets as uint<64>;
+    var oh  = 1UL + 1UL + 2UL + o;   /* H5SM_OH_LOC_SIZE */
+    var loc = 12UL;                   /* H5SM_HEAP_LOC_SIZE = MAX(oh, 12) */
+    if (oh > 12UL) loc = oh;
+    global_sohm_num_indexes = n;
+    global_sohm_entry_size  = 5UL + loc;   /* 1(loc)+4(hash)+body */
+    global_sohm_table_size  = 8UL + n * (14UL + 2UL * o);
+};
+
+/* ----------------------------------------------------------------------- *
+ * Per-index getters / setter
+ * ----------------------------------------------------------------------- */
+
+fun sohm_save_idx = (uint<64> n, uint<8> it, uint<64> lmax,
+                     uint<64> nm, uint<64> ia) void:
+{
+    if      (n == 0UL) { global_sohm_0_idx_type = it; global_sohm_0_list_max = lmax;
+                         global_sohm_0_num_mesg = nm; global_sohm_0_index_addr = ia; }
+    else if (n == 1UL) { global_sohm_1_idx_type = it; global_sohm_1_list_max = lmax;
+                         global_sohm_1_num_mesg = nm; global_sohm_1_index_addr = ia; }
+    else if (n == 2UL) { global_sohm_2_idx_type = it; global_sohm_2_list_max = lmax;
+                         global_sohm_2_num_mesg = nm; global_sohm_2_index_addr = ia; }
+    else if (n == 3UL) { global_sohm_3_idx_type = it; global_sohm_3_list_max = lmax;
+                         global_sohm_3_num_mesg = nm; global_sohm_3_index_addr = ia; }
+    else if (n == 4UL) { global_sohm_4_idx_type = it; global_sohm_4_list_max = lmax;
+                         global_sohm_4_num_mesg = nm; global_sohm_4_index_addr = ia; }
+    else if (n == 5UL) { global_sohm_5_idx_type = it; global_sohm_5_list_max = lmax;
+                         global_sohm_5_num_mesg = nm; global_sohm_5_index_addr = ia; }
+    else if (n == 6UL) { global_sohm_6_idx_type = it; global_sohm_6_list_max = lmax;
+                         global_sohm_6_num_mesg = nm; global_sohm_6_index_addr = ia; }
+    else               { global_sohm_7_idx_type = it; global_sohm_7_list_max = lmax;
+                         global_sohm_7_num_mesg = nm; global_sohm_7_index_addr = ia; }
+};
+
+fun sohm_get_idx_type = (uint<64> n) uint<8>:
+{
+    if      (n == 0UL) return global_sohm_0_idx_type;
+    else if (n == 1UL) return global_sohm_1_idx_type;
+    else if (n == 2UL) return global_sohm_2_idx_type;
+    else if (n == 3UL) return global_sohm_3_idx_type;
+    else if (n == 4UL) return global_sohm_4_idx_type;
+    else if (n == 5UL) return global_sohm_5_idx_type;
+    else if (n == 6UL) return global_sohm_6_idx_type;
+    return global_sohm_7_idx_type;
+};
+
+fun sohm_get_list_max = (uint<64> n) uint<64>:
+{
+    if      (n == 0UL) return global_sohm_0_list_max;
+    else if (n == 1UL) return global_sohm_1_list_max;
+    else if (n == 2UL) return global_sohm_2_list_max;
+    else if (n == 3UL) return global_sohm_3_list_max;
+    else if (n == 4UL) return global_sohm_4_list_max;
+    else if (n == 5UL) return global_sohm_5_list_max;
+    else if (n == 6UL) return global_sohm_6_list_max;
+    return global_sohm_7_list_max;
+};
+
+fun sohm_get_num_mesg = (uint<64> n) uint<64>:
+{
+    if      (n == 0UL) return global_sohm_0_num_mesg;
+    else if (n == 1UL) return global_sohm_1_num_mesg;
+    else if (n == 2UL) return global_sohm_2_num_mesg;
+    else if (n == 3UL) return global_sohm_3_num_mesg;
+    else if (n == 4UL) return global_sohm_4_num_mesg;
+    else if (n == 5UL) return global_sohm_5_num_mesg;
+    else if (n == 6UL) return global_sohm_6_num_mesg;
+    return global_sohm_7_num_mesg;
+};
+
+fun sohm_get_index_addr = (uint<64> n) uint<64>:
+{
+    if      (n == 0UL) return global_sohm_0_index_addr;
+    else if (n == 1UL) return global_sohm_1_index_addr;
+    else if (n == 2UL) return global_sohm_2_index_addr;
+    else if (n == 3UL) return global_sohm_3_index_addr;
+    else if (n == 4UL) return global_sohm_4_index_addr;
+    else if (n == 5UL) return global_sohm_5_index_addr;
+    else if (n == 6UL) return global_sohm_6_index_addr;
+    return global_sohm_7_index_addr;
+};
+
+/* ----------------------------------------------------------------------- *
+ * sohm_set_list -- configure list globals for index n.
+ * Called by print_sohm_list before mapping sohm_list_raw.
+ * ----------------------------------------------------------------------- */
+
+fun sohm_set_list = (uint<64> n) void:
+{
+    global_sohm_num_mesg  = sohm_get_num_mesg(n);
+    global_sohm_list_size = 8UL + global_sohm_num_mesg * global_sohm_entry_size;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Helper: print mesg_types flag field as a human-readable tag list.
+ * ----------------------------------------------------------------------- */
+
+fun sohm_print_mesg_types = (uint<64> mt) void:
+{
+    var found = 0;
+    printf(" (");
+    if ((mt & 0x0002UL) != 0UL) { printf("sdspace");                         found = 1; }
+    if ((mt & 0x0008UL) != 0UL) { if (found != 0) printf(","); printf("dtype");  found = 1; }
+    if ((mt & 0x0020UL) != 0UL) { if (found != 0) printf(","); printf("fill");   found = 1; }
+    if ((mt & 0x0800UL) != 0UL) { if (found != 0) printf(","); printf("pline");  found = 1; }
+    if ((mt & 0x1000UL) != 0UL) { if (found != 0) printf(","); printf("attr");   found = 1; }
+    if (found == 0) printf("none");
+    printf(")");
+};
+
+/* ----------------------------------------------------------------------- *
+ * Shared Object Header Message Table  (signature "SMTB")
+ *
+ * Must call sohm_set_num_indexes(N) first so global_sohm_table_size is set.
+ * Mapping this type populates per-index globals via sohm_save_idx().
+ *
+ * On-disk layout:
+ *   [sig:4]
+ *   For each index i in [0, N):
+ *     [version:1][index_type:1][mesg_types:2][min_mesg_size:4]
+ *     [list_max:2][btree_min:2][num_messages:2]
+ *     [index_addr:O][heap_addr:O]
+ *   [chksum:4]
+ * ----------------------------------------------------------------------- */
+
+type sohm_table_raw = struct {
+    byte[global_sohm_table_size] data;
+
+    method _print = void:
+    {
+        if (global_sohm_table_size < 8UL) {
+            printf("sohm_table_raw: table_size=%u64d is too small\n",
+                   global_sohm_table_size);
+            return;
+        }
+        if (data[0] != 0x53UB || data[1] != 0x4dUB ||
+            data[2] != 0x54UB || data[3] != 0x42UB) {
+            printf("sohm_table_raw: bad signature (expected SMTB)\n");
+            return;
+        }
+
+        var o    = global_sizeof_offsets as uint<64>;
+        var isz  = 14UL + 2UL * o;   /* H5SM_INDEX_HEADER_SIZE */
+        var n    = global_sohm_num_indexes;
+
+        printf("sohm_table_raw {\n");
+        printf("  signature=SMTB\n");
+        printf("  num_indexes=%u64d\n", n);
+
+        var i = 0UL;
+        while (i < n) {
+            var base = 4UL + i * isz;
+            var ver  = data[base] as uint<64>;
+            var it   = data[base + 1UL] as uint<64>;
+            var mt   = bytes_to_u64_le_at(data, base + 2UL, 2UL);
+            var ms   = bytes_to_u64_le_at(data, base + 4UL, 4UL);
+            var lmax = bytes_to_u64_le_at(data, base + 8UL, 2UL);
+            var bmin = bytes_to_u64_le_at(data, base + 10UL, 2UL);
+            var nm   = bytes_to_u64_le_at(data, base + 12UL, 2UL);
+            var ia   = bytes_to_u64_le_at(data, base + 14UL, o);
+            var ha   = bytes_to_u64_le_at(data, base + 14UL + o, o);
+
+            sohm_save_idx(i, it as uint<8>, lmax, nm, ia);
+
+            printf("  index[%u64d] {\n",      i);
+            printf("    version=%u64d\n",     ver);
+            printf("    index_type=%u64d",    it);
+            if      (it == 0UL) printf(" (list)");
+            else if (it == 1UL) printf(" (btree)");
+            else                printf(" (unknown)");
+            printf("\n");
+            printf("    mesg_types=0x%u16x",  mt as uint<16>);
+            sohm_print_mesg_types(mt);
+            printf("\n");
+            printf("    min_mesg_size=%u64d\n", ms);
+            printf("    list_max=%u64d\n",    lmax);
+            printf("    btree_min=%u64d\n",   bmin);
+            printf("    num_messages=%u64d\n", nm);
+            printf("    index_addr=%u64d\n",  ia);
+            printf("    heap_addr=%u64d\n",   ha);
+            printf("  }\n");
+            i = i + 1UL;
+        }
+
+        var ck = bytes_to_u64_le_at(data, global_sohm_table_size - 4UL, 4UL)
+                 as uint<32>;
+        printf("  chksum=0x%u32x\n", ck);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * SOHM list entry types  (H5SM_sohm_t)
+ *
+ * sohm_heap_body -- body for H5SM_IN_HEAP (location == 0) entries:
+ *   [ref_count:4][fheap_id:8]
+ *
+ * sohm_oh_body -- body for H5SM_IN_OH (location == 1) entries:
+ *   [reserved:1][msg_type_id:1][creat_idx:2][oh_addr:O]
+ *
+ * sohm_entry -- one SOHM list entry:
+ *   [location:1][hash:4][body per union]
+ * ----------------------------------------------------------------------- */
+
+type sohm_heap_body = struct {
+    uint<32> ref_count;
+    byte[8]  fheap_id;
+};
+
+type sohm_oh_body = struct {
+    byte     reserved;
+    uint<8>  msg_type_id;
+    uint<16> creat_idx;
+    byte[global_sizeof_offsets] oh_addr_raw;
+};
+
+type sohm_entry = struct {
+    uint<8>  location;
+    uint<32> hash;
+    union {
+        sohm_heap_body  heap    : location == 0UB;
+        sohm_oh_body    oh      : location == 1UB;
+        byte[12]        unknown;
+    } u;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Shared Message Record List  (signature "SMLI")
+ *
+ * Must call sohm_set_list(idx) first so global_sohm_list_size
+ * and global_sohm_num_mesg are set.
+ *
+ * On-disk layout:
+ *   [sig:4]
+ *   num_messages entries, each global_sohm_entry_size bytes:
+ *     [location:1][hash:4]
+ *     if location == 0 (heap):  [ref_count:4][fheap_id:8]
+ *     if location == 1 (OH):    [reserved:1][msg_type_id:1][creat_idx:2][oh_addr:O]
+ *     [padding to entry_size]
+ *   [chksum:4]  <- at byte offset 4 + num_messages * entry_size
+ *   [zeros]     <- pad to list_max * entry_size + 8
+ * ----------------------------------------------------------------------- */
+
+type sohm_list_raw = struct {
+    byte[global_sohm_list_size] data;
+
+    method _print = void:
+    {
+        if (global_sohm_list_size < 8UL) {
+            printf("sohm_list_raw: list_size=%u64d is too small\n",
+                   global_sohm_list_size);
+            return;
+        }
+        if (data[0] != 0x53UB || data[1] != 0x4dUB ||
+            data[2] != 0x4cUB || data[3] != 0x49UB) {
+            printf("sohm_list_raw: bad signature (expected SMLI)\n");
+            return;
+        }
+
+        var esz      = global_sohm_entry_size;
+        var nm       = global_sohm_num_mesg;
+        var base_off = data'offset as offset<uint<64>,B>;
+
+        printf("sohm_list_raw {\n");
+        printf("  signature=SMLI\n");
+        printf("  [entry_size=%u64d num_messages=%u64d]\n", esz, nm);
+
+        var i = 0UL;
+        while (i < nm) {
+            var e   = sohm_entry @ (base_off + (4UL + i * esz)#B);
+            var loc = e.location as uint<64>;
+            printf("  entry[%u64d] {\n",   i);
+            printf("    location=%u64d",   loc);
+            if      (loc == 0UL) printf(" (heap)");
+            else if (loc == 1UL) printf(" (OH)");
+            else                 printf(" (unknown)");
+            printf("\n");
+            printf("    hash=0x%u32x (%u32d)\n", e.hash, e.hash);
+            if (loc == 0UL) {
+                printf("    ref_count=%u64d\n", e.u.heap.ref_count as uint<64>);
+                printf("    fheap_id=");
+                var bi = 0UL;
+                while (bi < 8UL) {
+                    printf("%u8x", e.u.heap.fheap_id[bi]);
+                    bi = bi + 1UL;
+                }
+                printf("\n");
+            } else if (loc == 1UL) {
+                printf("    msg_type_id=%u64d\n",    e.u.oh.msg_type_id as uint<64>);
+                printf("    creation_index=%u64d\n", e.u.oh.creat_idx as uint<64>);
+                printf("    oh_addr=%u64d\n",        bytes_to_u64_le(e.u.oh.oh_addr_raw));
+            }
+            printf("  }\n");
+            i = i + 1UL;
+        }
+
+        /* checksum immediately follows the serialized entries */
+        var ck_off = 4UL + nm * esz;
+        var ck = bytes_to_u64_le_at(data, ck_off, 4UL) as uint<32>;
+        printf("  chksum=0x%u32x\n", ck);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_sohm_table -- map and print the SMTB master table.
+ *
+ * Requires global_sohm_num_indexes to be set first via sohm_set_num_indexes().
+ * Also sets per-index globals used by print_sohm_list / print_sohm.
+ *
+ * Usage:
+ *   sohm_set_num_indexes(2);
+ *   print_sohm_table(<smtb_addr>#B);
+ * ----------------------------------------------------------------------- */
+
+fun print_sohm_table = (offset<uint<64>,B> off) void:
+{
+    sohm_set_num_indexes(global_sohm_num_indexes);   /* recompute sizes */
+    var t = sohm_table_raw @ off;
+    t._print;
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_sohm_list -- map and print an SMLI list for index idx.
+ *
+ * Requires print_sohm_table (or sohm_save_idx) to have been called first
+ * so per-index data is populated.
+ *
+ * Usage:
+ *   print_sohm_list(<smli_addr>#B, 0);
+ * ----------------------------------------------------------------------- */
+
+fun print_sohm_list = (offset<uint<64>,B> off, uint<64> idx) void:
+{
+    sohm_set_list(idx);
+    var sl = sohm_list_raw @ off;
+    sl._print;
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_sohm -- map and print SMTB plus all associated SMLI list indexes.
+ *
+ * Requires global_sohm_num_indexes to be set first.
+ * B-tree indexes are noted but not traversed (use v2_btree.pk for those).
+ *
+ * Usage:
+ *   sohm_set_num_indexes(2);
+ *   print_sohm(<smtb_addr>#B);
+ * ----------------------------------------------------------------------- */
+
+fun print_sohm = (offset<uint<64>,B> off) void:
+{
+    sohm_set_num_indexes(global_sohm_num_indexes);
+    var t = sohm_table_raw @ off;
+    t._print;
+
+    var i = 0UL;
+    while (i < global_sohm_num_indexes) {
+        var ia = sohm_get_index_addr(i);
+        if (sohm_get_idx_type(i) == 0UB) {
+            printf("--- sohm_list_raw (index=%u64d addr=%u64d) ---\n", i, ia);
+            sohm_set_list(i);
+            var sl = sohm_list_raw @ (ia#B);
+            sl._print;
+        } else {
+            printf("--- index %u64d is a v2 B-tree at addr=%u64d (use v2_btree.pk) ---\n", i, ia);
+        }
+        i = i + 1UL;
+    }
+};
