@@ -26,6 +26,8 @@ set(PKDOC_SPECS
     earray
     farray
     fheap
+    gheap
+    lheap
     messages
     ohdr
     superblock

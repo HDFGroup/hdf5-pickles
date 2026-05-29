@@ -1,4 +1,4 @@
-# C.III. Fixed Array Chunk Index
+# VII.C. The Fixed Array Index
 
 The Fixed Array (FA) is a chunk index used for datasets with a fixed
 number of chunks — i.e. datasets whose every dimension is either fixed

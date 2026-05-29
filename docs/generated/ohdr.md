@@ -1,4 +1,4 @@
-# IV.A.2. Disk Format: Level 1A – Object Headers
+# IV.A. Disk Format: Level 2A – Data Object Headers
 
 Object headers store all metadata associated with an HDF5 data object
 (a group or a dataset). Every object header is composed of a prefix

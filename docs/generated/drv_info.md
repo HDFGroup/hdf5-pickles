@@ -2,7 +2,7 @@
 
 The driver information block stores optional virtual file driver
 metadata for legacy superblock versions 0 and 1. It is present only
-when the superblock's `drv_info_addr_raw` field is not HADDR_UNDEF.
+when the superblock's `drv_info_addr_raw` field is not `HADDR_UNDEF`.
 
 The block begins with a small fixed header followed by an 8-byte
 driver identifier and a driver-specific payload. This pickle decodes

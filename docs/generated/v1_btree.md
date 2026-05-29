@@ -1,4 +1,4 @@
-# III.A.1. Disk Format: Level 1A1 – Version 1 B-tree Nodes and Symbol Table Nodes
+# III.A.1. Disk Format: Level 1A – Version 1 B-tree Nodes and Symbol Table Nodes
 
 Version 1 B-trees (on-disk signature 'TREE') are the original indexing
 structure in HDF5. Two node types are defined:
