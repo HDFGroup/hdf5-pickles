@@ -1,0 +1,544 @@
+/* vds.pk - HDF5 Virtual Dataset Global Heap Block (Section III.F, Level 1F). */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   Virtual Dataset (VDS) Global Heap Block (Section III.F, Level 1F of
+ *   the HDF5 format spec v3).  The block is stored as the data payload of
+ *   a Global Heap entry (section III.E, Level 1E) and contains the VDS
+ *   source-to-virtual mapping table.
+ *
+ * Load order:
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk   <- sets global_sizeof_offsets,
+ *                                                global_sizeof_lengths
+ *   (poke) .load pickles/gheap.pk
+ *   (poke) .load pickles/vds.pk
+ *
+ * Quick start:
+ *   print_vds(<gcol_addr>#B, <heap_idx>);
+ *     Finds heap entry <heap_idx> and prints the full source-to-virtual
+ *     mapping table.  heap_idx is the global heap object index stored in
+ *     the VDS layout message (serial_list_hobjid.idx, H5Olayout.c line ~540),
+ *     decoded as a uint32 following the heap collection address.  In
+ *     practice it is 1 when the VDS block is the first object in its
+ *     collection, but may differ if the collection already held other
+ *     objects.
+ *
+ *   Example 1 testfiles/vds_test.h5 has a GCOL at byte offset 2048,
+ *   heap_idx = 1:
+ *     (poke) print_vds(2048#B, 1UL);
+ *
+ * On-disk layout of the VDS heap block (H5Dvirtual.c
+ * H5D__virtual_store_layout / H5D__virtual_load_layout):
+ *
+ *   [version : 1]                   0 = vers 0 (no flags); 1 = vers 1 (flags)
+ *   [num_mappings : L]              number of source→virtual mapping entries
+ *   For each mapping entry:
+ *     [flags : 1]                   (version 1 only)
+ *       bit 0 = SOURCE_FILE_SHARED  source file name shared with earlier entry
+ *       bit 1 = SOURCE_DSET_SHARED  source dataset name shared with earlier entry
+ *       bit 2 = SOURCE_SAME_FILE    source file is "." (in same file as VDS)
+ *     source_file_name:
+ *       if SOURCE_SAME_FILE:        no bytes (implicit ".")
+ *       if SOURCE_FILE_SHARED:      [origin_idx : L]
+ *       else:                       NUL-terminated string
+ *     source_dset_name:
+ *       if SOURCE_DSET_SHARED:      [origin_idx : L]
+ *       else:                       NUL-terminated string
+ *     [source_select : var]         serialized H5S dataspace selection
+ *     [virtual_select : var]        serialized H5S dataspace selection
+ *   [checksum : 4]                  Jenkins lookup3 of all preceding bytes
+ *   where L = sizeof_lengths.
+ *
+ * Serialized H5S dataspace selection formats (H5Sselect.c, H5Sall.c,
+ * H5Snone.c, H5Shyper.c, H5Spoint.c):
+ *
+ *   All selections share a 4-byte LE type prefix:
+ *     0 = H5S_SEL_NONE, 1 = H5S_SEL_POINTS,
+ *     2 = H5S_SEL_HYPERSLABS, 3 = H5S_SEL_ALL
+ *
+ *   NONE / ALL (both version 1, 16 bytes fixed):
+ *     [sel_type:4][version:4][padding:4=0][extra_len:4=0]
+ *
+ *   HYPERSLABS version 1 (uint32 coords, block-list encoding):
+ *     [sel_type:4][version:4][padding:4=0][length:4]
+ *     [ndims:4][nblocks:4]
+ *     For each block (length includes ndims+nblocks dwords + block data):
+ *       start[0..ndims-1] : uint32 each
+ *       end[0..ndims-1]   : uint32 each (inclusive)
+ *     Total = 16 + length bytes
+ *
+ *   HYPERSLABS version 2 (uint64, may be regular):
+ *     [sel_type:4][version:4][flags:1][length:4]
+ *     [ndims:4]
+ *     If REGULAR (flags & 0x01):
+ *       For each dim: start, stride, count, block (uint64 each)
+ *       length = 4 + ndims*32
+ *     Else (block-list):
+ *       [nblocks:4]
+ *       For each block: start[0..ndims-1], end[0..ndims-1] (uint64 each)
+ *       length = 4 + 4 + nblocks*ndims*2*8
+ *     Total = 13 + length bytes
+ *
+ *   HYPERSLABS version 3 (enc_size-based, may be regular):
+ *     [sel_type:4][version:4][flags:1][enc_size:1][ndims:4]
+ *     If REGULAR (flags & 0x01):
+ *       For each dim: start, stride, count, block (enc_size each)
+ *       Total = 14 + ndims*4*enc_size bytes
+ *     Else (block-list):
+ *       [nblocks:enc_size]
+ *       For each block: start[0..ndims-1], end[0..ndims-1] (enc_size each)
+ *       Total = 14 + enc_size + nblocks*ndims*2*enc_size bytes
+ *
+ *   POINTS version 1 (uint32 coords):
+ *     [sel_type:4][version:4][padding:4=0][length:4]
+ *     [ndims:4][npoints:4]
+ *     For each point: coord[0..ndims-1] (uint32 each)
+ *     length = 4 + 4 + npoints*ndims*4
+ *     Total = 16 + length bytes
+ *
+ *   POINTS version 2 (enc_size-based):
+ *     [sel_type:4][version:4][enc_size:1][ndims:4]
+ *     [npoints:enc_size]
+ *     For each point: coord[0..ndims-1] (enc_size each)
+ *     Total = 9 + 4 + enc_size + npoints*ndims*enc_size bytes
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Constants
+ * ----------------------------------------------------------------------- */
+
+/* VDS heap block encoding versions                                          */
+var VDS_GH_ENC_VERS_0 = 0UB;   /* no per-entry flags field                  */
+var VDS_GH_ENC_VERS_1 = 1UB;   /* per-entry flags field present             */
+
+/* Per-entry flags (version 1 only)                                          */
+var VDS_SOURCE_FILE_SHARED = 0x01UB;
+var VDS_SOURCE_DSET_SHARED = 0x02UB;
+var VDS_SOURCE_SAME_FILE   = 0x04UB;
+
+/* H5S selection type codes                                                  */
+var H5S_SEL_NONE       = 0UL;
+var H5S_SEL_POINTS     = 1UL;
+var H5S_SEL_HYPERSLABS = 2UL;
+var H5S_SEL_ALL        = 3UL;
+
+/* H5S hyperslab flags                                                       */
+var H5S_HYPER_REGULAR = 0x01UB;
+
+/* ----------------------------------------------------------------------- *
+ * vds_strlen -- length of NUL-terminated string starting at data[off].
+ * Returns the number of characters NOT including the terminating NUL.
+ * ----------------------------------------------------------------------- */
+
+fun vds_strlen = (byte[] data, uint<64> off) uint<64>:
+{
+    var n = 0UL;
+    while (off + n < data'length as uint<64> && data[off + n] != 0UB)
+        n = n + 1UL;
+    return n;
+}
+
+/* ----------------------------------------------------------------------- *
+ * vds_sel_size -- number of bytes consumed by one serialized H5S selection
+ * beginning at data[off].  Returns 0 for an unrecognised type/version.
+ * ----------------------------------------------------------------------- */
+
+fun vds_sel_size = (byte[] data, uint<64> off) uint<64>:
+{
+    var sel_type = bytes_to_u64_le_at(data, off,        4UL);
+    var version  = bytes_to_u64_le_at(data, off + 4UL,  4UL);
+
+    if (sel_type == H5S_SEL_NONE || sel_type == H5S_SEL_ALL)
+        return 16UL;
+
+    if (sel_type == H5S_SEL_HYPERSLABS) {
+        if (version == 1UL) {
+            /* [type:4][ver:4][pad:4][length:4] ... length bytes ... */
+            var length = bytes_to_u64_le_at(data, off + 12UL, 4UL);
+            return 16UL + length;
+        }
+        if (version == 2UL) {
+            /* [type:4][ver:4][flags:1][length:4] ... length bytes ... */
+            var length = bytes_to_u64_le_at(data, off + 9UL, 4UL);
+            return 13UL + length;
+        }
+        if (version == 3UL) {
+            /* [type:4][ver:4][flags:1][enc_size:1][ndims:4] no length field */
+            var flags    = data[off + 8UL];
+            var enc_size = data[off + 9UL] as uint<64>;
+            var ndims    = bytes_to_u64_le_at(data, off + 10UL, 4UL);
+            if (flags & H5S_HYPER_REGULAR)
+                return 14UL + 4UL * ndims * enc_size;
+            var nblocks = bytes_to_u64_le_at(data, off + 14UL, enc_size);
+            return 14UL + enc_size + 2UL * ndims * enc_size * nblocks;
+        }
+    }
+
+    if (sel_type == H5S_SEL_POINTS) {
+        if (version == 1UL) {
+            /* [type:4][ver:4][pad:4][length:4] ... length bytes ... */
+            var length = bytes_to_u64_le_at(data, off + 12UL, 4UL);
+            return 16UL + length;
+        }
+        if (version == 2UL) {
+            /* [type:4][ver:4][enc_size:1][ndims:4][npoints:enc_size]... */
+            var enc_size = data[off + 8UL] as uint<64>;
+            var ndims    = bytes_to_u64_le_at(data, off + 9UL,  4UL);
+            var npoints  = bytes_to_u64_le_at(data, off + 13UL, enc_size);
+            return 13UL + enc_size + ndims * enc_size * npoints;
+        }
+    }
+
+    return 0UL;
+}
+
+/* ----------------------------------------------------------------------- *
+ * vds_print_sel_hyper_v1 -- print a version-1 hyperslab selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun vds_print_sel_hyper_v1 = (byte[] data, uint<64> off) void:
+{
+    var ndims   = bytes_to_u64_le_at(data, off + 16UL, 4UL);
+    var nblocks = bytes_to_u64_le_at(data, off + 20UL, 4UL);
+    printf("        ndims=%u64d nblocks=%u64d\n", ndims, nblocks);
+    var boff = off + 24UL;
+    for (var b = 0UL; b < nblocks; b = b + 1UL) {
+        printf("        block[%u64d] start=[", b);
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            if (d > 0UL) printf(",");
+            printf("%u64d", bytes_to_u64_le_at(data, boff + d * 4UL, 4UL));
+        }
+        var eoff = boff + ndims * 4UL;
+        printf("] end=[");
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            if (d > 0UL) printf(",");
+            printf("%u64d", bytes_to_u64_le_at(data, eoff + d * 4UL, 4UL));
+        }
+        printf("]\n");
+        boff = eoff + ndims * 4UL;
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * vds_print_sel_hyper_v2 -- print a version-2 hyperslab selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun vds_print_sel_hyper_v2 = (byte[] data, uint<64> off) void:
+{
+    var flags = data[off + 8UL];
+    var ndims = bytes_to_u64_le_at(data, off + 13UL, 4UL);
+    printf("        ndims=%u64d flags=0x%u8x", ndims, flags);
+    if (flags & H5S_HYPER_REGULAR) printf(" REGULAR"); else printf(" IRREGULAR");
+    printf("\n");
+    if (flags & H5S_HYPER_REGULAR) {
+        var coff = off + 17UL;
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            printf("        dim[%u64d] start=%u64d stride=%u64d count=%u64d block=%u64d\n",
+                   d,
+                   bytes_to_u64_le_at(data, coff,           8UL),
+                   bytes_to_u64_le_at(data, coff +  8UL,    8UL),
+                   bytes_to_u64_le_at(data, coff + 16UL,    8UL),
+                   bytes_to_u64_le_at(data, coff + 24UL,    8UL));
+            coff = coff + 32UL;
+        }
+    } else {
+        var nblocks = bytes_to_u64_le_at(data, off + 17UL, 4UL);
+        printf("        nblocks=%u64d\n", nblocks);
+        var boff = off + 21UL;
+        for (var b = 0UL; b < nblocks; b = b + 1UL) {
+            printf("        block[%u64d] start=[", b);
+            for (var d = 0UL; d < ndims; d = d + 1UL) {
+                if (d > 0UL) printf(",");
+                printf("%u64d", bytes_to_u64_le_at(data, boff + d * 8UL, 8UL));
+            }
+            var eoff = boff + ndims * 8UL;
+            printf("] end=[");
+            for (var d = 0UL; d < ndims; d = d + 1UL) {
+                if (d > 0UL) printf(",");
+                printf("%u64d", bytes_to_u64_le_at(data, eoff + d * 8UL, 8UL));
+            }
+            printf("]\n");
+            boff = eoff + ndims * 8UL;
+        }
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * vds_print_sel_hyper_v3 -- print a version-3 hyperslab selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun vds_print_sel_hyper_v3 = (byte[] data, uint<64> off) void:
+{
+    var flags    = data[off + 8UL];
+    var enc_size = data[off + 9UL] as uint<64>;
+    var ndims    = bytes_to_u64_le_at(data, off + 10UL, 4UL);
+    printf("        ndims=%u64d enc_size=%u64d flags=0x%u8x", ndims, enc_size, flags);
+    if (flags & H5S_HYPER_REGULAR) printf(" REGULAR"); else printf(" IRREGULAR");
+    printf("\n");
+    if (flags & H5S_HYPER_REGULAR) {
+        var coff = off + 14UL;
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            printf("        dim[%u64d] start=%u64d stride=%u64d count=%u64d block=%u64d\n",
+                   d,
+                   bytes_to_u64_le_at(data, coff,                 enc_size),
+                   bytes_to_u64_le_at(data, coff + enc_size,      enc_size),
+                   bytes_to_u64_le_at(data, coff + 2UL*enc_size,  enc_size),
+                   bytes_to_u64_le_at(data, coff + 3UL*enc_size,  enc_size));
+            coff = coff + 4UL * enc_size;
+        }
+    } else {
+        var nblocks = bytes_to_u64_le_at(data, off + 14UL, enc_size);
+        printf("        nblocks=%u64d\n", nblocks);
+        var boff = off + 14UL + enc_size;
+        for (var b = 0UL; b < nblocks; b = b + 1UL) {
+            printf("        block[%u64d] start=[", b);
+            for (var d = 0UL; d < ndims; d = d + 1UL) {
+                if (d > 0UL) printf(",");
+                printf("%u64d", bytes_to_u64_le_at(data, boff + d * enc_size, enc_size));
+            }
+            var eoff = boff + ndims * enc_size;
+            printf("] end=[");
+            for (var d = 0UL; d < ndims; d = d + 1UL) {
+                if (d > 0UL) printf(",");
+                printf("%u64d", bytes_to_u64_le_at(data, eoff + d * enc_size, enc_size));
+            }
+            printf("]\n");
+            boff = eoff + ndims * enc_size;
+        }
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * vds_print_sel_points_v1 -- print a version-1 point selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun vds_print_sel_points_v1 = (byte[] data, uint<64> off) void:
+{
+    var ndims   = bytes_to_u64_le_at(data, off + 16UL, 4UL);
+    var npoints = bytes_to_u64_le_at(data, off + 20UL, 4UL);
+    printf("        ndims=%u64d npoints=%u64d\n", ndims, npoints);
+    var poff = off + 24UL;
+    for (var p = 0UL; p < npoints; p = p + 1UL) {
+        printf("        point[%u64d] [", p);
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            if (d > 0UL) printf(",");
+            printf("%u64d", bytes_to_u64_le_at(data, poff + d * 4UL, 4UL));
+        }
+        printf("]\n");
+        poff = poff + ndims * 4UL;
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * vds_print_sel_points_v2 -- print a version-2 point selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun vds_print_sel_points_v2 = (byte[] data, uint<64> off) void:
+{
+    var enc_size = data[off + 8UL] as uint<64>;
+    var ndims    = bytes_to_u64_le_at(data, off + 9UL,  4UL);
+    var npoints  = bytes_to_u64_le_at(data, off + 13UL, enc_size);
+    printf("        ndims=%u64d enc_size=%u64d npoints=%u64d\n",
+           ndims, enc_size, npoints);
+    var poff = off + 13UL + enc_size;
+    for (var p = 0UL; p < npoints; p = p + 1UL) {
+        printf("        point[%u64d] [", p);
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            if (d > 0UL) printf(",");
+            printf("%u64d", bytes_to_u64_le_at(data, poff + d * enc_size, enc_size));
+        }
+        printf("]\n");
+        poff = poff + ndims * enc_size;
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * vds_print_sel -- print one serialized H5S selection stored in data[off].
+ * sel_label is a short prefix for the printout ("source_select" etc.).
+ * ----------------------------------------------------------------------- */
+
+fun vds_print_sel = (byte[] data, uint<64> off, string sel_label) void:
+{
+    var sel_type = bytes_to_u64_le_at(data, off,       4UL);
+    var version  = bytes_to_u64_le_at(data, off + 4UL, 4UL);
+
+    printf("      %s {\n", sel_label);
+
+    if (sel_type == H5S_SEL_NONE) {
+        printf("        sel_type=NONE version=%u64d\n", version);
+    } else if (sel_type == H5S_SEL_ALL) {
+        printf("        sel_type=ALL version=%u64d\n", version);
+    } else if (sel_type == H5S_SEL_HYPERSLABS) {
+        printf("        sel_type=HYPERSLABS version=%u64d\n", version);
+        if      (version == 1UL) vds_print_sel_hyper_v1(data, off);
+        else if (version == 2UL) vds_print_sel_hyper_v2(data, off);
+        else if (version == 3UL) vds_print_sel_hyper_v3(data, off);
+        else printf("        /* unrecognised hyperslab version */\n");
+    } else if (sel_type == H5S_SEL_POINTS) {
+        printf("        sel_type=POINTS version=%u64d\n", version);
+        if      (version == 1UL) vds_print_sel_points_v1(data, off);
+        else if (version == 2UL) vds_print_sel_points_v2(data, off);
+        else printf("        /* unrecognised point version */\n");
+    } else {
+        printf("        sel_type=%u64d version=%u64d /* unrecognised */\n",
+               sel_type, version);
+    }
+
+    printf("      }\n");
+}
+
+/* ----------------------------------------------------------------------- *
+ * print_vds_block -- parse and print the raw VDS heap block data.
+ *
+ *   abs_off   : absolute file offset of the first byte of the block
+ *                (i.e. the byte immediately following the gheap_obj_hdr)
+ *   data_size : exact number of bytes in the block (= gheap_obj_hdr.data_size)
+ * ----------------------------------------------------------------------- */
+
+fun print_vds_block = (offset<uint<64>,B> abs_off, uint<64> data_size) void:
+{
+    var data    = byte[data_size] @ abs_off;
+    var pos     = 0UL;
+    var L       = global_sizeof_lengths as uint<64>;
+
+    /* Version */
+    var version = data[pos];
+    pos = pos + 1UL;
+
+    /* Number of mappings */
+    var nmap = bytes_to_u64_le_at(data, pos, L);
+    pos = pos + L;
+
+    printf("vds_block {\n");
+    printf("  version=%u8d\n", version);
+    printf("  num_mappings=%u64d\n", nmap);
+
+    for (var i = 0UL; i < nmap; i = i + 1UL) {
+        printf("  mapping[%u64d] {\n", i);
+
+        /* Flags (version 1 only) */
+        var flags = 0UB;
+        if (version >= VDS_GH_ENC_VERS_1) {
+            flags = data[pos];
+            pos = pos + 1UL;
+            printf("    flags=0x%u8x", flags);
+            if (flags & VDS_SOURCE_FILE_SHARED) printf(" SOURCE_FILE_SHARED");
+            if (flags & VDS_SOURCE_DSET_SHARED) printf(" SOURCE_DSET_SHARED");
+            if (flags & VDS_SOURCE_SAME_FILE)   printf(" SOURCE_SAME_FILE");
+            printf("\n");
+        }
+
+        /* Source file name */
+        if (version >= VDS_GH_ENC_VERS_1 && (flags & VDS_SOURCE_SAME_FILE)) {
+            printf("    source_file=\".\"\n");
+        } else if (version >= VDS_GH_ENC_VERS_1 && (flags & VDS_SOURCE_FILE_SHARED)) {
+            var orig = bytes_to_u64_le_at(data, pos, L);
+            printf("    source_file=<shared from mapping[%u64d]>\n", orig);
+            pos = pos + L;
+        } else {
+            var slen = vds_strlen(data, pos);
+            printf("    source_file=\"%s\"\n", string @ (abs_off + pos#B));
+            pos = pos + slen + 1UL;
+        }
+
+        /* Source dataset name */
+        if (version >= VDS_GH_ENC_VERS_1 && (flags & VDS_SOURCE_DSET_SHARED)) {
+            var orig = bytes_to_u64_le_at(data, pos, L);
+            printf("    source_dset=<shared from mapping[%u64d]>\n", orig);
+            pos = pos + L;
+        } else {
+            var slen = vds_strlen(data, pos);
+            printf("    source_dset=\"%s\"\n", string @ (abs_off + pos#B));
+            pos = pos + slen + 1UL;
+        }
+
+        /* Source selection */
+        vds_print_sel(data, pos, "source_select");
+        pos = pos + vds_sel_size(data, pos);
+
+        /* Virtual selection */
+        vds_print_sel(data, pos, "virtual_select");
+        pos = pos + vds_sel_size(data, pos);
+
+        printf("  }\n");
+    }
+
+    /* Checksum (last 4 bytes) */
+    var chksum = bytes_to_u64_le_at(data, data_size - 4UL, 4UL);
+    printf("  checksum=0x%u32x\n", chksum as uint<32>);
+    printf("}\n");
+}
+
+/* ----------------------------------------------------------------------- *
+ * print_vds -- top-level entry point.
+ *
+ *   gcol_off  : file offset of the Global Heap Collection header ("GCOL")
+ *               that contains the VDS mapping block.
+ *   heap_idx  : global heap object index of the VDS block within the
+ *               collection.  Read this from the VDS layout message field
+ *               serial_list_hobjid.idx (a uint32 immediately following
+ *               the heap collection address, H5Olayout.c line ~540).
+ *
+ * Walks the collection to find the entry whose index matches heap_idx
+ * and calls print_vds_block.
+ *
+ * Example:
+ *   (poke) print_vds(2048#B, 1UL);
+ * ----------------------------------------------------------------------- */
+
+fun print_vds = (offset<uint<64>,B> gcol_off, uint<64> heap_idx) void:
+{
+    var hdr       = gheap_hdr @ gcol_off;
+    var coll_sz   = bytes_to_u64_le(hdr.coll_size_raw);
+    var hdr_sz    = gheap_sizeof_hdr;
+    var objhdr_sz = gheap_sizeof_objhdr;
+    var L         = global_sizeof_lengths as uint<64>;
+
+    var pos = hdr_sz;
+
+    while (pos < coll_sz) {
+        if (coll_sz - pos < objhdr_sz) {
+            pos = coll_sz;
+        } else {
+            var oh      = gheap_obj_hdr @ (gcol_off + pos#B);
+            var idx     = bytes_to_u64_le(oh.idx_raw);
+            var data_sz = bytes_to_u64_le(oh.data_size_raw);
+
+            if (idx == 0UL) {
+                /* Free-space sentinel: skip it. */
+                pos = pos + data_sz;
+            } else if (idx == heap_idx) {
+                /* VDS mapping block */
+                var data_off = gcol_off + (pos + objhdr_sz)#B;
+                print_vds_block(data_off, data_sz);
+                return;
+            } else {
+                pos = pos + objhdr_sz + align8(data_sz);
+            }
+        }
+    }
+
+    printf("/* VDS mapping block (heap entry idx=%u64d) not found in collection */\n", heap_idx);
+}
