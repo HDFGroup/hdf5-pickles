@@ -1,0 +1,155 @@
+/* dspace_enc.pk - HDF5 Dataspace Encoding (Appendix D, Section VIII.A). */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   Appendix D, Section VIII.A of the HDF5 format spec v3.
+ *   This is the format produced by the public H5Sencode2() / H5Sdecode()
+ *   API calls.  The HDF5 library itself never writes H5Sencode buffers into
+ *   a file as part of normal file operations; they appear on disk only when
+ *   application code explicitly stores the raw bytes as dataset or attribute
+ *   data.  The test file dspace_enc_test.h5 does exactly that — each dataset
+ *   holds one encoded buffer as its raw data — so that poke can verify
+ *   print_h5s_encode() against bytes at a known absolute file offset.
+ *
+ * On-disk layout (H5S.c H5S_encode / H5S_decode):
+ *
+ *   [ds_id         : 1]   H5O_SDSPACE_ID = 0x01
+ *   [encode_version: 1]   H5S_ENCODE_VERSION = 0
+ *   [size_of_size  : 1]   sizeof(hsize_t) on encoding platform (typically 8)
+ *   [extent_size   : 4]   uint32 LE — byte count of the dataspace extent msg
+ *   [extent_msg  : extent_size]  H5O_msg_sdspace payload (see IV.A.2.b);
+ *                                each dim_size value occupies <size_of_size>
+ *                                bytes (same as global_sizeof_lengths)
+ *   [selection     : var]  H5S serialized selection — identical wire format
+ *                          to VDS selections (Section III.F):
+ *     [sel_type : 4]  uint32 LE: 0=NONE, 1=POINTS, 2=HYPERSLABS, 3=ALL
+ *     [version  : 4]  uint32 LE
+ *     ...see vds.pk header comment for full per-version layouts...
+ *
+ * Total buffer size = 7 + extent_size + select_size
+ *
+ * Load order:
+ *   (poke) .file <hdf5-file>
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk
+ *   (poke) var _sb = superblock @ 0#B   <- MUST map superblock to set
+ *                                               global_sizeof_lengths
+ *   (poke) .load pickles/messages.pk     <- H5O_msg_sdspace
+ *   (poke) .load pickles/gheap.pk        <- required by vds.pk
+ *   (poke) .load pickles/vds.pk          <- vds_sel_size, vds_print_sel
+ *   (poke) .load pickles/dspace_enc.pk
+ *
+ * Quick start:
+ *   print_h5s_encode(<addr>#B)
+ *     Parses and prints the H5Sencode buffer at the given absolute file
+ *     offset.  The superblock of the containing HDF5 file must be mapped
+ *     first (see above) so that global_sizeof_lengths is set.  It must
+ *     equal the size_of_size byte in the buffer (byte 2).  For 64-bit HDF5
+ *     files both are 8, so no adjustment is normally needed.  If they
+ *     differ, call set_global_sizeof_lengths(n) before mapping.
+ *
+ * Example — testfiles/dspace_enc_test.h5
+ *   (sizeof_lengths=8, superblock at offset 0):
+ *
+ * Default fapl (low_bound=EARLIEST -> hyper-v1, point-v1):
+ *   /scalar_all          data at 2048:  (poke) print_h5s_encode(2048#B)
+ *   /simple_all          data at 2079:  (poke) print_h5s_encode(2079#B)
+ *   /simple_hyper        data at 2142:  (poke) print_h5s_encode(2142#B)
+ *   /simple_point        data at 2229:  (poke) print_h5s_encode(2229#B)
+ *   /null_none           data at 2324:  (poke) print_h5s_encode(2324#B)
+ *
+ * Non-default fapl (low_bound=V110 -> hyper-v2):
+ *   /strided_hyper_v110  data at 2351:  (poke) print_h5s_encode(2351#B)
+ *
+ * Non-default fapl (low_bound=LATEST -> hyper-v3, point-v2):
+ *   /simple_hyper_latest data at 2479:  (poke) print_h5s_encode(2479#B)
+ *   /simple_point_latest data at 2556:  (poke) print_h5s_encode(2556#B)
+ */
+
+/* ----------------------------------------------------------------------- *
+ * h5s_encode_hdr -- fixed 7-byte prefix of an H5Sencode buffer.
+ *
+ * Fields:
+ *   ds_id          H5O_SDSPACE_ID (0x01); constraint fails on mismatch.
+ *   encode_version H5S_ENCODE_VERSION (0); constraint fails on mismatch.
+ *   size_of_size   sizeof(hsize_t) on the encoding platform (typically 8).
+ *   extent_size    byte count of the dataspace extent message that follows.
+ * ----------------------------------------------------------------------- */
+type h5s_encode_hdr =
+    struct {
+        byte     ds_id == 1;           /* H5O_SDSPACE_ID                      */
+        byte     encode_version == 0;  /* H5S_ENCODE_VERSION                  */
+        byte     size_of_size;         /* sizeof(hsize_t) on encoding platform */
+        uint<32> extent_size;          /* size of the extent message (bytes)   */
+    };
+
+/* ----------------------------------------------------------------------- *
+ * h5s_encode_sel_size -- byte count of the selection that begins at
+ * abs_off + 7 + extent_sz.
+ *
+ * Delegates to vds_sel_size() using the minimum safe probe window:
+ *   - NONE / ALL: always 16 bytes; only the 8-byte type+version header is
+ *     read so we never over-read when the selection sits at end-of-file.
+ *   - All other types: a 24-byte probe covers the length/enc_size/ndims
+ *     fields that vds_sel_size() needs for every version variant.
+ * ----------------------------------------------------------------------- */
+fun h5s_encode_sel_size = (offset<uint<64>,B> abs_off, uint<64> extent_sz) uint<64>:
+{
+    var sel_start = abs_off + (7UL + extent_sz)#B;
+    var hdr8      = byte[8] @ sel_start;
+    var sel_type  = bytes_to_u64_le_at(hdr8, 0UL, 4UL);
+
+    /* NONE and ALL are exactly 16 bytes; vds_sel_size needs only bytes 0-3. */
+    if (sel_type == H5S_SEL_NONE || sel_type == H5S_SEL_ALL)
+        return vds_sel_size(hdr8, 0UL);
+
+    /* For HYPERSLABS and POINTS a 24-byte window is sufficient for all
+     * version variants (max needed: hyper-v3 irregular at offset 14+enc_size,
+     * enc_size <= 8, so 22 bytes; 24 >= 22). */
+    var probe = byte[24] @ sel_start;
+    return vds_sel_size(probe, 0UL);
+}
+
+/* ----------------------------------------------------------------------- *
+ * print_h5s_encode -- parse and print one H5Sencode buffer at abs_off.
+ *
+ *   abs_off : absolute file offset of the first byte (the ds_id byte).
+ * ----------------------------------------------------------------------- */
+fun print_h5s_encode = (offset<uint<64>,B> abs_off) void:
+{
+    var hdr       = h5s_encode_hdr @ abs_off;
+    var extent_sz = hdr.extent_size as uint<64>;
+    var sel_off   = 7UL + extent_sz;
+    var sel_sz    = h5s_encode_sel_size(abs_off, extent_sz);
+
+    printf("h5s_encode {\n");
+    printf("  ds_id=%u8d\n", hdr.ds_id);
+    printf("  encode_version=%u8d\n", hdr.encode_version);
+    printf("  size_of_size=%u8d\n", hdr.size_of_size);
+    printf("  extent_size=%u32d\n", hdr.extent_size);
+
+    var ds = H5O_msg_sdspace @ (abs_off + 7#B);
+    ds.print_dspace_indent(1);
+
+    printf("  Dataspace selection:\n");
+    var sel = byte[sel_sz] @ (abs_off + sel_off#B);
+    vds_print_sel(sel, 0UL, "selection");
+
+    printf("}\n");
+}
