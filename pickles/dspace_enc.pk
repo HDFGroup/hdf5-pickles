@@ -36,13 +36,64 @@
  *   [extent_msg  : extent_size]  H5O_msg_sdspace payload (see IV.A.2.b);
  *                                each dim_size value occupies <size_of_size>
  *                                bytes (same as global_sizeof_lengths)
- *   [selection     : var]  H5S serialized selection — identical wire format
- *                          to VDS selections (Section III.F):
+ *   [selection     : var]  H5S serialized selection (see formats below):
  *     [sel_type : 4]  uint32 LE: 0=NONE, 1=POINTS, 2=HYPERSLABS, 3=ALL
  *     [version  : 4]  uint32 LE
- *     ...see vds.pk header comment for full per-version layouts...
  *
  * Total buffer size = 7 + extent_size + select_size
+ *
+ * Serialized H5S dataspace selection formats (H5Sselect.c, H5Sall.c,
+ * H5Snone.c, H5Shyper.c, H5Spoint.c):
+ *
+ *   All selections share a 4-byte LE type prefix:
+ *     0 = H5S_SEL_NONE, 1 = H5S_SEL_POINTS,
+ *     2 = H5S_SEL_HYPERSLABS, 3 = H5S_SEL_ALL
+ *
+ *   NONE / ALL (both version 1, 16 bytes fixed):
+ *     [sel_type:4][version:4][padding:4=0][extra_len:4=0]
+ *
+ *   HYPERSLABS version 1 (uint32 coords, block-list encoding):
+ *     [sel_type:4][version:4][padding:4=0][length:4]
+ *     [ndims:4][nblocks:4]
+ *     For each block (length includes ndims+nblocks dwords + block data):
+ *       start[0..ndims-1] : uint32 each
+ *       end[0..ndims-1]   : uint32 each (inclusive)
+ *     Total = 16 + length bytes
+ *
+ *   HYPERSLABS version 2 (uint64, may be regular):
+ *     [sel_type:4][version:4][flags:1][length:4]
+ *     [ndims:4]
+ *     If REGULAR (flags & 0x01):
+ *       For each dim: start, stride, count, block (uint64 each)
+ *       length = 4 + ndims*32
+ *     Else (block-list):
+ *       [nblocks:4]
+ *       For each block: start[0..ndims-1], end[0..ndims-1] (uint64 each)
+ *       length = 4 + 4 + nblocks*ndims*2*8
+ *     Total = 13 + length bytes
+ *
+ *   HYPERSLABS version 3 (enc_size-based, may be regular):
+ *     [sel_type:4][version:4][flags:1][enc_size:1][ndims:4]
+ *     If REGULAR (flags & 0x01):
+ *       For each dim: start, stride, count, block (enc_size each)
+ *       Total = 14 + ndims*4*enc_size bytes
+ *     Else (block-list):
+ *       [nblocks:enc_size]
+ *       For each block: start[0..ndims-1], end[0..ndims-1] (enc_size each)
+ *       Total = 14 + enc_size + nblocks*ndims*2*enc_size bytes
+ *
+ *   POINTS version 1 (uint32 coords):
+ *     [sel_type:4][version:4][padding:4=0][length:4]
+ *     [ndims:4][npoints:4]
+ *     For each point: coord[0..ndims-1] (uint32 each)
+ *     length = 4 + 4 + npoints*ndims*4
+ *     Total = 16 + length bytes
+ *
+ *   POINTS version 2 (enc_size-based):
+ *     [sel_type:4][version:4][enc_size:1][ndims:4]
+ *     [npoints:enc_size]
+ *     For each point: coord[0..ndims-1] (enc_size each)
+ *     Total = 9 + 4 + enc_size + npoints*ndims*enc_size bytes
  *
  * Load order:
  *   (poke) .file <hdf5-file>
@@ -51,8 +102,6 @@
  *   (poke) var _sb = superblock @ 0#B   <- MUST map superblock to set
  *                                               global_sizeof_lengths
  *   (poke) .load pickles/messages.pk     <- H5O_msg_sdspace
- *   (poke) .load pickles/gheap.pk        <- required by vds.pk
- *   (poke) .load pickles/vds.pk          <- vds_sel_size, vds_print_sel
  *   (poke) .load pickles/dspace_enc.pk
  *
  * Quick start:
@@ -100,14 +149,283 @@ type h5s_encode_hdr =
     };
 
 /* ----------------------------------------------------------------------- *
+ * Constants
+ * ----------------------------------------------------------------------- */
+
+/* H5S selection type codes                                                  */
+var H5S_SEL_NONE       = 0UL;
+var H5S_SEL_POINTS     = 1UL;
+var H5S_SEL_HYPERSLABS = 2UL;
+var H5S_SEL_ALL        = 3UL;
+
+/* H5S hyperslab flags                                                       */
+var H5S_HYPER_REGULAR = 0x01UB;
+
+/* ----------------------------------------------------------------------- *
+ * dspace_enc_sel_size -- number of bytes consumed by one serialized H5S
+ * selection beginning at data[off].  Returns 0 for an unrecognised
+ * type/version.
+ * ----------------------------------------------------------------------- */
+
+fun dspace_enc_sel_size = (byte[] data, uint<64> off) uint<64>:
+{
+    var sel_type = bytes_to_u64_le_at(data, off,        4UL);
+    var version  = bytes_to_u64_le_at(data, off + 4UL,  4UL);
+
+    if (sel_type == H5S_SEL_NONE || sel_type == H5S_SEL_ALL)
+        return 16UL;
+
+    if (sel_type == H5S_SEL_HYPERSLABS) {
+        if (version == 1UL) {
+            /* [type:4][ver:4][pad:4][length:4] ... length bytes ... */
+            var length = bytes_to_u64_le_at(data, off + 12UL, 4UL);
+            return 16UL + length;
+        }
+        if (version == 2UL) {
+            /* [type:4][ver:4][flags:1][length:4] ... length bytes ... */
+            var length = bytes_to_u64_le_at(data, off + 9UL, 4UL);
+            return 13UL + length;
+        }
+        if (version == 3UL) {
+            /* [type:4][ver:4][flags:1][enc_size:1][ndims:4] no length field */
+            var flags    = data[off + 8UL];
+            var enc_size = data[off + 9UL] as uint<64>;
+            var ndims    = bytes_to_u64_le_at(data, off + 10UL, 4UL);
+            if (flags & H5S_HYPER_REGULAR)
+                return 14UL + 4UL * ndims * enc_size;
+            var nblocks = bytes_to_u64_le_at(data, off + 14UL, enc_size);
+            return 14UL + enc_size + 2UL * ndims * enc_size * nblocks;
+        }
+    }
+
+    if (sel_type == H5S_SEL_POINTS) {
+        if (version == 1UL) {
+            /* [type:4][ver:4][pad:4][length:4] ... length bytes ... */
+            var length = bytes_to_u64_le_at(data, off + 12UL, 4UL);
+            return 16UL + length;
+        }
+        if (version == 2UL) {
+            /* [type:4][ver:4][enc_size:1][ndims:4][npoints:enc_size]... */
+            var enc_size = data[off + 8UL] as uint<64>;
+            var ndims    = bytes_to_u64_le_at(data, off + 9UL,  4UL);
+            var npoints  = bytes_to_u64_le_at(data, off + 13UL, enc_size);
+            return 13UL + enc_size + ndims * enc_size * npoints;
+        }
+    }
+
+    return 0UL;
+}
+
+/* ----------------------------------------------------------------------- *
+ * dspace_enc_print_sel_hyper_v1 -- print a version-1 hyperslab selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun dspace_enc_print_sel_hyper_v1 = (byte[] data, uint<64> off) void:
+{
+    var ndims   = bytes_to_u64_le_at(data, off + 16UL, 4UL);
+    var nblocks = bytes_to_u64_le_at(data, off + 20UL, 4UL);
+    printf("        ndims=%u64d nblocks=%u64d\n", ndims, nblocks);
+    var boff = off + 24UL;
+    for (var b = 0UL; b < nblocks; b = b + 1UL) {
+        printf("        block[%u64d] start=[", b);
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            if (d > 0UL) printf(",");
+            printf("%u64d", bytes_to_u64_le_at(data, boff + d * 4UL, 4UL));
+        }
+        var eoff = boff + ndims * 4UL;
+        printf("] end=[");
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            if (d > 0UL) printf(",");
+            printf("%u64d", bytes_to_u64_le_at(data, eoff + d * 4UL, 4UL));
+        }
+        printf("]\n");
+        boff = eoff + ndims * 4UL;
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * dspace_enc_print_sel_hyper_v2 -- print a version-2 hyperslab selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun dspace_enc_print_sel_hyper_v2 = (byte[] data, uint<64> off) void:
+{
+    var flags = data[off + 8UL];
+    var ndims = bytes_to_u64_le_at(data, off + 13UL, 4UL);
+    printf("        ndims=%u64d flags=0x%u8x", ndims, flags);
+    if (flags & H5S_HYPER_REGULAR) printf(" REGULAR"); else printf(" IRREGULAR");
+    printf("\n");
+    if (flags & H5S_HYPER_REGULAR) {
+        var coff = off + 17UL;
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            printf("        dim[%u64d] start=%u64d stride=%u64d count=%u64d block=%u64d\n",
+                   d,
+                   bytes_to_u64_le_at(data, coff,           8UL),
+                   bytes_to_u64_le_at(data, coff +  8UL,    8UL),
+                   bytes_to_u64_le_at(data, coff + 16UL,    8UL),
+                   bytes_to_u64_le_at(data, coff + 24UL,    8UL));
+            coff = coff + 32UL;
+        }
+    } else {
+        var nblocks = bytes_to_u64_le_at(data, off + 17UL, 4UL);
+        printf("        nblocks=%u64d\n", nblocks);
+        var boff = off + 21UL;
+        for (var b = 0UL; b < nblocks; b = b + 1UL) {
+            printf("        block[%u64d] start=[", b);
+            for (var d = 0UL; d < ndims; d = d + 1UL) {
+                if (d > 0UL) printf(",");
+                printf("%u64d", bytes_to_u64_le_at(data, boff + d * 8UL, 8UL));
+            }
+            var eoff = boff + ndims * 8UL;
+            printf("] end=[");
+            for (var d = 0UL; d < ndims; d = d + 1UL) {
+                if (d > 0UL) printf(",");
+                printf("%u64d", bytes_to_u64_le_at(data, eoff + d * 8UL, 8UL));
+            }
+            printf("]\n");
+            boff = eoff + ndims * 8UL;
+        }
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * dspace_enc_print_sel_hyper_v3 -- print a version-3 hyperslab selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun dspace_enc_print_sel_hyper_v3 = (byte[] data, uint<64> off) void:
+{
+    var flags    = data[off + 8UL];
+    var enc_size = data[off + 9UL] as uint<64>;
+    var ndims    = bytes_to_u64_le_at(data, off + 10UL, 4UL);
+    printf("        ndims=%u64d enc_size=%u64d flags=0x%u8x", ndims, enc_size, flags);
+    if (flags & H5S_HYPER_REGULAR) printf(" REGULAR"); else printf(" IRREGULAR");
+    printf("\n");
+    if (flags & H5S_HYPER_REGULAR) {
+        var coff = off + 14UL;
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            printf("        dim[%u64d] start=%u64d stride=%u64d count=%u64d block=%u64d\n",
+                   d,
+                   bytes_to_u64_le_at(data, coff,                 enc_size),
+                   bytes_to_u64_le_at(data, coff + enc_size,      enc_size),
+                   bytes_to_u64_le_at(data, coff + 2UL*enc_size,  enc_size),
+                   bytes_to_u64_le_at(data, coff + 3UL*enc_size,  enc_size));
+            coff = coff + 4UL * enc_size;
+        }
+    } else {
+        var nblocks = bytes_to_u64_le_at(data, off + 14UL, enc_size);
+        printf("        nblocks=%u64d\n", nblocks);
+        var boff = off + 14UL + enc_size;
+        for (var b = 0UL; b < nblocks; b = b + 1UL) {
+            printf("        block[%u64d] start=[", b);
+            for (var d = 0UL; d < ndims; d = d + 1UL) {
+                if (d > 0UL) printf(",");
+                printf("%u64d", bytes_to_u64_le_at(data, boff + d * enc_size, enc_size));
+            }
+            var eoff = boff + ndims * enc_size;
+            printf("] end=[");
+            for (var d = 0UL; d < ndims; d = d + 1UL) {
+                if (d > 0UL) printf(",");
+                printf("%u64d", bytes_to_u64_le_at(data, eoff + d * enc_size, enc_size));
+            }
+            printf("]\n");
+            boff = eoff + ndims * enc_size;
+        }
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * dspace_enc_print_sel_points_v1 -- print a version-1 point selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun dspace_enc_print_sel_points_v1 = (byte[] data, uint<64> off) void:
+{
+    var ndims   = bytes_to_u64_le_at(data, off + 16UL, 4UL);
+    var npoints = bytes_to_u64_le_at(data, off + 20UL, 4UL);
+    printf("        ndims=%u64d npoints=%u64d\n", ndims, npoints);
+    var poff = off + 24UL;
+    for (var p = 0UL; p < npoints; p = p + 1UL) {
+        printf("        point[%u64d] [", p);
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            if (d > 0UL) printf(",");
+            printf("%u64d", bytes_to_u64_le_at(data, poff + d * 4UL, 4UL));
+        }
+        printf("]\n");
+        poff = poff + ndims * 4UL;
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * dspace_enc_print_sel_points_v2 -- print a version-2 point selection.
+ * data[off] is at the start of the serialized selection (sel_type field).
+ * ----------------------------------------------------------------------- */
+
+fun dspace_enc_print_sel_points_v2 = (byte[] data, uint<64> off) void:
+{
+    var enc_size = data[off + 8UL] as uint<64>;
+    var ndims    = bytes_to_u64_le_at(data, off + 9UL,  4UL);
+    var npoints  = bytes_to_u64_le_at(data, off + 13UL, enc_size);
+    printf("        ndims=%u64d enc_size=%u64d npoints=%u64d\n",
+           ndims, enc_size, npoints);
+    var poff = off + 13UL + enc_size;
+    for (var p = 0UL; p < npoints; p = p + 1UL) {
+        printf("        point[%u64d] [", p);
+        for (var d = 0UL; d < ndims; d = d + 1UL) {
+            if (d > 0UL) printf(",");
+            printf("%u64d", bytes_to_u64_le_at(data, poff + d * enc_size, enc_size));
+        }
+        printf("]\n");
+        poff = poff + ndims * enc_size;
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * dspace_enc_print_sel -- print one serialized H5S selection stored in
+ * data[off]. sel_label is a short prefix for the printout ("source_select"
+ * etc.).
+ * ----------------------------------------------------------------------- */
+
+fun dspace_enc_print_sel = (byte[] data, uint<64> off, string sel_label) void:
+{
+    var sel_type = bytes_to_u64_le_at(data, off,       4UL);
+    var version  = bytes_to_u64_le_at(data, off + 4UL, 4UL);
+
+    printf("      %s {\n", sel_label);
+
+    if (sel_type == H5S_SEL_NONE) {
+        printf("        sel_type=NONE version=%u64d\n", version);
+    } else if (sel_type == H5S_SEL_ALL) {
+        printf("        sel_type=ALL version=%u64d\n", version);
+    } else if (sel_type == H5S_SEL_HYPERSLABS) {
+        printf("        sel_type=HYPERSLABS version=%u64d\n", version);
+        if      (version == 1UL) dspace_enc_print_sel_hyper_v1(data, off);
+        else if (version == 2UL) dspace_enc_print_sel_hyper_v2(data, off);
+        else if (version == 3UL) dspace_enc_print_sel_hyper_v3(data, off);
+        else printf("        /* unrecognised hyperslab version */\n");
+    } else if (sel_type == H5S_SEL_POINTS) {
+        printf("        sel_type=POINTS version=%u64d\n", version);
+        if      (version == 1UL) dspace_enc_print_sel_points_v1(data, off);
+        else if (version == 2UL) dspace_enc_print_sel_points_v2(data, off);
+        else printf("        /* unrecognised point version */\n");
+    } else {
+        printf("        sel_type=%u64d version=%u64d /* unrecognised */\n",
+               sel_type, version);
+    }
+
+    printf("      }\n");
+}
+
+/* ----------------------------------------------------------------------- *
  * h5s_encode_sel_size -- byte count of the selection that begins at
  * abs_off + 7 + extent_sz.
  *
- * Delegates to vds_sel_size() using the minimum safe probe window:
+ * Delegates to dspace_enc_sel_size() using the minimum safe probe window:
  *   - NONE / ALL: always 16 bytes; only the 8-byte type+version header is
  *     read so we never over-read when the selection sits at end-of-file.
  *   - All other types: a 24-byte probe covers the length/enc_size/ndims
- *     fields that vds_sel_size() needs for every version variant.
+ *     fields that dspace_enc_sel_size() needs for every version variant.
  * ----------------------------------------------------------------------- */
 fun h5s_encode_sel_size = (offset<uint<64>,B> abs_off, uint<64> extent_sz) uint<64>:
 {
@@ -115,15 +433,15 @@ fun h5s_encode_sel_size = (offset<uint<64>,B> abs_off, uint<64> extent_sz) uint<
     var hdr8      = byte[8] @ sel_start;
     var sel_type  = bytes_to_u64_le_at(hdr8, 0UL, 4UL);
 
-    /* NONE and ALL are exactly 16 bytes; vds_sel_size needs only bytes 0-3. */
+    /* NONE and ALL are exactly 16 bytes; dspace_enc_sel_size needs only bytes 0-3. */
     if (sel_type == H5S_SEL_NONE || sel_type == H5S_SEL_ALL)
-        return vds_sel_size(hdr8, 0UL);
+        return dspace_enc_sel_size(hdr8, 0UL);
 
     /* For HYPERSLABS and POINTS a 24-byte window is sufficient for all
      * version variants (max needed: hyper-v3 irregular at offset 14+enc_size,
      * enc_size <= 8, so 22 bytes; 24 >= 22). */
     var probe = byte[24] @ sel_start;
-    return vds_sel_size(probe, 0UL);
+    return dspace_enc_sel_size(probe, 0UL);
 }
 
 /* ----------------------------------------------------------------------- *
@@ -149,7 +467,7 @@ fun print_h5s_encode = (offset<uint<64>,B> abs_off) void:
 
     printf("  Dataspace selection:\n");
     var sel = byte[sel_sz] @ (abs_off + sel_off#B);
-    vds_print_sel(sel, 0UL, "selection");
+    dspace_enc_print_sel(sel, 0UL, "selection");
 
     printf("}\n");
 }
