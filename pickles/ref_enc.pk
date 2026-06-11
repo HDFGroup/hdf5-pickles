@@ -1,0 +1,455 @@
+/* ref_enc.pk - HDF5 Reference Encoding (Appendix D, Sections VIII.B and VIII.C). */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   Appendix D, Sections VIII.B and VIII.C of the HDF5 format spec v3.
+ *
+ * -----------------------------------------------------------------------
+ * VIII.B.  Reference Encoding (Revised)
+ * -----------------------------------------------------------------------
+ * Format of one element in a dataset of type H5T_STD_REF (the new
+ * reference API introduced in HDF5 1.12).  All elements are the same
+ * fixed size on disk:
+ *
+ *   element_size = MAX(H5R_ENCODE_HEADER_SIZE + sizeof(uint32_t)
+ *                      + blob_id_size,
+ *                      min_encode_size)
+ *
+ * where:
+ *   H5R_ENCODE_HEADER_SIZE = 2 bytes  (ref_type + flags)
+ *   sizeof(uint32_t)       = 4 bytes  (blob_size field)
+ *   blob_id_size           = sizeof_addr + 4 bytes  (global heap ID)
+ *   min_encode_size        = 3 + sizeof_addr bytes  (H5R_OBJECT2 direct)
+ *
+ * For sizeof_addr = 8: element_size = MAX(18, 11) = 18 bytes.
+ * For sizeof_addr = 4: element_size = MAX(14, 7) = 14 bytes.
+ *
+ * Two on-disk sub-formats depending on ref_type and flags:
+ *
+ * Case 1 – H5R_OBJECT2 internal (ref_type=2, flags & H5R_IS_EXTERNAL == 0):
+ *   [ref_type  : 1]  = 2 (H5R_OBJECT2)
+ *   [flags     : 1]  = 0 (no external-file flag)
+ *   [token_size: 1]  = sizeof_addr (number of valid bytes in token)
+ *   [token     : token_size bytes]   opaque object token
+ *   [padding   : element_size - 3 - token_size bytes]  zeros
+ *
+ * Case 2 – all other revised references (H5R_DATASET_REGION2 / H5R_ATTR /
+ *           external H5R_OBJECT2):
+ *   The encoded reference data is stored as a blob in the global heap.
+ *   The on-disk element holds only the header, the blob byte count, and
+ *   the global heap ID (address + index); the blob content itself resides
+ *   in the heap at (heap_addr, heap_idx).
+ *   [ref_type  : 1]
+ *   [flags     : 1]  H5R_IS_EXTERNAL = 0x01 if referencing an external file
+ *   [blob_size : 4]  uint32 LE — byte count of the blob stored in the heap
+ *                    (written directly in the element, NOT inside the heap)
+ *                    NOTE: the HDF5 format spec (Appendix D, VIII.B) omits
+ *                    this field; confirmed by H5T__ref_disk_write() in
+ *                    H5Tref.c (UINT32ENCODE + H5VL_blob_put).
+ *   [heap_addr : sizeof_addr bytes]  global heap collection address (LE)
+ *   [heap_idx  : 4]  uint32 LE — object index within that collection
+ *
+ * Blob layout (in global heap at (heap_addr, heap_idx)):
+ *   [token_size: 1]  sizeof_addr
+ *   [token     : token_size bytes]   opaque object token
+ *   — if H5R_IS_EXTERNAL (flags & 0x01) —
+ *   [fn_len    : 2]  uint16 LE — filename byte count
+ *   [filename  : fn_len bytes]  file name (not NUL-terminated)
+ *   — if H5R_DATASET_REGION2 (ref_type == 3) —
+ *   [sel_size  : 4]  uint32 LE — serialized selection byte count
+ *   [rank      : 4]  uint32 LE — extent rank
+ *   [selection : sel_size bytes]  H5S serialized selection (same wire
+ *                                 format as VDS selections in vds.pk)
+ *   — if H5R_ATTR (ref_type == 4) —
+ *   [name_len  : 2]  uint16 LE — attribute name byte count
+ *   [attr_name : name_len bytes]  attribute name (not NUL-terminated)
+ *
+ * -----------------------------------------------------------------------
+ * VIII.C.  Reference Encoding (Backward Compatibility)
+ * -----------------------------------------------------------------------
+ * Old-style reference types, used by datasets of type H5T_STD_REF_OBJ
+ * or H5T_STD_REF_DSETREG (HDF5 1.10 and earlier API).
+ *
+ * H5R_OBJECT1 element  (H5R_OBJ_REF_BUF_SIZE = sizeof_addr bytes):
+ *   [addr : sizeof_addr bytes]  raw file address of the referenced object
+ *
+ * H5R_DATASET_REGION1 element  (H5R_DSET_REG_REF_BUF_SIZE = sizeof_addr+4):
+ *   [heap_addr : sizeof_addr bytes]  global heap collection address (LE)
+ *   [heap_idx  : 4]  uint32 LE — object index within that collection
+ *
+ *   Global heap object at (heap_addr, heap_idx) contains:
+ *   [dataset_addr : sizeof_addr bytes]  raw file address of the dataset
+ *   [selection    : var]  serialized H5S selection (same wire format as
+ *                         vds.pk; no preceding sel_size / rank header)
+ *
+ * -----------------------------------------------------------------------
+ * Load order:
+ *   (poke) .file <hdf5-file>
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk
+ *   (poke) var _sb = superblock @ 0#B    <- sets global_sizeof_offsets
+ *   (poke) .load pickles/gheap.pk        <- gheap_gcol_find_obj()
+ *   (poke) .load pickles/messages.pk     <- H5O_msg_sdspace (required by dspace_enc.pk)
+ *   (poke) .load pickles/dspace_enc.pk   <- dspace_enc_sel_size, dspace_enc_print_sel
+ *   (poke) .load pickles/ref_enc.pk
+ *
+ * Quick start:
+ *
+ *   VIII.B — print_h5r_revised(<addr>#B)
+ *     Parses one H5T_STD_REF element at the given absolute file offset.
+ *     Follows the global heap for DATASET_REGION2 / ATTR / external refs.
+ *
+ *   VIII.C — print_h5r_obj1(<addr>#B)
+ *     Parses one H5R_OBJECT1 element (sizeof_addr raw bytes = address).
+ *
+ *   VIII.C — print_h5r_region1(<addr>#B)
+ *     Parses one H5R_DATASET_REGION1 element (global heap ID + heap data).
+ *
+ * Examples — testfiles/ref_enc_test.h5  (sizeof_offsets = 8):
+ *
+ *   (poke) var _sb = superblock @ 0#B
+ *   (poke) print_h5r_revised(2088#B)    <- /ref_obj2   (H5R_OBJECT2)
+ *   (poke) print_h5r_revised(2106#B)    <- /ref_reg2   (H5R_DATASET_REGION2)
+ *   (poke) print_h5r_revised(6220#B)    <- /ref_attr2  (H5R_ATTR)
+ *
+ * Examples — testfiles/ref_enc_compat_test.h5  (sizeof_offsets = 8):
+ *
+ *   (poke) var _sb = superblock @ 0#B
+ *   (poke) print_h5r_obj1(2088#B)        <- /ref_obj1  (H5R_OBJECT1)
+ *   (poke) print_h5r_region1(6192#B)     <- /ref_reg1  (H5R_DATASET_REGION1)
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Constants
+ * ----------------------------------------------------------------------- */
+
+var H5R_OBJECT2           = 2UL;
+var H5R_DATASET_REGION2   = 3UL;
+var H5R_ATTR              = 4UL;
+var H5R_IS_EXTERNAL       = 0x01UL;
+
+/* ----------------------------------------------------------------------- *
+ * ref_enc_hdr -- 2-byte common header for every H5T_STD_REF element.
+ *
+ * Shared prefix for both the direct format (H5R_OBJECT2 internal) and the
+ * blob format (all other reference types and external H5R_OBJECT2).
+ *
+ * Fields:
+ *   ref_type  H5R_OBJECT2=2, H5R_DATASET_REGION2=3, H5R_ATTR=4
+ *   flags     H5R_IS_EXTERNAL=0x01 if referencing an external file
+ * ----------------------------------------------------------------------- */
+type ref_enc_hdr = struct {
+    byte ref_type;
+    byte flags;
+
+    method _print = void:
+    {
+        var rt       = ref_type as uint<64>;
+        var ref_name =
+            rt == H5R_OBJECT2         ? "H5R_OBJECT2"         :
+            rt == H5R_DATASET_REGION2 ? "H5R_DATASET_REGION2" :
+            rt == H5R_ATTR            ? "H5R_ATTR"            :
+                                        "UNKNOWN";
+        printf("ref_enc_hdr {\n");
+        printf("  ref_type=%u8d (%s)\n", ref_type, ref_name);
+        printf("  flags=0x%u8x", flags);
+        if ((flags as uint<64> & H5R_IS_EXTERNAL) != 0UL)
+            printf(" H5R_IS_EXTERNAL");
+        printf("\n");
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * ref_enc_print_token -- print an object token as a hex address.
+ *
+ *   blob   : byte array containing the blob data
+ *   off    : offset within blob of the 1-byte token_size field
+ * ----------------------------------------------------------------------- */
+fun ref_enc_print_token = (byte[] blob, uint<64> off) uint<64>:
+{
+    var token_size = blob[off] as uint<64>;
+    var addr       = bytes_to_u64_le_at(blob, off + 1UL, token_size);
+    printf("  token_size=%u64d  token=0x%u64x  (%u64d)\n",
+           token_size, addr, addr);
+    return 1UL + token_size;   /* bytes consumed */
+}
+
+/* ----------------------------------------------------------------------- *
+ * ref_enc_print_sel_at -- determine size and print the serialized H5S
+ * selection that begins at absolute file offset sel_abs_off.
+ *
+ * Used for VIII.C region references where there is no preceding
+ * sel_size / rank header — the selection wire bytes start immediately.
+ * ----------------------------------------------------------------------- */
+fun ref_enc_print_sel_at = (offset<uint<64>,B> sel_abs_off) void:
+{
+    var hdr8     = byte[8] @ sel_abs_off;
+    var sel_type = bytes_to_u64_le_at(hdr8, 0UL, 4UL);
+
+    if (sel_type == H5S_SEL_NONE || sel_type == H5S_SEL_ALL) {
+        var sel = byte[16] @ sel_abs_off;
+        dspace_enc_print_sel(sel, 0UL, "selection");
+    } else {
+        var probe   = byte[24] @ sel_abs_off;
+        var sel_sz  = dspace_enc_sel_size(probe, 0UL);
+        var sel_dat = byte[sel_sz] @ sel_abs_off;
+        dspace_enc_print_sel(sel_dat, 0UL, "selection");
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * ref_enc_print_blob_reg2 -- print the DATASET_REGION2 portion of a blob.
+ *
+ *   blob   : byte array holding blob data starting at off
+ *   off    : offset within blob of the sel_size field
+ *   data_abs_off : absolute file offset of blob[0]
+ * ----------------------------------------------------------------------- */
+fun ref_enc_print_blob_reg2 = (byte[] blob, uint<64> off,
+                                offset<uint<64>,B> data_abs_off) void:
+{
+    var sel_size = bytes_to_u64_le_at(blob, off, 4UL);
+    var rank     = bytes_to_u64_le_at(blob, off + 4UL, 4UL);
+    printf("  sel_size=%u64d  rank=%u64d\n", sel_size, rank);
+    var sel_dat = byte[sel_size] @ (data_abs_off + (off + 8UL)#B);
+    dspace_enc_print_sel(sel_dat, 0UL, "selection");
+}
+
+/* ----------------------------------------------------------------------- *
+ * ref_enc_block -- complete on-disk H5T_STD_REF element (VIII.B).
+ *
+ * Embeds ref_enc_hdr (ref_type + flags) as the 2-byte common header,
+ * followed by the conditional body fields for the two sub-formats:
+ *
+ *   Case 1 – H5R_OBJECT2 internal (direct format):
+ *     token_size + token   (both present when hdr.ref_type==2 and !IS_EXTERNAL)
+ *
+ *   Case 2 – all other / external (blob format):
+ *     blob_size_raw + heap_addr_raw + heap_idx_raw
+ *
+ * The _print method follows the global heap for Case 2 and decodes the
+ * full blob content (token, optional external filename, dataspace
+ * selection, or attribute name).
+ * ----------------------------------------------------------------------- */
+type ref_enc_block = struct {
+    ref_enc_hdr hdr;
+
+    /* Case 1: H5R_OBJECT2 internal (direct format) */
+    byte                        token_size    if (hdr.ref_type == 2UB &&
+                                                  (hdr.flags & 1UB) == 0UB);
+    byte[global_sizeof_offsets] token         if (hdr.ref_type == 2UB &&
+                                                  (hdr.flags & 1UB) == 0UB);
+
+    /* Case 2: blob format */
+    byte[4]                     blob_size_raw if (hdr.ref_type != 2UB ||
+                                                  (hdr.flags & 1UB) != 0UB);
+    byte[global_sizeof_offsets] heap_addr_raw if (hdr.ref_type != 2UB ||
+                                                  (hdr.flags & 1UB) != 0UB);
+    byte[4]                     heap_idx_raw  if (hdr.ref_type != 2UB ||
+                                                  (hdr.flags & 1UB) != 0UB);
+
+    method _print = void:
+    {
+        var rt          = hdr.ref_type as uint<64>;
+        var fl          = hdr.flags as uint<64>;
+        var is_external = (fl & H5R_IS_EXTERNAL) != 0UL;
+        var is_direct   = (rt == H5R_OBJECT2 && !is_external);
+
+        var ref_name =
+            rt == H5R_OBJECT2         ? "H5R_OBJECT2"         :
+            rt == H5R_DATASET_REGION2 ? "H5R_DATASET_REGION2" :
+            rt == H5R_ATTR            ? "H5R_ATTR"            :
+                                        "UNKNOWN";
+
+        printf("ref_enc_block {\n");
+        printf("  ref_type=%u8d (%s)\n", hdr.ref_type, ref_name);
+        printf("  flags=0x%u8x", hdr.flags);
+        if (is_external) printf(" H5R_IS_EXTERNAL");
+        printf("\n");
+
+        if (is_direct) {
+            /* Case 1: all data is inline */
+            printf("  [direct format]\n");
+            var addr = bytes_to_u64_le_at(token, 0UL, token_size as uint<64>);
+            printf("  token_size=%u8d  token=0x%u64x  (%u64d)\n",
+                   token_size, addr, addr);
+        } else {
+            /* Case 2: data is in the global heap */
+            var blob_size = bytes_to_u64_le(blob_size_raw);
+            var heap_addr = bytes_to_u64_le(heap_addr_raw);
+            var heap_idx  = bytes_to_u64_le(heap_idx_raw);
+            printf("  [blob format]\n");
+            printf("  blob_size=%u64d\n",            blob_size);
+            printf("  heap_addr=0x%u64x  (%u64d)\n", heap_addr, heap_addr);
+            printf("  heap_idx=%u64d\n",             heap_idx);
+
+            var data_off = gheap_gcol_find_obj(heap_addr#B, heap_idx);
+            if (data_off == 0#B) {
+                printf("}\n");
+                return;
+            }
+
+            var blob     = byte[blob_size] @ data_off;
+            var consumed = ref_enc_print_token(blob, 0UL);
+
+            if (is_external) {
+                var fn_len = bytes_to_u64_le_at(blob, consumed, 2UL);
+                printf("  filename_len=%u64d\n", fn_len);
+                printf("  filename=\"");
+                for (var i = 0UL; i < fn_len; i = i + 1UL)
+                    printf("%c", blob[consumed + 2UL + i] as char);
+                printf("\"\n");
+                consumed = consumed + 2UL + fn_len;
+            }
+
+            if (rt == H5R_DATASET_REGION2) {
+                ref_enc_print_blob_reg2(blob, consumed, data_off);
+            } else if (rt == H5R_ATTR) {
+                var name_len = bytes_to_u64_le_at(blob, consumed, 2UL);
+                printf("  attr_name_len=%u64d\n", name_len);
+                printf("  attr_name=\"");
+                for (var i = 0UL; i < name_len; i = i + 1UL)
+                    printf("%c", blob[consumed + 2UL + i] as char);
+                printf("\"\n");
+            }
+        }
+
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * ref_enc_elem_size -- fixed disk element size for H5T_STD_REF.
+ *
+ * Public helper: returns the number of bytes occupied by one element in a
+ * dataset of type H5T_STD_REF.  All elements in such a dataset are the same
+ * fixed size regardless of their sub-format (direct or blob).  Use this to
+ * step through a contiguous array of elements, e.g.:
+ *
+ *   var stride = ref_enc_elem_size();
+ *   for (var i = 0UL; i < n_elems; i = i + 1UL)
+ *       print_h5r_revised(base_off + (i * stride)#B);
+ *
+ * Derivation:
+ *   = MAX(H5R_ENCODE_HEADER_SIZE + sizeof(uint32) + blob_id_size,
+ *         min_encode_size)
+ *   = MAX(2 + 4 + sizeof_addr + 4, 3 + sizeof_addr)
+ *   = 10 + sizeof_addr
+ *
+ * For sizeof_addr=8: 18 bytes.
+ * For sizeof_addr=4: 14 bytes.
+ * ----------------------------------------------------------------------- */
+fun ref_enc_elem_size = uint<64>:
+{
+    return 10UL + global_sizeof_offsets as uint<64>;
+}
+
+/* ----------------------------------------------------------------------- *
+ * print_h5r_revised -- parse and print one H5T_STD_REF element (VIII.B).
+ *
+ *   abs_off : absolute file offset of the first byte of the element.
+ * ----------------------------------------------------------------------- */
+fun print_h5r_revised = (offset<uint<64>,B> abs_off) void:
+{
+    (ref_enc_block @ abs_off)._print();
+}
+
+/* ----------------------------------------------------------------------- *
+ * ref_enc_obj1_block -- on-disk H5R_OBJECT1 element (VIII.C).
+ *
+ * Element size = global_sizeof_offsets bytes.
+ *
+ * Fields:
+ *   addr_raw   raw file address of the referenced object (LE)
+ * ----------------------------------------------------------------------- */
+type ref_enc_obj1_block = struct {
+    byte[global_sizeof_offsets] addr_raw;
+
+    method _print = void:
+    {
+        var addr = bytes_to_u64_le(addr_raw);
+        printf("h5r_obj1 {\n");
+        printf("  addr=0x%u64x  (%u64d)\n", addr, addr);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_h5r_obj1 -- parse and print one H5R_OBJECT1 element (VIII.C).
+ *
+ *   abs_off : absolute file offset of the first byte of the element.
+ * ----------------------------------------------------------------------- */
+fun print_h5r_obj1 = (offset<uint<64>,B> abs_off) void:
+{
+    (ref_enc_obj1_block @ abs_off)._print();
+}
+
+/* ----------------------------------------------------------------------- *
+ * ref_enc_region1_block -- on-disk H5R_DATASET_REGION1 element (VIII.C).
+ *
+ * Element size = global_sizeof_offsets + 4 bytes.
+ *
+ * Fields:
+ *   heap_addr_raw   global heap collection address (LE)
+ *   heap_idx_raw    object index within that collection (uint32 LE)
+ *
+ * The global heap object at (heap_addr, heap_idx) contains:
+ *   [dataset_addr : sizeof_offsets bytes]  raw file address of the dataset
+ *   [selection    : var]  serialized H5S selection (no sel_size/rank header)
+ * ----------------------------------------------------------------------- */
+type ref_enc_region1_block = struct {
+    byte[global_sizeof_offsets] heap_addr_raw;
+    byte[4]                     heap_idx_raw;
+
+    method _print = void:
+    {
+        var heap_addr = bytes_to_u64_le(heap_addr_raw);
+        var heap_idx  = bytes_to_u64_le(heap_idx_raw);
+
+        printf("h5r_region1 {\n");
+        printf("  heap_addr=0x%u64x  (%u64d)\n", heap_addr, heap_addr);
+        printf("  heap_idx=%u64d\n", heap_idx);
+
+        var data_off = gheap_gcol_find_obj(heap_addr#B, heap_idx);
+        if (data_off == 0#B) {
+            printf("}\n");
+            return;
+        }
+
+        var sizeof_addr  = global_sizeof_offsets as uint<64>;
+        var ds_addr_raw  = byte[sizeof_addr] @ data_off;
+        var dataset_addr = bytes_to_u64_le(ds_addr_raw);
+        printf("  dataset_addr=0x%u64x  (%u64d)\n", dataset_addr, dataset_addr);
+
+        ref_enc_print_sel_at(data_off + sizeof_addr#B);
+
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_h5r_region1 -- parse and print one H5R_DATASET_REGION1 element
+ * (VIII.C).
+ *
+ *   abs_off : absolute file offset of the first byte of the element.
+ * ----------------------------------------------------------------------- */
+fun print_h5r_region1 = (offset<uint<64>,B> abs_off) void:
+{
+    (ref_enc_region1_block @ abs_off)._print();
+}
