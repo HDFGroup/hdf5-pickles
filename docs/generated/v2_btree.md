@@ -169,14 +169,14 @@ Record type 10 — non-filtered dataset chunk address. Used as the chunk index f
 
 ## `bt2_rec_type11`
 
-Record type 11 — filtered dataset chunk address. Like type 10 but includes the on-disk (filtered) chunk size and a filter skip mask.
+Record type 11 — filtered dataset chunk address. Like type 10 but includes the on-disk (filtered) chunk size and a filter skip mask. HDF5 supplies layout context to the v2 B-tree callbacks; for layout version 4 the chunk-size field can be shorter than `sizeof_lengths`. Set `global_bt2_ndims` to the number of real dataset dimensions and `global_bt2_chunk_size_len` before mapping when that context is known.
 
 | Field | Description |
 |-------|-------------|
 | `chunk_addr_raw` | File address of the filtered chunk data payload (`sizeof_offsets` bytes). |
-| `chunk_size_raw` | On-disk (filtered) chunk size in bytes (`sizeof_lengths` bytes). |
+| `chunk_size_raw` | On-disk filtered chunk size, `global_bt2_chunk_size_len` bytes. |
 | `filter_mask` | Filter pipeline skip mask for this chunk. |
-| `scaled_offsets` | Array of `global_bt2_ndims` uint64 scaled chunk position values (B-tree key). |
+| `scaled_offsets` | Array of `global_bt2_ndims` uint64 scaled chunk position values for real dataset dimensions only. |
 
 
 ## `bt2_raw_record`
@@ -242,5 +242,4 @@ Child-pointer array for a depth-1 internal node (children are leaves). Each poin
 ### `dn`
 
 Child-pointer array for a depth > 1 internal node (children are internal nodes). Each pointer is a `bt2_child_ptr_dn` carrying the child address, node record count, and subtree record count.
-
 

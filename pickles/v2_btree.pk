@@ -142,6 +142,28 @@ fun set_bt2_chunk_size_len = (uint<8> n) void:
     global_bt2_chunk_size_len = n;
 };
 
+/* Derive and set the type-11 filtered chunk-size field width from the
+ * record size and the (externally supplied) dataset dimensionality.
+ *
+ * A type-11 record is under-determined by record_size alone: the
+ * chunk-size width and the dimension count share one equation, so ndims
+ * MUST be known from layout context.  An out-of-range result therefore
+ * means the supplied ndims is wrong or stale; we raise rather than map a
+ * misaligned record silently.                                          */
+fun set_bt2_chunk_size_len_from_hdr = (uint<16> record_size, uint<8> ndims) void:
+{
+    var csl = record_size
+              - (global_sizeof_offsets as uint<16>)
+              - 4UH
+              - ((ndims as uint<16>) * 8UH);
+    if (csl < 1UH || csl > (global_sizeof_lengths as uint<16>)) {
+        printf("v2_btree: type-11 chunk_size_len %u16d out of range [1,%u8d]; ndims=%u8d is likely wrong (pass the dataset rank).\n",
+               csl, global_sizeof_lengths, ndims);
+        raise E_inval;
+    }
+    set_bt2_chunk_size_len(csl as uint<8>);
+};
+
 fun set_bt2_nrec_in_node_bytes = (uint<8> sz) void:
 {
     global_bt2_nrec_in_node_bytes = sz;
@@ -690,16 +712,20 @@ fun print_recurse_v2_btree = (offset<uint<64>,B> off) void:
  * Maps the header at the given file offset, computes field-width globals,
  * then prints the full tree recursively.
  *
- * For chunk index B-trees (record type 10 or 11), the dataset
- * dimensionality is derived automatically from hdr.record_size:
- *   type 10: ndims = (record_size - sizeof_offsets) / 8
- *   type 11: ndims = (record_size - sizeof_offsets - sizeof_lengths - 4) / 8
+ * For chunk index B-trees (record type 10 or 11) the dataset
+ * dimensionality is needed to size the record.  Type 10 has a single
+ * unknown and is recovered from hdr.record_size automatically.  Type 11
+ * is under-determined (the chunk-size width and ndims share one
+ * equation), so pass the real dataset rank via the optional `ndims`
+ * argument; otherwise the value previously primed with set_bt2_ndims
+ * (default 1) is used and a mis-sized record is rejected loudly.
  *
  * Usage:
- *   print_v2_btree(<addr>#B);
+ *   print_v2_btree(<addr>#B);          // type 10, or type 11 with primed ndims
+ *   print_v2_btree(<addr>#B, 3UB);     // type 11, dataset rank = 3
  * ----------------------------------------------------------------------- */
 
-fun print_v2_btree = (offset<uint<64>,B> off) void:
+fun print_v2_btree = (offset<uint<64>,B> off, uint<8> ndims = 0UB) void:
 {
     var hdr = v2_btree_hdr @ off;
     /* Mapping hdr called set_v2btree_type/node_size/record_size/depth
@@ -708,15 +734,19 @@ fun print_v2_btree = (offset<uint<64>,B> off) void:
     set_bt2_nrec_size_from_hdr(hdr.node_size, hdr.record_size);
     set_bt2_nrec_subtree_size_from_hdr(hdr.node_size, hdr.record_size, hdr.depth);
     set_bt2_nrec(hdr.num_root_records);
-    /* Derive dimensionality from record_size for chunk index B-trees. */
-    if (hdr.record_type == 10UB)
-        set_bt2_ndims(((hdr.record_size as uint<16>)
-                       - (global_sizeof_offsets as uint<16>)) / 8UH as uint<8>);
-    else if (hdr.record_type == 11UB)
-        set_bt2_chunk_size_len(((hdr.record_size as uint<16>)
-                                - (global_sizeof_offsets as uint<16>)
-                                - 4UH
-                                - ((global_bt2_ndims as uint<16>) * 8UH)) as uint<8>);
+    /* Resolve dimensionality for chunk-index B-trees.  An explicit ndims
+     * argument always wins; type 10 can otherwise self-derive it. */
+    if (hdr.record_type == 10UB) {
+        if (ndims > 0UB)
+            set_bt2_ndims(ndims);
+        else
+            set_bt2_ndims(((hdr.record_size as uint<16>)
+                           - (global_sizeof_offsets as uint<16>)) / 8UH as uint<8>);
+    } else if (hdr.record_type == 11UB) {
+        if (ndims > 0UB)
+            set_bt2_ndims(ndims);
+        set_bt2_chunk_size_len_from_hdr(hdr.record_size, global_bt2_ndims);
+    }
     hdr._print;
     print_recurse_v2_btree(bytes_to_off(hdr.root_addr_raw));
 };
