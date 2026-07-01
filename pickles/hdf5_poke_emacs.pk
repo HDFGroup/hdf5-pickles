@@ -1,0 +1,2092 @@
+/* hdf5_poke_emacs.pk - Machine-readable Emacs protocol helpers.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+load "common.pk";
+load "superblock.pk";
+load "ohdr.pk";
+load "btree.pk";
+load "farray.pk";
+load "earray.pk";
+load "fheap.pk";
+load "lheap.pk";
+load "lookup3.pk";
+
+var HPE_CONT_ID = 0x10UL;
+var HPE_LINK_ID = 0x06UL;
+var HPE_LINFO_ID = 0x02UL;
+var HPE_STAB_ID = 0x11UL;
+var HPE_LAYOUT_ID = 0x08UL;
+
+var hpe_ctx_version = 0UB;
+var hpe_ctx_prefix_bytes = 0;
+var hpe_ctx_chunk_off = 0UL#B;
+var hpe_ctx_chunk_size = 0UL;
+var hpe_ctx_flags = 0UB;
+var hpe_msg_index = 0UL;
+var hpe_old_link_storage_emitted = 0;
+var hpe_prev_layout = 0UL;
+var hpe_prev_data_off = 0UL#B;
+var hpe_prev_data_size = 0UL;
+var hpe_prev_dtype_class = 0UL;
+var hpe_prev_dtype_size = 0UL;
+var hpe_prev_dtype_signed = 0UL;
+var hpe_prev_dtype_byte_order = 0UL;
+var hpe_prev_has_dtype = 0;
+var hpe_prev_nelts = 0UL;
+var hpe_prev_has_space = 0;
+
+/* Emit the structured response start marker for request req. */
+fun hpe_begin = (int req) void:
+{
+    printf("@@HDF5-POKE-BEGIN %u64d\n", req as uint<64>);
+}
+
+/* Emit the structured response end marker for request req. */
+fun hpe_end = (int req) void:
+{
+    printf("@@HDF5-POKE-END %u64d\n", req as uint<64>);
+}
+
+/* Emit the raw-output start marker for request req. */
+fun hpe_raw_begin = (int req) void:
+{
+    printf("@@HDF5-POKE-RAW-BEGIN %u64d\n", req as uint<64>);
+}
+
+/* Emit the raw-output end marker for request req. */
+fun hpe_raw_end = (int req) void:
+{
+    printf("@@HDF5-POKE-RAW-END %u64d\n", req as uint<64>);
+}
+
+/* Print s as an escaped string in the Emacs plist protocol. */
+fun hpe_print_string = (string s) void:
+{
+    var i = 0UL;
+
+    printf("\"");
+    while (i < s'length) {
+        var c = s[i];
+
+        if (c == '"')
+            printf("\\\"");
+        else if (c == '\\')
+            printf("\\\\");
+        else if (c == '\n')
+            printf("\\n");
+        else if (c == '\t')
+            printf("\\t");
+        else
+            printf("%c", c);
+
+        i = i + 1UL;
+    }
+    printf("\"");
+}
+
+/* Return nonzero when raw encodes HADDR_UNDEF as all 0xff bytes. */
+fun hpe_addr_is_undef = (byte[] raw) int:
+{
+    var n = 0UL;
+
+    while (n < raw'length) {
+        if (raw[n] != 0xffUB) return 0;
+        n = n + 1UL;
+    }
+
+    return 1;
+}
+
+/* Print a plist address field, using nil for HADDR_UNDEF. */
+fun hpe_print_addr_field = (string name, byte[] raw) void:
+{
+    printf(" :%s ", name);
+    if (hpe_addr_is_undef(raw))
+        printf("nil");
+    else
+        printf("%u64d", bytes_to_off(raw)/#B);
+}
+
+/* Print uint32 dimension values as a space-separated protocol list. */
+fun hpe_print_u32_dims = (uint<32>[] dims) void:
+{
+    var i = 0UL;
+
+    printf("(");
+    while (i < dims'length) {
+        if (i > 0UL) printf(" ");
+        printf("%u64d", dims[i] as uint<64>);
+        i = i + 1UL;
+    }
+    printf(")");
+}
+
+/* Print variable-width little-endian dimension values as a protocol list. */
+fun hpe_print_byte_dims = (byte[][] dims) void:
+{
+    var i = 0UL;
+
+    printf("(");
+    while (i < dims'length) {
+        if (i > 0UL) printf(" ");
+        printf("%u64d", bytes_to_u64_le(dims[i]));
+        i = i + 1UL;
+    }
+    printf(")");
+}
+
+/* Map an object-header message type ID to its display name. */
+fun hpe_message_name = (uint<64> m_type) string:
+{
+    if (m_type == 0x00UL) return "Nil";
+    if (m_type == 0x01UL) return "Dataspace";
+    if (m_type == 0x02UL) return "Link Info";
+    if (m_type == 0x03UL) return "Datatype";
+    if (m_type == 0x04UL) return "Fill Value (Old)";
+    if (m_type == 0x05UL) return "Fill Value";
+    if (m_type == 0x06UL) return "Link";
+    if (m_type == 0x07UL) return "External Data Files";
+    if (m_type == 0x08UL) return "Data Layout";
+    if (m_type == 0x09UL) return "Bogus";
+    if (m_type == 0x0aUL) return "Group Info";
+    if (m_type == 0x0bUL) return "Filter Pipeline";
+    if (m_type == 0x0cUL) return "Attribute";
+    if (m_type == 0x0dUL) return "Object Name";
+    if (m_type == 0x0eUL) return "Modification Time (Old)";
+    if (m_type == 0x0fUL) return "Shared Message Table";
+    if (m_type == 0x10UL) return "Object Header Continuation";
+    if (m_type == 0x11UL) return "Symbol Table";
+    if (m_type == 0x12UL) return "Modification Time";
+    if (m_type == 0x13UL) return "B-tree K Values";
+    if (m_type == 0x14UL) return "Driver Info";
+    if (m_type == 0x15UL) return "Attribute Info";
+    if (m_type == 0x16UL) return "Object Reference Count";
+    if (m_type == 0x17UL) return "File Space Info";
+    if (m_type == 0x18UL) return "Metadata Cache Image";
+    return "Unknown";
+}
+
+/* Load object-header iteration state into the hpe_ctx_* globals. */
+fun hpe_load_ohdr_ctx = (offset<uint<64>,B> off) void:
+{
+    var hdr = ohdr @ off;
+
+    if (hdr.sig_peek == V2_SIG) {
+        hpe_ctx_version = hdr._ohdr.v2.version;
+        hpe_ctx_flags = hdr._ohdr.v2.flags;
+        global_crt_tracked = ((hdr._ohdr.v2.flags & 4U) != 0);
+        hpe_ctx_prefix_bytes = global_crt_tracked ? V2_PREFIX_BYTES + 2 : V2_PREFIX_BYTES;
+        hpe_ctx_chunk_off =
+            hdr._ohdr.v2._msg_chunk.msg_chunk'offset as offset<uint<64>,B>;
+        hpe_ctx_chunk_size = bytes_to_u64_le(hdr._ohdr.v2.chunk0_size);
+    } else {
+        hpe_ctx_version = hdr._ohdr.v1.version;
+        hpe_ctx_flags = 0UB;
+        global_crt_tracked = 0;
+        hpe_ctx_prefix_bytes = V1_PREFIX_BYTES;
+        hpe_ctx_chunk_off =
+            hdr._ohdr.v1._msg_chunk.msg_chunk'offset as offset<uint<64>,B>;
+        hpe_ctx_chunk_size = hdr._ohdr.v1.obj_hdr_size as uint<64>;
+    }
+}
+
+/* Emit a summary record for one object-header message prefix. */
+fun hpe_print_message_record = (uint<64> idx, uint<64> m_type,
+                                uint<64> m_size, uint<64> flags,
+                                offset<uint<64>,B> prefix_off,
+                                offset<uint<64>,B> payload_off,
+                                int has_crt, uint<64> crt) void:
+{
+    printf("(:record message :index %u64d :type %u64d :name ",
+           idx, m_type);
+    hpe_print_string(hpe_message_name(m_type));
+    printf(" :prefix-offset %u64d :payload-offset %u64d :size %u64d :flags %u64d :creation-order ",
+           prefix_off/#B, payload_off/#B, m_size, flags);
+    if (has_crt)
+        printf("%u64d", crt);
+    else
+        printf("nil");
+    printf(")\n");
+}
+
+/* Emit a hard-link record discovered in compact, dense, or symbol storage. */
+fun hpe_print_link_record = (string source, string name,
+                             offset<uint<64>,B> target,
+                             uint<64> message_index,
+                             offset<uint<64>,B> payload_off) void:
+{
+    printf("(:record link :name ");
+    hpe_print_string(name);
+    printf(" :message-index %u64d :payload-offset %u64d :source ",
+           message_index, payload_off/#B);
+    hpe_print_string(source);
+    printf(" :kind \"hard\" :target %u64d :note nil)\n", target/#B);
+}
+
+/* Emit parsed layout message details for supported layout versions. */
+fun hpe_print_layout_record = (uint<64> idx,
+                               offset<uint<64>,B> payload_off) void:
+{
+    var layout = H5O_msg_layout @ payload_off;
+
+    printf("(:record layout :message-index %u64d :payload-offset %u64d :version %u64d",
+           idx, payload_off/#B, layout.version as uint<64>);
+
+    if (layout.version == 3UB) {
+        printf(" :class ");
+        if (layout.layout.v3.layout_class == CHUNKED) {
+            hpe_print_string("chunked");
+            printf(" :ndims %u64d", layout.layout.v3.properties.chunked.ndims as uint<64>);
+            printf(" :chunk-dims ");
+            hpe_print_u32_dims(layout.layout.v3.properties.chunked.dim_size);
+            hpe_print_addr_field("chunk-index", layout.layout.v3.properties.chunked.idx_addr_raw);
+        } else if (layout.layout.v3.layout_class == CONTIG) {
+            hpe_print_string("contiguous");
+            hpe_print_addr_field("data-addr", layout.layout.v3.properties.contig.data_addr_raw);
+            printf(" :data-size %u64d",
+                   bytes_to_u64_le(layout.layout.v3.properties.contig.data_size_raw));
+        } else if (layout.layout.v3.layout_class == COMPACT) {
+            hpe_print_string("compact");
+            printf(" :compact-size %u64d",
+                   layout.layout.v3.properties.compact.size as uint<64>);
+        } else {
+            hpe_print_string("unknown");
+        }
+    } else if (layout.version == 4UB) {
+        printf(" :class ");
+        if (layout.layout.v4.layout_class == CHUNKED) {
+            hpe_print_string("chunked");
+            printf(" :ndims %u64d :index-type %u64d",
+                   layout.layout.v4.properties.chunked.ndims as uint<64>,
+                   layout.layout.v4.properties.chunked.idx_type as uint<64>);
+            printf(" :chunk-dims ");
+            hpe_print_byte_dims(layout.layout.v4.properties.chunked.dim_size);
+            hpe_print_addr_field("chunk-index", layout.layout.v4.properties.chunked.idx_addr_raw);
+        } else if (layout.layout.v4.layout_class == CONTIG) {
+            hpe_print_string("contiguous");
+            hpe_print_addr_field("data-addr", layout.layout.v4.properties.contig.data_addr_raw);
+            printf(" :data-size %u64d",
+                   bytes_to_u64_le(layout.layout.v4.properties.contig.data_size_raw));
+        } else if (layout.layout.v4.layout_class == COMPACT) {
+            hpe_print_string("compact");
+            printf(" :compact-size %u64d",
+                   layout.layout.v4.properties.compact.size as uint<64>);
+        } else if (layout.layout.v4.layout_class == VIRTUAL) {
+            hpe_print_string("virtual");
+            hpe_print_addr_field("gheap", layout.layout.v4.properties.virtual.gheap_addr_raw);
+            printf(" :gheap-index %u64d", layout.layout.v4.properties.virtual.idx as uint<64>);
+        } else {
+            hpe_print_string("unknown");
+        }
+    } else {
+        printf(" :class ");
+        if (layout.layout.v1_v2.layout_class == CHUNKED) {
+            hpe_print_string("chunked");
+            printf(" :ndims %u64d", layout.layout.v1_v2.ndims as uint<64>);
+            printf(" :chunk-dims ");
+            hpe_print_u32_dims(layout.layout.v1_v2.properties.chunked.dim_size);
+            hpe_print_addr_field("chunk-index", layout.layout.v1_v2.properties.chunked.idx_addr_raw);
+        } else if (layout.layout.v1_v2.layout_class == CONTIG) {
+            hpe_print_string("contiguous");
+            hpe_print_addr_field("data-addr", layout.layout.v1_v2.properties.contig.data_addr_raw);
+        } else if (layout.layout.v1_v2.layout_class == COMPACT) {
+            hpe_print_string("compact");
+            printf(" :compact-size %u64d",
+                   layout.layout.v1_v2.properties.compact.size as uint<64>);
+        } else {
+            hpe_print_string("unknown");
+        }
+    }
+
+    printf(")\n");
+}
+
+/* Print uint64 offsets or coordinates as a space-separated protocol list. */
+fun hpe_print_offsets_u64 = (uint<64>[] values) void:
+{
+    var i = 0UL;
+
+    printf("(");
+    while (i < values'length) {
+        if (i > 0UL) printf(" ");
+        printf("%u64d", values[i]);
+        i = i + 1UL;
+    }
+    printf(")");
+}
+
+/* Print nbytes raw bytes at off as decimal values in a protocol list. */
+fun hpe_print_bytes_at = (offset<uint<64>,B> off, uint<64> nbytes) void:
+{
+    var i = 0UL;
+
+    printf("(");
+    while (i < nbytes) {
+        var b = byte @ (off + i#B);
+        if (i > 0UL) printf(" ");
+        printf("%u64d", b as uint<64>);
+        i = i + 1UL;
+    }
+    printf(")");
+}
+
+/* Print count little-endian uint64 values starting at off. */
+fun hpe_print_u64s_at = (offset<uint<64>,B> off, uint<64> count) void:
+{
+    var i = 0UL;
+
+    printf("(");
+    while (i < count) {
+        var raw = byte[8] @ (off + (i * 8UL)#B);
+        if (i > 0UL) printf(" ");
+        printf("%u64d", bytes_to_u64_le(raw));
+        i = i + 1UL;
+    }
+    printf(")");
+}
+
+/* Walk a message chunk, emit message records, and follow continuation chunks. */
+fun hpe_emit_messages_in_chunk = (uint<8> version, int prefix_bytes,
+                                  offset<uint<64>,B> chunk_off,
+                                  uint<64> chunk_size) void:
+{
+    var i = 0UL;
+
+    global_version = version;
+
+    while ((i + (prefix_bytes as uint<64>)) < chunk_size) {
+        var m_type = 0UL;
+        var m_size = 0UL;
+        var flags = 0UL;
+        var has_crt = 0;
+        var crt = 0UL;
+        var prefix_off = chunk_off + i#B;
+        var prefix = msg_prefix @ prefix_off;
+
+        if (version == 1UB) {
+            m_type = prefix.v1_msg_prefix.msg_type as uint<64>;
+            m_size = prefix.v1_msg_prefix.msg_size as uint<64>;
+            flags = prefix.v1_msg_prefix.msg_flags as uint<64>;
+        } else {
+            m_type = prefix.v2_msg_prefix.msg_type as uint<64>;
+            m_size = prefix.v2_msg_prefix.msg_size as uint<64>;
+            flags = prefix.v2_msg_prefix.msg_flags as uint<64>;
+            if (global_crt_tracked) {
+                has_crt = 1;
+                crt = prefix.v2_msg_prefix.crt_order as uint<64>;
+            }
+        }
+
+        var payload_off = chunk_off + i#B + prefix_bytes#B;
+        hpe_print_message_record(hpe_msg_index, m_type, m_size, flags,
+                                 prefix_off, payload_off, has_crt, crt);
+        if (m_type == HPE_LAYOUT_ID)
+            hpe_print_layout_record(hpe_msg_index, payload_off);
+        hpe_msg_index = hpe_msg_index + 1UL;
+
+        if (m_type == HPE_CONT_ID) {
+            var cont = H5O_msg_cont @ payload_off;
+            var cont_off = bytes_to_off(cont.addr_raw);
+            var cont_size = bytes_to_u64_le(cont.size_raw);
+
+            if (version == 2UB)
+                hpe_emit_messages_in_chunk(version, prefix_bytes,
+                                           cont_off + 4#B, cont_size - 4UL);
+            else
+                hpe_emit_messages_in_chunk(version, prefix_bytes,
+                                           cont_off, cont_size);
+        }
+
+        i = i + (prefix_bytes as uint<64>) + m_size;
+    }
+}
+
+/* Read a nul-terminated string from a local heap data segment. */
+fun hpe_heap_cstring = (offset<uint<64>,B> heap_addr,
+                        uint<64> name_off) string:
+{
+    var heap = local_heap @ heap_addr;
+    var data_addr = bytes_to_off(heap.data_seg_addr_raw);
+    var data_size = bytes_to_u64_le(heap.data_seg_size_raw);
+    var pos = name_off;
+    var result = "";
+
+    while (pos < data_size) {
+        var b = byte @ (data_addr + pos#B);
+        if (b == 0UB) return result;
+        result = result + ((b as char) as string);
+        pos = pos + 1UL;
+    }
+
+    return result;
+}
+
+/* Emit links from a symbol-table node and return the number emitted. */
+fun hpe_links_in_snod = (offset<uint<64>,B> snod_off,
+                         offset<uint<64>,B> heap_addr,
+                         uint<64> message_index) uint<64>:
+{
+    var snod = snod_node @ snod_off;
+    var n = 0UL;
+    var count = 0UL;
+
+    while (n < snod.num_symbols as uint<64>) {
+        if (snod.entries[n].cache_type != 2U) {
+            var name_off = bytes_to_u64_le(snod.entries[n].lnk_nm_off_raw);
+            var name = hpe_heap_cstring(heap_addr, name_off);
+            var addr = bytes_to_off(snod.entries[n].ohdr_addr_raw);
+            hpe_print_link_record("symbol-table", name, addr,
+                                  message_index, snod.entries[n]'offset);
+            count = count + 1UL;
+        }
+        n = n + 1UL;
+    }
+
+    return count;
+}
+
+/* Traverse a version 1 group B-tree and emit links from leaf symbol nodes. */
+fun hpe_links_in_v1_btree = (offset<uint<64>,B> btree_addr,
+                             offset<uint<64>,B> heap_addr,
+                             uint<64> message_index) uint<64>:
+{
+    var node = v1_btree @ btree_addr;
+    var n = 0UL;
+    var count = 0UL;
+
+    if (node.node_type != 0UB) return 0UL;
+
+    while (n < node.entries_used as uint<64>) {
+        var child = bytes_to_off(node.body.type0.pairs[n].child_raw);
+        if (node.node_level > 0UB)
+            count = count + hpe_links_in_v1_btree(child, heap_addr,
+                                                  message_index);
+        else
+            count = count + hpe_links_in_snod(child, heap_addr,
+                                              message_index);
+        n = n + 1UL;
+    }
+
+    return count;
+}
+
+/* Return the number of bytes needed to store nbits bits. */
+fun hpe_bytes_for_bits = (uint<64> nbits) uint<64>:
+{
+    return (nbits + 7UL) / 8UL;
+}
+
+/* Return the smallest byte count that can encode limit. */
+fun hpe_bytes_for_limit = (uint<64> limit) uint<64>:
+{
+    var nbytes = 1UL;
+    var max = 0xffUL;
+
+    while (nbytes < 8UL && limit > max) {
+        nbytes = nbytes + 1UL;
+        max = (max <<. 8UL) | 0xffUL;
+    }
+
+    return nbytes;
+}
+
+/* Return the smaller of two uint64 values. */
+fun hpe_min_u64 = (uint<64> a, uint<64> b) uint<64>:
+{
+    return a < b ? a : b;
+}
+
+/* Return floor(log2(value)); zero maps to zero. */
+fun hpe_floor_log2 = (uint<64> value) uint<64>:
+{
+    var v = value;
+    var n = 0UL;
+
+    while ((v .>> 1UL) > 0UL) {
+        v = v .>> 1UL;
+        n = n + 1UL;
+    }
+
+    return n;
+}
+
+/* Decode nbytes little-endian bytes from raw starting at start. */
+fun hpe_u64_from_slice = (byte[] raw, uint<64> start,
+                          uint<64> nbytes) uint<64>:
+{
+    var n = 0UL;
+    var v = 0UL;
+
+    while (n < nbytes) {
+        v = v | ((raw[start + n] as uint<64>) <<. (n * 8UL));
+        n = n + 1UL;
+    }
+
+    return v;
+}
+
+/* Compute the fractal-heap managed-object offset field width. */
+fun hpe_fheap_heap_off_size = (frhp_hdr hdr) uint<64>:
+{
+    return hpe_bytes_for_bits(hdr.dtable.max_heap_size_bits as uint<64>);
+}
+
+/* Compute the managed-object length field width used in heap IDs. */
+fun hpe_fheap_heap_len_size = (frhp_hdr hdr) uint<64>:
+{
+    return hpe_min_u64(hpe_fheap_heap_off_size(hdr),
+                       hpe_bytes_for_limit(hdr.max_man_size as uint<64>));
+}
+
+/* Compute the rows that point directly to direct blocks in the doubling table. */
+fun hpe_fheap_max_direct_rows = (frhp_hdr hdr) uint<64>:
+{
+    var start_size = bytes_to_u64_le(hdr.dtable.start_block_size_raw);
+    var max_direct_size = bytes_to_u64_le(hdr.dtable.max_direct_size_raw);
+
+    return hpe_floor_log2(max_direct_size)
+           - hpe_floor_log2(start_size) + 2UL;
+}
+
+/* Resolve a managed-object heap offset through indirect and direct blocks. */
+fun hpe_fheap_locate_managed = (frhp_hdr hdr,
+                                offset<uint<64>,B> iblock_addr,
+                                uint<64> nrows,
+                                uint<64> heap_obj_off) offset<uint<64>,B>:
+{
+    var start_size = bytes_to_u64_le(hdr.dtable.start_block_size_raw);
+    var width = hdr.dtable.table_width as uint<64>;
+    var first_row_bits = hpe_floor_log2(start_size)
+                         + hpe_floor_log2(width);
+    var max_direct_rows = hpe_fheap_max_direct_rows(hdr);
+    var prefix_size = 5UL + (global_sizeof_offsets as uint<64>)
+                      + hpe_fheap_heap_off_size(hdr);
+    var entry_size = global_sizeof_offsets as uint<64>;
+    var cur_addr = iblock_addr;
+    var cur_nrows = nrows;
+    var cur_block_off = 0UL;
+
+    while (1) {
+        var local_off = heap_obj_off - cur_block_off;
+        var row = 0UL;
+        var col = 0UL;
+        var row_block_size = start_size;
+        var row_block_off = 0UL;
+
+        if (local_off < start_size * width) {
+            row = 0UL;
+            col = local_off / start_size;
+            row_block_off = 0UL;
+            row_block_size = start_size;
+        } else {
+            var high_bit = hpe_floor_log2(local_off);
+            var off_mask = 1UL <<. high_bit;
+
+            row = (high_bit - first_row_bits) + 1UL;
+            row_block_size = start_size <<. (row - 1UL);
+            row_block_off = off_mask;
+            col = (local_off - off_mask) / row_block_size;
+        }
+
+        if (row >= cur_nrows) return 0UL#B;
+        if (col >= width)     return 0UL#B;
+
+        var entry_off = cur_addr + (prefix_size
+                                    + ((row * width + col) * entry_size))#B;
+        var addr_raw = byte[global_sizeof_offsets] @ entry_off;
+        if (hpe_addr_is_undef(addr_raw)) return 0UL#B;
+
+        var child_addr = bytes_to_off(addr_raw);
+        var child_block_off = cur_block_off + row_block_off + col * row_block_size;
+
+        if (row < max_direct_rows)
+            return child_addr + (heap_obj_off - child_block_off)#B;
+
+        cur_addr = child_addr;
+        cur_nrows = row - hpe_floor_log2(width);
+        cur_block_off = child_block_off;
+    }
+
+    return 0UL#B;
+}
+
+/* Resolve a managed-object heap ID to its absolute payload offset. */
+fun hpe_fheap_managed_object_off = (offset<uint<64>,B> fheap_addr,
+                                    byte[] heap_id_raw) offset<uint<64>,B>:
+{
+    var hdr = frhp_hdr @ fheap_addr;
+    var heap_id_type = ((heap_id_raw[0] .>> 4) & 3U) as uint<64>;
+    var off_size = hpe_fheap_heap_off_size(hdr);
+    var len_size = hpe_fheap_heap_len_size(hdr);
+    var root_addr = 0UL#B;
+    var heap_obj_off = 0UL;
+    var heap_obj_len = 0UL;
+
+    if (heap_id_type != 0UL) return 0UL#B;
+    if (hdr.filter_len != 0UH) return 0UL#B;
+    if (heap_id_raw'length < (1UL + off_size + len_size)) return 0UL#B;
+
+    heap_obj_off = hpe_u64_from_slice(heap_id_raw, 1UL, off_size);
+    heap_obj_len = hpe_u64_from_slice(heap_id_raw, 1UL + off_size, len_size);
+    root_addr = bytes_to_off(hdr.dtable.root_addr_raw);
+
+    if (heap_obj_len == 0UL || root_addr == 0UL#B) return 0UL#B;
+    if (hdr.dtable.curr_root_rows == 0UH) return root_addr + heap_obj_off#B;
+
+    return hpe_fheap_locate_managed(hdr, root_addr,
+                                    hdr.dtable.curr_root_rows as uint<64>,
+                                    heap_obj_off);
+}
+
+/* Decode and emit a dense hard link referenced by a fractal-heap ID. */
+fun hpe_dense_link_from_heap_id = (offset<uint<64>,B> fheap_addr,
+                                   byte[] heap_id_raw,
+                                   uint<64> message_index) uint<64>:
+{
+    var payload_off = hpe_fheap_managed_object_off(fheap_addr, heap_id_raw);
+
+    if (payload_off == 0UL#B) return 0UL;
+
+    var link = H5O_msg_link @ payload_off;
+    if ((link.flags & 8U) == 0U) {
+        var name = char_array_to_string(link.lnk_name);
+        var addr = bytes_to_off(link.ohdr_addr_raw);
+        hpe_print_link_record("dense", name, addr, message_index, payload_off);
+        return 1UL;
+    }
+
+    return 0UL;
+}
+
+/* Handle one v2 B-tree dense-link record and emit the referenced link. */
+fun hpe_dense_record_at = (offset<uint<64>,B> rec_off,
+                           uint<8> rec_type,
+                           offset<uint<64>,B> fheap_addr,
+                           uint<64> message_index) uint<64>:
+{
+    if (rec_type == 6UB) {
+        var rec6 = bt2_rec_type6 @ rec_off;
+        return hpe_dense_link_from_heap_id(fheap_addr, rec6.heap_id_raw,
+                                           message_index);
+    }
+
+    var rec5 = bt2_rec_type5 @ rec_off;
+    return hpe_dense_link_from_heap_id(fheap_addr, rec5.heap_id_raw,
+                                       message_index);
+}
+
+/* Traverse a dense-link v2 B-tree node and return the emitted link count. */
+fun hpe_dense_links_in_v2_node = (offset<uint<64>,B> node_addr,
+                                  uint<16> depth,
+                                  uint<16> nrec,
+                                  uint<8> rec_type,
+                                  offset<uint<64>,B> fheap_addr,
+                                  uint<64> message_index) uint<64>:
+{
+    var count = 0UL;
+
+    set_bt2_depth(depth);
+    set_bt2_nrec(nrec);
+
+    if (depth == 0UH) {
+        var leaf = v2_btree_leaf @ node_addr;
+        var n = 0UL;
+
+        while (n < nrec as uint<64>) {
+            count = count + hpe_dense_record_at(
+                leaf.records[n]'offset as offset<uint<64>,B>,
+                rec_type, fheap_addr, message_index);
+            n = n + 1UL;
+        }
+    } else {
+        var inode = v2_btree_internal @ node_addr;
+        var n = 0UL;
+
+        while (n < nrec as uint<64>) {
+            count = count + hpe_dense_record_at(
+                inode.records[n]'offset as offset<uint<64>,B>,
+                rec_type, fheap_addr, message_index);
+            n = n + 1UL;
+        }
+
+        n = 0UL;
+        while (n < (nrec as uint<64>) + 1UL) {
+            var child_addr = 0UL#B;
+            var child_nrec = 0UH;
+
+            if (depth == 1UH) {
+                child_addr = bytes_to_off(inode.children.d1[n].child_addr_raw);
+                child_nrec = bytes_to_u64_le(inode.children.d1[n].nrec_in_child_raw) as uint<16>;
+            } else {
+                child_addr = bytes_to_off(inode.children.dn[n].child_addr_raw);
+                child_nrec = bytes_to_u64_le(inode.children.dn[n].nrec_in_child_raw) as uint<16>;
+            }
+
+            count = count + hpe_dense_links_in_v2_node(child_addr, depth - 1,
+                                                       child_nrec, rec_type,
+                                                       fheap_addr,
+                                                       message_index);
+            set_bt2_depth(depth);
+            set_bt2_nrec(nrec);
+            n = n + 1UL;
+        }
+    }
+
+    return count;
+}
+
+/* Initialize dense-link B-tree state and emit all stored links. */
+fun hpe_links_in_dense_btree = (offset<uint<64>,B> bt2_addr,
+                                offset<uint<64>,B> fheap_addr,
+                                uint<64> message_index) uint<64>:
+{
+    var hdr = v2_btree_hdr @ bt2_addr;
+
+    if (hdr.record_type != 5UB && hdr.record_type != 6UB)
+        return 0UL;
+
+    set_bt2_nrec_size_from_hdr(hdr.node_size, hdr.record_size);
+    set_bt2_nrec_subtree_size_from_hdr(hdr.node_size, hdr.record_size, hdr.depth);
+    set_bt2_nrec(hdr.num_root_records);
+
+    return hpe_dense_links_in_v2_node(bytes_to_off(hdr.root_addr_raw),
+                                      hdr.depth, hdr.num_root_records,
+                                      hdr.record_type, fheap_addr,
+                                      message_index);
+}
+
+/* Scan object-header messages for compact, dense, and symbol-table links. */
+fun hpe_emit_links_in_chunk = (uint<8> version, int prefix_bytes,
+                               offset<uint<64>,B> chunk_off,
+                               uint<64> chunk_size) void:
+{
+    var i = 0UL;
+
+    global_version = version;
+
+    while ((i + (prefix_bytes as uint<64>)) < chunk_size) {
+        var m_type = 0UL;
+        var m_size = 0UL;
+        var prefix_off = chunk_off + i#B;
+        var prefix = msg_prefix @ prefix_off;
+
+        if (version == 1UB) {
+            m_type = prefix.v1_msg_prefix.msg_type as uint<64>;
+            m_size = prefix.v1_msg_prefix.msg_size as uint<64>;
+        } else {
+            m_type = prefix.v2_msg_prefix.msg_type as uint<64>;
+            m_size = prefix.v2_msg_prefix.msg_size as uint<64>;
+        }
+
+        var payload_off = chunk_off + i#B + prefix_bytes#B;
+
+        if (m_type == HPE_LINK_ID) {
+            var link = H5O_msg_link @ payload_off;
+            var name = char_array_to_string(link.lnk_name);
+
+            if ((link.flags & 8U) == 0U) {
+                hpe_print_link_record("compact", name,
+                                      bytes_to_off(link.ohdr_addr_raw),
+                                      hpe_msg_index, payload_off);
+            } else {
+                printf("(:record link :name ");
+                hpe_print_string(name);
+                printf(" :message-index %u64d :payload-offset %u64d :source \"compact\"",
+                       hpe_msg_index, payload_off/#B);
+                printf(" :kind \"non-hard\" :target nil :note \"not-expanded\"");
+                printf(")\n");
+            }
+        } else if (m_type == HPE_LINFO_ID) {
+            var linfo = H5O_msg_linfo @ payload_off;
+
+            if (!hpe_addr_is_undef(linfo.fheap_addr_raw)) {
+                var bt2_addr = 0UL#B;
+                var count = 0UL;
+
+                if (!hpe_addr_is_undef(linfo.name_bt2_addr_raw))
+                    bt2_addr = bytes_to_off(linfo.name_bt2_addr_raw);
+                else if ((linfo.flags & 2U) != 0U
+                         && !hpe_addr_is_undef(linfo.corder_bt2_addr_raw))
+                    bt2_addr = bytes_to_off(linfo.corder_bt2_addr_raw);
+
+                printf("(:record link-storage :kind \"dense\" :message-index %u64d :status ",
+                       hpe_msg_index);
+                if (bt2_addr == 0UL#B)
+                    hpe_print_string("no-index");
+                else
+                    hpe_print_string("expanded");
+                hpe_print_addr_field("fheap", linfo.fheap_addr_raw);
+                hpe_print_addr_field("name-btree", linfo.name_bt2_addr_raw);
+                if ((linfo.flags & 2U) != 0U)
+                    hpe_print_addr_field("corder-btree", linfo.corder_bt2_addr_raw);
+                else
+                    printf(" :corder-btree nil");
+                printf(")\n");
+
+                if (bt2_addr != 0UL#B)
+                    count = hpe_links_in_dense_btree(bt2_addr,
+                                                     bytes_to_off(linfo.fheap_addr_raw),
+                                                     hpe_msg_index);
+            }
+        } else if (m_type == HPE_STAB_ID) {
+            var stab = H5O_msg_stab @ payload_off;
+
+            printf("(:record link-storage :kind \"symbol-table\" :message-index %u64d :status \"expanded\"",
+                   hpe_msg_index);
+            hpe_print_addr_field("btree", stab.btree_addr_raw);
+            hpe_print_addr_field("heap", stab.heap_addr_raw);
+            printf(")\n");
+            hpe_old_link_storage_emitted = 1;
+            var old_count = hpe_links_in_v1_btree(bytes_to_off(stab.btree_addr_raw),
+                                                  bytes_to_off(stab.heap_addr_raw),
+                                                  hpe_msg_index);
+        } else if (m_type == HPE_CONT_ID) {
+            var cont = H5O_msg_cont @ payload_off;
+            var cont_off = bytes_to_off(cont.addr_raw);
+            var cont_size = bytes_to_u64_le(cont.size_raw);
+
+            hpe_msg_index = hpe_msg_index + 1UL;
+            if (version == 2UB)
+                hpe_emit_links_in_chunk(version, prefix_bytes,
+                                        cont_off + 4#B, cont_size - 4UL);
+            else
+                hpe_emit_links_in_chunk(version, prefix_bytes,
+                                        cont_off, cont_size);
+            i = i + (prefix_bytes as uint<64>) + m_size;
+            continue;
+        }
+
+        hpe_msg_index = hpe_msg_index + 1UL;
+        i = i + (prefix_bytes as uint<64>) + m_size;
+    }
+}
+
+/* Entry point: emit a superblock summary record for off. */
+fun hdf5_poke_emacs_superblock = (int req, offset<uint<64>,B> off) void:
+{
+    var sb = superblock @ off;
+    var root = 0UL#B;
+
+    if (sb.super_vers < 2UB)
+        root = bytes_to_off(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw);
+    else
+        root = bytes_to_off(sb.super.v2_v3.root_obj_addr_raw);
+
+    hpe_begin(req);
+    printf("(:record superblock :offset %u64d :version %u64d :sizeof-offsets %u64d :sizeof-lengths %u64d",
+           off/#B,
+           sb.super_vers as uint<64>,
+           global_sizeof_offsets as uint<64>,
+           global_sizeof_lengths as uint<64>);
+    printf(" :root-offset %u64d", root/#B);
+
+    if (sb.super_vers < 2UB) {
+        hpe_print_addr_field("base-addr", sb.super.v0_v1.base_addr_raw);
+        hpe_print_addr_field("eof-addr", sb.super.v0_v1.eof_addr_raw);
+        hpe_print_addr_field("driver-info-addr", sb.super.v0_v1.drv_info_addr_raw);
+        printf(" :status-flags %u64d", sb.super.v0_v1.status_flags as uint<64>);
+    } else {
+        hpe_print_addr_field("base-addr", sb.super.v2_v3.base_addr_raw);
+        hpe_print_addr_field("extension-addr", sb.super.v2_v3.ext_addr_raw);
+        hpe_print_addr_field("eof-addr", sb.super.v2_v3.eof_addr_raw);
+        if (sb.super_vers == 2UB)
+            printf(" :status-flags %u64d", sb.super.v2_v3.status_flags.v2_flags as uint<64>);
+        else
+            printf(" :status-flags %u64d", sb.super.v2_v3.status_flags.v3_flags as uint<64>);
+        printf(" :checksum %u64d", sb.super.v2_v3.chksum as uint<64>);
+    }
+
+    printf(")\n");
+    hpe_end(req);
+}
+
+/* Entry point: emit the root object-header address from a superblock. */
+fun hdf5_poke_emacs_root = (int req, offset<uint<64>,B> super_off) void:
+{
+    var sb = superblock @ super_off;
+    var root = 0UL#B;
+
+    if (sb.super_vers < 2UB)
+        root = bytes_to_off(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw);
+    else
+        root = bytes_to_off(sb.super.v2_v3.root_obj_addr_raw);
+
+    hpe_begin(req);
+    printf("(:record root :superblock-offset %u64d :offset %u64d)\n",
+           super_off/#B, root/#B);
+    hpe_end(req);
+}
+
+/* Entry point: emit object-header metadata and message records. */
+fun hdf5_poke_emacs_object_header = (int req, offset<uint<64>,B> off,
+                                     offset<uint<64>,B> super_off = 0UL#B) void:
+{
+    var hpe_sb_init = superblock @ super_off;
+    hpe_load_ohdr_ctx(off);
+
+    hpe_begin(req);
+    printf("(:record object-header :offset %u64d :version %u64d :flags %u64d :chunk-offset %u64d :chunk-size %u64d :prefix-size %u64d)\n",
+           off/#B,
+           hpe_ctx_version as uint<64>,
+           hpe_ctx_flags as uint<64>,
+           hpe_ctx_chunk_off/#B,
+           hpe_ctx_chunk_size,
+           hpe_ctx_prefix_bytes as uint<64>);
+    hpe_msg_index = 0UL;
+    hpe_emit_messages_in_chunk(hpe_ctx_version, hpe_ctx_prefix_bytes,
+                               hpe_ctx_chunk_off, hpe_ctx_chunk_size);
+    hpe_end(req);
+}
+
+/* Entry point: emit group links reachable from an object header. */
+fun hdf5_poke_emacs_links = (int req, offset<uint<64>,B> off,
+                             offset<uint<64>,B> super_off = 0UL#B) void:
+{
+    var hpe_sb_init = superblock @ super_off;
+    hpe_load_ohdr_ctx(off);
+    hpe_old_link_storage_emitted = 0;
+
+    hpe_begin(req);
+    printf("(:record links :object-header-offset %u64d)\n", off/#B);
+    hpe_msg_index = 0UL;
+    hpe_emit_links_in_chunk(hpe_ctx_version, hpe_ctx_prefix_bytes,
+                            hpe_ctx_chunk_off, hpe_ctx_chunk_size);
+
+    if (!hpe_old_link_storage_emitted) {
+        var sb = superblock @ super_off;
+        if (sb.super_vers < 2UB
+            && off == bytes_to_off(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw)
+            && sb.super.v0_v1.root_stab_ent.cache_type == 1U) {
+            var btree_addr =
+                bytes_to_off(sb.super.v0_v1.root_stab_ent.scratch_pad.obj_info.btree_addr_raw);
+            var heap_addr =
+                bytes_to_off(sb.super.v0_v1.root_stab_ent.scratch_pad.obj_info.heap_addr_raw);
+
+            printf("(:record link-storage :kind \"symbol-table\" :message-index nil :status \"expanded\"");
+            printf(" :btree %u64d :heap %u64d)\n", btree_addr/#B, heap_addr/#B);
+            var root_old_count = hpe_links_in_v1_btree(btree_addr, heap_addr, 0UL);
+        }
+    }
+    hpe_end(req);
+}
+
+/* Map a datatype class number to its display name. */
+fun hpe_dtype_class_name = (int ctype) string:
+{
+    if (ctype == 0) return "fixed-point";
+    if (ctype == 1) return "floating-point";
+    if (ctype == 2) return "time";
+    if (ctype == 3) return "string";
+    if (ctype == 4) return "bitfield";
+    if (ctype == 5) return "opaque";
+    if (ctype == 6) return "compound";
+    if (ctype == 7) return "reference";
+    if (ctype == 8) return "enum";
+    if (ctype == 9) return "variable-length";
+    if (ctype == 10) return "array";
+    return "unknown";
+}
+
+/* Print a dataspace extent type as a protocol string. */
+fun hpe_print_space_type = (uint<8> space_type) void:
+{
+    if (space_type == 0UB)
+        hpe_print_string("scalar");
+    else if (space_type == 1UB)
+        hpe_print_string("simple");
+    else if (space_type == 2UB)
+        hpe_print_string("null");
+    else
+        hpe_print_string("unknown");
+}
+
+/* Emit parsed fields from a dataspace message payload. */
+fun hpe_emit_dataspace_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var space = H5O_msg_sdspace @ payload_off;
+
+    printf("(:record dataspace :version %u64d", space.version as uint<64>);
+    if (space.version == 1UB) {
+        printf(" :ndims %u64d :flags %u64d :dims ",
+               space.space.v1.ndims as uint<64>,
+               space.space.v1.flags as uint<64>);
+        printf("(");
+        var i = 0UL;
+        while (i < space.space.v1.ndims as uint<64>) {
+            if (i > 0UL) printf(" ");
+            printf("%u64d", bytes_to_u64_le(space.space.v1.dim_size[i]));
+            i = i + 1UL;
+        }
+        printf(")");
+    } else if (space.version == 2UB) {
+        printf(" :ndims %u64d :flags %u64d :space-type ",
+               space.space.v2.ndims as uint<64>,
+               space.space.v2.flags as uint<64>);
+        hpe_print_space_type(space.space.v2.space_type);
+        if (space.space.v2.space_type == 1UB) {
+            printf(" :dims ");
+            printf("(");
+            var i = 0UL;
+            while (i < space.space.v2.ndims as uint<64>) {
+                if (i > 0UL) printf(" ");
+                printf("%u64d", bytes_to_u64_le(space.space.v2.dim_size[i]));
+                i = i + 1UL;
+            }
+            printf(")");
+        }
+    }
+    printf(")\n");
+}
+
+/* Emit a compact summary record for a datatype message payload. */
+fun hpe_emit_datatype_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var dtype = H5O_msg_dtype @ payload_off;
+    var ctype = dtype.hdr.get_ctype();
+
+    printf("(:record datatype :version %u64d :class %u64d :class-name ",
+           dtype.hdr.get_version() as uint<64>, ctype as uint<64>);
+    hpe_print_string(hpe_dtype_class_name(ctype));
+    printf(" :element-size %u64d :flags %u64d)\n",
+           dtype.hdr.elm_size as uint<64>,
+           dtype.hdr.flags as uint<64>);
+}
+
+/* Print a datatype byte-order enum as a protocol string. */
+fun hpe_print_byte_order = (int order) void:
+{
+    if (order == 0)
+        hpe_print_string("little-endian");
+    else if (order == 1)
+        hpe_print_string("big-endian");
+    else
+        hpe_print_string("mixed");
+}
+
+/* Print a string datatype padding enum as a protocol string. */
+fun hpe_print_string_pad = (int pad) void:
+{
+    if (pad == 0)
+        hpe_print_string("null-terminated");
+    else if (pad == 1)
+        hpe_print_string("null-padded");
+    else if (pad == 2)
+        hpe_print_string("space-padded");
+    else
+        hpe_print_string("unknown");
+}
+
+/* Print a datatype character-set enum as a protocol string. */
+fun hpe_print_charset = (int cset) void:
+{
+    if (cset == 0)
+        hpe_print_string("ascii");
+    else if (cset == 1)
+        hpe_print_string("utf-8");
+    else
+        hpe_print_string("unknown");
+}
+
+/* Print a variable-length datatype kind as a protocol string. */
+fun hpe_print_vlen_type = (int vtype) void:
+{
+    if (vtype == 0)
+        hpe_print_string("sequence");
+    else if (vtype == 1)
+        hpe_print_string("string");
+    else
+        hpe_print_string("unknown");
+}
+
+/* Emit recursive datatype structure records up to max_depth. */
+fun hpe_emit_datatype_tree = (offset<uint<64>,B> dtype_off,
+                              string path,
+                              uint<64> depth,
+                              uint<64> max_depth) void:
+{
+    var dtype = H5O_msg_dtype @ dtype_off;
+    var ctype = dtype.hdr.get_ctype();
+    var ver = dtype.hdr.get_version();
+
+    printf("(:record datatype-node :path ");
+    hpe_print_string(path);
+    printf(" :depth %u64d :offset %u64d :version %u64d :class %u64d :class-name ",
+           depth, dtype_off/#B, ver as uint<64>, ctype as uint<64>);
+    hpe_print_string(hpe_dtype_class_name(ctype));
+    printf(" :element-size %u64d :flags %u64d",
+           dtype.hdr.elm_size as uint<64>,
+           dtype.hdr.flags as uint<64>);
+
+    if (ctype == 0) {
+        printf(" :byte-order ");
+        hpe_print_byte_order(dtype.types.fixed_point.byte_order());
+        printf(" :signed %s :bit-offset %u64d :bit-precision %u64d",
+               dtype.types.fixed_point.signed() ? "t" : "nil",
+               dtype.types.fixed_point.bit_offset as uint<64>,
+               dtype.types.fixed_point.bit_precision as uint<64>);
+    } else if (ctype == 1) {
+        printf(" :byte-order ");
+        hpe_print_byte_order(dtype.types.floating_point.byte_order());
+        printf(" :bit-offset %u64d :bit-precision %u64d :exponent-location %u64d :exponent-size %u64d :mantissa-location %u64d :mantissa-size %u64d :exponent-bias %u64d",
+               dtype.types.floating_point.bit_offset as uint<64>,
+               dtype.types.floating_point.bit_precision as uint<64>,
+               dtype.types.floating_point.eloc as uint<64>,
+               dtype.types.floating_point.esize as uint<64>,
+               dtype.types.floating_point.mloc as uint<64>,
+               dtype.types.floating_point.msize as uint<64>,
+               dtype.types.floating_point.ebias as uint<64>);
+    } else if (ctype == 3) {
+        printf(" :padding ");
+        hpe_print_string_pad(dtype.types.text_string.pad_type());
+        printf(" :charset ");
+        hpe_print_charset(dtype.types.text_string.cset());
+    } else if (ctype == 6) {
+        printf(" :members %u64d",
+               dtype.types.compound.nmembs() as uint<64>);
+    } else if (ctype == 8) {
+        printf(" :members %u64d",
+               dtype.types.enumeration.nmembs() as uint<64>);
+    } else if (ctype == 9) {
+        printf(" :vlen-type ");
+        hpe_print_vlen_type(dtype.types.variable_length.vlen_type());
+    } else if (ctype == 10) {
+        printf(" :dims ");
+        if (ver == 2)
+            hpe_print_u32_dims(dtype.types.array.arr.v2.dim_size);
+        else if (ver == 3)
+            hpe_print_u32_dims(dtype.types.array.arr.v3.dim_size);
+        else
+            printf("nil");
+    }
+    printf(")\n");
+
+    if (depth >= max_depth) {
+        printf("(:record datatype-truncated :path ");
+        hpe_print_string(path);
+        printf(" :depth %u64d :reason \"max-depth\")\n", depth);
+        return;
+    }
+
+    if (ctype == 6) {
+        var n = dtype.types.compound.nmembs();
+        var i = 0;
+        while (i < n) {
+            var name = "";
+            var memb_off = 0UL;
+            var child_off = 0UL#B;
+
+            if (ver == 1) {
+                name = dtype.types.compound.membs.v1[i].memb_name;
+                memb_off = bytes_to_u64_le(dtype.types.compound.membs.v1[i].memb_off);
+                child_off = dtype.types.compound.membs.v1[i].memb_hdr'offset as offset<uint<64>,B>;
+            } else if (ver == 2) {
+                name = dtype.types.compound.membs.v2[i].memb_name;
+                memb_off = bytes_to_u64_le(dtype.types.compound.membs.v2[i].memb_off);
+                child_off = dtype.types.compound.membs.v2[i].memb_hdr'offset as offset<uint<64>,B>;
+            } else {
+                name = dtype.types.compound.membs.v3[i].memb_name;
+                memb_off = bytes_to_u64_le(dtype.types.compound.membs.v3[i].memb_off);
+                child_off = dtype.types.compound.membs.v3[i].memb_hdr'offset as offset<uint<64>,B>;
+            }
+
+            var child_path = path + "." + name;
+            printf("(:record datatype-member :parent-path ");
+            hpe_print_string(path);
+            printf(" :child-path ");
+            hpe_print_string(child_path);
+            printf(" :depth %u64d :index %u64d :name ",
+                   depth + 1UL, i as uint<64>);
+            hpe_print_string(name);
+            printf(" :member-offset %u64d)\n", memb_off);
+            hpe_emit_datatype_tree(child_off, child_path,
+                                   depth + 1UL, max_depth);
+            i = i + 1;
+        }
+    } else if (ctype == 8) {
+        var base_path = path + "<base>";
+        printf("(:record datatype-base :parent-path ");
+        hpe_print_string(path);
+        printf(" :child-path ");
+        hpe_print_string(base_path);
+        printf(" :depth %u64d :role \"enum-base\")\n", depth + 1UL);
+        hpe_emit_datatype_tree(dtype.types.enumeration.base_hdr'offset as offset<uint<64>,B>,
+                               base_path, depth + 1UL, max_depth);
+
+        var en = dtype.types.enumeration.nmembs();
+        var ei = 0;
+        var values_off = dtype.types.enumeration.memb_values'offset as offset<uint<64>,B>;
+        while (ei < en) {
+            var ename = "";
+            if (ver <= 2)
+                ename = dtype.types.enumeration.memb_names.v1_2[ei].name;
+            else
+                ename = dtype.types.enumeration.memb_names.v3[ei];
+
+            printf("(:record datatype-enum-member :path ");
+            hpe_print_string(path);
+            printf(" :depth %u64d :index %u64d :name ",
+                   depth + 1UL, ei as uint<64>);
+            hpe_print_string(ename);
+            printf(" :value-bytes ");
+            hpe_print_bytes_at(values_off
+                               + ((ei as uint<64>)
+                                  * (dtype.types.enumeration.base_hdr.elm_size as uint<64>))#B,
+                               dtype.types.enumeration.base_hdr.elm_size as uint<64>);
+            printf(")\n");
+            ei = ei + 1;
+        }
+    } else if (ctype == 9) {
+        var vpath = path + "<base>";
+        printf("(:record datatype-base :parent-path ");
+        hpe_print_string(path);
+        printf(" :child-path ");
+        hpe_print_string(vpath);
+        printf(" :depth %u64d :role \"vlen-base\")\n", depth + 1UL);
+        hpe_emit_datatype_tree(dtype.types.variable_length.base_hdr'offset as offset<uint<64>,B>,
+                               vpath, depth + 1UL, max_depth);
+    } else if (ctype == 10) {
+        var apath = path + "[]";
+        printf("(:record datatype-base :parent-path ");
+        hpe_print_string(path);
+        printf(" :child-path ");
+        hpe_print_string(apath);
+        printf(" :depth %u64d :role \"array-base\")\n", depth + 1UL);
+        hpe_emit_datatype_tree(dtype.types.array.base_hdr'offset as offset<uint<64>,B>,
+                               apath, depth + 1UL, max_depth);
+    }
+}
+
+/* Emit a datatype summary plus the recursive tree view. */
+fun hpe_emit_datatype_detail_full = (offset<uint<64>,B> payload_off) void:
+{
+    hpe_emit_datatype_detail(payload_off);
+    hpe_emit_datatype_tree(payload_off, "$", 0UL, 8UL);
+}
+
+/* Emit fields from the legacy fill-value message payload. */
+fun hpe_emit_old_fill_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var fill = H5O_msg_old_fill @ payload_off;
+
+    printf("(:record fill-value :version 0 :size %u64d :defined %s)\n",
+           fill.fill_size as uint<64>,
+           fill.fill_size > 0U ? "t" : "nil");
+}
+
+/* Emit fields from a versioned fill-value message payload. */
+fun hpe_emit_fill_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var fill = H5O_msg_fill @ payload_off;
+
+    printf("(:record fill-value :version %u64d",
+           fill.version as uint<64>);
+    if (fill.version < 3UB) {
+        printf(" :alloc-time %u64d :fill-time %u64d :defined %s",
+               fill.space.v1_v2.alloc_time as uint<64>,
+               fill.space.v1_v2.fill_time as uint<64>,
+               fill.space.v1_v2.fill_defined > 0UB ? "t" : "nil");
+        if (fill.space.v1_v2.fill_defined > 0UB)
+            printf(" :size %u64d", fill.space.v1_v2.fill_size as uint<64>);
+    } else if (fill.version == 3UB) {
+        printf(" :flags %u64d :defined %s",
+               fill.space.v3.flags as uint<64>,
+               (fill.space.v3.flags & 0x020U) ? "t" : "nil");
+        if ((fill.space.v3.flags & 0x020U) != 0)
+            printf(" :size %u64d", fill.space.v3.fill_size as uint<64>);
+    }
+    printf(")\n");
+}
+
+/* Emit fields from a group-info message payload. */
+fun hpe_emit_group_info_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var ginfo = H5O_msg_ginfo @ payload_off;
+
+    printf("(:record group-info :version %u64d :flags %u64d",
+           ginfo.version as uint<64>, ginfo.flags as uint<64>);
+    if ((ginfo.flags & 1U) != 0)
+        printf(" :max-compact %u64d :min-dense %u64d",
+               ginfo.max_compact as uint<64>,
+               ginfo.min_dense as uint<64>);
+    if ((ginfo.flags & 2U) != 0)
+        printf(" :est-num-entries %u64d :est-name-len %u64d",
+               ginfo.est_num_entries as uint<64>,
+               ginfo.est_name_len as uint<64>);
+    printf(")\n");
+}
+
+/* Emit link-info fields and dense-link storage addresses. */
+fun hpe_emit_link_info_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var linfo = H5O_msg_linfo @ payload_off;
+
+    printf("(:record link-info :version %u64d :flags %u64d",
+           linfo.version as uint<64>, linfo.flags as uint<64>);
+    hpe_print_addr_field("fheap", linfo.fheap_addr_raw);
+    hpe_print_addr_field("name-btree", linfo.name_bt2_addr_raw);
+    if ((linfo.flags & 2U) != 0)
+        hpe_print_addr_field("corder-btree", linfo.corder_bt2_addr_raw);
+    else
+        printf(" :corder-btree nil");
+    printf(")\n");
+}
+
+/* Emit the object-name message payload. */
+fun hpe_emit_object_name_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var name = H5O_msg_name @ payload_off;
+
+    printf("(:record object-name :name ");
+    hpe_print_string(name.name);
+    printf(")\n");
+}
+
+/* Emit fields from the legacy modification-time message payload. */
+fun hpe_emit_old_mtime_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var mt = H5O_msg_old_mtime @ payload_off;
+
+    printf("(:record modification-time :version 0 :year %i32d :month %i32d :day %i32d :hour %i32d :minute %i32d :second %i32d)\n",
+           mt.year as int<32>,
+           mt.month as int<32>,
+           mt.mday as int<32>,
+           mt.hour as int<32>,
+           mt.minute as int<32>,
+           mt.second as int<32>);
+}
+
+/* Emit fields from the modern modification-time message payload. */
+fun hpe_emit_mtime_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var mt = H5O_msg_mtime @ payload_off;
+
+    printf("(:record modification-time :version %u64d :seconds %u64d)\n",
+           mt.version as uint<64>, mt.seconds as uint<64>);
+}
+
+/* Emit object-header continuation address and size fields. */
+fun hpe_emit_continuation_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var cont = H5O_msg_cont @ payload_off;
+
+    printf("(:record continuation");
+    hpe_print_addr_field("address", cont.addr_raw);
+    printf(" :size %u64d)\n", bytes_to_u64_le(cont.size_raw));
+}
+
+/* Emit a filter-pipeline summary and one record per filter. */
+fun hpe_emit_filter_pipeline_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var pline = H5O_msg_pline @ payload_off;
+
+    printf("(:record filter-pipeline :version %u64d :filters %u64d)\n",
+           pline.version as uint<64>, pline.nfilters as uint<64>);
+
+    var i = 0UL;
+    while (i < pline.nfilters as uint<64>) {
+        if (pline.version == 1UB) {
+            printf("(:record filter :index %u64d :id %u64d :flags %u64d :client-data-count %u64d",
+                   i,
+                   pline.pline.v1.filt_list[i].id as uint<64>,
+                   pline.pline.v1.filt_list[i].flags as uint<64>,
+                   pline.pline.v1.filt_list[i].cd_nelmts as uint<64>);
+            if (pline.pline.v1.filt_list[i].name_len != 0UH) {
+                printf(" :name ");
+                hpe_print_string(char_array_to_string(pline.pline.v1.filt_list[i].name));
+            }
+            printf(")\n");
+        } else if (pline.version == 2UB) {
+            printf("(:record filter :index %u64d :id %u64d :flags %u64d :client-data-count %u64d",
+                   i,
+                   pline.pline.v2.filt_list[i].id as uint<64>,
+                   pline.pline.v2.filt_list[i].flags as uint<64>,
+                   pline.pline.v2.filt_list[i].cd_nelmts as uint<64>);
+            if (pline.pline.v2.filt_list[i].name_len != 0UH) {
+                printf(" :name ");
+                hpe_print_string(char_array_to_string(pline.pline.v2.filt_list[i].name));
+            }
+            printf(")\n");
+        }
+        i = i + 1UL;
+    }
+}
+
+/* Emit symbol-table message addresses. */
+fun hpe_emit_symbol_table_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var stab = H5O_msg_stab @ payload_off;
+
+    printf("(:record symbol-table :payload-offset %u64d", payload_off/#B);
+    hpe_print_addr_field("btree", stab.btree_addr_raw);
+    hpe_print_addr_field("heap", stab.heap_addr_raw);
+    printf(")\n");
+}
+
+/* Emit version 1 B-tree K-value message fields. */
+fun hpe_emit_btree_k_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var btk = H5O_msg_btreek @ payload_off;
+
+    printf("(:record btree-k-values :version %u64d :chunk-k %u64d :snode-k %u64d :symbol-leaf-k %u64d)\n",
+           btk.version as uint<64>,
+           btk.btree_k_chunk as uint<64>,
+           btk.btree_k_snode as uint<64>,
+           btk.sym_leaf_k as uint<64>);
+}
+
+/* Emit attribute-info fields and dense-attribute storage addresses. */
+fun hpe_emit_attribute_info_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var ainfo = H5O_msg_ainfo @ payload_off;
+
+    printf("(:record attribute-info :version %u64d :flags %u64d",
+           ainfo.version as uint<64>, ainfo.flags as uint<64>);
+    if ((ainfo.flags & 1U) != 0)
+        printf(" :max-creation-index %u64d", ainfo.max_crt_idx as uint<64>);
+    hpe_print_addr_field("fheap", ainfo.fheap_addr_raw);
+    hpe_print_addr_field("name-btree", ainfo.name_bt2_addr_raw);
+    if ((ainfo.flags & 2U) != 0)
+        hpe_print_addr_field("corder-btree", ainfo.corder_bt2_addr_raw);
+    else
+        printf(" :corder-btree nil");
+    printf(")\n");
+}
+
+/* Emit object reference-count message fields. */
+fun hpe_emit_refcount_detail = (offset<uint<64>,B> payload_off) void:
+{
+    var ref = H5O_msg_refcount @ payload_off;
+
+    printf("(:record reference-count :version %u64d :count %u64d)\n",
+           ref.version as uint<64>, ref.ref_cnt as uint<64>);
+}
+
+/* Dispatch a message payload to the parsed-detail emitter for its type. */
+fun hpe_emit_message_detail_records = (uint<8> m_type,
+                                       offset<uint<64>,B> payload_off) void:
+{
+    if (m_type == 0x01UB)
+        hpe_emit_dataspace_detail(payload_off);
+    else if (m_type == 0x02UB)
+        hpe_emit_link_info_detail(payload_off);
+    else if (m_type == 0x03UB)
+        hpe_emit_datatype_detail_full(payload_off);
+    else if (m_type == 0x04UB)
+        hpe_emit_old_fill_detail(payload_off);
+    else if (m_type == 0x05UB)
+        hpe_emit_fill_detail(payload_off);
+    else if (m_type == 0x08UB)
+        hpe_print_layout_record(0UL, payload_off);
+    else if (m_type == 0x0aUB)
+        hpe_emit_group_info_detail(payload_off);
+    else if (m_type == 0x0bUB)
+        hpe_emit_filter_pipeline_detail(payload_off);
+    else if (m_type == 0x0dUB)
+        hpe_emit_object_name_detail(payload_off);
+    else if (m_type == 0x0eUB)
+        hpe_emit_old_mtime_detail(payload_off);
+    else if (m_type == 0x10UB)
+        hpe_emit_continuation_detail(payload_off);
+    else if (m_type == 0x11UB)
+        hpe_emit_symbol_table_detail(payload_off);
+    else if (m_type == 0x12UB)
+        hpe_emit_mtime_detail(payload_off);
+    else if (m_type == 0x13UB)
+        hpe_emit_btree_k_detail(payload_off);
+    else if (m_type == 0x15UB)
+        hpe_emit_attribute_info_detail(payload_off);
+    else if (m_type == 0x16UB)
+        hpe_emit_refcount_detail(payload_off);
+}
+
+/* Emit raw payload bytes plus a GNU poke typed rendering for a message. */
+fun hpe_emit_message_raw = (uint<8> m_type,
+                            offset<uint<64>,B> payload_off,
+                            uint<16> m_size) void:
+{
+    printf("Payload bytes @ %u64d (%u64d bytes)\n",
+           payload_off/#B, m_size as uint<64>);
+    hpe_print_bytes_at(payload_off, m_size as uint<64>);
+    printf("\n\n");
+
+    if (m_type == 0x03UB) {
+        var dtype = H5O_msg_dtype @ payload_off;
+        printf("GNU poke datatype view\n");
+        printf("----------------------\n");
+        print_recurse_dtype(dtype, 0);
+    } else {
+        printf("GNU poke typed view\n");
+        printf("-------------------\n");
+        printf("%Tv\n", message_factory(m_type, m_size, payload_off));
+    }
+}
+
+/* Entry point: emit parsed and raw details for one message payload. */
+fun hdf5_poke_emacs_message = (int req, uint<8> m_type,
+                               offset<uint<64>,B> payload_off,
+                               uint<16> m_size,
+                               offset<uint<64>,B> super_off = 0UL#B) void:
+{
+    var hpe_sb_init = superblock @ super_off;
+    hpe_begin(req);
+    printf("(:record message-detail :type %u64d :name ",
+           m_type as uint<64>);
+    hpe_print_string(hpe_message_name(m_type as uint<64>));
+    printf(" :payload-offset %u64d :size %u64d)\n",
+           payload_off/#B, m_size as uint<64>);
+    hpe_emit_message_detail_records(m_type, payload_off);
+    hpe_raw_begin(req);
+    hpe_emit_message_raw(m_type, payload_off, m_size);
+    hpe_raw_end(req);
+    hpe_end(req);
+}
+
+/* Clear globals used while building a dataset preview. */
+fun hpe_preview_reset = void:
+{
+    hpe_prev_layout = 0UL;
+    hpe_prev_data_off = 0UL#B;
+    hpe_prev_data_size = 0UL;
+    hpe_prev_dtype_class = 0UL;
+    hpe_prev_dtype_size = 0UL;
+    hpe_prev_dtype_signed = 0UL;
+    hpe_prev_dtype_byte_order = 0UL;
+    hpe_prev_has_dtype = 0;
+    hpe_prev_nelts = 0UL;
+    hpe_prev_has_space = 0;
+}
+
+/* Record element count from dataspace metadata and emit its details. */
+fun hpe_preview_record_dataspace = (offset<uint<64>,B> payload_off) void:
+{
+    var space = H5O_msg_sdspace @ payload_off;
+
+    hpe_prev_has_space = 1;
+    hpe_prev_nelts = 1UL;
+    if (space.version == 1UB) {
+        var i = 0UL;
+        while (i < space.space.v1.ndims as uint<64>) {
+            hpe_prev_nelts =
+                hpe_prev_nelts * bytes_to_u64_le(space.space.v1.dim_size[i]);
+            i = i + 1UL;
+        }
+    } else if (space.version == 2UB && space.space.v2.space_type == 1UB) {
+        var i = 0UL;
+        while (i < space.space.v2.ndims as uint<64>) {
+            hpe_prev_nelts =
+                hpe_prev_nelts * bytes_to_u64_le(space.space.v2.dim_size[i]);
+            i = i + 1UL;
+        }
+    }
+
+    hpe_emit_dataspace_detail(payload_off);
+}
+
+/* Record fixed-point datatype properties and emit datatype details. */
+fun hpe_preview_record_datatype = (offset<uint<64>,B> payload_off) void:
+{
+    var dtype = H5O_msg_dtype @ payload_off;
+    var ctype = dtype.hdr.get_ctype();
+
+    hpe_prev_has_dtype = 1;
+    hpe_prev_dtype_class = ctype as uint<64>;
+    hpe_prev_dtype_size = dtype.hdr.elm_size as uint<64>;
+    hpe_prev_dtype_signed = 0UL;
+    hpe_prev_dtype_byte_order = 0UL;
+    if (ctype == 0) {
+        hpe_prev_dtype_signed = dtype.types.fixed_point.signed() as uint<64>;
+        hpe_prev_dtype_byte_order = dtype.types.fixed_point.byte_order() as uint<64>;
+    }
+
+    hpe_emit_datatype_detail(payload_off);
+}
+
+/* Record previewable raw-data location and emit layout details. */
+fun hpe_preview_record_layout = (offset<uint<64>,B> payload_off) void:
+{
+    var layout = H5O_msg_layout @ payload_off;
+
+    hpe_prev_layout = 0UL;
+    hpe_prev_data_off = 0UL#B;
+    hpe_prev_data_size = 0UL;
+
+    if (layout.version == 3UB) {
+        if (layout.layout.v3.layout_class == COMPACT) {
+            hpe_prev_layout = 1UL;
+            hpe_prev_data_off =
+                layout.layout.v3.properties.compact.raw_data'offset as offset<uint<64>,B>;
+            hpe_prev_data_size =
+                layout.layout.v3.properties.compact.size as uint<64>;
+        } else if (layout.layout.v3.layout_class == CONTIG) {
+            hpe_prev_layout = 2UL;
+            hpe_prev_data_off = bytes_to_off(layout.layout.v3.properties.contig.data_addr_raw);
+            hpe_prev_data_size = bytes_to_u64_le(layout.layout.v3.properties.contig.data_size_raw);
+        } else if (layout.layout.v3.layout_class == CHUNKED) {
+            hpe_prev_layout = 3UL;
+        }
+    } else if (layout.version == 4UB) {
+        if (layout.layout.v4.layout_class == COMPACT) {
+            hpe_prev_layout = 1UL;
+            hpe_prev_data_off =
+                layout.layout.v4.properties.compact.raw_data'offset as offset<uint<64>,B>;
+            hpe_prev_data_size =
+                layout.layout.v4.properties.compact.size as uint<64>;
+        } else if (layout.layout.v4.layout_class == CONTIG) {
+            hpe_prev_layout = 2UL;
+            hpe_prev_data_off = bytes_to_off(layout.layout.v4.properties.contig.data_addr_raw);
+            hpe_prev_data_size = bytes_to_u64_le(layout.layout.v4.properties.contig.data_size_raw);
+        } else if (layout.layout.v4.layout_class == CHUNKED) {
+            hpe_prev_layout = 3UL;
+        }
+    } else {
+        if (layout.layout.v1_v2.layout_class == COMPACT) {
+            hpe_prev_layout = 1UL;
+            hpe_prev_data_off =
+                layout.layout.v1_v2.properties.compact.compact_data'offset as offset<uint<64>,B>;
+            hpe_prev_data_size =
+                layout.layout.v1_v2.properties.compact.size as uint<64>;
+        } else if (layout.layout.v1_v2.layout_class == CONTIG) {
+            hpe_prev_layout = 2UL;
+            hpe_prev_data_off = bytes_to_off(layout.layout.v1_v2.properties.contig.data_addr_raw);
+            hpe_prev_data_size = 0UL;
+        } else if (layout.layout.v1_v2.layout_class == CHUNKED) {
+            hpe_prev_layout = 3UL;
+        }
+    }
+
+    hpe_print_layout_record(0UL, payload_off);
+}
+
+/* Scan messages needed for dataset preview, following continuations. */
+fun hpe_preview_scan_chunk = (uint<8> version, int prefix_bytes,
+                              offset<uint<64>,B> chunk_off,
+                              uint<64> chunk_size) void:
+{
+    var i = 0UL;
+
+    global_version = version;
+
+    while ((i + (prefix_bytes as uint<64>)) < chunk_size) {
+        var m_type = 0UL;
+        var m_size = 0UL;
+        var prefix_off = chunk_off + i#B;
+        var prefix = msg_prefix @ prefix_off;
+
+        if (version == 1UB) {
+            m_type = prefix.v1_msg_prefix.msg_type as uint<64>;
+            m_size = prefix.v1_msg_prefix.msg_size as uint<64>;
+        } else {
+            m_type = prefix.v2_msg_prefix.msg_type as uint<64>;
+            m_size = prefix.v2_msg_prefix.msg_size as uint<64>;
+        }
+
+        var payload_off = chunk_off + i#B + prefix_bytes#B;
+
+        if (m_type == 0x01UL)
+            hpe_preview_record_dataspace(payload_off);
+        else if (m_type == 0x03UL)
+            hpe_preview_record_datatype(payload_off);
+        else if (m_type == 0x08UL)
+            hpe_preview_record_layout(payload_off);
+        else if (m_type == HPE_CONT_ID) {
+            var cont = H5O_msg_cont @ payload_off;
+            var cont_off = bytes_to_off(cont.addr_raw);
+            var cont_size = bytes_to_u64_le(cont.size_raw);
+
+            if (version == 2UB)
+                hpe_preview_scan_chunk(version, prefix_bytes,
+                                       cont_off + 4#B, cont_size - 4UL);
+            else
+                hpe_preview_scan_chunk(version, prefix_bytes,
+                                       cont_off, cont_size);
+        }
+
+        i = i + (prefix_bytes as uint<64>) + m_size;
+    }
+}
+
+/* Map an internal preview layout code to its display name. */
+fun hpe_preview_layout_name = (uint<64> layout) string:
+{
+    if (layout == 1UL) return "compact";
+    if (layout == 2UL) return "contiguous";
+    if (layout == 3UL) return "chunked";
+    return "unknown";
+}
+
+/* Emit the dataset-preview record and inline bytes when supported. */
+fun hpe_emit_preview_result = (uint<64> max_bytes) void:
+{
+    var supported = 0;
+    var reason = "";
+
+    if (hpe_prev_layout == 0UL)
+        reason = "no supported layout message";
+    else if (hpe_prev_layout == 3UL)
+        reason = "chunked layout preview is not implemented";
+    else if (!hpe_prev_has_dtype)
+        reason = "missing datatype message";
+    else if (hpe_prev_dtype_class != 0UL)
+        reason = "only fixed-point datatypes are implemented";
+    else if (hpe_prev_dtype_byte_order != 0UL)
+        reason = "only little-endian fixed-point datatypes are implemented";
+    else {
+        if (hpe_prev_data_size == 0UL && hpe_prev_has_space)
+            hpe_prev_data_size = hpe_prev_nelts * hpe_prev_dtype_size;
+
+        if (hpe_prev_data_size == 0UL)
+            reason = "dataset byte size is unknown";
+        else if (hpe_prev_data_size > max_bytes)
+            reason = "dataset is larger than preview limit";
+        else
+            supported = 1;
+    }
+
+    printf("(:record dataset-preview :layout ");
+    hpe_print_string(hpe_preview_layout_name(hpe_prev_layout));
+    printf(" :data-offset %u64d :size %u64d :max-bytes %u64d :dtype-class %u64d :element-size %u64d :signed %s :supported %s :reason ",
+           hpe_prev_data_off/#B,
+           hpe_prev_data_size,
+           max_bytes,
+           hpe_prev_dtype_class,
+           hpe_prev_dtype_size,
+           hpe_prev_dtype_signed ? "t" : "nil",
+           supported ? "t" : "nil");
+    if (supported)
+        printf("nil");
+    else
+        hpe_print_string(reason);
+    printf(")\n");
+
+    if (supported) {
+        printf("(:record data-bytes :offset %u64d :size %u64d :bytes ",
+               hpe_prev_data_off/#B,
+               hpe_prev_data_size);
+        hpe_print_bytes_at(hpe_prev_data_off, hpe_prev_data_size);
+        printf(")\n");
+    }
+}
+
+/* Entry point: emit dataset metadata and a bounded raw-data preview. */
+fun hdf5_poke_emacs_dataset_preview = (int req,
+                                       offset<uint<64>,B> off,
+                                       uint<64> max_bytes = 256UL,
+                                       offset<uint<64>,B> super_off = 0UL#B) void:
+{
+    var hpe_sb_init = superblock @ super_off;
+    hpe_load_ohdr_ctx(off);
+    hpe_preview_reset();
+
+    hpe_begin(req);
+    printf("(:record dataset :object-header-offset %u64d :max-bytes %u64d)\n",
+           off/#B, max_bytes);
+    hpe_preview_scan_chunk(hpe_ctx_version, hpe_ctx_prefix_bytes,
+                           hpe_ctx_chunk_off, hpe_ctx_chunk_size);
+    hpe_emit_preview_result(max_bytes);
+    hpe_end(req);
+}
+
+/* Emit records from a version 1 B-tree chunk index. */
+fun hpe_emit_v1_chunk_index = (offset<uint<64>,B> off, uint<8> ndims) void:
+{
+    if (ndims > 0UB) set_bt1_ndims(ndims);
+
+    var bt = v1_btree @ off;
+    printf("(:record chunk-index :offset %u64d :kind \"v1-btree\" :node-type %u64d :level %u64d :entries %u64d :ndims %u64d)\n",
+           off/#B,
+           bt.node_type as uint<64>,
+           bt.node_level as uint<64>,
+           bt.entries_used as uint<64>,
+           global_bt1_ndims as uint<64>);
+
+    if (bt.node_type == 1UB) {
+        var i = 0UL;
+        while (i < bt.entries_used as uint<64>) {
+            printf("(:record chunk :index %u64d :source \"v1-btree\" :chunk-addr %u64d :chunk-size %u64d :filter-mask %u64d :offsets ",
+                   i,
+                   bytes_to_off(bt.body.type1.pairs[i].child_raw)/#B,
+                   bt.body.type1.pairs[i].key.chunk_size as uint<64>,
+                   bt.body.type1.pairs[i].key.filter_mask as uint<64>);
+            hpe_print_offsets_u64(bt.body.type1.pairs[i].key.chunk_offsets);
+            printf(")\n");
+            i = i + 1UL;
+        }
+    }
+}
+
+/* Emit one chunk record from a version 2 B-tree record payload. */
+fun hpe_emit_v2_chunk_record = (uint<64> idx,
+                                offset<uint<64>,B> rec_off,
+                                uint<8> rec_type,
+                                uint<8> coord_ndims) void:
+{
+    if (rec_type == 10UB) {
+        var addr_raw = byte[global_sizeof_offsets] @ rec_off;
+        var scaled_off = rec_off + (global_sizeof_offsets as uint<64>)#B;
+
+        printf("(:record chunk :index %u64d :source \"v2-btree\" :chunk-addr %u64d :scaled-offsets ",
+               idx, bytes_to_off(addr_raw)/#B);
+        hpe_print_u64s_at(scaled_off, coord_ndims as uint<64>);
+        printf(")\n");
+    } else if (rec_type == 11UB) {
+        var addr_raw = byte[global_sizeof_offsets] @ rec_off;
+        var size_len = (global_bt2_record_size as uint<64>)
+                       - (global_sizeof_offsets as uint<64>)
+                       - 4UL
+                       - ((coord_ndims as uint<64>) * 8UL);
+        var size_off = rec_off + (global_sizeof_offsets as uint<64>)#B;
+        var size_raw = byte[size_len] @ size_off;
+        var key_off = size_off + size_len#B;
+        var filter_raw = byte[4] @ key_off;
+        var scaled_off = key_off + 4#B;
+
+        printf("(:record chunk :index %u64d :source \"v2-btree\" :chunk-addr %u64d :chunk-size %u64d :filter-mask %u64d :scaled-offsets ",
+               idx,
+               bytes_to_off(addr_raw)/#B,
+               bytes_to_u64_le(size_raw),
+               bytes_to_u64_le(filter_raw));
+        hpe_print_u64s_at(scaled_off, coord_ndims as uint<64>);
+        printf(")\n");
+    }
+}
+
+/* Traverse a version 2 B-tree node or subtree and emit chunk records. */
+fun hpe_emit_v2_chunk_node = (offset<uint<64>,B> node_addr,
+                              uint<16> depth,
+                              uint<16> nrec,
+                              uint<8> rec_type,
+                              uint<8> coord_ndims,
+                              uint<64> start_index) uint<64>:
+{
+    var count = 0UL;
+
+    set_bt2_depth(depth);
+    set_bt2_nrec(nrec);
+
+    if (depth == 0UH) {
+        var leaf = v2_btree_leaf @ node_addr;
+        var n = 0UL;
+        while (n < nrec as uint<64>) {
+            hpe_emit_v2_chunk_record(start_index + count,
+                                     leaf.records[n]'offset as offset<uint<64>,B>,
+                                     rec_type, coord_ndims);
+            count = count + 1UL;
+            n = n + 1UL;
+        }
+    } else {
+        var inode = v2_btree_internal @ node_addr;
+        var n = 0UL;
+
+        while (n < nrec as uint<64>) {
+            hpe_emit_v2_chunk_record(start_index + count,
+                                     inode.records[n]'offset as offset<uint<64>,B>,
+                                     rec_type, coord_ndims);
+            count = count + 1UL;
+            n = n + 1UL;
+        }
+
+        n = 0UL;
+        while (n < (nrec as uint<64>) + 1UL) {
+            var child_addr = 0UL#B;
+            var child_nrec = 0UH;
+
+            if (depth == 1UH) {
+                child_addr = bytes_to_off(inode.children.d1[n].child_addr_raw);
+                child_nrec = bytes_to_u64_le(inode.children.d1[n].nrec_in_child_raw) as uint<16>;
+            } else {
+                child_addr = bytes_to_off(inode.children.dn[n].child_addr_raw);
+                child_nrec = bytes_to_u64_le(inode.children.dn[n].nrec_in_child_raw) as uint<16>;
+            }
+
+            count = count + hpe_emit_v2_chunk_node(child_addr, depth - 1,
+                                                   child_nrec, rec_type,
+                                                   coord_ndims,
+                                                   start_index + count);
+            set_bt2_depth(depth);
+            set_bt2_nrec(nrec);
+            n = n + 1UL;
+        }
+    }
+
+    return count;
+}
+
+/* Initialize v2 B-tree parsing state and emit all chunk records. */
+fun hpe_emit_v2_chunk_index = (offset<uint<64>,B> off, uint<8> ndims = 0UB) void:
+{
+    var hdr = v2_btree_hdr @ off;
+
+    set_bt2_nrec_size_from_hdr(hdr.node_size, hdr.record_size);
+    set_bt2_nrec_subtree_size_from_hdr(hdr.node_size, hdr.record_size, hdr.depth);
+    set_bt2_nrec(hdr.num_root_records);
+    var coord_ndims = 0UB;
+    if (ndims > 1UB)
+        coord_ndims = ndims - 1UB;
+    else if (hdr.record_type == 10UB)
+        coord_ndims = (((hdr.record_size as uint<16>)
+                        - (global_sizeof_offsets as uint<16>)) / 8UH) as uint<8>;
+    else if (hdr.record_type == 11UB)
+        coord_ndims = (((hdr.record_size as uint<16>)
+                        - (global_sizeof_offsets as uint<16>)
+                        - (global_sizeof_lengths as uint<16>)
+                        - 4UH) / 8UH) as uint<8>;
+
+    if (coord_ndims > 0UB)
+        set_bt2_ndims(coord_ndims);
+    else if (ndims > 0UB)
+        set_bt2_ndims(ndims);
+
+    /* Type 11 also needs the filtered chunk-size field width, which is
+     * under-determined by record_size alone; derive it from the resolved
+     * dimensionality so v4 layouts (csl < sizeof_lengths) map correctly. */
+    if (hdr.record_type == 11UB)
+        set_bt2_chunk_size_len_from_hdr(hdr.record_size, global_bt2_ndims);
+
+    printf("(:record chunk-index :offset %u64d :kind \"v2-btree\" :record-type %u64d :depth %u64d :root %u64d :root-records %u64d :total-records %u64d :ndims %u64d :coord-ndims %u64d)\n",
+           off/#B,
+           hdr.record_type as uint<64>,
+           hdr.depth as uint<64>,
+           bytes_to_off(hdr.root_addr_raw)/#B,
+           hdr.num_root_records as uint<64>,
+           bytes_to_u64_le(hdr.total_nrec_raw),
+           ndims as uint<64>,
+           coord_ndims as uint<64>);
+
+    if (hdr.record_type == 10UB || hdr.record_type == 11UB) {
+        var emitted = hpe_emit_v2_chunk_node(bytes_to_off(hdr.root_addr_raw),
+                                             hdr.depth, hdr.num_root_records,
+                                             hdr.record_type, coord_ndims,
+                                             0UL);
+    }
+}
+
+/* Emit chunk records from a fixed-array chunk index. */
+fun hpe_emit_fa_chunk_index = (offset<uint<64>,B> off) void:
+{
+    var hdr = fa_hdr @ off;
+    printf("(:record chunk-index :offset %u64d :kind \"fixed-array\" :client-id %u64d :elements %u64d :data-block %u64d :pages %u64d)\n",
+           off/#B,
+           hdr.client_id as uint<64>,
+           bytes_to_u64_le(hdr.nelmts_raw),
+           bytes_to_off(hdr.dblk_addr_raw)/#B,
+           global_fa_npages);
+
+    var db = fa_dblock @ bytes_to_off(hdr.dblk_addr_raw);
+    if (global_fa_npages == 0UL) {
+        var i = 0UL;
+        while (i < global_fa_nelmts) {
+            if (global_fa_client_id == 0UB) {
+                var e = fa_chunk_elem @ (db.nopaged.elements[i]'offset as offset<uint<64>,B>);
+                if (!hpe_addr_is_undef(e.addr_raw))
+                    printf("(:record chunk :index %u64d :source \"fixed-array\" :chunk-addr %u64d)\n",
+                           i, bytes_to_off(e.addr_raw)/#B);
+            } else {
+                var fe = fa_filt_chunk_elem @ (db.nopaged.elements[i]'offset as offset<uint<64>,B>);
+                if (!hpe_addr_is_undef(fe.addr_raw))
+                    printf("(:record chunk :index %u64d :source \"fixed-array\" :chunk-addr %u64d :chunk-size %u64d :filter-mask %u64d)\n",
+                           i, bytes_to_off(fe.addr_raw)/#B,
+                           bytes_to_u64_le(fe.chunk_size_raw),
+                           fe.filter_mask as uint<64>);
+            }
+            i = i + 1UL;
+        }
+    }
+}
+
+/* Emit chunk records from an extensible-array chunk index. */
+fun hpe_emit_ea_chunk_index = (offset<uint<64>,B> off) void:
+{
+    var hdr = ea_hdr @ off;
+    printf("(:record chunk-index :offset %u64d :kind \"extensible-array\" :client-id %u64d :elements %u64d :index-block %u64d :data-blocks %u64d :secondary-blocks %u64d)\n",
+           off/#B,
+           hdr.client_id as uint<64>,
+           bytes_to_u64_le(hdr.nelmts_raw),
+           bytes_to_off(hdr.idx_blk_addr_raw)/#B,
+           bytes_to_u64_le(hdr.ndata_blks_raw),
+           bytes_to_u64_le(hdr.nsuper_blks_raw));
+
+    var ib = ea_iblock @ bytes_to_off(hdr.idx_blk_addr_raw);
+    var i = 0UL;
+    while (i < global_ea_idx_blk_elmts as uint<64>) {
+        if (global_ea_client_id == 0UB || global_ea_client_id == 2UB) {
+            var e = ea_chunk_elem @ (ib.elements[i]'offset as offset<uint<64>,B>);
+            if (!hpe_addr_is_undef(e.addr_raw))
+                printf("(:record chunk :index %u64d :source \"extensible-array\" :chunk-addr %u64d)\n",
+                       i, bytes_to_off(e.addr_raw)/#B);
+        } else {
+            var fe = ea_filt_chunk_elem @ (ib.elements[i]'offset as offset<uint<64>,B>);
+            if (!hpe_addr_is_undef(fe.addr_raw))
+                printf("(:record chunk :index %u64d :source \"extensible-array\" :chunk-addr %u64d :chunk-size %u64d :filter-mask %u64d)\n",
+                       i, bytes_to_off(fe.addr_raw)/#B,
+                       bytes_to_u64_le(fe.chunk_size_raw),
+                       fe.filter_mask as uint<64>);
+        }
+        i = i + 1UL;
+    }
+}
+
+/* Entry point: detect the chunk-index kind by signature and emit records. */
+fun hdf5_poke_emacs_chunk_index = (int req,
+                                   offset<uint<64>,B> off,
+                                   uint<8> ndims = 0UB,
+                                   offset<uint<64>,B> super_off = 0UL#B) void:
+{
+    var hpe_sb_init = superblock @ super_off;
+    var sig = byte[4] @ off;
+
+    hpe_begin(req);
+    if (sig == ['T', 'R', 'E', 'E'])
+        hpe_emit_v1_chunk_index(off, ndims);
+    else if (sig == ['B', 'T', 'H', 'D'])
+        hpe_emit_v2_chunk_index(off, ndims);
+    else if (sig == ['F', 'A', 'H', 'D'])
+        hpe_emit_fa_chunk_index(off);
+    else if (sig == ['E', 'A', 'H', 'D'])
+        hpe_emit_ea_chunk_index(off);
+    else {
+        printf("(:record chunk-index :offset %u64d :kind \"unknown\")\n",
+               off/#B);
+    }
+    hpe_end(req);
+}
+
+/* Entry point: emit a typed GNU poke view or raw bytes for a region. */
+fun hdf5_poke_emacs_raw = (int req, string kind,
+                           offset<uint<64>,B> off,
+                           uint<64> size,
+                           offset<uint<64>,B> super_off = 0UL#B) void:
+{
+    var hpe_sb_init = superblock @ super_off;
+    hpe_begin(req);
+    printf("(:record raw :kind ");
+    hpe_print_string(kind);
+    printf(" :offset %u64d)\n", off/#B);
+    hpe_raw_begin(req);
+
+    if (kind == "superblock")
+        printf("%Tv\n", superblock @ off);
+    else if (kind == "object-header")
+        printf("%Tv\n", ohdr @ off);
+    else if (kind == "v1-btree")
+        printf("%Tv\n", v1_btree @ off);
+    else
+        printf("%Tv\n", byte[size] @ off);
+
+    hpe_raw_end(req);
+    hpe_end(req);
+}
