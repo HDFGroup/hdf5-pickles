@@ -13,15 +13,20 @@ This overlay intentionally freezes the Phase 0 boundary:
 - no application deserialization
 
 Phase 1 validates the superblock and the root object header. It opens the target
-file read-only, maps metadata with the selected profile, checks basic file geometry
-and checksums, scans root object-header message prefixes for chunk overruns, and
-emits a JSON decision with stable exit codes.
+file read-only, maps metadata with the selected profile, checks basic file
+geometry and checksums, scans root object-header message prefixes for chunk
+overruns, and emits a JSON decision with stable exit codes.
 
 Phase 2 adds bounded root object-header message validators for dataspace,
 datatype, layout, filter pipeline, link, attribute, fill value, continuation,
-free-space info, and metadata cache image messages. It still does not traverse the
-object graph; child object headers, dense heaps, B-trees, and chunk indexes are
-reserved for Phase 3.
+free-space info, and metadata cache image messages.
+
+Phase 3 walks reachable object headers through compact hard-link messages with
+explicit visited sets and profile budgets for metadata bytes, object count,
+object-header continuation chunks, attributes, traversal depth, and chunk-index
+references. Continuation chunks are followed with loop detection. Dense link
+storage, old-style group B-trees, and chunk-index roots are bounded and reported
+as `unsupported_coverage_gap` until their pickle decoders are covered.
 
 Run:
 
