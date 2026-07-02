@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Generate the h5policy regression corpus.
+
+Writes small, deterministic HDF5 fixtures into a corpus tree (default
+``h5policy/tests``), grouped by the decision they are expected to produce.
+Valid fixtures use h5py; malformed fixtures are byte-patched from a valid base
+so no assumption is made about libhdf5 accepting them.
+
+The generated ``*.h5`` files are build artifacts (git-ignored); the tracked
+specification lives in ``tests/expected/*.yml`` and is checked by ``run.sh``.
+
+Requires: h5py.  Usage: h5policy-gencorpus [TARGET_DIR]
+"""
+import os
+import sys
+
+import numpy as np
+
+try:
+    import h5py
+except ImportError:  # pragma: no cover
+    sys.exit("h5policy-gencorpus: h5py is required to generate the corpus")
+
+
+def _write(path, fn):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with h5py.File(path, "w", libver="latest") as h:
+        fn(h)
+
+
+def _write_earliest(path, fn):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with h5py.File(path, "w", libver="earliest") as h:
+        fn(h)
+
+
+def generate(root):
+    # ---- valid/ : fully covered metadata, expected `accept` -------------
+    _write(f"{root}/valid/empty.h5", lambda h: None)
+    _write(f"{root}/valid/simple_dataset.h5",
+           lambda h: h.create_dataset("a", data=np.arange(6, dtype="i4")))
+    # Regression guard for the datatype-recursion validator (#5) and the
+    # version-4 compound encoding written by modern libhdf5: a compound whose
+    # member is itself an array type -> two levels of datatype recursion.
+    _write(f"{root}/valid/nested_datatypes.h5",
+           lambda h: h.create_dataset(
+               "rec", shape=(2,),
+               dtype=np.dtype([("id", np.int32), ("xyz", np.float64, (3,))])))
+    _write(f"{root}/valid/enum_vlen.h5", lambda h: (
+        h.create_dataset("e", shape=(3,),
+                         dtype=h5py.enum_dtype({"A": 0, "B": 1, "C": 2},
+                                               basetype="i4")),
+        h.create_dataset("v", shape=(2,), dtype=h5py.vlen_dtype(np.int32))))
+    # ---- policy/ : denied feature, expected `reject_policy` -------------
+    _write(f"{root}/policy/external_link.h5",
+           lambda h: h.__setitem__("ext", h5py.ExternalLink("other.h5", "/x")))
+
+    # ---- resource/ : over budget, expected `reject_resource` -----------
+    # Contiguous + late allocation: the huge logical shape is recorded but no
+    # bytes are written, so the file stays tiny (the memory-exhaustion shape).
+    _write(f"{root}/resource/huge_logical_dataset.h5",
+           lambda h: h.create_dataset("big", shape=(2 ** 34,), dtype="f8"))
+
+    # ---- coverage/ : not yet classified, expected `unsupported_coverage_gap`
+    _write_earliest(f"{root}/coverage/old_style_group.h5",
+                    lambda h: h.create_dataset("a", data=np.arange(4, dtype="i4")))
+    # Modern libhdf5 stores even a single attribute in a dense fractal-heap
+    # index, which the pickles do not decode yet -> a coverage gap, not accept.
+    _write(f"{root}/coverage/dense_attribute.h5", lambda h: (
+        h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        h["d"].attrs.create("tag", np.arange(5, dtype="i8"))))
+
+    # ---- malformed/ : expected `reject_corrupt`, byte-patched from a base --
+    base = f"{root}/valid/empty.h5"
+    raw = open(base, "rb").read()
+    _patch(f"{root}/malformed/bad_signature.h5",
+           bytes([raw[0] ^ 0xFF]) + raw[1:])
+    _patch(f"{root}/malformed/truncated.h5", raw[:32])
+    _patch(f"{root}/malformed/bad_superblock_version.h5",
+           raw[:8] + b"\xff" + raw[9:])
+
+
+def _patch(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else \
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests")
+    target = os.path.abspath(target)
+    generate(target)
+    print(f"h5policy-gencorpus: wrote corpus under {target}")
