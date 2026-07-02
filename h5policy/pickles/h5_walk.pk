@@ -426,6 +426,269 @@ fun h5policy_validate_dataspace_payload = (int ios,
                                                 payload_off, object);
 }
 
+fun h5policy_round_up_8 = (uint<64> n) uint<64>:
+{
+    var r = n % 8UL;
+    if (r == 0UL)
+        return n;
+    return n + (8UL - r);
+}
+
+/* Width of the "byte offset of member" field in a version-3 compound, keyed
+   to the compound's own element size (mirrors the on-disk encoding).  */
+fun h5policy_v3_memb_off_size = (uint<64> elm_size) uint<64>:
+{
+    if (elm_size < 256UL) return 1UL;
+    if (elm_size < 65536UL) return 2UL;
+    if (elm_size < 4294967296UL) return 4UL;
+    return 8UL;
+}
+
+/* NUL-terminated name length, but never scanning past the datatype blob.
+   Returns max if no terminator is found in the window (the caller then fails
+   the room check rather than reading unbounded attacker-controlled bytes).  */
+fun h5policy_dtype_name_len = (int ios, H5PolicyLimits profile,
+                               offset<uint<64>,B> off, uint<64> max) uint<64>:
+{
+    var i = 0UL;
+
+    while (i < max)
+        {
+            var b = h5policy_msg_u64_at(ios, profile, off + i#B, 1UL) as uint<8>;
+            if (b == 0UB)
+                return i;
+            i = i + 1UL;
+        }
+
+    return max;
+}
+
+fun h5policy_dtype_room = (uint<64> need, uint<64> avail, uint<64> used,
+                           off64 loc, string object) int:
+{
+    if (need > avail - used)
+        {
+            h5policy_emit_error("H5_CORRUPT_DATATYPE_MESSAGE_TOO_SMALL",
+                                "corrupt", loc, object,
+                                "datatype properties overrun the blob");
+            return 0;
+        }
+
+    return 1;
+}
+
+/* Bounded, depth-guarded recursive datatype validator.  Returns the total
+   consumed size (8-byte header + properties) of the blob at blob_off, or 0 on
+   a hard error (after emitting a finding).  `avail` is the number of bytes the
+   blob may occupy; every field read and every recursion stays inside it, and
+   nesting is capped by profile.max_datatype_recursion_depth so a maliciously
+   deep type cannot exhaust the stack (the audit's top datatype CVE class).  */
+fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
+                            offset<uint<64>,B> blob_off,
+                            uint<64> avail, string object,
+                            uint<64> depth) uint<64>:
+{
+    if (depth > profile.max_datatype_recursion_depth)
+        {
+            h5policy_emit_error("H5_CORRUPT_DATATYPE_RECURSION_LIMIT",
+                                "corrupt", blob_off, object,
+                                "datatype nesting exceeds the selected profile limit");
+            return 0UL;
+        }
+
+    if (avail < 8UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_DATATYPE_MESSAGE_TOO_SMALL",
+                                "corrupt", blob_off, object,
+                                "datatype blob is too small for its header");
+            return 0UL;
+        }
+
+    var flags = h5policy_msg_u64_at(ios, profile, blob_off, 4UL);
+    var elm_size = h5policy_msg_u64_at(ios, profile, blob_off + 4#B, 4UL);
+    var version = (flags .>> 4) & 0xfUL;
+    var ctype = flags & 0xfUL;
+    var used = 8UL;
+
+    if (version == 0UL || version > 3UL)
+        h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_DATATYPE_VERSION",
+                            "corrupt", blob_off, object,
+                            "unsupported datatype message version");
+
+    if (ctype > 10UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNKNOWN_DATATYPE_CLASS",
+                                "corrupt", blob_off, object,
+                                "unknown datatype class");
+            return 0UL;
+        }
+
+    if (elm_size == 0UL)
+        h5policy_emit_error("H5_CORRUPT_DATATYPE_ZERO_SIZE",
+                            "corrupt", blob_off, object,
+                            "datatype storage size is zero");
+
+    /* Non-recursive classes have fixed-size property blocks. */
+    var simple = 1;
+    var props = 0UL;
+    if (ctype == 0UL || ctype == 4UL)
+        props = 4UL;                             /* fixed-point / bit field */
+    else if (ctype == 1UL)
+        props = 12UL;                            /* floating-point */
+    else if (ctype == 2UL)
+        props = 2UL;                             /* time */
+    else if (ctype == 3UL || ctype == 7UL)
+        props = 0UL;                             /* string / reference */
+    else if (ctype == 5UL)
+        props = (flags .>> 8) & 0xffUL;          /* opaque tag */
+    else
+        simple = 0;
+
+    if (simple)
+        {
+            if (!h5policy_dtype_room(props, avail, used, blob_off, object))
+                return 0UL;
+            return used + props;
+        }
+
+    /* ---- class 9: Variable-Length (single inline base type) ---- */
+    if (ctype == 9UL)
+        {
+            var child = h5policy_dtype_check(ios, profile, blob_off + used#B,
+                                             avail - used, object, depth + 1UL);
+            if (child == 0UL)
+                return 0UL;
+            return used + child;
+        }
+
+    /* ---- class 10: Array (rank + dims [+ v2 reserved/perm] + base type) ---- */
+    if (ctype == 10UL)
+        {
+            if (!h5policy_dtype_room(1UL, avail, used, blob_off, object))
+                return 0UL;
+            var rank = h5policy_msg_u64_at(ios, profile, blob_off + used#B, 1UL);
+            used = used + 1UL;
+
+            if (version == 2UL)
+                {
+                    if (!h5policy_dtype_room(3UL, avail, used, blob_off, object))
+                        return 0UL;
+                    used = used + 3UL;           /* reserved */
+                }
+
+            var dims = h5policy_checked_mul_u64(rank, 4UL, 0xffffffffffffffffUL,
+                                                "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                "corrupt", blob_off, object,
+                                                "array dimension byte count overflow");
+            if (!h5policy_dtype_room(dims, avail, used, blob_off, object))
+                return 0UL;
+            used = used + dims;
+
+            if (version == 2UL)
+                {
+                    if (!h5policy_dtype_room(dims, avail, used, blob_off, object))
+                        return 0UL;
+                    used = used + dims;          /* permutation indices */
+                }
+
+            var child = h5policy_dtype_check(ios, profile, blob_off + used#B,
+                                             avail - used, object, depth + 1UL);
+            if (child == 0UL)
+                return 0UL;
+            return used + child;
+        }
+
+    /* ---- class 8: Enum (base type, then member names and values) ---- */
+    if (ctype == 8UL)
+        {
+            var num = (flags .>> 8) & 0xffffUL;
+
+            if (!h5policy_dtype_room(8UL, avail, used, blob_off, object))
+                return 0UL;
+            var base_elm = h5policy_msg_u64_at(ios, profile,
+                                               blob_off + used#B + 4#B, 4UL);
+            var child = h5policy_dtype_check(ios, profile, blob_off + used#B,
+                                             avail - used, object, depth + 1UL);
+            if (child == 0UL)
+                return 0UL;
+            used = used + child;
+
+            var m = 0UL;
+            while (m < num)
+                {
+                    var nlen = h5policy_dtype_name_len(ios, profile,
+                                                       blob_off + used#B,
+                                                       avail - used);
+                    var adv = version == 3UL
+                              ? (nlen + 1UL)
+                              : h5policy_round_up_8(nlen + 1UL);
+                    if (!h5policy_dtype_room(adv, avail, used, blob_off, object))
+                        return 0UL;
+                    used = used + adv;
+                    m = m + 1UL;
+                }
+
+            var vals = h5policy_checked_mul_u64(num, base_elm,
+                                                0xffffffffffffffffUL,
+                                                "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                "corrupt", blob_off, object,
+                                                "enum value byte count overflow");
+            if (!h5policy_dtype_room(vals, avail, used, blob_off, object))
+                return 0UL;
+            used = used + vals;
+            return used;
+        }
+
+    /* ---- class 6: Compound (per-member name, offset, and nested type) ---- */
+    if (ctype == 6UL)
+        {
+            var num = (flags .>> 8) & 0xffffUL;
+            var m = 0UL;
+
+            while (m < num)
+                {
+                    var nlen = h5policy_dtype_name_len(ios, profile,
+                                                       blob_off + used#B,
+                                                       avail - used);
+                    var adv = (version == 1UL || version == 2UL)
+                              ? h5policy_round_up_8(nlen + 1UL)
+                              : (nlen + 1UL);
+                    if (!h5policy_dtype_room(adv, avail, used, blob_off, object))
+                        return 0UL;
+                    used = used + adv;
+
+                    var off_w = version == 3UL
+                                ? h5policy_v3_memb_off_size(elm_size)
+                                : 4UL;
+                    if (!h5policy_dtype_room(off_w, avail, used, blob_off, object))
+                        return 0UL;
+                    used = used + off_w;
+
+                    if (version == 1UL)
+                        {
+                            /* ndim(1) + res(3) + perm(4) + res(4) + dims(16) */
+                            if (!h5policy_dtype_room(28UL, avail, used,
+                                                     blob_off, object))
+                                return 0UL;
+                            used = used + 28UL;
+                        }
+
+                    var child = h5policy_dtype_check(ios, profile,
+                                                     blob_off + used#B,
+                                                     avail - used, object,
+                                                     depth + 1UL);
+                    if (child == 0UL)
+                        return 0UL;
+                    used = used + child;
+                    m = m + 1UL;
+                }
+
+            return used;
+        }
+
+    return used;
+}
+
 fun h5policy_validate_dtype_payload = (int ios,
                                        H5PolicyLimits profile,
                                        H5WalkContext ctx,
@@ -433,59 +696,18 @@ fun h5policy_validate_dtype_payload = (int ios,
                                        uint<64> msg_size,
                                        string object) H5WalkContext:
 {
-    if (!h5policy_payload_range_ok(msg_size, 0UL, 8UL,
-                                   "H5_CORRUPT_DATATYPE_MESSAGE_TOO_SMALL",
-                                   payload_off, object,
-                                   "datatype message is too small"))
+    var consumed = h5policy_dtype_check(ios, profile, payload_off,
+                                        msg_size, object, 0UL);
+    if (consumed == 0UL)
         return ctx;
 
-    var flags = h5policy_msg_u64_at(ios, profile, payload_off, 4UL);
     var elm_size = h5policy_msg_u64_at(ios, profile, payload_off + 4#B, 4UL);
-    var version = (flags .>> 4) & 0xfUL;
-    var ctype = flags & 0xfUL;
-    var min_props = 0UL;
-
-    if (version == 0UL || version > 3UL)
-        h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_DATATYPE_VERSION",
-                            "corrupt", payload_off, object,
-                            "unsupported datatype message version");
-
-    if (ctype > 10UL)
-        h5policy_emit_error("H5_CORRUPT_UNKNOWN_DATATYPE_CLASS",
-                            "corrupt", payload_off, object,
-                            "unknown datatype class");
-
-    if (elm_size == 0UL)
-        h5policy_emit_error("H5_CORRUPT_DATATYPE_ZERO_SIZE",
-                            "corrupt", payload_off, object,
-                            "datatype storage size is zero");
 
     if (profile.max_single_allocation_bytes != 0UL
         && elm_size > profile.max_single_allocation_bytes)
         h5policy_emit_error("H5_RESOURCE_SINGLE_ALLOCATION_BYTES",
                             "resource", payload_off, object,
                             "datatype storage size exceeds the selected profile limit");
-
-    if (ctype == 0UL || ctype == 4UL)
-        min_props = 4UL;
-    else if (ctype == 1UL)
-        min_props = 12UL;
-    else if (ctype == 2UL)
-        min_props = 2UL;
-    else if (ctype == 5UL)
-        min_props = (flags .>> 8) & 0xffUL;
-
-    if (min_props != 0UL
-        && !h5policy_payload_range_ok(msg_size, 8UL, min_props,
-                                      "H5_CORRUPT_DATATYPE_MESSAGE_TOO_SMALL",
-                                      payload_off, object,
-                                      "datatype properties overrun the message"))
-        return ctx;
-
-    if (ctype == 6UL || ctype == 8UL || ctype == 9UL || ctype == 10UL)
-        h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
-                            "unsupported", payload_off, object,
-                            "recursive datatype validation is deferred to a later policy phase");
 
     ctx.has_datatype = 1UB;
     ctx.datatype_size = elm_size;
