@@ -1,6 +1,6 @@
 # h5policy Tests
 
-Phase 1 reserves the corpus layout described in `h5policy.md`:
+Phase 2 reserves the corpus layout described in `h5policy.md`:
 
 - `valid/`
 - `malformed/`
@@ -8,7 +8,6 @@ Phase 1 reserves the corpus layout described in `h5policy.md`:
 - `cve/`
 - `expected/`
 
-The first implementation is validated against the repository `file.h5` and simple
-synthetic malformed inputs. Future phases should add expected YAML files with
-required findings and forbidden outcomes.
-
+The current implementation is validated against the repository `file.h5` and simple
+synthetic malformed or policy-denied inputs. Future phases should add expected
+YAML files with required findings and forbidden outcomes.
