@@ -28,6 +28,11 @@ references. Continuation chunks are followed with loop detection. Dense link
 storage, old-style group B-trees, and chunk-index roots are bounded and reported
 as `unsupported_coverage_gap` until their pickle decoders are covered.
 
+Phase 4 adds policy reporting summaries. JSON output now includes `features`
+for security-relevant constructs such as external links, external storage, VDS,
+dynamic filters, unknown messages, maximum rank, and maximum logical dataset
+bytes, plus `metrics` for traversal/accounting counters.
+
 Run:
 
 ```sh

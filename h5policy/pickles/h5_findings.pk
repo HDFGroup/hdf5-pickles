@@ -18,6 +18,13 @@ var h5policy_finding_messages = string[]();
 var h5policy_exit_code = H5POLICY_EXIT_ACCEPT;
 var h5policy_exit_rank = 0;
 
+/* Self-defense: the oracle must not be exhausted by the file it judges.
+   Cap the number of stored findings, and collapse repeated resource-budget
+   findings (which otherwise re-fire on every increment past the limit).  */
+var H5POLICY_MAX_FINDINGS = 4096UL;
+var h5policy_findings_truncated = 0;
+var h5policy_emitted_resource_codes = string[]();
+
 var h5policy_feature_external_links = 0UL;
 var h5policy_feature_external_storage = 0UL;
 var h5policy_feature_vds = 0UL;
@@ -37,10 +44,15 @@ fun h5policy_class_exit_code = (string klass) int:
 
 fun h5policy_class_rank = (string klass) int:
 {
+    /* Ranks must be distinct so the top-level decision is order-independent:
+       a file that is both policy-denied and over a resource budget always
+       reports reject_policy, regardless of which finding the walk hit first.
+       A denied feature is a categorical "no"; a resource budget is a tunable
+       threshold, so policy outranks resource.  */
     if (klass == "internal") return 60;
     if (klass == "corrupt") return 50;
-    if (klass == "policy") return 45;
-    if (klass == "resource") return 45;
+    if (klass == "policy") return 46;
+    if (klass == "resource") return 44;
     if (klass == "unsupported") return 40;
     if (klass == "warning") return 10;
     return 0;
@@ -68,6 +80,20 @@ fun h5policy_consider_exit = (string klass) void:
 }
 
 fun h5policy_feature_seen_u64 = (uint<64>[] values, uint<64> value) int:
+{
+    var i = 0UL;
+
+    while (i < values'length)
+        {
+            if (values[i] == value)
+                return 1;
+            i = i + 1UL;
+        }
+
+    return 0;
+}
+
+fun h5policy_string_seen = (string[] values, string value) int:
 {
     var i = 0UL;
 
@@ -126,19 +152,56 @@ fun h5policy_reset_findings = void:
     h5policy_finding_messages = string[]();
     h5policy_exit_code = H5POLICY_EXIT_ACCEPT;
     h5policy_exit_rank = 0;
+    h5policy_findings_truncated = 0;
+    h5policy_emitted_resource_codes = string[]();
     h5policy_reset_features;
 }
 
 fun h5policy_emit = (string severity, string code, string klass,
                      off64 loc, string object, string message) void:
 {
-    h5policy_finding_severities += [severity];
-    h5policy_finding_codes += [code];
-    h5policy_finding_classes += [klass];
-    h5policy_finding_offsets += [(loc/#B) as uint<64>];
-    h5policy_finding_objects += [object];
-    h5policy_finding_messages += [message];
+    /* The decision always reflects this finding's severity, even if the
+       finding itself is deduplicated or dropped past the storage cap.  */
     h5policy_consider_exit(klass);
+
+    if (h5policy_findings_truncated)
+        return;
+
+    /* Resource-budget findings re-fire on every increment past the limit
+       (and forensic mode never stops the walk).  Record the decision once,
+       but store only the first finding for each resource code.  */
+    if (klass == "resource"
+        && h5policy_string_seen(h5policy_emitted_resource_codes, code))
+        return;
+
+    var out_severity = severity;
+    var out_code = code;
+    var out_klass = klass;
+    var out_object = object;
+    var out_message = message;
+    var out_offset = (loc/#B) as uint<64>;
+
+    if (h5policy_finding_codes'length >= H5POLICY_MAX_FINDINGS)
+        {
+            /* Replace this finding with a single terminal marker and stop
+               storing.  The decision has already been updated above.  */
+            h5policy_findings_truncated = 1;
+            out_severity = "warning";
+            out_code = "H5_POLICY_FINDINGS_TRUNCATED";
+            out_klass = "warning";
+            out_object = "";
+            out_message = "finding limit reached; additional findings suppressed";
+            out_offset = 0UL;
+        }
+    else if (klass == "resource")
+        h5policy_emitted_resource_codes += [code];
+
+    h5policy_finding_severities += [out_severity];
+    h5policy_finding_codes += [out_code];
+    h5policy_finding_classes += [out_klass];
+    h5policy_finding_offsets += [out_offset];
+    h5policy_finding_objects += [out_object];
+    h5policy_finding_messages += [out_message];
 }
 
 fun h5policy_emit_error = (string code, string klass,
@@ -151,6 +214,13 @@ fun h5policy_emit_warning = (string code,
                              off64 loc, string object, string message) void:
 {
     h5policy_emit("warning", code, "warning", loc, object, message);
+}
+
+var H5POLICY_HEX_DIGITS = "0123456789abcdef";
+
+fun h5policy_hex_nibble = (uint<8> n) string:
+{
+    return (H5POLICY_HEX_DIGITS[(n & 0xfUB) as uint<64>]) as string;
 }
 
 fun h5policy_json_escape = (string value) string:
@@ -172,6 +242,12 @@ fun h5policy_json_escape = (string value) string:
                 escaped = escaped + "\\r";
             else if (c == '\t')
                 escaped = escaped + "\\t";
+            else if (c < ' ')
+                /* Any other control byte (attacker-controlled names can carry
+                   them) must be \u-escaped or the report is invalid JSON.  */
+                escaped = escaped + "\\u00"
+                          + h5policy_hex_nibble(((c as uint<8>) .>> 4) & 0xfUB)
+                          + h5policy_hex_nibble((c as uint<8>) & 0xfUB);
             else
                 escaped = escaped + (c as string);
 
