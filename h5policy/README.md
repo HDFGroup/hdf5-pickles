@@ -33,10 +33,28 @@ for security-relevant constructs such as external links, external storage, VDS,
 dynamic filters, unknown messages, maximum rank, and maximum logical dataset
 bytes, plus `metrics` for traversal/accounting counters.
 
+Profiles implement the four HDF5 security profiles from the audit report
+(main.pdf, Table 5). They differ in feature policy and resource budgets, not in
+whether corruption is caught — every profile still rejects genuinely unmappable
+metadata:
+
+| Profile            | Mapping     | Resource budgets | Feature policy                         |
+| ------------------ | ----------- | ---------------- | -------------------------------------- |
+| `legacy`           | strict      | unlimited        | all features allowed                   |
+| `trusted-fast`     | strict      | generous         | external refs / VDS / filters allowed  |
+| `untrusted-strict` | strict      | tight            | denied (default)                       |
+| `forensic`         | non-strict  | unlimited        | never follows refs; reports anomalies  |
+
+For example, an external-link file or a 128 GiB logical dataset is rejected
+under `untrusted-strict` but accepted under `trusted-fast` and `legacy`; a
+truncated file is `reject_corrupt` under all four.
+
 Run:
 
 ```sh
 ./h5policy/tools/h5policy --profile untrusted-strict --json file.h5
+./h5policy/tools/h5policy --profile trusted-fast --json file.h5
+./h5policy/tools/h5policy --profile legacy --json file.h5
 ./h5policy/tools/h5policy --profile forensic --json --continue-after-corruption file.h5
 ```
 
