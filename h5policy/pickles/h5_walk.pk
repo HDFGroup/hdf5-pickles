@@ -13,6 +13,7 @@ type H5WalkContext = struct
     uint<64> dataset_element_count;
     uint<64> datatype_size;
     uint<64> logical_dataset_bytes;
+    uint<64> max_logical_dataset_bytes_seen;
     uint<64> chunk_index_count;
     uint<8> has_dataspace;
     uint<8> has_datatype;
@@ -128,6 +129,7 @@ fun h5policy_new_walk_context = H5WalkContext:
         dataset_element_count = 0UL,
         datatype_size = 0UL,
         logical_dataset_bytes = 0UL,
+        max_logical_dataset_bytes_seen = 0UL,
         chunk_index_count = 0UL,
         has_dataspace = 0UB,
         has_datatype = 0UB
@@ -309,6 +311,8 @@ fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
                                          "resource",
                                          loc, object,
                                          "logical dataset byte budget exceeded");
+            if (ctx.logical_dataset_bytes > ctx.max_logical_dataset_bytes_seen)
+                ctx.max_logical_dataset_bytes_seen = ctx.logical_dataset_bytes;
         }
 
     return ctx;
@@ -650,10 +654,14 @@ fun h5policy_validate_layout_payload = (int ios,
                 return ctx;
 
             layout_class = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
-            if (layout_class == VIRTUAL as uint<64> && profile.allow_vds == 0UB)
-                h5policy_emit_error("H5_POLICY_VDS", "policy",
-                                    payload_off, object,
-                                    "virtual dataset layout encountered; profile denies VDS");
+            if (layout_class == VIRTUAL as uint<64>)
+                {
+                    h5policy_note_vds;
+                    if (profile.allow_vds == 0UB)
+                        h5policy_emit_error("H5_POLICY_VDS", "policy",
+                                            payload_off, object,
+                                            "virtual dataset layout encountered; profile denies VDS");
+                }
 
             if (layout_class == CHUNKED as uint<64>
                 && h5policy_payload_range_ok(msg_size, 0UL, 5UL,
@@ -812,11 +820,14 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                                                 payload_off + (cur + 4UL)#B,
                                                 2UL);
 
-            if (!h5policy_core_filter(filter_id)
-                && profile.allow_dynamic_filters == 0UB)
-                h5policy_emit_error("H5_POLICY_DYNAMIC_FILTER", "policy",
-                                    payload_off + cur#B, object,
-                                    "non-core filter required; profile disables dynamic filters");
+            if (!h5policy_core_filter(filter_id))
+                {
+                    h5policy_note_dynamic_filter(filter_id);
+                    if (profile.allow_dynamic_filters == 0UB)
+                        h5policy_emit_error("H5_POLICY_DYNAMIC_FILTER", "policy",
+                                            payload_off + cur#B, object,
+                                            "non-core filter required; profile disables dynamic filters");
+                }
 
             var cd_bytes = h5policy_checked_mul_u64(cd_nelmts, 4UL,
                                                     0xffffffffffffffffUL,
@@ -972,9 +983,11 @@ fun h5policy_validate_link_payload = (int ios,
         }
     else if (link_type == 64UL)
         {
-            h5policy_emit_error("H5_POLICY_EXTERNAL_LINK", "policy",
-                                payload_off, object,
-                                "external link encountered; profile denies external references");
+            h5policy_note_external_link;
+            if (profile.allow_external_links == 0UB)
+                h5policy_emit_error("H5_POLICY_EXTERNAL_LINK", "policy",
+                                    payload_off, object,
+                                    "external link encountered; profile denies external references");
         }
     else
         {
@@ -1397,8 +1410,7 @@ fun h5policy_validate_message_payload = (int ios,
 
 fun h5policy_known_message_id = (uint<64> m_type) int:
 {
-    if (m_type <= 0x06UL) return 1;
-    if (m_type == 0x08UL) return 1;
+    if (m_type <= 0x09UL) return 1;
     if (m_type >= 0x0aUL && m_type <= 0x18UL) return 1;
     return 0;
 }
@@ -1439,9 +1451,14 @@ fun h5policy_validate_message_policy = (uint<64> m_type,
                                         string object) void:
 {
     if (m_type == 0x07UL && profile.allow_external_storage == 0UB)
-        h5policy_emit_error("H5_POLICY_EXTERNAL_STORAGE", "policy",
-                            loc, object,
-                            "external file list message encountered; profile denies external storage");
+        {
+            h5policy_note_external_storage;
+            h5policy_emit_error("H5_POLICY_EXTERNAL_STORAGE", "policy",
+                                loc, object,
+                                "external file list message encountered; profile denies external storage");
+        }
+    else if (m_type == 0x07UL)
+        h5policy_note_external_storage;
 
     if (m_type == 0x09UL && profile.allow_legacy_dangerous_messages == 0UB)
         h5policy_emit_error("H5_POLICY_LEGACY_DANGEROUS_MESSAGE", "policy",
@@ -1450,6 +1467,7 @@ fun h5policy_validate_message_policy = (uint<64> m_type,
 
     if (!h5policy_known_message_id(m_type))
         {
+            h5policy_note_unknown_message;
             if (profile.allow_unknown_messages == 0UB)
                 h5policy_emit_error("H5_POLICY_UNKNOWN_MESSAGE", "policy",
                                     loc, object,
