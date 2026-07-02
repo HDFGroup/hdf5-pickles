@@ -76,3 +76,29 @@ add_custom_target(docs-check
     VERBATIM
     USES_TERMINAL
 )
+
+# ---- h5policy regression suite (CTest) -------------------------------------
+# Runs h5policy/tests/run.sh: datatype unit checks, the corpus, and the
+# differential harness.  Requires GNU poke and python3 with h5py; if either is
+# missing the test is skipped rather than reported as a failure (h5dump/h5debug
+# are optional and the harness degrades gracefully without them).
+enable_testing()
+
+find_program(POKE_EXECUTABLE poke)
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c "import h5py"
+    RESULT_VARIABLE H5POLICY_H5PY_RC
+    OUTPUT_QUIET ERROR_QUIET
+)
+
+if(POKE_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0)
+    add_test(
+        NAME h5policy_regression
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/run.sh"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(h5policy_regression PROPERTIES TIMEOUT 300)
+    message(STATUS "h5policy regression test enabled (poke: ${POKE_EXECUTABLE})")
+else()
+    message(STATUS "h5policy regression test skipped (needs poke and python3 h5py)")
+endif()

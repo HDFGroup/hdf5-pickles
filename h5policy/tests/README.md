@@ -24,6 +24,10 @@ This regenerates the fixtures, runs the datatype unit checks, runs `h5policy`
 over every `expected/*.yml` case and asserts the result, then runs the
 differential harness.
 
+The suite is also wired into CTest (top-level `CMakeLists.txt`), so
+`ctest -R h5policy_regression` runs it from a CMake build. The test is skipped
+if `poke` or `python3` + `h5py` are unavailable.
+
 ## Differential harness
 
 `../tools/h5policy-diff` cross-checks h5policy's independent parse against
