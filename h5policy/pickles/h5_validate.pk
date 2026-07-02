@@ -1,0 +1,374 @@
+/* h5_validate.pk - Phase 1 semantic validators for h5policy.  */
+
+var H5POLICY_SIGNATURE = [0x89UB, 'H', 'D', 'F', '\r', '\n', 0x1aUB, '\n'];
+var h5policy_super_found = 0;
+var h5policy_super_off = 0UL#B;
+
+fun h5policy_addr_is_undef = (byte[] raw) int:
+{
+    var n = 0UL;
+
+    while (n < raw'length)
+        {
+            if (raw[n] != 0xffUB) return 0;
+            n = n + 1UL;
+        }
+
+    return 1;
+}
+
+fun h5policy_width_supported = (uint<8> width) int:
+{
+    return width == 2UB || width == 4UB || width == 8UB;
+}
+
+fun h5policy_signature_at = (int ios, offset<uint<64>,B> off) int:
+{
+    if ((off/#B + 8UL) > iosize(ios)/#B)
+        return 0;
+    return (byte[8] @ ios : off) == H5POLICY_SIGNATURE;
+}
+
+fun h5policy_locate_superblock = (int ios) void:
+{
+    h5policy_super_found = 0;
+    h5policy_super_off = 0UL#B;
+
+    if (h5policy_signature_at(ios, 0UL#B))
+        {
+            h5policy_super_found = 1;
+            h5policy_super_off = 0UL#B;
+            return;
+        }
+
+    var pos = 512UL;
+    var file_size = iosize(ios)/#B;
+    while (pos + 8UL <= file_size)
+        {
+            if (h5policy_signature_at(ios, pos#B))
+                {
+                    h5policy_super_found = 1;
+                    h5policy_super_off = pos#B;
+                    return;
+                }
+            pos = pos * 2UL;
+        }
+}
+
+fun h5policy_map_super = (int ios, H5PolicyLimits profile,
+                          offset<uint<64>,B> off) superblock:
+{
+    if (profile.forensic_mode != 0UB)
+        return superblock @! ios : off;
+    return superblock @ ios : off;
+}
+
+fun h5policy_map_ohdr = (int ios, H5PolicyLimits profile,
+                         offset<uint<64>,B> off) ohdr:
+{
+    if (profile.forensic_mode != 0UB)
+        return ohdr @! ios : off;
+    return ohdr @ ios : off;
+}
+
+fun h5policy_map_bytes = (int ios, H5PolicyLimits profile,
+                          offset<uint<64>,B> off,
+                          uint<64> size) byte[]:
+{
+    if (profile.forensic_mode != 0UB)
+        return byte[size] @! ios : off;
+    return byte[size] @ ios : off;
+}
+
+fun h5policy_read_u64_le_at = (int ios, H5PolicyLimits profile,
+                               offset<uint<64>,B> off,
+                               uint<64> size) uint<64>:
+{
+    return bytes_to_u64_le(h5policy_map_bytes(ios, profile, off, size));
+}
+
+fun h5policy_addr_in_file = (uint<64> addr, uint<64> file_size,
+                             string code, off64 loc,
+                             string object, string message) int:
+{
+    if (addr >= file_size)
+        {
+            h5policy_emit_error(code, "corrupt", loc, object, message);
+            return 0;
+        }
+
+    return 1;
+}
+
+fun h5policy_validate_optional_addr = (byte[] raw, uint<64> file_size,
+                                       off64 loc, string object,
+                                       string message) void:
+{
+    if (!h5policy_addr_is_undef(raw))
+        {
+            var addr = bytes_to_u64_le(raw);
+            var ok = h5policy_addr_in_file(addr, file_size,
+                                           "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                           loc, object, message);
+        }
+}
+
+fun h5policy_root_addr = (superblock sb) offset<uint<64>,B>:
+{
+    if (sb.super_vers < 2UB)
+        return bytes_to_off(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw);
+    return bytes_to_off(sb.super.v2_v3.root_obj_addr_raw);
+}
+
+fun h5policy_validate_superblock = (int ios, superblock sb,
+                                    H5PolicyLimits profile,
+                                    H5WalkContext ctx,
+                                    offset<uint<64>,B> super_off) H5WalkContext:
+{
+    var file_size = iosize(ios)/#B;
+
+    ctx = h5policy_account_metadata(ctx, profile,
+                                    sb'size/#B, super_off, "superblock");
+
+    if (sb.super_vers < 2UB)
+        {
+            if (!h5policy_width_supported(sb.super.v0_v1.sizeof_offsets))
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", super_off, "superblock",
+                                    "unsupported superblock offset width");
+
+            if (!h5policy_width_supported(sb.super.v0_v1.sizeof_lengths))
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", super_off, "superblock",
+                                    "unsupported superblock length width");
+
+            var base = bytes_to_u64_le(sb.super.v0_v1.base_addr_raw);
+            var eof = bytes_to_u64_le(sb.super.v0_v1.eof_addr_raw);
+            var root = bytes_to_u64_le(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw);
+
+            var ok_base = h5policy_addr_in_file(base, file_size,
+                                                "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                super_off, "superblock",
+                                                "base address is outside the file");
+            if (eof > file_size)
+                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                    "corrupt", super_off, "superblock",
+                                    "end-of-file address is beyond the available file image");
+            var ok_root = h5policy_addr_in_file(root, file_size,
+                                                "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                super_off, "/",
+                                                "root object header address is outside the file");
+            h5policy_validate_optional_addr(sb.super.v0_v1.fs_info_addr_raw,
+                                            file_size, super_off,
+                                            "superblock",
+                                            "free-space info address is outside the file");
+            h5policy_validate_optional_addr(sb.super.v0_v1.drv_info_addr_raw,
+                                            file_size, super_off,
+                                            "superblock",
+                                            "driver-info address is outside the file");
+        }
+    else
+        {
+            if (!h5policy_width_supported(sb.super.v2_v3.sizeof_offsets))
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", super_off, "superblock",
+                                    "unsupported superblock offset width");
+
+            if (!h5policy_width_supported(sb.super.v2_v3.sizeof_lengths))
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", super_off, "superblock",
+                                    "unsupported superblock length width");
+
+            var base2 = bytes_to_u64_le(sb.super.v2_v3.base_addr_raw);
+            var eof2 = bytes_to_u64_le(sb.super.v2_v3.eof_addr_raw);
+            var root2 = bytes_to_u64_le(sb.super.v2_v3.root_obj_addr_raw);
+
+            var ok_base2 = h5policy_addr_in_file(base2, file_size,
+                                                 "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                 super_off, "superblock",
+                                                 "base address is outside the file");
+            if (eof2 > file_size)
+                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                    "corrupt", super_off, "superblock",
+                                    "end-of-file address is beyond the available file image");
+            var ok_root2 = h5policy_addr_in_file(root2, file_size,
+                                                 "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                 super_off, "/",
+                                                 "root object header address is outside the file");
+            h5policy_validate_optional_addr(sb.super.v2_v3.ext_addr_raw,
+                                            file_size, super_off,
+                                            "superblock",
+                                            "superblock extension address is outside the file");
+
+            var checksum_bytes = byte[(sb'size/#B) - 4UL] @ ios : super_off;
+            var checksum = lookup3_hashlittle(checksum_bytes, 0);
+            if (checksum != sb.super.v2_v3.chksum)
+                h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM",
+                                    "corrupt", super_off, "superblock",
+                                    "superblock checksum mismatch");
+        }
+
+    return ctx;
+}
+
+fun h5policy_validate_root_ohdr = (int ios, ohdr root,
+                                   H5PolicyLimits profile,
+                                   H5WalkContext ctx,
+                                   offset<uint<64>,B> root_off) H5WalkContext:
+{
+    ctx = h5policy_count_root_object(ctx, profile, root_off);
+    ctx = h5policy_account_metadata(ctx, profile,
+                                    root'size/#B, root_off, "/");
+
+    if (root.sig_peek == V2_SIG)
+        {
+            var version = root._ohdr.v2.version;
+            var crt_order_tracked = ((root._ohdr.v2.flags & 4U) != 0);
+            var prefix_bytes = crt_order_tracked ? (V2_PREFIX_BYTES + 2) : V2_PREFIX_BYTES;
+            var chunk_size = bytes_to_u64_le(root._ohdr.v2.chunk0_size);
+            var chunk_off = root._ohdr.v2._msg_chunk.msg_chunk'offset;
+
+            global_crt_tracked = crt_order_tracked;
+            ctx = h5policy_validate_msg_chunk(ios, profile, ctx,
+                                              version, prefix_bytes,
+                                              chunk_off, chunk_size, "/");
+
+            var checksum_bytes = byte[(root'size/#B) - 4UL] @ ios : root_off;
+            var checksum = lookup3_hashlittle(checksum_bytes, 0);
+            if (checksum != lookup3_u32_le(root._ohdr.v2.chksum))
+                h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM",
+                                    "corrupt", root_off, "/",
+                                    "root object-header checksum mismatch");
+        }
+    else
+        {
+            var version1 = root._ohdr.v1.version;
+            var prefix_bytes1 = V1_PREFIX_BYTES;
+            var chunk_size1 = root._ohdr.v1.obj_hdr_size as uint<64>;
+            var chunk_off1 = root._ohdr.v1._msg_chunk.msg_chunk'offset;
+
+            global_crt_tracked = 0;
+            ctx = h5policy_validate_msg_chunk(ios, profile, ctx,
+                                              version1, prefix_bytes1,
+                                              chunk_off1, chunk_size1, "/");
+        }
+
+    return ctx;
+}
+
+fun h5policy_validate_root_ohdr_raw = (int ios,
+                                       H5PolicyLimits profile,
+                                       H5WalkContext ctx,
+                                       offset<uint<64>,B> root_off) H5WalkContext:
+{
+    var file_size = iosize(ios)/#B;
+    var sig = h5policy_map_bytes(ios, profile, root_off, 4UL);
+
+    ctx = h5policy_count_root_object(ctx, profile, root_off);
+
+    if (sig == V2_SIG)
+        {
+            var version = h5policy_read_u64_le_at(ios, profile,
+                                                  root_off + 4#B, 1UL) as uint<8>;
+            var flags = h5policy_read_u64_le_at(ios, profile,
+                                                root_off + 5#B, 1UL) as uint<8>;
+
+            if (version != 2UB)
+                {
+                    h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
+                                        "corrupt", root_off, "/",
+                                        "v2 object-header signature has an unsupported version byte");
+                    return ctx;
+                }
+
+            var cursor = root_off + 6#B;
+            if ((flags & (1U <<. 5)) != 0U)
+                cursor = cursor + 16#B;
+            if ((flags & (1U <<. 4)) != 0U)
+                cursor = cursor + 4#B;
+
+            var size_width = 1UL <<. (flags & 3U);
+            var chunk_size = h5policy_read_u64_le_at(ios, profile,
+                                                     cursor, size_width);
+            var chunk_off = cursor + size_width#B;
+            var header_bytes = ((chunk_off - root_off)/#B) as uint<64>;
+            var total_without_checksum =
+                h5policy_checked_add_u64(header_bytes, chunk_size,
+                                         0xffffffffffffffffUL,
+                                         "H5_CORRUPT_LENGTH_OVERFLOW",
+                                         "corrupt", root_off, "/",
+                                         "root object-header size overflow");
+            var total_size =
+                h5policy_checked_add_u64(total_without_checksum, 4UL,
+                                         0xffffffffffffffffUL,
+                                         "H5_CORRUPT_LENGTH_OVERFLOW",
+                                         "corrupt", root_off, "/",
+                                         "root object-header checksum size overflow");
+
+            var ok = h5policy_checked_addr_range(root_off/#B, total_size,
+                                                 file_size,
+                                                 "root object header outside file",
+                                                 root_off, "/");
+            if (!ok)
+                return ctx;
+
+            ctx = h5policy_account_metadata(ctx, profile,
+                                            total_size, root_off, "/");
+
+            var crt_order_tracked = ((flags & 4U) != 0U);
+            var prefix_bytes = crt_order_tracked ? (V2_PREFIX_BYTES + 2) : V2_PREFIX_BYTES;
+
+            global_crt_tracked = crt_order_tracked;
+            ctx = h5policy_validate_msg_chunk(ios, profile, ctx,
+                                              version, prefix_bytes,
+                                              chunk_off, chunk_size, "/");
+
+            var checksum_bytes = h5policy_map_bytes(ios, profile,
+                                                    root_off,
+                                                    total_size - 4UL);
+            var stored_checksum = lookup3_u32_le(h5policy_map_bytes(ios, profile,
+                                                                    root_off + (total_size - 4UL)#B,
+                                                                    4UL));
+            var checksum = lookup3_hashlittle(checksum_bytes, 0);
+            if (checksum != stored_checksum)
+                h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM",
+                                    "corrupt", root_off, "/",
+                                    "root object-header checksum mismatch");
+
+            return ctx;
+        }
+
+    var version1 = h5policy_read_u64_le_at(ios, profile, root_off, 1UL) as uint<8>;
+    if (version1 != 1UB)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
+                                "corrupt", root_off, "/",
+                                "root object header is neither v1 nor v2");
+            return ctx;
+        }
+
+    var chunk_size1 = h5policy_read_u64_le_at(ios, profile,
+                                             root_off + 8#B, 4UL);
+    var total_size1 =
+        h5policy_checked_add_u64(16UL, chunk_size1,
+                                 0xffffffffffffffffUL,
+                                 "H5_CORRUPT_LENGTH_OVERFLOW",
+                                 "corrupt", root_off, "/",
+                                 "root object-header size overflow");
+    var ok1 = h5policy_checked_addr_range(root_off/#B, total_size1,
+                                          file_size,
+                                          "root object header outside file",
+                                          root_off, "/");
+    if (!ok1)
+        return ctx;
+
+    ctx = h5policy_account_metadata(ctx, profile,
+                                    total_size1, root_off, "/");
+
+    global_crt_tracked = 0;
+    ctx = h5policy_validate_msg_chunk(ios, profile, ctx,
+                                      version1, V1_PREFIX_BYTES,
+                                      root_off + 16#B, chunk_size1, "/");
+
+    return ctx;
+}

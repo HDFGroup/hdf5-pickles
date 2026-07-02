@@ -1,0 +1,240 @@
+/* h5_walk.pk - Bounded object-header walking for h5policy Phase 1.  */
+
+type H5WalkContext = struct
+{
+    uint<64> metadata_seen;
+    uint<64> object_count;
+    uint<64> attribute_count;
+    uint<64> object_header_chunk_count;
+    uint<64> btree_depth;
+    uint<64> link_depth;
+    uint<64> dtype_depth;
+};
+
+fun h5policy_new_walk_context = H5WalkContext:
+{
+    return H5WalkContext
+    {
+        metadata_seen = 0UL,
+        object_count = 0UL,
+        attribute_count = 0UL,
+        object_header_chunk_count = 0UL,
+        btree_depth = 0UL,
+        link_depth = 0UL,
+        dtype_depth = 0UL
+    };
+}
+
+fun h5policy_account_metadata = (H5WalkContext ctx,
+                                 H5PolicyLimits profile,
+                                 uint<64> bytes,
+                                 off64 loc,
+                                 string object) H5WalkContext:
+{
+    var next = h5policy_checked_add_u64(ctx.metadata_seen, bytes,
+                                        profile.max_metadata_bytes,
+                                        "H5_RESOURCE_METADATA_BYTES",
+                                        "resource",
+                                        loc, object,
+                                        "metadata byte budget exceeded");
+    ctx.metadata_seen = next;
+    return ctx;
+}
+
+fun h5policy_count_root_object = (H5WalkContext ctx,
+                                  H5PolicyLimits profile,
+                                  off64 loc) H5WalkContext:
+{
+    var next = h5policy_checked_add_u64(ctx.object_count, 1UL,
+                                        profile.max_object_count,
+                                        "H5_RESOURCE_OBJECT_COUNT",
+                                        "resource",
+                                        loc, "/",
+                                        "object count budget exceeded");
+    ctx.object_count = next;
+    return ctx;
+}
+
+fun h5policy_map_msg_prefix = (int ios, H5PolicyLimits profile,
+                               offset<uint<64>,B> off) msg_prefix:
+{
+    if (profile.forensic_mode != 0UB)
+        return msg_prefix @! ios : off;
+    return msg_prefix @ ios : off;
+}
+
+fun h5policy_map_cont = (int ios, H5PolicyLimits profile,
+                         offset<uint<64>,B> off) H5O_msg_cont:
+{
+    if (profile.forensic_mode != 0UB)
+        return H5O_msg_cont @! ios : off;
+    return H5O_msg_cont @ ios : off;
+}
+
+fun h5policy_known_message_id = (uint<64> m_type) int:
+{
+    if (m_type <= 0x06UL) return 1;
+    if (m_type == 0x08UL) return 1;
+    if (m_type >= 0x0aUL && m_type <= 0x18UL) return 1;
+    return 0;
+}
+
+fun h5policy_message_name = (uint<64> m_type) string:
+{
+    if (m_type == 0x00UL) return "nil";
+    if (m_type == 0x01UL) return "dataspace";
+    if (m_type == 0x02UL) return "link_info";
+    if (m_type == 0x03UL) return "datatype";
+    if (m_type == 0x04UL) return "old_fill_value";
+    if (m_type == 0x05UL) return "fill_value";
+    if (m_type == 0x06UL) return "link";
+    if (m_type == 0x07UL) return "external_file_list";
+    if (m_type == 0x08UL) return "layout";
+    if (m_type == 0x09UL) return "bogus";
+    if (m_type == 0x0aUL) return "group_info";
+    if (m_type == 0x0bUL) return "filter_pipeline";
+    if (m_type == 0x0cUL) return "attribute";
+    if (m_type == 0x0dUL) return "object_name";
+    if (m_type == 0x0eUL) return "old_mtime";
+    if (m_type == 0x0fUL) return "shared_message_table";
+    if (m_type == 0x10UL) return "object_header_continuation";
+    if (m_type == 0x11UL) return "symbol_table";
+    if (m_type == 0x12UL) return "mtime";
+    if (m_type == 0x13UL) return "btree_k";
+    if (m_type == 0x14UL) return "driver_info";
+    if (m_type == 0x15UL) return "attribute_info";
+    if (m_type == 0x16UL) return "reference_count";
+    if (m_type == 0x17UL) return "file_space_info";
+    if (m_type == 0x18UL) return "metadata_cache_image";
+    return "unknown";
+}
+
+fun h5policy_validate_message_policy = (uint<64> m_type,
+                                        H5PolicyLimits profile,
+                                        off64 loc,
+                                        string object) void:
+{
+    if (m_type == 0x07UL && profile.allow_external_storage == 0UB)
+        h5policy_emit_error("H5_POLICY_EXTERNAL_STORAGE", "policy",
+                            loc, object,
+                            "external file list message encountered; profile denies external storage");
+
+    if (m_type == 0x09UL && profile.allow_legacy_dangerous_messages == 0UB)
+        h5policy_emit_error("H5_POLICY_LEGACY_DANGEROUS_MESSAGE", "policy",
+                            loc, object,
+                            "bogus-valid object header message encountered");
+
+    if (!h5policy_known_message_id(m_type))
+        {
+            if (profile.allow_unknown_messages == 0UB)
+                h5policy_emit_error("H5_POLICY_UNKNOWN_MESSAGE", "policy",
+                                    loc, object,
+                                    "unknown object-header message encountered");
+            else
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", loc, object,
+                                    "unknown object-header message is not classified by this validator");
+        }
+}
+
+fun h5policy_validate_msg_chunk = (int ios,
+                                   H5PolicyLimits profile,
+                                   H5WalkContext ctx,
+                                   uint<8> version,
+                                   int prefix_bytes,
+                                   offset<uint<64>,B> chunk_off,
+                                   uint<64> chunk_size,
+                                   string object) H5WalkContext:
+{
+    var i = 0UL;
+    var msg_count = 0UL;
+    var file_size = iosize(ios)/#B;
+
+    global_version = version;
+
+    while (i < chunk_size)
+        {
+            if ((chunk_size - i) < (prefix_bytes as uint<64>))
+                {
+                    h5policy_emit_error("H5_CORRUPT_MESSAGE_PREFIX_OVERRUNS_CHUNK",
+                                        "corrupt",
+                                        chunk_off + i#B, object,
+                                        "object-header message prefix overruns chunk");
+                    return ctx;
+                }
+
+            var prefix = h5policy_map_msg_prefix(ios, profile, chunk_off + i#B);
+            var m_type = 0UL;
+            var m_size = 0UL;
+            var m_flags = 0UB;
+
+            if (version == 1UB)
+                {
+                    m_type = prefix.v1_msg_prefix.msg_type as uint<64>;
+                    m_size = prefix.v1_msg_prefix.msg_size as uint<64>;
+                    m_flags = prefix.v1_msg_prefix.msg_flags;
+                }
+            else
+                {
+                    m_type = prefix.v2_msg_prefix.msg_type as uint<64>;
+                    m_size = prefix.v2_msg_prefix.msg_size as uint<64>;
+                    m_flags = prefix.v2_msg_prefix.msg_flags;
+                }
+
+            var payload_off = chunk_off + i#B + (prefix_bytes as uint<64>)#B;
+            var remaining = chunk_size - i - (prefix_bytes as uint<64>);
+
+            if (m_size > remaining)
+                {
+                    h5policy_emit_error("H5_CORRUPT_MESSAGE_OVERRUNS_CHUNK",
+                                        "corrupt",
+                                        payload_off, object,
+                                        "object-header message payload overruns chunk");
+                    return ctx;
+                }
+
+            h5policy_validate_message_policy(m_type, profile,
+                                             chunk_off + i#B, object);
+
+            if (m_type == 0x10UL)
+                {
+                    var cont = h5policy_map_cont(ios, profile, payload_off);
+                    var cont_addr = bytes_to_u64_le(cont.addr_raw);
+                    var cont_size = bytes_to_u64_le(cont.size_raw);
+
+                    ctx.object_header_chunk_count =
+                        h5policy_checked_add_u64(ctx.object_header_chunk_count,
+                                                 1UL,
+                                                 profile.max_object_header_chunks,
+                                                 "H5_RESOURCE_OBJECT_HEADER_CHUNKS",
+                                                 "resource",
+                                                 payload_off, object,
+                                                 "object-header continuation chunk budget exceeded");
+
+                    if (cont_size == 0UL)
+                        h5policy_emit_error("H5_CORRUPT_ZERO_CONTINUATION_CHUNK",
+                                            "corrupt",
+                                            payload_off, object,
+                                            "object-header continuation chunk has zero size");
+                    else
+                        {
+                            var ok = h5policy_checked_addr_range(cont_addr,
+                                                                 cont_size,
+                                                                 file_size,
+                                                                 "object-header continuation chunk outside file",
+                                                                 payload_off,
+                                                                 object);
+                            if (ok && cont_addr == (chunk_off/#B))
+                                h5policy_emit_error("H5_CORRUPT_SELF_REFERENTIAL_CONTINUATION",
+                                                    "corrupt",
+                                                    payload_off, object,
+                                                    "object-header continuation chunk points to its own chunk");
+                        }
+                }
+
+            i = i + (prefix_bytes as uint<64>) + m_size;
+            msg_count = msg_count + 1UL;
+        }
+
+    return ctx;
+}

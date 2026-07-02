@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  h5policy [--profile untrusted-strict|forensic] [--json] [--non-strict] FILE
+  h5policy [--profile forensic] [--json] [--continue-after-corruption] FILE
+  h5policy -h|--help
+
+Phase 0/1 boundary:
+  metadata-only, read-only, no libhdf5, no plugins, no decompression,
+  no external file opens, no repair, no writes, no application deserialization.
+
+Exit codes:
+  0  accept
+  1  accept_with_warnings
+  2  reject_corrupt
+  3  reject_policy
+  4  reject_resource
+  5  unsupported_coverage_gap
+  70 internal_error
+EOF
+}
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+overlay_dir="$(cd -- "$script_dir/.." && pwd)"
+repo_dir="$(cd -- "$overlay_dir/.." && pwd)"
+
+profile="untrusted_strict"
+json=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --json)
+            json=1
+            shift
+            ;;
+        --profile)
+            if [[ $# -lt 2 ]]; then
+                printf 'h5policy: --profile requires an argument\n\n' >&2
+                usage >&2
+                exit 2
+            fi
+            case "$2" in
+                untrusted-strict|untrusted_strict)
+                    profile="untrusted_strict"
+                    ;;
+                forensic)
+                    profile="forensic"
+                    ;;
+                *)
+                    printf 'h5policy: unsupported profile: %s\n\n' "$2" >&2
+                    usage >&2
+                    exit 2
+                    ;;
+            esac
+            shift 2
+            ;;
+        --non-strict|--continue-after-corruption)
+            profile="forensic"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            printf 'h5policy: unknown option: %s\n\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ $# -ne 1 ]]; then
+    usage >&2
+    exit 2
+fi
+
+file=$1
+
+if [[ ! -e "$file" ]]; then
+    printf 'h5policy: file not found: %s\n' "$file" >&2
+    exit 1
+fi
+
+if [[ "$file" == *$'\n'* ]]; then
+    printf 'h5policy: file names containing newlines are not supported\n' >&2
+    exit 1
+fi
+
+if [[ $json -eq 0 ]]; then
+    printf 'h5policy: Phase 1 currently supports JSON output only; pass --json\n' >&2
+    exit 2
+fi
+
+escape_poke_string() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '%s' "$value"
+}
+
+if [[ -n "${POKE_LOAD_PATH:-}" ]]; then
+    export POKE_LOAD_PATH="$overlay_dir/pickles:$repo_dir/pickles:$POKE_LOAD_PATH"
+else
+    export POKE_LOAD_PATH="$overlay_dir/pickles:$repo_dir/pickles"
+fi
+
+cmd_file=$(mktemp "${TMPDIR:-/tmp}/h5policy.XXXXXX")
+trap 'rm -f "$cmd_file"' EXIT
+
+{
+    printf 'load h5_policy\n'
+    printf 'h5policy_profile_name = "%s"\n' "$(escape_poke_string "$profile")"
+    printf 'h5policy_file_name = "%s"\n' "$(escape_poke_string "$file")"
+    printf 'h5policy_run\n'
+    printf '.exit 0\n'
+} >"$cmd_file"
+
+poke_status=0
+poke_output=$(poke --quiet -s "$cmd_file" 2>&1) || poke_status=$?
+
+exit_code=
+report=""
+while IFS= read -r line; do
+    case "$line" in
+        __H5POLICY_EXIT_CODE=*)
+            exit_code=${line#__H5POLICY_EXIT_CODE=}
+            ;;
+        *)
+            report+="$line"$'\n'
+            ;;
+    esac
+done <<<"$poke_output"
+
+if [[ -z "$exit_code" ]]; then
+    printf '%s' "$poke_output" >&2
+    if [[ $poke_status -ne 0 ]]; then
+        exit "$poke_status"
+    fi
+    exit 70
+fi
+
+printf '%s' "$report"
+exit "$exit_code"
