@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Differential harness: h5policy vs. libhdf5 (h5py / h5dump / h5debug).
+
+h5policy parses HDF5 bytes independently of libhdf5.  This tool cross-checks
+that independent parse against the reference implementation, catching the class
+of field-offset bug that unit tests miss (e.g. mis-decoding a datatype version).
+
+For each file it runs h5policy in forensic mode (so the walk accumulates full
+metrics) and compares against:
+
+  * h5py    - the structural reference: does libhdf5 open the bytes, and what
+              external links / dataset shapes / ranks does it see?
+  * h5dump  - an independent "does libhdf5 accept these bytes" signal (rc).
+  * h5debug - a second such signal, plus a human-auditable superblock dump.
+
+Cross-invariants (a hard failure exits non-zero; a warning is informational):
+
+  A  libhdf5 opens  =>  h5policy decision is not reject_corrupt   (no false +)
+  A' libhdf5 rejects =>  h5policy decision is reject_corrupt       (no false -)
+  B  (h5py sees an external link)  <=>  (h5policy external_links > 0)
+  C  h5policy max logical dataset bytes  <=  h5py's                (no overcount)
+  D  h5policy max rank seen  <=  h5py's                            (no overcount)
+
+Usage: h5policy-diff FILE [FILE ...]
+       h5policy-diff --dir DIR        # every *.h5 under DIR
+"""
+import argparse
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+try:
+    import h5py
+except ImportError:  # pragma: no cover
+    sys.exit("h5policy-diff: h5py is required (it is the reference implementation)")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+H5POLICY = os.path.join(HERE, "h5policy")
+KNOWN_EXITS = {0, 1, 2, 3, 4, 5, 70}
+
+
+def run_h5policy(path):
+    """Forensic run so metrics reflect the whole reachable graph."""
+    proc = subprocess.run([H5POLICY, "--profile", "forensic", "--json", path],
+                          capture_output=True, text=True, timeout=60)
+    if proc.returncode not in KNOWN_EXITS:
+        raise RuntimeError(f"h5policy crashed (exit {proc.returncode}): "
+                           f"{proc.stderr.strip()[:200]}")
+    return json.loads(proc.stdout), proc.returncode
+
+
+def reference_rc(tool, path):
+    """rc of an independent libhdf5 tool, or None if the tool is unavailable."""
+    if shutil.which(tool) is None:
+        return None
+    args = [tool, "-pBH", path] if tool == "h5dump" else [tool, path]
+    return subprocess.run(args, capture_output=True, text=True).returncode
+
+
+def introspect(path):
+    """Structural facts from libhdf5, following only hard links."""
+    facts = dict(opens=False, ext_links=0, max_logical=0, max_rank=0)
+    try:
+        f = h5py.File(path, "r")
+    except Exception:
+        return facts
+    facts["opens"] = True
+    stack, seen = [f], set()
+    while stack:
+        grp = stack.pop()
+        for key in grp.keys():
+            link = grp.get(key, getlink=True)
+            if isinstance(link, h5py.ExternalLink):
+                facts["ext_links"] += 1
+                continue
+            if isinstance(link, h5py.SoftLink):
+                continue
+            obj = grp.get(key)            # hard link: safe to resolve
+            if isinstance(obj, h5py.Group):
+                if id(obj) not in seen:
+                    seen.add(id(obj))
+                    stack.append(obj)
+            elif isinstance(obj, h5py.Dataset):
+                n = 1
+                for d in obj.shape:
+                    n *= int(d)
+                # Use libhdf5's on-disk datatype size (H5Tget_size), not numpy's
+                # in-memory itemsize: they differ for VLEN/reference types, and
+                # the on-disk size is what h5policy reads from the file.
+                elm = obj.id.get_type().get_size()
+                facts["max_logical"] = max(facts["max_logical"], n * elm)
+                facts["max_rank"] = max(facts["max_rank"], len(obj.shape))
+    f.close()
+    return facts
+
+
+def check(path):
+    """Return (hard_failures, warnings, lines) for one file."""
+    fails, warns, lines = [], [], []
+    report, _ = run_h5policy(path)
+    decision = report["decision"]
+    feat = report.get("features", {})
+    ref = introspect(path)
+    h5dump_rc = reference_rc("h5dump", path)
+    h5debug_rc = reference_rc("h5debug", path)
+
+    def hard(ok, msg):
+        (lines if ok else fails).append(("PASS " if ok else "FAIL ") + msg)
+
+    def soft(ok, msg):
+        (lines if ok else warns).append(("ok   " if ok else "WARN ") + msg)
+
+    # A / A': corruption agreement with libhdf5.
+    if ref["opens"]:
+        hard(decision != "reject_corrupt",
+             f"A  libhdf5 opens => not reject_corrupt (got {decision})")
+    else:
+        hard(decision == "reject_corrupt",
+             f"A' libhdf5 rejects => reject_corrupt (got {decision})")
+
+    # Independent oracles should agree with h5py on open-ability.
+    for tool, rc in (("h5dump", h5dump_rc), ("h5debug", h5debug_rc)):
+        if rc is not None:
+            soft((rc == 0) == ref["opens"],
+                 f"   {tool} rc={rc} agrees with libhdf5 open={ref['opens']}")
+
+    if ref["opens"]:
+        # B: external-reference detection.
+        hard((feat.get("external_links", 0) > 0) == (ref["ext_links"] > 0),
+             f"B  external links: h5policy={feat.get('external_links',0)} "
+             f"h5py={ref['ext_links']}")
+
+        # C: logical dataset bytes must never exceed the reference (overcount =
+        # a decode bug); undercount is an accepted coverage gap.
+        pmax, rmax = feat.get("max_logical_dataset_bytes_seen", 0), ref["max_logical"]
+        hard(pmax <= rmax,
+             f"C  max logical bytes: h5policy={pmax} h5py={rmax}")
+        if pmax < rmax:
+            soft(False, f"C  undercount (coverage gap): h5policy={pmax} < h5py={rmax}")
+
+        # D: rank must never exceed the reference.
+        prank, rrank = feat.get("max_rank_seen", 0), ref["max_rank"]
+        hard(prank <= rrank,
+             f"D  max rank: h5policy={prank} h5py={rrank}")
+        if prank < rrank:
+            soft(False, f"D  rank undercount: h5policy={prank} < h5py={rrank}")
+
+    return fails, warns, lines
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("paths", nargs="*", help="HDF5 files")
+    ap.add_argument("--dir", help="check every *.h5 under this directory")
+    args = ap.parse_args()
+
+    files = list(args.paths)
+    if args.dir:
+        files += sorted(glob.glob(os.path.join(args.dir, "**", "*.h5"),
+                                  recursive=True))
+    if not files:
+        ap.error("no files given (pass files or --dir)")
+
+    for tool in ("h5dump", "h5debug"):
+        if shutil.which(tool) is None:
+            print(f"note: {tool} not found; skipping its oracle", file=sys.stderr)
+
+    total_fail = 0
+    for path in files:
+        rel = os.path.relpath(path)
+        try:
+            fails, warns, lines = check(path)
+        except Exception as exc:
+            print(f"\n{rel}\n  ERROR {exc}")
+            total_fail += 1
+            continue
+        status = "FAIL" if fails else ("WARN" if warns else "PASS")
+        print(f"\n{rel}  [{status}]")
+        for ln in lines + warns + fails:
+            print(f"  {ln}")
+        total_fail += len(fails)
+
+    print(f"\ndifferential: {total_fail} hard failure(s) across {len(files)} file(s)")
+    return 1 if total_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

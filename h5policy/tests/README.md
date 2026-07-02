@@ -20,8 +20,28 @@ controlled outcome; a change that alters any decision is surfaced for review.
 ./run.sh
 ```
 
-This regenerates the fixtures, runs the datatype unit checks, then runs
-`h5policy` over every `expected/*.yml` case and asserts the result.
+This regenerates the fixtures, runs the datatype unit checks, runs `h5policy`
+over every `expected/*.yml` case and asserts the result, then runs the
+differential harness.
+
+## Differential harness
+
+`../tools/h5policy-diff` cross-checks h5policy's independent parse against
+libhdf5, catching field-offset bugs that the corpus alone can miss:
+
+- **h5py** is the structural reference — does libhdf5 open the bytes, and what
+  external links / dataset shapes / on-disk datatype sizes does it report;
+- **h5dump** / **h5debug** are independent "does libhdf5 accept these bytes"
+  signals (optional; skipped if not on `PATH`).
+
+It fails if h5policy calls a libhdf5-valid file corrupt (or vice versa),
+disagrees on external references, or **over-counts** a dataset's logical size or
+rank versus libhdf5 (an under-count is only a warning — it is the expected
+symptom of a coverage gap). Run standalone with:
+
+```sh
+../tools/h5policy-diff --dir .        # or: ../tools/h5policy-diff FILE ...
+```
 
 ## Fixtures
 

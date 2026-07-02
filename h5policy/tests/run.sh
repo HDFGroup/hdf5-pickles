@@ -27,9 +27,14 @@ TESTS_DIR="$tests_dir" TOOL="$overlay_dir/tools/h5policy" \
     python3 "$tests_dir/_check.py"
 corpus_status=$?
 
-if [[ $unit_status -eq 0 && $corpus_status -eq 0 ]]; then
+echo "== differential vs libhdf5 (h5py / h5dump / h5debug) =="
+"$overlay_dir/tools/h5policy-diff" --dir "$tests_dir" | \
+    grep -E '\[(PASS|FAIL|WARN)\]|FAIL |differential:'
+diff_status=${PIPESTATUS[0]}
+
+if [[ $unit_status -eq 0 && $corpus_status -eq 0 && $diff_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status corpus=$corpus_status)"
+echo "TESTS FAILED (unit=$unit_status corpus=$corpus_status diff=$diff_status)"
 exit 1
