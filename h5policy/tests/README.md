@@ -39,9 +39,11 @@ libhdf5, catching field-offset bugs that the corpus alone can miss:
   signals (optional; skipped if not on `PATH`).
 
 It fails if h5policy calls a libhdf5-valid file corrupt (or vice versa),
-disagrees on external references, or **over-counts** a dataset's logical size or
-rank versus libhdf5 (an under-count is only a warning — it is the expected
-symptom of a coverage gap). Run standalone with:
+disagrees on external references, or over-counts a dataset's **rank**. The
+logical-**bytes** comparison is advisory: h5policy reads the declared on-disk
+element size, which for padded compounds (and VLEN) legitimately differs from
+libhdf5's packed `H5Tget_size` — using the larger declared size is the
+conservative, correct choice for a security oracle. Run standalone with:
 
 ```sh
 ../tools/h5policy-diff --dir .        # or: ../tools/h5policy-diff FILE ...
