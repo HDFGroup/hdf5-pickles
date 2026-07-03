@@ -1063,6 +1063,95 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
     return ctx;
 }
 
+var H5POLICY_EAHD_SIG = [0x45UB, 0x41UB, 0x48UB, 0x44UB];   /* "EAHD" */
+var H5POLICY_EAIB_SIG = [0x45UB, 0x41UB, 0x49UB, 0x42UB];   /* "EAIB" */
+
+/* Validate an extensible-array chunk index (v4 layout index type 4), used by
+   chunked datasets with one unlimited dimension.  The checksummed header gives
+   the element count (= chunk count) and index-block address.  The index block
+   stores the first `idx_blk_elmts` chunk addresses inline (validated here);
+   deeper data/secondary blocks are counted via the header under budget rather
+   than fully walked ("validate the index root under a budget").  */
+fun h5policy_walk_ext_array_chunks = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                                      uint<64> hdr_addr, off64 loc,
+                                      string object) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var file_size = iosize(ios)/#B;
+    var hdr_size = 16UL + (6UL * el) + o;
+
+    if (!h5policy_checked_addr_range(hdr_addr, hdr_size, file_size,
+                                     "extensible array header outside file", loc, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL) != H5POLICY_EAHD_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", hdr_addr#B, object,
+                                "extensible array header signature mismatch");
+            return ctx;
+        }
+
+    var hdr_body = h5policy_msg_bytes(ios, profile, hdr_addr#B, hdr_size - 4UL);
+    var hdr_stored = lookup3_u32_le(h5policy_msg_bytes(ios, profile,
+                                                       hdr_addr#B + (hdr_size - 4UL)#B, 4UL));
+    if (lookup3_hashlittle(hdr_body, 0) != hdr_stored)
+        h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM", "corrupt", hdr_addr#B, object,
+                            "extensible array header checksum mismatch");
+
+    var raw_elmt_size = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 6#B, 1UL);
+    var idx_blk_elmts = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 8#B, 1UL);
+    var nelmts = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (12UL + (5UL * el))#B, el);
+    var idx_raw = h5policy_msg_bytes(ios, profile, hdr_addr#B + (12UL + (6UL * el))#B, o);
+    var idx_blk_addr = bytes_to_u64_le(idx_raw);
+
+    ctx.chunk_index_count =
+        h5policy_checked_add_u64(ctx.chunk_index_count, nelmts,
+                                 profile.max_chunk_count,
+                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
+                                 hdr_addr#B, object,
+                                 "chunk count exceeds the selected profile limit");
+    ctx = h5policy_account_metadata(ctx, profile, hdr_size, hdr_addr#B, object);
+
+    if (h5policy_msg_addr_is_undef(idx_raw))
+        return ctx;
+    if (idx_blk_addr >= file_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt", hdr_addr#B, object,
+                                "extensible array index block outside file");
+            return ctx;
+        }
+
+    var ib_prefix = 6UL + o;
+    var inline = h5policy_checked_mul_u64(idx_blk_elmts, raw_elmt_size, 0xffffffffffffffffUL,
+                                          "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                          idx_blk_addr#B, object,
+                                          "extensible array index block size overflow");
+    if (!h5policy_checked_addr_range(idx_blk_addr, ib_prefix + inline, file_size,
+                                     "extensible array index block body outside file",
+                                     idx_blk_addr#B, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, idx_blk_addr#B, 4UL) != H5POLICY_EAIB_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", idx_blk_addr#B, object,
+                                "extensible array index block signature mismatch");
+            return ctx;
+        }
+
+    var i = 0UL;
+    while (i < idx_blk_elmts)
+        {
+            var elem_off = idx_blk_addr + ib_prefix + (i * raw_elmt_size);
+            var caddr_raw = h5policy_msg_bytes(ios, profile, elem_off#B, o);
+            var caddr = bytes_to_u64_le(caddr_raw);
+            if (!h5policy_msg_addr_is_undef(caddr_raw) && caddr >= file_size)
+                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt", elem_off#B, object,
+                                    "chunk data address outside file");
+            i = i + 1UL;
+        }
+
+    return ctx;
+}
+
 fun h5policy_validate_layout_payload = (int ios,
                                         H5PolicyLimits profile,
                                         H5WalkContext ctx,
@@ -1320,6 +1409,13 @@ fun h5policy_validate_layout_payload = (int ios,
                                                                                idx_addr4,
                                                                                payload_off + idx_addr_rel#B,
                                                                                object);
+                                    else if (idx_type == 4UL
+                                             && idx_addr4 != 0UL
+                                             && idx_addr4 != 0xffffffffffffffffUL)
+                                        ctx = h5policy_walk_ext_array_chunks(ios, profile, ctx,
+                                                                             idx_addr4,
+                                                                             payload_off + idx_addr_rel#B,
+                                                                             object);
                                     else if (idx_type == 1UL)
                                         {
                                             /* Single Chunk: the address field is
