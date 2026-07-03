@@ -38,12 +38,17 @@ libhdf5, catching field-offset bugs that the corpus alone can miss:
 - **h5dump** / **h5debug** are independent "does libhdf5 accept these bytes"
   signals (optional; skipped if not on `PATH`).
 
-It fails if h5policy calls a libhdf5-valid file corrupt (or vice versa),
-disagrees on external references, or over-counts a dataset's **rank**. The
-logical-**bytes** comparison is advisory: h5policy reads the declared on-disk
-element size, which for padded compounds (and VLEN) legitimately differs from
-libhdf5's packed `H5Tget_size` — using the larger declared size is the
-conservative, correct choice for a security oracle. Run standalone with:
+It fails if h5policy accepts a file that libhdf5 structurally rejects, calls a
+structurally valid file corrupt with no deeper libhdf5 evidence, disagrees on
+external references, or over-counts a dataset's **rank**. A `reject_corrupt` on a
+file that h5py can structurally traverse is downgraded to an `A+` warning when a
+bounded, out-of-process libhdf5 probe also errors while inspecting attributes,
+reading small datasets, or running optional libhdf5 tools; those eager catches
+are security-useful, not hard false positives. The logical-**bytes** comparison
+is advisory: h5policy reads the declared on-disk element size, which for padded
+compounds (and VLEN) legitimately differs from libhdf5's packed `H5Tget_size` —
+using the larger declared size is the conservative, correct choice for a
+security oracle. Run standalone with:
 
 ```sh
 ../tools/h5policy-diff --dir .        # or: ../tools/h5policy-diff FILE ...

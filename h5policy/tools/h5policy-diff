@@ -15,8 +15,9 @@ metrics) and compares against:
 
 Cross-invariants (a hard failure exits non-zero; a warning is informational):
 
-  A  libhdf5 opens  =>  h5policy decision is not reject_corrupt   (no false +)
-  A' libhdf5 rejects =>  h5policy decision is reject_corrupt       (no false -)
+  A  libhdf5 structurally opens => h5policy is not reject_corrupt  (no false +)
+     unless a deeper libhdf5 probe also rejects attrs/data/tools (A+, warning)
+  A' libhdf5 rejects           => h5policy decision is reject_corrupt (no false -)
   B  (h5py sees an external link)  <=>  (h5policy external_links > 0)
   C  h5policy max logical dataset bytes  <=  h5py's                (no overcount)
   D  h5policy max rank seen  <=  h5py's                            (no overcount)
@@ -40,6 +41,7 @@ except ImportError:  # pragma: no cover
 HERE = os.path.dirname(os.path.abspath(__file__))
 H5POLICY = os.path.join(HERE, "h5policy")
 KNOWN_EXITS = {0, 1, 2, 3, 4, 5, 70}
+READ_PROBE_MAX_BYTES = 16 * 1024 * 1024
 
 
 def run_h5policy(path):
@@ -137,6 +139,159 @@ def introspect_isolated(path):
         return hard_reject
 
 
+def _err(exc):
+    msg = str(exc).replace("\n", " ")
+    return f"{type(exc).__name__}: {msg[:240]}"
+
+
+def _object_path(obj):
+    try:
+        return obj.name or "/"
+    except Exception:
+        return "?"
+
+
+def _object_key(obj):
+    """Stable-ish identity for cycle guards across h5py wrapper objects."""
+    try:
+        return ("addr", int(h5py.h5o.get_info(obj.id).addr))
+    except Exception:
+        return ("py", id(obj))
+
+
+def _dataset_logical_bytes(dset):
+    n = 1
+    for d in dset.shape:
+        n *= int(d)
+    return n * dset.id.get_type().get_size()
+
+
+def eager_probe(path):
+    """Exercise deeper libhdf5 paths after a structural open succeeds.
+
+    h5py's basic group traversal is deliberately shallow: it can say a file
+    "opens" while corrupt attributes or chunk addresses are only rejected when a
+    consumer asks for them.  h5policy intentionally catches those eagerly.  This
+    probe gathers bounded evidence for that distinction without making the main
+    harness run hostile libhdf5 calls in-process.
+    """
+    facts = dict(open_error=None, traversal_errors=[], attr_errors=[],
+                 read_errors=[], datasets_seen=0, datasets_read=0,
+                 skipped_large_reads=0, skipped_object_reads=0)
+
+    def record(bucket, where, op, exc):
+        facts[bucket].append(dict(path=where or "/", op=op, error=_err(exc)))
+
+    def probe_attrs(obj):
+        try:
+            list(obj.attrs.keys())
+        except Exception as exc:
+            record("attr_errors", _object_path(obj), "attrs.keys", exc)
+
+    def probe_dataset(dset):
+        facts["datasets_seen"] += 1
+        where = _object_path(dset)
+        try:
+            logical = _dataset_logical_bytes(dset)
+        except Exception as exc:
+            record("traversal_errors", where, "dataset.size", exc)
+            return
+        try:
+            if getattr(dset.dtype, "hasobject", False):
+                facts["skipped_object_reads"] += 1
+                return
+        except Exception as exc:
+            record("traversal_errors", where, "dataset.dtype", exc)
+            return
+        if logical > READ_PROBE_MAX_BYTES:
+            facts["skipped_large_reads"] += 1
+            return
+        try:
+            dset[...]
+            facts["datasets_read"] += 1
+        except Exception as exc:
+            record("read_errors", where, "dataset.read", exc)
+
+    try:
+        f = h5py.File(path, "r")
+    except Exception as exc:
+        facts["open_error"] = _err(exc)
+        return facts
+    try:
+        stack, seen = [f], {_object_key(f)}
+        while stack:
+            grp = stack.pop()
+            probe_attrs(grp)
+            try:
+                keys = list(grp.keys())
+            except Exception as exc:
+                record("traversal_errors", _object_path(grp), "group.keys", exc)
+                continue
+            for key in keys:
+                try:
+                    link = grp.get(key, getlink=True)
+                except Exception as exc:
+                    record("traversal_errors", _object_path(grp), "getlink", exc)
+                    continue
+                if isinstance(link, (h5py.ExternalLink, h5py.SoftLink)):
+                    continue
+                try:
+                    obj = grp[key]
+                except Exception as exc:
+                    record("traversal_errors", _object_path(grp), "open child", exc)
+                    continue
+                if isinstance(obj, h5py.Group):
+                    key_id = _object_key(obj)
+                    if key_id not in seen:
+                        seen.add(key_id)
+                        stack.append(obj)
+                elif isinstance(obj, h5py.Dataset):
+                    probe_attrs(obj)
+                    probe_dataset(obj)
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+    return facts
+
+
+def eager_probe_isolated(path):
+    """Run the eager probe in a child so crashes/hangs become evidence."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--probe-eager", path],
+            capture_output=True, text=True, errors="replace", timeout=60)
+    except subprocess.TimeoutExpired:
+        return {"probe_error": "timeout"}
+    if proc.returncode != 0:
+        err = proc.stderr.strip()[:240] or "no stderr"
+        return {"probe_error": f"rc={proc.returncode}: {err}"}
+    try:
+        return json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return {"probe_error": f"unparseable JSON: {_err(exc)}"}
+
+
+def eager_evidence(eager, h5dump_rc, h5debug_rc):
+    """Summarise deeper libhdf5 rejection evidence for A+ demotion."""
+    parts = []
+    if eager.get("probe_error"):
+        parts.append("probe_error")
+    if eager.get("open_error"):
+        parts.append("open_error")
+    for key, label in (("traversal_errors", "traverse"),
+                       ("attr_errors", "attrs"),
+                       ("read_errors", "reads")):
+        n = len(eager.get(key, []))
+        if n:
+            parts.append(f"{label}={n}")
+    for tool, rc in (("h5dump", h5dump_rc), ("h5debug", h5debug_rc)):
+        if rc not in (None, 0):
+            parts.append(f"{tool} rc={rc}")
+    return parts
+
+
 def check(path):
     """Return (hard_failures, warnings, lines) for one file."""
     fails, warns, lines = [], [], []
@@ -155,8 +310,20 @@ def check(path):
 
     # A / A': corruption agreement with libhdf5.
     if ref["opens"]:
-        hard(decision != "reject_corrupt",
-             f"A  libhdf5 opens => not reject_corrupt (got {decision})")
+        if decision == "reject_corrupt":
+            eager = eager_probe_isolated(path)
+            evidence = eager_evidence(eager, h5dump_rc, h5debug_rc)
+            if evidence:
+                soft(False,
+                     "A+ libhdf5 opens structurally; h5policy eager "
+                     f"reject_corrupt has deeper libhdf5 evidence "
+                     f"({', '.join(evidence)})")
+            else:
+                hard(False,
+                     f"A  libhdf5 opens => not reject_corrupt (got {decision})")
+        else:
+            hard(True,
+                 f"A  libhdf5 opens => not reject_corrupt (got {decision})")
     else:
         hard(decision == "reject_corrupt",
              f"A' libhdf5 rejects => reject_corrupt (got {decision})")
@@ -165,7 +332,7 @@ def check(path):
     for tool, rc in (("h5dump", h5dump_rc), ("h5debug", h5debug_rc)):
         if rc is not None:
             soft((rc == 0) == ref["opens"],
-                 f"   {tool} rc={rc} agrees with libhdf5 open={ref['opens']}")
+                 f"   {tool} rc={rc} vs h5py structural open={ref['opens']}")
 
     if ref["opens"]:
         # B: external-reference detection.
@@ -202,10 +369,15 @@ def main():
     ap.add_argument("--dir", help="check every *.h5 under this directory")
     ap.add_argument("--introspect", metavar="FILE",
                     help=argparse.SUPPRESS)  # internal: out-of-process oracle
+    ap.add_argument("--probe-eager", metavar="FILE",
+                    help=argparse.SUPPRESS)  # internal: deeper libhdf5 probe
     args = ap.parse_args()
 
     if args.introspect:  # child invocation: emit libhdf5 facts and exit
         print(json.dumps(introspect(args.introspect)))
+        return 0
+    if args.probe_eager:  # child invocation: emit deeper libhdf5 evidence
+        print(json.dumps(eager_probe(args.probe_eager)))
         return 0
 
     files = list(args.paths)
