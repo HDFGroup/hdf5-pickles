@@ -1,0 +1,152 @@
+/* h5_dataspace.pk - Dataspace message validation.  Split out of h5_walk.pk; loaded after it.  */
+
+fun h5policy_validate_dataspace_payload = (int ios,
+                                           H5PolicyLimits profile,
+                                           H5WalkContext ctx,
+                                           offset<uint<64>,B> payload_off,
+                                           uint<64> msg_size,
+                                           string object) H5WalkContext:
+{
+    if (!h5policy_payload_range_ok(msg_size, 0UL, 1UL,
+                                   "H5_CORRUPT_DATASPACE_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "dataspace message is too small"))
+        return ctx;
+
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL) as uint<8>;
+    var ndims = 0UL;
+    var dim_rel = 0UL;
+    var flags = 0UL;
+    var element_count = 1UL;
+    var element_count_overflowed = 0UB;
+    var dim_exceeds_max = 0UB;
+
+    if (version == 1UB)
+        {
+            if (!h5policy_payload_range_ok(msg_size, 0UL, 8UL,
+                                           "H5_CORRUPT_DATASPACE_MESSAGE_TOO_SMALL",
+                                           payload_off, object,
+                                           "dataspace v1 message is too small"))
+                return ctx;
+
+            ndims = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+            flags = h5policy_msg_u64_at(ios, profile, payload_off + 2#B, 1UL);
+            dim_rel = 8UL;
+        }
+    else if (version == 2UB)
+        {
+            if (!h5policy_payload_range_ok(msg_size, 0UL, 4UL,
+                                           "H5_CORRUPT_DATASPACE_MESSAGE_TOO_SMALL",
+                                           payload_off, object,
+                                           "dataspace v2 message is too small"))
+                return ctx;
+
+            ndims = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+            flags = h5policy_msg_u64_at(ios, profile, payload_off + 2#B, 1UL);
+            var space_type = h5policy_msg_u64_at(ios, profile,
+                                                 payload_off + 3#B, 1UL);
+            if (space_type > 2UL)
+                h5policy_emit_error("H5_CORRUPT_DATASPACE_INVALID_CLASS",
+                                    "corrupt", payload_off, object,
+                                    "dataspace v2 has an invalid space type");
+
+            if (space_type != 1UL && ndims > 0UL)
+                h5policy_emit_error("H5_CORRUPT_DATASPACE_INVALID_RANK",
+                                    "corrupt", payload_off, object,
+                                    "scalar/null dataspace has nonzero rank");
+
+            if (space_type == 0UL)
+                ndims = 0UL;
+            if (space_type == 2UL)
+                element_count = 0UL;
+
+            dim_rel = 4UL;
+        }
+    else
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_DATASPACE_VERSION",
+                                "corrupt", payload_off, object,
+                                "unsupported dataspace message version");
+            return ctx;
+        }
+
+    if (ndims > ctx.max_rank_seen)
+        ctx.max_rank_seen = ndims;
+
+    if (ndims > H5POLICY_H5S_MAX_RANK)
+        h5policy_emit_error("H5_CORRUPT_DATASPACE_RANK_TOO_LARGE",
+                            "corrupt", payload_off, object,
+                            "dataspace rank exceeds HDF5's maximum rank");
+
+    if (ndims > profile.max_rank)
+        h5policy_emit_error("H5_RESOURCE_DATASPACE_RANK",
+                            "resource", payload_off, object,
+                            "dataspace rank exceeds the selected profile limit");
+
+    var dims_bytes = h5policy_checked_mul_u64(ndims,
+                                             global_sizeof_lengths as uint<64>,
+                                             0xffffffffffffffffUL,
+                                             "H5_CORRUPT_LENGTH_OVERFLOW",
+                                             "corrupt",
+                                             payload_off, object,
+                                             "dataspace dimension byte count overflow");
+    if (!h5policy_payload_range_ok(msg_size, dim_rel, dims_bytes,
+                                   "H5_CORRUPT_DATASPACE_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "dataspace dimensions overrun the message"))
+        return ctx;
+
+    var has_max_dims = (flags & 1UL) != 0UL;
+    var max_dim_rel = dim_rel + dims_bytes;
+    if (has_max_dims
+        && !h5policy_payload_range_ok(msg_size, max_dim_rel, dims_bytes,
+                                      "H5_CORRUPT_DATASPACE_MESSAGE_TOO_SMALL",
+                                      payload_off, object,
+                                      "dataspace maximum dimensions overrun the message"))
+        return ctx;
+
+    if (element_count != 0UL)
+        {
+            var i = 0UL;
+            while (i < ndims)
+                {
+                    var dim = h5policy_msg_u64_at(ios, profile,
+                                                  payload_off
+                                                  + (dim_rel
+                                                     + i * (global_sizeof_lengths as uint<64>))#B,
+                                                  global_sizeof_lengths as uint<64>);
+                    if (has_max_dims)
+                        {
+                            var max_dim = h5policy_msg_u64_at(ios, profile,
+                                                              payload_off
+                                                              + (max_dim_rel
+                                                                 + i * (global_sizeof_lengths as uint<64>))#B,
+                                                              global_sizeof_lengths as uint<64>);
+                            if (max_dim != 0xffffffffffffffffUL
+                                && dim > max_dim)
+                                dim_exceeds_max = 1UB;
+                        }
+                    if (element_count != 0UL
+                        && dim > 0xffffffffffffffffUL / element_count)
+                        {
+                            h5policy_emit_error("H5_RESOURCE_LOGICAL_DATASET_BYTES",
+                                                "resource", payload_off, object,
+                                                "dataspace element count exceeds representable bounds");
+                            element_count = 0xffffffffffffffffUL;
+                            element_count_overflowed = 1UB;
+                        }
+                    else if (element_count_overflowed == 0UB)
+                        element_count = element_count * dim;
+                    i = i + 1UL;
+                }
+        }
+
+    ctx.has_dataspace = 1UB;
+    ctx.dataspace_rank = ndims;
+    ctx.dataset_element_count = element_count;
+    ctx.dataset_element_count_overflowed = element_count_overflowed;
+    ctx.dataset_dim_exceeds_max = dim_exceeds_max;
+    ctx = h5policy_update_legacy_chunked_layout_rank(ctx, payload_off, object);
+    return h5policy_update_logical_dataset_size(ctx, profile,
+                                                payload_off, object);
+}

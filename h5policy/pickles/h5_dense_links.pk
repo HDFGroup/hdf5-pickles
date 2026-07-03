@@ -1,0 +1,626 @@
+/* h5_dense_links.pk - Link message, fractal heap, and dense link storage.  Split out of h5_walk.pk; loaded after it.  */
+
+fun h5policy_validate_link_payload = (int ios,
+                                      H5PolicyLimits profile,
+                                      offset<uint<64>,B> payload_off,
+                                      uint<64> msg_size,
+                                      string object) void:
+{
+    if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
+                                   "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "link message is too small"))
+        return;
+
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
+    var flags = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+    var cur = 2UL;
+    var link_type = 0UL;
+
+    if (version != 1UL)
+        h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_LINK_VERSION",
+                            "corrupt", payload_off, object,
+                            "unsupported link message version");
+
+    if ((flags & 8UL) != 0UL)
+        {
+            if (!h5policy_payload_range_ok(msg_size, cur, 1UL,
+                                           "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                           payload_off + cur#B, object,
+                                           "link type byte is missing"))
+                return;
+            link_type = h5policy_msg_u64_at(ios, profile,
+                                            payload_off + cur#B, 1UL);
+            cur = cur + 1UL;
+        }
+
+    if ((flags & 4UL) != 0UL)
+        cur = cur + 8UL;
+    if ((flags & 16UL) != 0UL)
+        cur = cur + 1UL;
+
+    var len_width = 1UL <<. (flags & 3UL);
+    if (!h5policy_payload_range_ok(msg_size, cur, len_width,
+                                   "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                   payload_off + cur#B, object,
+                                   "link name length field is missing"))
+        return;
+
+    var name_len = h5policy_msg_u64_at(ios, profile,
+                                       payload_off + cur#B, len_width);
+    cur = cur + len_width;
+    var name_off = payload_off + cur#B;
+
+    if (name_len == 0UL)
+        h5policy_emit_error("H5_CORRUPT_LINK_NAME_EMPTY",
+                            "corrupt", payload_off + cur#B, object,
+                            "link name is empty");
+
+    if (!h5policy_payload_range_ok(msg_size, cur, name_len,
+                                   "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                   payload_off + cur#B, object,
+                                   "link name overruns the link message"))
+        return;
+
+    cur = cur + name_len;
+    var link_name = h5policy_string_from_payload(ios, profile,
+                                                 name_off, name_len);
+    if (link_name == "")
+        link_name = "<unnamed>";
+
+    if (link_type == 0UL)
+        {
+            if (!h5policy_payload_range_ok(msg_size, cur,
+                                           global_sizeof_offsets as uint<64>,
+                                           "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                           payload_off + cur#B, object,
+                                           "hard link target address is missing"))
+                return;
+
+            var target_raw = h5policy_msg_bytes(ios, profile,
+                                                payload_off + cur#B,
+                                                global_sizeof_offsets as uint<64>);
+            var target = bytes_to_u64_le(target_raw);
+            if (!h5policy_msg_addr_is_undef(target_raw))
+                {
+                    var ok = h5policy_checked_addr_range(target, 1UL,
+                                                         h5policy_ceiling(ios),
+                                                         "hard link target address outside file",
+                                                         payload_off + cur#B,
+                                                         object);
+                    if (ok)
+                        h5policy_enqueue_ohdr(profile, target,
+                                              h5policy_current_object_depth + 1UL,
+                                              h5policy_join_path(object, link_name),
+                                              payload_off + cur#B,
+                                              object);
+                }
+        }
+    else if (link_type == 1UL)
+        {
+            if (!h5policy_payload_range_ok(msg_size, cur, 2UL,
+                                           "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                           payload_off + cur#B, object,
+                                           "soft link length is missing"))
+                return;
+            var soft_len = h5policy_msg_u64_at(ios, profile,
+                                               payload_off + cur#B, 2UL);
+            if (!h5policy_payload_range_ok(msg_size, cur + 2UL, soft_len,
+                                           "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                           payload_off + cur#B, object,
+                                           "soft link target overruns the link message"))
+                return;
+        }
+    else if (link_type == 64UL)
+        {
+            h5policy_note_external_link;
+            if (!h5policy_payload_range_ok(msg_size, cur, 2UL,
+                                           "H5_CORRUPT_EXTERNAL_LINK_MESSAGE_TOO_SMALL",
+                                           payload_off + cur#B, object,
+                                           "external link value length is missing"))
+                return;
+            var ext_len = h5policy_msg_u64_at(ios, profile,
+                                              payload_off + cur#B, 2UL);
+            if (ext_len < 3UL)
+                h5policy_emit_error("H5_CORRUPT_EXTERNAL_LINK_INFO_TOO_SMALL",
+                                    "corrupt", payload_off + cur#B, object,
+                                    "external link information length is too small");
+            else if (!h5policy_payload_range_ok(msg_size, cur + 2UL, ext_len,
+                                                "H5_CORRUPT_EXTERNAL_LINK_MESSAGE_TOO_SMALL",
+                                                payload_off + cur#B, object,
+                                                "external link value overruns the link message"))
+                return;
+            if (profile.allow_external_links == 0UB)
+                h5policy_emit_error("H5_POLICY_EXTERNAL_LINK", "policy",
+                                    payload_off, object,
+                                    "external link encountered; profile denies external references");
+        }
+    else
+        {
+            h5policy_emit_error("H5_POLICY_USER_DEFINED_LINK", "policy",
+                                payload_off, object,
+                                "user-defined link encountered; profile denies user-defined links");
+        }
+}
+
+var H5POLICY_FRHP_SIG = [0x46UB, 0x52UB, 0x48UB, 0x50UB];   /* "FRHP" */
+
+fun h5policy_bytes_for_bits = (uint<64> nbits) uint<64>:
+{
+    return (nbits + 7UL) / 8UL;
+}
+
+fun h5policy_bytes_for_limit = (uint<64> limit) uint<64>:
+{
+    var nbytes = 1UL;
+    var max = 0xffUL;
+    while (nbytes < 8UL && limit > max)
+        {
+            nbytes = nbytes + 1UL;
+            max = (max <<. 8UL) | 0xffUL;
+        }
+    return nbytes;
+}
+
+fun h5policy_floor_log2 = (uint<64> value) uint<64>:
+{
+    var v = value;
+    var n = 0UL;
+    while ((v .>> 1UL) > 0UL)
+        {
+            v = v .>> 1UL;
+            n = n + 1UL;
+        }
+    return n;
+}
+
+/* File offset of a fractal-heap managed object, from its heap offset.  Mirrors
+   H5HF__man_dblock_locate (and the single-root-direct-block shortcut).  Returns
+   the undef sentinel when the lookup escapes the block geometry (corruption or
+   a heap id from another heap).  Bounded by a fixed descent guard.  */
+fun h5policy_frhp_locate = (int ios, H5PolicyLimits profile,
+                            uint<64> root_addr, uint<64> curr_root_rows,
+                            uint<64> start_size, uint<64> max_direct_size,
+                            uint<64> width, uint<64> off_size,
+                            uint<64> heap_obj_off, uint<64> file_size) uint<64>:
+{
+    if (curr_root_rows == 0UL)
+        return root_addr + heap_obj_off;
+
+    var first_row_bits = h5policy_floor_log2(start_size)
+                         + h5policy_floor_log2(width);
+    var max_direct_rows = h5policy_floor_log2(max_direct_size)
+                          - h5policy_floor_log2(start_size) + 2UL;
+    var prefix_size = 5UL + (global_sizeof_offsets as uint<64>) + off_size;
+    var entry_size = global_sizeof_offsets as uint<64>;
+    var cur_addr = root_addr;
+    var cur_nrows = curr_root_rows;
+    var cur_block_off = 0UL;
+    var guard = 0UL;
+
+    while (guard < 64UL)
+        {
+            guard = guard + 1UL;
+            var local_off = heap_obj_off - cur_block_off;
+            var row = 0UL;
+            var col = 0UL;
+            var row_block_size = start_size;
+            var row_block_off = 0UL;
+
+            if (local_off < start_size * width)
+                {
+                    row = 0UL;
+                    col = local_off / start_size;
+                }
+            else
+                {
+                    var high_bit = h5policy_floor_log2(local_off);
+                    var off_mask = 1UL <<. high_bit;
+                    row = (high_bit - first_row_bits) + 1UL;
+                    row_block_size = start_size <<. (row - 1UL);
+                    row_block_off = off_mask;
+                    col = (local_off - off_mask) / row_block_size;
+                }
+
+            if (row >= cur_nrows || col >= width)
+                return 0xffffffffffffffffUL;
+
+            var entry_off = cur_addr + prefix_size
+                            + ((row * width + col) * entry_size);
+            if (entry_off > file_size || entry_size > file_size - entry_off)
+                return 0xffffffffffffffffUL;
+
+            var addr_raw = h5policy_msg_bytes(ios, profile, entry_off#B, entry_size);
+            if (h5policy_msg_addr_is_undef(addr_raw))
+                return 0xffffffffffffffffUL;
+
+            var child_addr = bytes_to_u64_le(addr_raw);
+            var child_block_off = cur_block_off + row_block_off
+                                  + (col * row_block_size);
+
+            if (row < max_direct_rows)
+                return child_addr + (heap_obj_off - child_block_off);
+
+            cur_addr = child_addr;
+            cur_nrows = row - h5policy_floor_log2(width);
+            cur_block_off = child_block_off;
+        }
+
+    return 0xffffffffffffffffUL;
+}
+
+/* Minimum bytes for the "records in child node" field of a v2 B-tree child
+   pointer (mirrors H5B2's fixed-point sizing).  */
+fun h5policy_bt2_nrec_bytes = (uint<64> node_sz, uint<64> rec_sz) uint<64>:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var bytes = 1UL;
+    var prev = 0UL;
+    while (bytes != prev)
+        {
+            prev = bytes;
+            var ptr_sz = o + bytes;
+            if (node_sz < 10UL + ptr_sz || rec_sz + ptr_sz == 0UL)
+                return bytes;
+            var max_nrec = (node_sz - 10UL - ptr_sz) / (rec_sz + ptr_sz);
+            bytes = 1UL;
+            var thresh = 256UL;
+            while (max_nrec >= thresh)
+                {
+                    bytes = bytes + 1UL;
+                    thresh = thresh * 256UL;
+                }
+        }
+    return bytes;
+}
+
+/* Process one v2 B-tree leaf of dense-link (type-5) records: resolve each
+   fractal-heap object and validate/enqueue it as a link message.  */
+/* Process nrec dense-link (type-5) records starting at rec_base (node prefix +
+   6): resolve each heap object and validate/enqueue it as a link message.
+   Used for both leaf and internal nodes -- in a v2 B-tree every node stores
+   records, so internal-node records must be processed too, not just leaves.  */
+fun h5policy_dense_link_records = (int ios, H5PolicyLimits profile,
+                                   uint<64> rec_base, uint<64> nrec, uint<64> record_size,
+                                   uint<64> fheap_root, uint<64> curr_root_rows,
+                                   uint<64> start_size, uint<64> max_direct_size,
+                                   uint<64> table_width, uint<64> off_size,
+                                   uint<64> len_size, uint<64> file_size,
+                                   string object) void:
+{
+    var i = 0UL;
+    while (i < nrec)
+        {
+            /* type-5 record: name_hash(4) + heap id */
+            var id_off = rec_base + (i * record_size) + 4UL;
+            var id_flags = h5policy_msg_u64_at(ios, profile, id_off#B, 1UL);
+            if (((id_flags .>> 4) & 3UL) == 0UL)
+                {
+                    var heap_obj_off = h5policy_msg_u64_at(ios, profile,
+                                                           id_off#B + 1#B, off_size);
+                    var heap_obj_len = h5policy_msg_u64_at(ios, profile,
+                                                           id_off#B + (1UL + off_size)#B,
+                                                           len_size);
+                    if (heap_obj_len != 0UL)
+                        {
+                            var obj_off = h5policy_frhp_locate(ios, profile,
+                                                               fheap_root, curr_root_rows,
+                                                               start_size, max_direct_size,
+                                                               table_width, off_size,
+                                                               heap_obj_off, file_size);
+                            if (obj_off != 0xffffffffffffffffUL
+                                && obj_off < file_size
+                                && heap_obj_len <= file_size - obj_off)
+                                h5policy_validate_link_payload(ios, profile,
+                                                               obj_off#B, heap_obj_len,
+                                                               object);
+                        }
+                }
+            i = i + 1UL;
+        }
+}
+
+fun h5policy_dense_leaf_links = (int ios, H5PolicyLimits profile,
+                                 uint<64> leaf_addr, uint<64> nrec, uint<64> record_size,
+                                 uint<64> fheap_root, uint<64> curr_root_rows,
+                                 uint<64> start_size, uint<64> max_direct_size,
+                                 uint<64> table_width, uint<64> off_size,
+                                 uint<64> len_size, uint<64> file_size,
+                                 string object) void:
+{
+    var leaf_need = 6UL + (nrec * record_size);
+    if (!h5policy_checked_addr_range(leaf_addr, leaf_need, file_size,
+                                     "dense link v2 B-tree leaf outside file",
+                                     leaf_addr#B, object))
+        return;
+    if (h5policy_msg_bytes(ios, profile, leaf_addr#B, 4UL) != H5POLICY_BTLF_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                leaf_addr#B, object,
+                                "dense link v2 B-tree leaf signature mismatch");
+            return;
+        }
+
+    h5policy_dense_link_records(ios, profile, leaf_addr + 6UL, nrec, record_size,
+                                fheap_root, curr_root_rows, start_size, max_direct_size,
+                                table_width, off_size, len_size, file_size, object);
+}
+
+/* Enumerate dense-link records from the name-indexed v2 B-tree (root leaf, or a
+   depth-1 root internal node's leaves), resolve each fractal-heap object, and
+   validate/enqueue it as a link message.  Returns 1 when handled; 0 when the
+   structure is outside the supported subset (filtered heap, v2 B-tree depth>1,
+   non-managed ids), so the caller falls back to a coverage gap.  */
+/* Bytes for the "records in child subtree" field of a v2 B-tree child pointer
+   at a node whose children are height-`level` subtrees (level >= 1).  Ports the
+   spec's cumulative-max recurrence.  */
+fun h5policy_bt2_subtree_bytes = (uint<64> node_sz, uint<64> rec_sz, uint<64> level) uint<64>:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    if (level == 0UL || rec_sz == 0UL || node_sz < 10UL)
+        return 0UL;
+    var nrec_bytes = h5policy_bt2_nrec_bytes(node_sz, rec_sz);
+    var cum_max = (node_sz - 10UL) / rec_sz;         /* cum_max[0]: leaf capacity */
+    var subtree_bytes = 0UL;
+    var lv = 1UL;
+    while (lv <= level)
+        {
+            var ptr_sz = o + nrec_bytes + subtree_bytes;
+            if (node_sz < 10UL + ptr_sz || rec_sz + ptr_sz == 0UL)
+                return subtree_bytes;
+            var max_int = (node_sz - 10UL - ptr_sz) / (rec_sz + ptr_sz);
+            cum_max = ((max_int + 1UL) * cum_max) + max_int;
+            subtree_bytes = 1UL;
+            var thresh = 256UL;
+            while (cum_max >= thresh)
+                {
+                    subtree_bytes = subtree_bytes + 1UL;
+                    thresh = thresh * 256UL;
+                }
+            lv = lv + 1UL;
+        }
+    return subtree_bytes;
+}
+
+/* Recursively descend a dense-link name v2 B-tree node.  A node at depth 0 is a
+   leaf (processed directly); a node at depth D is internal, and its child
+   pointers are addr + records-in-child (+ records-in-subtree when D > 1).
+   Bounded by the tree depth itself and max_btree_depth.  */
+fun h5policy_dense_links_node = (int ios, H5PolicyLimits profile,
+                                 uint<64> node_addr, uint<64> node_depth, uint<64> nrec,
+                                 uint<64> node_size, uint<64> record_size,
+                                 uint<64> fheap_root, uint<64> curr_root_rows,
+                                 uint<64> start_size, uint<64> max_direct_size,
+                                 uint<64> table_width, uint<64> off_size,
+                                 uint<64> len_size, uint<64> file_size,
+                                 string object) void:
+{
+    if (node_depth == 0UL)
+        {
+            h5policy_dense_leaf_links(ios, profile, node_addr, nrec, record_size,
+                                      fheap_root, curr_root_rows, start_size,
+                                      max_direct_size, table_width, off_size,
+                                      len_size, file_size, object);
+            return;
+        }
+
+    if (node_depth > profile.max_btree_depth)
+        {
+            h5policy_emit_error("H5_CORRUPT_BTREE_DEPTH_EXCEEDED", "corrupt",
+                                node_addr#B, object,
+                                "dense link v2 B-tree depth exceeds the selected profile limit");
+            return;
+        }
+
+    var o = global_sizeof_offsets as uint<64>;
+    var nrec_bytes = h5policy_bt2_nrec_bytes(node_size, record_size);
+    var sub_bytes = node_depth > 1UL
+                    ? h5policy_bt2_subtree_bytes(node_size, record_size, node_depth - 1UL)
+                    : 0UL;
+    var ptr_size = o + nrec_bytes + sub_bytes;
+    var recs = h5policy_checked_mul_u64(nrec, record_size, 0xffffffffffffffffUL,
+                                        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                        node_addr#B, object,
+                                        "dense link v2 B-tree node size overflow");
+    var ptrs = h5policy_checked_mul_u64(nrec + 1UL, ptr_size, 0xffffffffffffffffUL,
+                                        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                        node_addr#B, object,
+                                        "dense link v2 B-tree node size overflow");
+    if (!h5policy_checked_addr_range(node_addr, 6UL + recs + ptrs, file_size,
+                                     "dense link v2 B-tree internal node outside file",
+                                     node_addr#B, object))
+        return;
+    if (h5policy_msg_bytes(ios, profile, node_addr#B, 4UL) != H5POLICY_BTIN_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", node_addr#B, object,
+                                "dense link v2 B-tree internal node signature mismatch");
+            return;
+        }
+
+    /* The internal node's own records are real link records too. */
+    h5policy_dense_link_records(ios, profile, node_addr + 6UL, nrec, record_size,
+                                fheap_root, curr_root_rows, start_size, max_direct_size,
+                                table_width, off_size, len_size, file_size, object);
+
+    var ptr_base = node_addr + 6UL + recs;
+    var j = 0UL;
+    while (j < nrec + 1UL)
+        {
+            var ptr_off = ptr_base + (j * ptr_size);
+            var child_raw = h5policy_msg_bytes(ios, profile, ptr_off#B, o);
+            var child_addr = bytes_to_u64_le(child_raw);
+            var child_nrec = h5policy_msg_u64_at(ios, profile, ptr_off#B + o#B, nrec_bytes);
+            if (!h5policy_msg_addr_is_undef(child_raw))
+                h5policy_dense_links_node(ios, profile, child_addr, node_depth - 1UL,
+                                          child_nrec, node_size, record_size, fheap_root,
+                                          curr_root_rows, start_size, max_direct_size,
+                                          table_width, off_size, len_size, file_size, object);
+            j = j + 1UL;
+        }
+}
+
+fun h5policy_walk_dense_links = (int ios, H5PolicyLimits profile,
+                                 uint<64> fheap_addr, uint<64> btree_addr,
+                                 off64 loc, string object) int:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var file_size = h5policy_ceiling(ios);
+
+    /* ---- fractal heap header ---- */
+    var frhp_min = 14UL + (2UL * o) + (10UL * el) + 8UL + (2UL * el) + o + 2UL;
+    if (!h5policy_checked_addr_range(fheap_addr, frhp_min, file_size,
+                                     "fractal heap header outside file", loc, object))
+        return 0;
+    if (h5policy_msg_bytes(ios, profile, fheap_addr#B, 4UL) != H5POLICY_FRHP_SIG)
+        return 0;
+
+    var filter_len = h5policy_msg_u64_at(ios, profile, fheap_addr#B + 7#B, 2UL);
+    if (filter_len != 0UL)
+        return 0;                       /* filtered heap: not supported here */
+
+    var max_man_size = h5policy_msg_u64_at(ios, profile, fheap_addr#B + 10#B, 4UL);
+    var dtable = 14UL + (10UL * el) + (2UL * o);
+    var table_width = h5policy_msg_u64_at(ios, profile, fheap_addr#B + dtable#B, 2UL);
+    var start_size = h5policy_msg_u64_at(ios, profile,
+                                         fheap_addr#B + (dtable + 2UL)#B, el);
+    var max_direct_size = h5policy_msg_u64_at(ios, profile,
+                                              fheap_addr#B + (dtable + 2UL + el)#B, el);
+    var max_heap_bits = h5policy_msg_u64_at(ios, profile,
+                                            fheap_addr#B + (dtable + 2UL + (2UL * el))#B, 2UL);
+    var root_raw = h5policy_msg_bytes(ios, profile,
+                                      fheap_addr#B + (dtable + 6UL + (2UL * el))#B, o);
+    var root_addr = bytes_to_u64_le(root_raw);
+    var curr_root_rows = h5policy_msg_u64_at(ios, profile,
+                                             fheap_addr#B + (dtable + 6UL + (2UL * el) + o)#B, 2UL);
+
+    var off_size = h5policy_bytes_for_bits(max_heap_bits);
+    var len_size = h5policy_bytes_for_limit(max_man_size);
+    if (len_size > off_size)
+        len_size = off_size;
+    if (h5policy_msg_addr_is_undef(root_raw) || start_size == 0UL || table_width == 0UL)
+        return 0;
+
+    /* ---- name-indexed v2 B-tree (root leaf only) ---- */
+    var bt_hdr = 22UL + o + el;
+    if (!h5policy_checked_addr_range(btree_addr, bt_hdr, file_size,
+                                     "dense link v2 B-tree header outside file", loc, object))
+        return 0;
+    if (h5policy_msg_bytes(ios, profile, btree_addr#B, 4UL) != H5POLICY_BTHD_SIG)
+        return 0;
+
+    var record_type = h5policy_msg_u64_at(ios, profile, btree_addr#B + 5#B, 1UL);
+    var node_size = h5policy_msg_u64_at(ios, profile, btree_addr#B + 6#B, 4UL);
+    var record_size = h5policy_msg_u64_at(ios, profile, btree_addr#B + 10#B, 2UL);
+    var depth = h5policy_msg_u64_at(ios, profile, btree_addr#B + 12#B, 2UL);
+    var bt_root_raw = h5policy_msg_bytes(ios, profile, btree_addr#B + 16#B, o);
+    var bt_root = bytes_to_u64_le(bt_root_raw);
+    var num_root = h5policy_msg_u64_at(ios, profile, btree_addr#B + (16UL + o)#B, 2UL);
+
+    if (record_type != 5UL || h5policy_msg_addr_is_undef(bt_root_raw))
+        return 0;
+
+    h5policy_dense_links_node(ios, profile, bt_root, depth, num_root, node_size,
+                              record_size, root_addr, curr_root_rows, start_size,
+                              max_direct_size, table_width, off_size, len_size,
+                              file_size, object);
+    return 1;
+}
+
+fun h5policy_validate_linfo_payload = (int ios,
+                                       H5PolicyLimits profile,
+                                       offset<uint<64>,B> payload_off,
+                                       uint<64> msg_size,
+                                       string object) void:
+{
+    if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
+                                   "H5_CORRUPT_LINK_INFO_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "link-info message is too small"))
+        return;
+
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
+    var flags = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+    var cur = 2UL;
+
+    if (version != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_LINK_INFO_VERSION",
+                                "corrupt", payload_off, object,
+                                "unsupported link-info message version");
+            return;
+        }
+
+    if ((flags & ~3UL) != 0UL)
+        h5policy_emit_error("H5_CORRUPT_LINK_INFO_FLAGS",
+                            "corrupt", payload_off + 1#B, object,
+                            "link-info message has invalid flag bits");
+
+    if ((flags & 1UL) != 0UL)
+        {
+            if (!h5policy_payload_range_ok(msg_size, cur, 8UL,
+                                           "H5_CORRUPT_LINK_INFO_MESSAGE_TOO_SMALL",
+                                           payload_off + cur#B, object,
+                                           "link-info max creation order is missing"))
+                return;
+
+            var max_corder = h5policy_msg_u64_at(ios, profile,
+                                                 payload_off + cur#B, 8UL);
+            if ((max_corder & 0x8000000000000000UL) != 0UL)
+                h5policy_emit_error("H5_CORRUPT_LINK_INFO_NEGATIVE_MAX_CORDER",
+                                    "corrupt", payload_off + cur#B, object,
+                                    "link-info max creation order is negative");
+
+            cur = cur + 8UL;
+        }
+
+    var min_size = cur + (2UL * (global_sizeof_offsets as uint<64>));
+    if ((flags & 2UL) != 0UL)
+        min_size = min_size + (global_sizeof_offsets as uint<64>);
+
+    if (!h5policy_payload_range_ok(msg_size, 0UL, min_size,
+                                   "H5_CORRUPT_LINK_INFO_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "link-info addresses overrun the message"))
+        return;
+
+    var fheap_raw = h5policy_msg_bytes(ios, profile,
+                                       payload_off + cur#B,
+                                       global_sizeof_offsets as uint<64>);
+    var fheap_addr = bytes_to_u64_le(fheap_raw);
+    cur = cur + (global_sizeof_offsets as uint<64>);
+
+    var name_btree_raw = h5policy_msg_bytes(ios, profile,
+                                            payload_off + cur#B,
+                                            global_sizeof_offsets as uint<64>);
+    var name_btree_addr = bytes_to_u64_le(name_btree_raw);
+    cur = cur + (global_sizeof_offsets as uint<64>);
+
+    var handled = 0;
+    if (!h5policy_msg_addr_is_undef(fheap_raw)
+        && !h5policy_msg_addr_is_undef(name_btree_raw))
+        handled = h5policy_walk_dense_links(ios, profile, fheap_addr,
+                                            name_btree_addr, payload_off, object);
+
+    if (!handled && !h5policy_msg_addr_is_undef(fheap_raw))
+        h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                            "unsupported", payload_off, object,
+                            "dense link storage uses an unsupported fractal-heap/B-tree layout");
+}
+
+/* ---- Old-style group traversal (symbol table -> v1 B-tree -> SNOD -> heap) --
+   A pre-1.8 group stores its members through a symbol-table message giving a
+   v1 B-tree (node type 0) and a local heap.  The B-tree indexes symbol-table
+   nodes (SNOD); each entry names a child (via a heap offset) and points to its
+   object header.  Everything below is decoded from raw bytes with bounds
+   checks, a visited set (cycle/shared-node guard), the max_btree_depth budget,
+   and metadata accounting -- and it enqueues the child object headers into the
+   same bounded BFS the link-message path uses.  */
+var H5POLICY_HEAP_SIG = [0x48UB, 0x45UB, 0x41UB, 0x50UB];   /* "HEAP" */
+var H5POLICY_SNOD_SIG = [0x53UB, 0x4eUB, 0x4fUB, 0x44UB];   /* "SNOD" */
+var H5POLICY_MAX_HEAP_NAME = 1024UL;   /* H5POLICY_TREE_SIG defined earlier */
+
+/* Data-segment size of the local heap currently being walked; a link-name
+   offset must fall inside it.  Set by h5policy_local_heap_data_addr (the whole
+   group walk for one heap runs synchronously, so a global is sufficient).  */
+var h5policy_heap_data_seg_size = 0UL;

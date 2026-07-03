@@ -1,0 +1,564 @@
+/* h5_layout.pk - Data layout message, compact data, and filter pipeline.  Split out of h5_walk.pk; loaded after it.  */
+
+fun h5policy_validate_compact_layout_data = (int ios,
+                                             H5PolicyLimits profile,
+                                             offset<uint<64>,B> payload_off,
+                                             uint<64> msg_size,
+                                             uint<64> size_rel,
+                                             uint<64> size_width,
+                                             string object) void:
+{
+    if (!h5policy_payload_range_ok(msg_size, size_rel, size_width,
+                                   "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                   payload_off + size_rel#B, object,
+                                   "compact layout data-size field overruns the layout message"))
+        return;
+
+    var compact_size = h5policy_msg_u64_at(ios, profile,
+                                           payload_off + size_rel#B,
+                                           size_width);
+    var data_rel = h5policy_checked_add_u64(size_rel, size_width,
+                                            0xffffffffffffffffUL,
+                                            "H5_CORRUPT_LENGTH_OVERFLOW",
+                                            "corrupt", payload_off, object,
+                                            "compact layout data offset overflow");
+    var ok = h5policy_payload_range_ok(msg_size, data_rel, compact_size,
+                                       "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                       payload_off + data_rel#B, object,
+                                       "compact layout data overruns the layout message");
+}
+
+fun h5policy_validate_layout_payload = (int ios,
+                                        H5PolicyLimits profile,
+                                        H5WalkContext ctx,
+                                        offset<uint<64>,B> payload_off,
+                                        uint<64> msg_size,
+                                        string object) H5WalkContext:
+{
+    if (!h5policy_payload_range_ok(msg_size, 0UL, 1UL,
+                                   "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "layout message is too small"))
+        return ctx;
+
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
+    var layout_class = 0UL;
+    var file_size = h5policy_ceiling(ios);
+
+    ctx.has_dataset_layout = 1UB;
+
+    if (version == 1UL || version == 2UL)
+        {
+            if (!h5policy_payload_range_ok(msg_size, 0UL, 8UL,
+                                           "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                           payload_off, object,
+                                           "layout v1/v2 message is too small"))
+                return ctx;
+
+            var ndims = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+            layout_class = h5policy_msg_u64_at(ios, profile, payload_off + 2#B, 1UL);
+            if (ndims == 0UL || ndims > H5POLICY_LAYOUT_MAX_DIMS)
+                h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
+                                    "corrupt", payload_off + 1#B, object,
+                                    "layout dimensionality is out of range");
+            if (layout_class == CHUNKED as uint<64>)
+                {
+                    ctx.has_legacy_chunked_layout = 1UB;
+                    ctx.legacy_chunked_layout_ndims = ndims;
+                    ctx = h5policy_update_legacy_chunked_layout_rank(ctx,
+                                                                     payload_off + 1#B,
+                                                                     object);
+                    var idx_addr = h5policy_msg_u64_at(ios, profile,
+                                                       payload_off + 8#B,
+                                                       global_sizeof_offsets as uint<64>);
+                    if (idx_addr != 0UL && idx_addr != 0xffffffffffffffffUL)
+                        ctx = h5policy_walk_chunk_btree(ios, profile, ctx,
+                                                        idx_addr, ndims,
+                                                        object, 0UL);
+                    var dims_rel = 8UL + (global_sizeof_offsets as uint<64>);
+                    var dims_bytes = h5policy_checked_mul_u64(ndims, 4UL,
+                                                             0xffffffffffffffffUL,
+                                                             "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                             "corrupt",
+                                                             payload_off, object,
+                                                             "chunk dimension byte count overflow");
+                    if (h5policy_payload_range_ok(msg_size, dims_rel, dims_bytes,
+                                                  "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                                  payload_off, object,
+                                                  "chunk dimensions overrun the layout message"))
+                        {
+                            var i = 0UL;
+                            while (i < ndims)
+                                {
+                                    var dim = h5policy_msg_u64_at(ios, profile,
+                                                                  payload_off
+                                                                  + (dims_rel + i * 4UL)#B,
+                                                                  4UL);
+                                    if (dim == 0UL)
+                                        h5policy_emit_error("H5_CORRUPT_ZERO_CHUNK_DIMENSION",
+                                                            "corrupt",
+                                                            payload_off, object,
+                                                            "chunk dimension is zero");
+                                    i = i + 1UL;
+                                }
+                        }
+                }
+            else if (layout_class == COMPACT as uint<64>)
+                {
+                    var compact_dims_rel = 8UL;
+                    var compact_dims_bytes =
+                        h5policy_checked_mul_u64(ndims, 4UL,
+                                                 0xffffffffffffffffUL,
+                                                 "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                 "corrupt",
+                                                 payload_off, object,
+                                                 "compact dimension byte count overflow");
+                    if (h5policy_payload_range_ok(msg_size, compact_dims_rel,
+                                                  compact_dims_bytes,
+                                                  "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                                  payload_off, object,
+                                                  "compact dimensions overrun the layout message"))
+                        {
+                            var compact_size_rel =
+                                h5policy_checked_add_u64(compact_dims_rel,
+                                                         compact_dims_bytes,
+                                                         0xffffffffffffffffUL,
+                                                         "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                         "corrupt",
+                                                         payload_off, object,
+                                                         "compact data-size offset overflow");
+                            h5policy_validate_compact_layout_data(ios, profile,
+                                                                  payload_off, msg_size,
+                                                                  compact_size_rel, 4UL,
+                                                                  object);
+                        }
+                }
+        }
+    else if (version == 3UL)
+        {
+            if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
+                                           "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                           payload_off, object,
+                                           "layout v3 message is too small"))
+                return ctx;
+
+            layout_class = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+            if (layout_class == CONTIG as uint<64>)
+                {
+                    var min_size = 2UL + (global_sizeof_offsets as uint<64>)
+                                   + (global_sizeof_lengths as uint<64>);
+                    if (h5policy_payload_range_ok(msg_size, 0UL, min_size,
+                                                  "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                                  payload_off, object,
+                                                  "contiguous layout message is too small"))
+                        {
+                            var data_addr_raw =
+                                h5policy_msg_bytes(ios, profile, payload_off + 2#B,
+                                                   global_sizeof_offsets as uint<64>);
+                            var data_addr = bytes_to_u64_le(data_addr_raw);
+                            var data_size = h5policy_msg_u64_at(ios, profile,
+                                                                payload_off
+                                                                + (2UL
+                                                                   + (global_sizeof_offsets as uint<64>))#B,
+                                                                global_sizeof_lengths as uint<64>);
+                            if (!h5policy_msg_addr_is_undef(data_addr_raw))
+                                {
+                                    var ok = h5policy_checked_addr_range(data_addr,
+                                                                         data_size,
+                                                                         file_size,
+                                                                         "contiguous data range outside file",
+                                                                         payload_off,
+                                                                         object);
+                                }
+                        }
+                }
+            else if (layout_class == CHUNKED as uint<64>)
+                {
+                    if (h5policy_payload_range_ok(msg_size, 0UL,
+                                                  3UL + (global_sizeof_offsets as uint<64>),
+                                                  "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                                  payload_off, object,
+                                                  "chunked layout message is too small"))
+                        {
+                            var ndims3 = h5policy_msg_u64_at(ios, profile,
+                                                             payload_off + 2#B, 1UL);
+                            if (ndims3 == 0UL || ndims3 > H5POLICY_LAYOUT_MAX_DIMS)
+                                h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
+                                                    "corrupt", payload_off + 2#B, object,
+                                                    "layout dimensionality is out of range");
+                            ctx.has_legacy_chunked_layout = 1UB;
+                            ctx.legacy_chunked_layout_ndims = ndims3;
+                            ctx = h5policy_update_legacy_chunked_layout_rank(ctx,
+                                                                             payload_off + 2#B,
+                                                                             object);
+                            var idx_addr3 = h5policy_msg_u64_at(ios, profile,
+                                                                payload_off + 3#B,
+                                                                global_sizeof_offsets as uint<64>);
+                            if (idx_addr3 != 0UL && idx_addr3 != 0xffffffffffffffffUL)
+                                ctx = h5policy_walk_chunk_btree(ios, profile, ctx,
+                                                                idx_addr3, ndims3,
+                                                                object, 0UL);
+                            var dims_rel3 = 3UL + (global_sizeof_offsets as uint<64>);
+                            var dims_bytes3 = h5policy_checked_mul_u64(ndims3,
+                                                                      4UL,
+                                                                      0xffffffffffffffffUL,
+                                                                      "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                                      "corrupt",
+                                                                      payload_off, object,
+                                                                      "chunk dimension byte count overflow");
+                            if (h5policy_payload_range_ok(msg_size, dims_rel3,
+                                                          dims_bytes3,
+                                                          "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                                          payload_off, object,
+                                                          "chunk dimensions overrun the layout message"))
+                                {
+                                    var j = 0UL;
+                                    while (j < ndims3)
+                                        {
+                                            var dim3 = h5policy_msg_u64_at(ios, profile,
+                                                                          payload_off
+                                                                          + (dims_rel3 + j * 4UL)#B,
+                                                                          4UL);
+                                            if (dim3 == 0UL)
+                                                h5policy_emit_error("H5_CORRUPT_ZERO_CHUNK_DIMENSION",
+                                                                    "corrupt",
+                                                                    payload_off, object,
+                                                                    "chunk dimension is zero");
+                                            j = j + 1UL;
+                                        }
+                                }
+                        }
+                }
+            else if (layout_class == COMPACT as uint<64>)
+                h5policy_validate_compact_layout_data(ios, profile,
+                                                      payload_off, msg_size,
+                                                      2UL, 2UL, object);
+        }
+    else if (version == 4UL)
+        {
+            if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
+                                           "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                           payload_off, object,
+                                           "layout v4 message is too small"))
+                return ctx;
+
+            layout_class = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+            if (layout_class == COMPACT as uint<64>)
+                h5policy_validate_compact_layout_data(ios, profile,
+                                                      payload_off, msg_size,
+                                                      2UL, 2UL, object);
+
+            if (layout_class == VIRTUAL as uint<64>)
+                {
+                    h5policy_note_vds;
+                    if (profile.allow_vds == 0UB)
+                        h5policy_emit_error("H5_POLICY_VDS", "policy",
+                                            payload_off, object,
+                                            "virtual dataset layout encountered; profile denies VDS");
+                }
+
+            if (layout_class == CHUNKED as uint<64>
+                && h5policy_payload_range_ok(msg_size, 0UL, 5UL,
+                                             "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                             payload_off, object,
+                                             "chunked v4 layout message is too small"))
+                {
+                    var ndims4 = h5policy_msg_u64_at(ios, profile,
+                                                     payload_off + 3#B, 1UL);
+                    if (ndims4 == 0UL || ndims4 > H5POLICY_LAYOUT_MAX_DIMS)
+                        h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
+                                            "corrupt", payload_off + 3#B, object,
+                                            "layout dimensionality is out of range");
+                    var enc = h5policy_msg_u64_at(ios, profile,
+                                                  payload_off + 4#B, 1UL);
+                    var dims_rel4 = 5UL;
+                    var dims_bytes4 = h5policy_checked_mul_u64(ndims4, enc,
+                                                               0xffffffffffffffffUL,
+                                                               "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                               "corrupt",
+                                                               payload_off, object,
+                                                               "chunk dimension byte count overflow");
+                    var idx_type_rel = dims_rel4 + dims_bytes4;
+                    var chunk_elem_count = 1UL;
+                    if (h5policy_payload_range_ok(msg_size, dims_rel4,
+                                                  dims_bytes4,
+                                                  "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                                  payload_off, object,
+                                                  "chunk dimensions overrun the layout message"))
+                        {
+                            var k = 0UL;
+                            while (k < ndims4)
+                                {
+                                    var dim4 = h5policy_msg_u64_at(ios, profile,
+                                                                  payload_off
+                                                                  + (dims_rel4 + k * enc)#B,
+                                                                  enc);
+                                    if (dim4 == 0UL)
+                                        h5policy_emit_error("H5_CORRUPT_ZERO_CHUNK_DIMENSION",
+                                                            "corrupt",
+                                                            payload_off, object,
+                                                            "chunk dimension is zero");
+                                    else
+                                        chunk_elem_count =
+                                            h5policy_checked_mul_u64(chunk_elem_count, dim4,
+                                                                     0xffffffffffffffffUL,
+                                                                     "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                                     "corrupt", payload_off, object,
+                                                                     "chunk element count overflow");
+                                    k = k + 1UL;
+                                }
+                        }
+                    if (h5policy_payload_range_ok(msg_size, idx_type_rel, 1UL,
+                                                  "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                                  payload_off, object,
+                                                  "chunk index type overruns the layout message"))
+                        {
+                            var idx_type = h5policy_msg_u64_at(ios, profile,
+                                                               payload_off + idx_type_rel#B,
+                                                               1UL);
+                            var idx_info_len = 0UL;
+                            if (idx_type == 1UL)
+                                idx_info_len = 0UL;
+                            else if (idx_type == 2UL)
+                                idx_info_len = 0UL;
+                            else if (idx_type == 3UL)
+                                idx_info_len = 1UL;
+                            else if (idx_type == 4UL)
+                                idx_info_len = 5UL;
+                            else if (idx_type == 5UL)
+                                idx_info_len = 6UL;
+                            else
+                                h5policy_emit_error("H5_CORRUPT_UNKNOWN_CHUNK_INDEX_TYPE",
+                                                    "corrupt", payload_off, object,
+                                                    "unknown chunk index type");
+
+                            var idx_addr_rel = idx_type_rel + 1UL + idx_info_len;
+                            if (h5policy_payload_range_ok(msg_size, idx_addr_rel,
+                                                          global_sizeof_offsets as uint<64>,
+                                                          "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                                          payload_off, object,
+                                                          "chunk index address overruns the layout message"))
+                                {
+                                    var idx_addr4 = h5policy_msg_u64_at(ios, profile,
+                                                                        payload_off + idx_addr_rel#B,
+                                                                        global_sizeof_offsets as uint<64>);
+                                    if (idx_type == 5UL
+                                        && idx_addr4 != 0UL
+                                        && idx_addr4 != 0xffffffffffffffffUL)
+                                        ctx = h5policy_walk_v2_btree_chunks(ios, profile, ctx,
+                                                                            idx_addr4,
+                                                                            payload_off + idx_addr_rel#B,
+                                                                            object);
+                                    else if (idx_type == 3UL
+                                             && idx_addr4 != 0UL
+                                             && idx_addr4 != 0xffffffffffffffffUL)
+                                        ctx = h5policy_walk_fixed_array_chunks(ios, profile, ctx,
+                                                                               idx_addr4,
+                                                                               payload_off + idx_addr_rel#B,
+                                                                               object);
+                                    else if (idx_type == 4UL
+                                             && idx_addr4 != 0UL
+                                             && idx_addr4 != 0xffffffffffffffffUL)
+                                        ctx = h5policy_walk_ext_array_chunks(ios, profile, ctx,
+                                                                             idx_addr4,
+                                                                             payload_off + idx_addr_rel#B,
+                                                                             object);
+                                    else if (idx_type == 2UL)
+                                        {
+                                            /* Implicit: chunks stored contiguously from a base
+                                               address, no index structure.  Estimate the chunk
+                                               count from the dataspace and chunk element counts. */
+                                            if (idx_addr4 != 0UL
+                                                && idx_addr4 != 0xffffffffffffffffUL)
+                                                {
+                                                    var nch = 1UL;
+                                                    if (ctx.has_dataspace != 0UB
+                                                        && chunk_elem_count != 0UL)
+                                                        nch = (ctx.dataset_element_count
+                                                               + chunk_elem_count - 1UL)
+                                                              / chunk_elem_count;
+                                                    ctx.chunk_index_count =
+                                                        h5policy_checked_add_u64(ctx.chunk_index_count, nch,
+                                                                                 profile.max_chunk_count,
+                                                                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
+                                                                                 payload_off + idx_addr_rel#B, object,
+                                                                                 "chunk count exceeds the selected profile limit");
+                                                    if (idx_addr4 >= (h5policy_ceiling(ios)))
+                                                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                                                            payload_off + idx_addr_rel#B, object,
+                                                                            "implicit chunk base address outside file");
+                                                }
+                                        }
+                                    else if (idx_type == 1UL)
+                                        {
+                                            /* Single Chunk: the address field is
+                                               the one chunk's data address.  */
+                                            if (idx_addr4 != 0UL
+                                                && idx_addr4 != 0xffffffffffffffffUL)
+                                                {
+                                                    ctx.chunk_index_count =
+                                                        h5policy_checked_add_u64(ctx.chunk_index_count, 1UL,
+                                                                                 profile.max_chunk_count,
+                                                                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
+                                                                                 payload_off + idx_addr_rel#B, object,
+                                                                                 "chunk count exceeds the selected profile limit");
+                                                    if (idx_addr4 >= (h5policy_ceiling(ios)))
+                                                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                                                            payload_off + idx_addr_rel#B, object,
+                                                                            "single-chunk data address outside file");
+                                                }
+                                        }
+                                    else
+                                        ctx = h5policy_note_chunk_index_addr(ctx, profile,
+                                                                             idx_addr4,
+                                                                             payload_off + idx_addr_rel#B,
+                                                                             object);
+                                }
+                        }
+                }
+        }
+    else
+        h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_LAYOUT_VERSION",
+                            "corrupt", payload_off, object,
+                            "unsupported layout message version");
+
+    if (layout_class > VIRTUAL as uint<64>)
+        h5policy_emit_error("H5_CORRUPT_UNKNOWN_LAYOUT_CLASS",
+                            "corrupt", payload_off, object,
+                            "unknown data layout class");
+
+    return h5policy_update_logical_dataset_size(ctx, profile,
+                                                payload_off, object);
+}
+
+fun h5policy_validate_filter_pipeline_payload = (int ios,
+                                                 H5PolicyLimits profile,
+                                                 offset<uint<64>,B> payload_off,
+                                                 uint<64> msg_size,
+                                                 string object) void:
+{
+    if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
+                                   "H5_CORRUPT_FILTER_PIPELINE_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "filter pipeline message is too small"))
+        return;
+
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
+    var nfilters = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+    var cur = 0UL;
+
+    if (nfilters > profile.max_filter_count)
+        h5policy_emit_error("H5_RESOURCE_FILTER_COUNT", "resource",
+                            payload_off, object,
+                            "filter count exceeds the selected profile limit");
+
+    if (version == 1UL)
+        cur = 8UL;
+    else if (version == 2UL)
+        cur = 2UL;
+    else
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_FILTER_PIPELINE_VERSION",
+                                "corrupt", payload_off, object,
+                                "unsupported filter pipeline version");
+            return;
+        }
+
+    var idx = 0UL;
+    while (idx < nfilters)
+        {
+            var desc_header = version == 1UL ? 8UL : 6UL;
+
+            if (!h5policy_payload_range_ok(msg_size, cur, desc_header,
+                                           "H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE",
+                                           payload_off + cur#B, object,
+                                           "filter descriptor overruns the pipeline message"))
+                return;
+
+            var filter_id = h5policy_msg_u64_at(ios, profile,
+                                                payload_off + cur#B, 2UL);
+            var name_len = 0UL;
+            var cd_nelmts = 0UL;
+
+            if (version == 1UL)
+                {
+                    name_len = h5policy_msg_u64_at(ios, profile,
+                                                   payload_off + (cur + 2UL)#B,
+                                                   2UL);
+                    cd_nelmts = h5policy_msg_u64_at(ios, profile,
+                                                    payload_off + (cur + 6UL)#B,
+                                                    2UL);
+                }
+            else
+                cd_nelmts = h5policy_msg_u64_at(ios, profile,
+                                                payload_off + (cur + 4UL)#B,
+                                                2UL);
+
+            if (!h5policy_core_filter(filter_id))
+                {
+                    h5policy_note_dynamic_filter(filter_id);
+                    if (profile.allow_dynamic_filters == 0UB)
+                        h5policy_emit_error("H5_POLICY_DYNAMIC_FILTER", "policy",
+                                            payload_off + cur#B, object,
+                                            "non-core filter required; profile disables dynamic filters");
+                }
+            else if (h5policy_filter_decodes(filter_id))
+                {
+                    /* Structurally fine, but reading the data requires a consumer
+                       to decode/decompress attacker-controlled bytes -- a surface
+                       this metadata-only oracle deliberately does not enter.
+                       Advisory only (accept_with_warnings), emitted once per
+                       distinct filter so many datasets don't spam the report.  */
+                    if (!h5policy_feature_seen_u64(h5policy_feature_decode_filters,
+                                                   filter_id))
+                        {
+                            h5policy_feature_decode_filters += [filter_id];
+                            h5policy_emit_warning("H5_ADVISORY_DECODE_FILTER",
+                                                  payload_off + cur#B, object,
+                                                  "dataset declares the "
+                                                  + h5policy_filter_name(filter_id)
+                                                  + " filter; a consumer must decode/decompress "
+                                                  + "untrusted data to read it");
+                        }
+                }
+
+            var cd_bytes = h5policy_checked_mul_u64(cd_nelmts, 4UL,
+                                                    0xffffffffffffffffUL,
+                                                    "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                    "corrupt",
+                                                    payload_off + cur#B,
+                                                    object,
+                                                    "filter client-data byte count overflow");
+            var desc_size = h5policy_checked_add_u64(desc_header, name_len,
+                                                     0xffffffffffffffffUL,
+                                                     "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                     "corrupt",
+                                                     payload_off + cur#B,
+                                                     object,
+                                                     "filter descriptor size overflow");
+            desc_size = h5policy_checked_add_u64(desc_size, cd_bytes,
+                                                 0xffffffffffffffffUL,
+                                                 "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                 "corrupt",
+                                                 payload_off + cur#B,
+                                                 object,
+                                                 "filter descriptor size overflow");
+            if (version == 1UL && (cd_nelmts % 2UL) != 0UL)
+                desc_size = h5policy_checked_add_u64(desc_size, 4UL,
+                                                     0xffffffffffffffffUL,
+                                                     "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                     "corrupt",
+                                                     payload_off + cur#B,
+                                                     object,
+                                                     "filter descriptor padding overflow");
+
+            if (!h5policy_payload_range_ok(msg_size, cur, desc_size,
+                                           "H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE",
+                                           payload_off + cur#B, object,
+                                           "filter descriptor overruns the pipeline message"))
+                return;
+
+            cur = cur + desc_size;
+            idx = idx + 1UL;
+        }
+}

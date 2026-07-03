@@ -1,0 +1,254 @@
+/* h5_dense_attrs.pk - Dense attribute storage.  Split out of h5_walk.pk; loaded after it.  */
+
+/* One v2 B-tree leaf of dense-attribute (type-8) records: resolve each
+   fractal-heap object and validate it as an attribute message.  Type-8 records
+   place the heap id at record offset 0.  */
+/* Process nrec dense-attribute (type-8) records starting at rec_base; used for
+   both leaf and internal nodes (internal-node records are real records too).  */
+fun h5policy_dense_attr_records = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                                   uint<64> rec_base, uint<64> nrec, uint<64> record_size,
+                                   uint<64> fheap_root, uint<64> curr_root_rows,
+                                   uint<64> start_size, uint<64> max_direct_size,
+                                   uint<64> table_width, uint<64> off_size,
+                                   uint<64> len_size, uint<64> file_size,
+                                   string object) H5WalkContext:
+{
+    var i = 0UL;
+    while (i < nrec)
+        {
+            var id_off = rec_base + (i * record_size);   /* type-8: heap id at rec+0 */
+            var id_flags = h5policy_msg_u64_at(ios, profile, id_off#B, 1UL);
+            if (((id_flags .>> 4) & 3UL) == 0UL)
+                {
+                    var heap_obj_off = h5policy_msg_u64_at(ios, profile,
+                                                           id_off#B + 1#B, off_size);
+                    var heap_obj_len = h5policy_msg_u64_at(ios, profile,
+                                                           id_off#B + (1UL + off_size)#B,
+                                                           len_size);
+                    if (heap_obj_len != 0UL)
+                        {
+                            var obj_off = h5policy_frhp_locate(ios, profile,
+                                                               fheap_root, curr_root_rows,
+                                                               start_size, max_direct_size,
+                                                               table_width, off_size,
+                                                               heap_obj_off, file_size);
+                            if (obj_off != 0xffffffffffffffffUL
+                                && obj_off < file_size
+                                && heap_obj_len <= file_size - obj_off)
+                                ctx = h5policy_validate_attribute_payload(ios, profile, ctx,
+                                                                          obj_off#B, heap_obj_len,
+                                                                          object);
+                        }
+                }
+            i = i + 1UL;
+        }
+    return ctx;
+}
+
+fun h5policy_dense_leaf_attrs = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                                 uint<64> leaf_addr, uint<64> nrec, uint<64> record_size,
+                                 uint<64> fheap_root, uint<64> curr_root_rows,
+                                 uint<64> start_size, uint<64> max_direct_size,
+                                 uint<64> table_width, uint<64> off_size,
+                                 uint<64> len_size, uint<64> file_size,
+                                 string object) H5WalkContext:
+{
+    var leaf_need = 6UL + (nrec * record_size);
+    if (!h5policy_checked_addr_range(leaf_addr, leaf_need, file_size,
+                                     "dense attribute v2 B-tree leaf outside file",
+                                     leaf_addr#B, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, leaf_addr#B, 4UL) != H5POLICY_BTLF_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                leaf_addr#B, object,
+                                "dense attribute v2 B-tree leaf signature mismatch");
+            return ctx;
+        }
+
+    ctx = h5policy_dense_attr_records(ios, profile, ctx, leaf_addr + 6UL, nrec, record_size,
+                                      fheap_root, curr_root_rows, start_size, max_direct_size,
+                                      table_width, off_size, len_size, file_size, object);
+
+    return ctx;
+}
+
+/* Recursively descend a dense-attribute name v2 B-tree node (see the dense-link
+   node walker for the pointer layout).  Threads ctx so attributes are counted
+   and validated.  */
+fun h5policy_dense_attrs_node = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                                 uint<64> node_addr, uint<64> node_depth, uint<64> nrec,
+                                 uint<64> node_size, uint<64> record_size,
+                                 uint<64> fheap_root, uint<64> curr_root_rows,
+                                 uint<64> start_size, uint<64> max_direct_size,
+                                 uint<64> table_width, uint<64> off_size,
+                                 uint<64> len_size, uint<64> file_size,
+                                 string object) H5WalkContext:
+{
+    if (node_depth == 0UL)
+        return h5policy_dense_leaf_attrs(ios, profile, ctx, node_addr, nrec, record_size,
+                                         fheap_root, curr_root_rows, start_size,
+                                         max_direct_size, table_width, off_size,
+                                         len_size, file_size, object);
+
+    if (node_depth > profile.max_btree_depth)
+        {
+            h5policy_emit_error("H5_CORRUPT_BTREE_DEPTH_EXCEEDED", "corrupt",
+                                node_addr#B, object,
+                                "dense attribute v2 B-tree depth exceeds the selected profile limit");
+            return ctx;
+        }
+
+    var o = global_sizeof_offsets as uint<64>;
+    var nrec_bytes = h5policy_bt2_nrec_bytes(node_size, record_size);
+    var sub_bytes = node_depth > 1UL
+                    ? h5policy_bt2_subtree_bytes(node_size, record_size, node_depth - 1UL)
+                    : 0UL;
+    var ptr_size = o + nrec_bytes + sub_bytes;
+    var recs = h5policy_checked_mul_u64(nrec, record_size, 0xffffffffffffffffUL,
+                                        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                        node_addr#B, object,
+                                        "dense attribute v2 B-tree node size overflow");
+    var ptrs = h5policy_checked_mul_u64(nrec + 1UL, ptr_size, 0xffffffffffffffffUL,
+                                        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                        node_addr#B, object,
+                                        "dense attribute v2 B-tree node size overflow");
+    if (!h5policy_checked_addr_range(node_addr, 6UL + recs + ptrs, file_size,
+                                     "dense attribute v2 B-tree internal node outside file",
+                                     node_addr#B, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, node_addr#B, 4UL) != H5POLICY_BTIN_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", node_addr#B, object,
+                                "dense attribute v2 B-tree internal node signature mismatch");
+            return ctx;
+        }
+
+    /* The internal node's own records are real attribute records too. */
+    ctx = h5policy_dense_attr_records(ios, profile, ctx, node_addr + 6UL, nrec, record_size,
+                                      fheap_root, curr_root_rows, start_size, max_direct_size,
+                                      table_width, off_size, len_size, file_size, object);
+
+    var ptr_base = node_addr + 6UL + recs;
+    var j = 0UL;
+    while (j < nrec + 1UL)
+        {
+            var ptr_off = ptr_base + (j * ptr_size);
+            var child_raw = h5policy_msg_bytes(ios, profile, ptr_off#B, o);
+            var child_addr = bytes_to_u64_le(child_raw);
+            var child_nrec = h5policy_msg_u64_at(ios, profile, ptr_off#B + o#B, nrec_bytes);
+            if (!h5policy_msg_addr_is_undef(child_raw))
+                ctx = h5policy_dense_attrs_node(ios, profile, ctx, child_addr, node_depth - 1UL,
+                                                child_nrec, node_size, record_size, fheap_root,
+                                                curr_root_rows, start_size, max_direct_size,
+                                                table_width, off_size, len_size, file_size, object);
+            j = j + 1UL;
+        }
+    return ctx;
+}
+
+/* Dense attributes: fractal heap + name-indexed v2 B-tree (type-8 records) of
+   any depth.  Sets h5policy_dense_handled.  */
+fun h5policy_walk_dense_attrs = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                                 uint<64> fheap_addr, uint<64> btree_addr,
+                                 off64 loc, string object) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var file_size = h5policy_ceiling(ios);
+    h5policy_dense_handled = 0;
+
+    var frhp_min = 14UL + (2UL * o) + (10UL * el) + 8UL + (2UL * el) + o + 2UL;
+    if (!h5policy_checked_addr_range(fheap_addr, frhp_min, file_size,
+                                     "fractal heap header outside file", loc, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, fheap_addr#B, 4UL) != H5POLICY_FRHP_SIG)
+        return ctx;
+    if (h5policy_msg_u64_at(ios, profile, fheap_addr#B + 7#B, 2UL) != 0UL)
+        return ctx;                     /* filtered heap: not supported here */
+
+    var max_man_size = h5policy_msg_u64_at(ios, profile, fheap_addr#B + 10#B, 4UL);
+    var dtable = 14UL + (10UL * el) + (2UL * o);
+    var table_width = h5policy_msg_u64_at(ios, profile, fheap_addr#B + dtable#B, 2UL);
+    var start_size = h5policy_msg_u64_at(ios, profile, fheap_addr#B + (dtable + 2UL)#B, el);
+    var max_direct_size = h5policy_msg_u64_at(ios, profile,
+                                              fheap_addr#B + (dtable + 2UL + el)#B, el);
+    var max_heap_bits = h5policy_msg_u64_at(ios, profile,
+                                            fheap_addr#B + (dtable + 2UL + (2UL * el))#B, 2UL);
+    var root_raw = h5policy_msg_bytes(ios, profile,
+                                      fheap_addr#B + (dtable + 6UL + (2UL * el))#B, o);
+    var root_addr = bytes_to_u64_le(root_raw);
+    var curr_root_rows = h5policy_msg_u64_at(ios, profile,
+                                             fheap_addr#B + (dtable + 6UL + (2UL * el) + o)#B, 2UL);
+
+    var off_size = h5policy_bytes_for_bits(max_heap_bits);
+    var len_size = h5policy_bytes_for_limit(max_man_size);
+    if (len_size > off_size)
+        len_size = off_size;
+    if (h5policy_msg_addr_is_undef(root_raw) || start_size == 0UL || table_width == 0UL)
+        return ctx;
+
+    var bt_hdr = 22UL + o + el;
+    if (!h5policy_checked_addr_range(btree_addr, bt_hdr, file_size,
+                                     "dense attribute v2 B-tree header outside file", loc, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, btree_addr#B, 4UL) != H5POLICY_BTHD_SIG)
+        return ctx;
+
+    var record_type = h5policy_msg_u64_at(ios, profile, btree_addr#B + 5#B, 1UL);
+    var node_size = h5policy_msg_u64_at(ios, profile, btree_addr#B + 6#B, 4UL);
+    var record_size = h5policy_msg_u64_at(ios, profile, btree_addr#B + 10#B, 2UL);
+    var depth = h5policy_msg_u64_at(ios, profile, btree_addr#B + 12#B, 2UL);
+    var bt_root_raw = h5policy_msg_bytes(ios, profile, btree_addr#B + 16#B, o);
+    var bt_root = bytes_to_u64_le(bt_root_raw);
+    var num_root = h5policy_msg_u64_at(ios, profile, btree_addr#B + (16UL + o)#B, 2UL);
+
+    if (record_type != 8UL || h5policy_msg_addr_is_undef(bt_root_raw))
+        return ctx;
+
+    ctx = h5policy_dense_attrs_node(ios, profile, ctx, bt_root, depth, num_root, node_size,
+                                    record_size, root_addr, curr_root_rows, start_size,
+                                    max_direct_size, table_width, off_size, len_size,
+                                    file_size, object);
+    h5policy_dense_handled = 1;
+    return ctx;
+}
+
+fun h5policy_validate_ainfo_payload = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                                       offset<uint<64>,B> payload_off,
+                                       uint<64> msg_size, string object) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
+                                   "H5_CORRUPT_ATTRIBUTE_INFO_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "attribute-info message is too small"))
+        return ctx;
+
+    var flags = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+    var cur = 2UL;
+    if ((flags & 1UL) != 0UL)
+        cur = cur + 2UL;                /* max creation index */
+
+    if (!h5policy_payload_range_ok(msg_size, 0UL, cur + (2UL * o),
+                                   "H5_CORRUPT_ATTRIBUTE_INFO_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "attribute-info addresses overrun the message"))
+        return ctx;
+
+    var fheap_raw = h5policy_msg_bytes(ios, profile, payload_off + cur#B, o);
+    var fheap_addr = bytes_to_u64_le(fheap_raw);
+    var btree_raw = h5policy_msg_bytes(ios, profile, payload_off + (cur + o)#B, o);
+    var btree_addr = bytes_to_u64_le(btree_raw);
+
+    if (h5policy_msg_addr_is_undef(fheap_raw) || h5policy_msg_addr_is_undef(btree_raw))
+        return ctx;
+
+    ctx = h5policy_walk_dense_attrs(ios, profile, ctx, fheap_addr, btree_addr,
+                                    payload_off, object);
+    if (!h5policy_dense_handled)
+        h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP", "unsupported",
+                            payload_off, object,
+                            "dense attribute storage uses an unsupported fractal-heap/B-tree layout");
+    return ctx;
+}
