@@ -50,6 +50,83 @@ fun h5policy_dtype_room = (uint<64> need, uint<64> avail, uint<64> used,
 
     return 1;
 }
+/* Validate a non-recursive (leaf) datatype's fixed-size property block:
+   fixed-point / float / time / string / bit field / opaque / reference.
+   Returns the datatype's on-disk size (header + props) or 0 on failure.
+   Split out of h5policy_dtype_check (it never recurses).  */
+fun h5policy_dtype_leaf = (int ios, H5PolicyLimits profile,
+                          offset<uint<64>,B> blob_off, string object,
+                          uint<64> ctype, uint<64> elm_size, uint<64> flags,
+                          uint<64> props, uint<64> avail, uint<64> used) uint<64>:
+{
+    if (!h5policy_dtype_room(props, avail, used, blob_off, object))
+        return 0UL;
+
+    /* Numeric types (fixed-point, floating-point, bit field) begin their
+       properties with bit offset then bit precision.  Reject a size that
+       vastly exceeds the precision -- an "unusually large number of
+       unused bits", which libhdf5 treats as a corrupt/crafted file
+       (H5T_is_numeric_with_unusual_unused_bits).  */
+    if (ctype == 0UL || ctype == 1UL || ctype == 4UL)
+        {
+            var bit_offset = h5policy_msg_u64_at(ios, profile,
+                                                 blob_off + 8#B, 2UL);
+            var bit_prec = h5policy_msg_u64_at(ios, profile,
+                                               blob_off + 10#B, 2UL);
+            if (elm_size > 1UL && bit_prec < (elm_size * 8UL)
+                && (elm_size * 8UL) > (2UL * (bit_prec + bit_offset)))
+                h5policy_emit_error("H5_CORRUPT_DATATYPE_UNUSED_BITS",
+                                    "corrupt", blob_off, object,
+                                    "numeric datatype has an unusually large number of unused bits");
+
+            var size_bits = elm_size * 8UL;
+            if (ctype == 1UL)
+                {
+                    var class_flags = flags .>> 8;
+                    var sign = (class_flags .>> 8) & 0xffUL;
+                    var epos = h5policy_msg_u64_at(ios, profile,
+                                                   blob_off + 12#B, 1UL);
+                    var esize = h5policy_msg_u64_at(ios, profile,
+                                                    blob_off + 13#B, 1UL);
+                    var mpos = h5policy_msg_u64_at(ios, profile,
+                                                   blob_off + 14#B, 1UL);
+                    var msize = h5policy_msg_u64_at(ios, profile,
+                                                    blob_off + 15#B, 1UL);
+
+                    if (sign >= size_bits)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_SIGN",
+                                            "corrupt", blob_off, object,
+                                            "floating-point sign bit is out of bounds");
+                    if (esize == 0UL)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_EXPONENT",
+                                            "corrupt", blob_off, object,
+                                            "floating-point exponent size is zero");
+                    else if (epos >= size_bits)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_EXPONENT",
+                                            "corrupt", blob_off, object,
+                                            "floating-point exponent range is out of bounds");
+                    else if (esize > size_bits - epos)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_EXPONENT",
+                                            "corrupt", blob_off, object,
+                                            "floating-point exponent range is out of bounds");
+                    if (msize == 0UL)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA",
+                                            "corrupt", blob_off, object,
+                                            "floating-point mantissa size is zero");
+                    else if (mpos >= size_bits)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA",
+                                            "corrupt", blob_off, object,
+                                            "floating-point mantissa range is out of bounds");
+                    else if (msize > size_bits - mpos)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA",
+                                            "corrupt", blob_off, object,
+                                            "floating-point mantissa range is out of bounds");
+                }
+        }
+
+    return used + props;
+}
+
 
 /* Bounded, depth-guarded recursive datatype validator.  Returns the total
    consumed size (8-byte header + properties) of the blob at blob_off, or 0 on
@@ -122,74 +199,8 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
         simple = 0;
 
     if (simple)
-        {
-            if (!h5policy_dtype_room(props, avail, used, blob_off, object))
-                return 0UL;
-
-            /* Numeric types (fixed-point, floating-point, bit field) begin their
-               properties with bit offset then bit precision.  Reject a size that
-               vastly exceeds the precision -- an "unusually large number of
-               unused bits", which libhdf5 treats as a corrupt/crafted file
-               (H5T_is_numeric_with_unusual_unused_bits).  */
-            if (ctype == 0UL || ctype == 1UL || ctype == 4UL)
-                {
-                    var bit_offset = h5policy_msg_u64_at(ios, profile,
-                                                         blob_off + 8#B, 2UL);
-                    var bit_prec = h5policy_msg_u64_at(ios, profile,
-                                                       blob_off + 10#B, 2UL);
-                    if (elm_size > 1UL && bit_prec < (elm_size * 8UL)
-                        && (elm_size * 8UL) > (2UL * (bit_prec + bit_offset)))
-                        h5policy_emit_error("H5_CORRUPT_DATATYPE_UNUSED_BITS",
-                                            "corrupt", blob_off, object,
-                                            "numeric datatype has an unusually large number of unused bits");
-
-                    var size_bits = elm_size * 8UL;
-                    if (ctype == 1UL)
-                        {
-                            var class_flags = flags .>> 8;
-                            var sign = (class_flags .>> 8) & 0xffUL;
-                            var epos = h5policy_msg_u64_at(ios, profile,
-                                                           blob_off + 12#B, 1UL);
-                            var esize = h5policy_msg_u64_at(ios, profile,
-                                                            blob_off + 13#B, 1UL);
-                            var mpos = h5policy_msg_u64_at(ios, profile,
-                                                           blob_off + 14#B, 1UL);
-                            var msize = h5policy_msg_u64_at(ios, profile,
-                                                            blob_off + 15#B, 1UL);
-
-                            if (sign >= size_bits)
-                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_SIGN",
-                                                    "corrupt", blob_off, object,
-                                                    "floating-point sign bit is out of bounds");
-                            if (esize == 0UL)
-                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_EXPONENT",
-                                                    "corrupt", blob_off, object,
-                                                    "floating-point exponent size is zero");
-                            else if (epos >= size_bits)
-                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_EXPONENT",
-                                                    "corrupt", blob_off, object,
-                                                    "floating-point exponent range is out of bounds");
-                            else if (esize > size_bits - epos)
-                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_EXPONENT",
-                                                    "corrupt", blob_off, object,
-                                                    "floating-point exponent range is out of bounds");
-                            if (msize == 0UL)
-                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA",
-                                                    "corrupt", blob_off, object,
-                                                    "floating-point mantissa size is zero");
-                            else if (mpos >= size_bits)
-                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA",
-                                                    "corrupt", blob_off, object,
-                                                    "floating-point mantissa range is out of bounds");
-                            else if (msize > size_bits - mpos)
-                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA",
-                                                    "corrupt", blob_off, object,
-                                                    "floating-point mantissa range is out of bounds");
-                        }
-                }
-
-            return used + props;
-        }
+            return h5policy_dtype_leaf(ios, profile, blob_off, object,
+                                       ctype, elm_size, flags, props, avail, used);
 
     /* ---- class 9: Variable-Length (single inline base type) ---- */
     if (ctype == 9UL)
@@ -443,3 +454,4 @@ fun h5policy_validate_dtype_payload = (int ios,
 }
 
 var H5POLICY_TREE_SIG = [0x54UB, 0x52UB, 0x45UB, 0x45UB];   /* "TREE" */
+
