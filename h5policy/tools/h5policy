@@ -155,8 +155,34 @@ trap 'rm -f "$cmd_file"' EXIT
     printf '.exit 0\n'
 } >"$cmd_file"
 
+# Hard wall-clock backstop.  The reachable-metadata walk is O(N^2) in poke's
+# linear-scan visited sets; the pickle enforces a soft per-profile deadline, but
+# a single long-running poke operation can run between those checks.  A process
+# timeout guarantees the preflight always terminates.  Kept above the pickle's
+# own max_walk_seconds so the clean in-pickle coverage-gap fires first when it can.
+case "$profile" in
+    forensic)             wall=50 ;;
+    legacy)               wall=90 ;;
+    trusted_fast|trusted-fast) wall=35 ;;
+    *)                    wall=20 ;;
+esac
+
 poke_status=0
-poke_output=$(poke --quiet -s "$cmd_file" 2>&1) || poke_status=$?
+if command -v timeout >/dev/null 2>&1; then
+    poke_output=$(timeout "${wall}s" poke --quiet -s "$cmd_file" 2>&1) || poke_status=$?
+else
+    poke_output=$(poke --quiet -s "$cmd_file" 2>&1) || poke_status=$?
+fi
+
+# timeout(1) exits 124 when it kills the child: emit a coverage-gap and stop.
+if [[ $poke_status -eq 124 ]]; then
+    printf '{\n  "decision": "unsupported_coverage_gap",\n'
+    printf '  "profile": "%s",\n  "file": "%s",\n' "$profile" "$file"
+    printf '  "features": {},\n  "metrics": {},\n'
+    printf '  "findings": [ { "code": "H5_UNSUPPORTED_WALK_TIMEOUT", "class": "unsupported", "severity": "warning", "object": "metadata", "offset": 0, "message": "analysis exceeded the %ss wall-clock limit; file too large or complex to fully vet" } ]\n' "$wall"
+    printf '}\n'
+    exit 5
+fi
 
 exit_code=
 report=""
