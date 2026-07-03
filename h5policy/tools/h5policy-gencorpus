@@ -12,6 +12,7 @@ specification lives in ``tests/expected/*.yml`` and is checked by ``run.sh``.
 Requires: h5py.  Usage: h5policy-gencorpus [TARGET_DIR]
 """
 import os
+import struct
 import sys
 
 import numpy as np
@@ -178,6 +179,50 @@ def generate(root):
     _patch(f"{root}/malformed/truncated.h5", raw[:32])
     _patch(f"{root}/malformed/bad_superblock_version.h5",
            raw[:8] + b"\xff" + raw[9:])
+    _make_bad_compound(f"{root}/malformed/bad_compound.h5")
+    _make_bad_offset(f"{root}/malformed/bad_offset.h5")
+
+
+def _make_bad_compound(path):
+    """Compound datatype patched to declare zero members (libhdf5: 'invalid
+    number of members: 0').  Built on a v1 object header (no checksum) so the
+    edit needs no checksum fix-up."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", shape=(2,),
+                         dtype=np.dtype([("aa", np.int32), ("bb", np.int32)]))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    # Compound datatype header: byte0 low nibble = class 6, bytes 1-2 = number
+    # of members (LE), bytes 4-7 = datatype size.  Locate the 2-member, 8-byte
+    # compound and zero its member count.
+    for i in range(len(raw) - 8):
+        if ((raw[i] & 0x0F) == 6
+                and struct.unpack_from("<H", raw, i + 1)[0] == 2
+                and struct.unpack_from("<I", raw, i + 4)[0] == 8):
+            struct.pack_into("<H", raw, i + 1, 0)
+            break
+    else:
+        raise RuntimeError("could not locate the compound datatype header")
+    _patch(path, bytes(raw))
+
+
+def _make_bad_offset(path):
+    """Old-style group whose first symbol-table entry has a link-name offset
+    past the end of the local heap data segment (libhdf5: 'unable to offset
+    into local heap data block')."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    snod = raw.find(b"SNOD")
+    if snod < 0:
+        raise RuntimeError("could not locate the symbol table node")
+    # First symbol-table entry's link-name offset (sizeof_offsets bytes at
+    # SNOD+8) -> a value well past any small heap's data segment.
+    struct.pack_into("<Q", raw, snod + 8, 0x1000)
+    _patch(path, bytes(raw))
 
 
 def _patch(path, data):
