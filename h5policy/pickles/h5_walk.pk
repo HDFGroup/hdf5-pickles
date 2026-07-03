@@ -962,6 +962,107 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
     return ctx;
 }
 
+var H5POLICY_FAHD_SIG = [0x46UB, 0x41UB, 0x48UB, 0x44UB];   /* "FAHD" */
+var H5POLICY_FADB_SIG = [0x46UB, 0x41UB, 0x44UB, 0x42UB];   /* "FADB" */
+
+/* Validate a fixed-array chunk index (v4 layout index type 3), used by chunked
+   datasets with fixed dimensions.  The checksummed header gives the element
+   count (= chunk count) and data-block address; the data block holds one
+   element per chunk whose leading offset-sized field is the chunk address.
+   Paged data blocks (very large arrays) fall back to a coverage gap.  */
+fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                                        uint<64> hdr_addr, off64 loc,
+                                        string object) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var file_size = iosize(ios)/#B;
+    var hdr_size = 12UL + el + o;
+
+    if (!h5policy_checked_addr_range(hdr_addr, hdr_size, file_size,
+                                     "fixed array header outside file", loc, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL) != H5POLICY_FAHD_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", hdr_addr#B, object,
+                                "fixed array header signature mismatch");
+            return ctx;
+        }
+
+    var hdr_body = h5policy_msg_bytes(ios, profile, hdr_addr#B, hdr_size - 4UL);
+    var hdr_stored = lookup3_u32_le(h5policy_msg_bytes(ios, profile,
+                                                       hdr_addr#B + (hdr_size - 4UL)#B, 4UL));
+    if (lookup3_hashlittle(hdr_body, 0) != hdr_stored)
+        h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM", "corrupt", hdr_addr#B, object,
+                            "fixed array header checksum mismatch");
+
+    var raw_elmt_size = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 6#B, 1UL);
+    var page_bits = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 7#B, 1UL);
+    var nelmts = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 8#B, el);
+    var dblk_raw = h5policy_msg_bytes(ios, profile, hdr_addr#B + (8UL + el)#B, o);
+    var dblk_addr = bytes_to_u64_le(dblk_raw);
+
+    ctx.chunk_index_count =
+        h5policy_checked_add_u64(ctx.chunk_index_count, nelmts,
+                                 profile.max_chunk_count,
+                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
+                                 hdr_addr#B, object,
+                                 "chunk count exceeds the selected profile limit");
+    ctx = h5policy_account_metadata(ctx, profile, hdr_size, hdr_addr#B, object);
+
+    if (h5policy_msg_addr_is_undef(dblk_raw))
+        return ctx;
+    if (dblk_addr >= file_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt", hdr_addr#B, object,
+                                "fixed array data block outside file");
+            return ctx;
+        }
+
+    /* Paged data block (large array): elements live in separate pages. */
+    if (page_bits > 0UL && nelmts > (1UL <<. page_bits))
+        {
+            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP", "unsupported",
+                                hdr_addr#B, object,
+                                "paged fixed-array chunk index is not covered yet");
+            return ctx;
+        }
+
+    var db_prefix = 6UL + o;
+    var elems = h5policy_checked_mul_u64(nelmts, raw_elmt_size, 0xffffffffffffffffUL,
+                                         "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                         dblk_addr#B, object,
+                                         "fixed array data block size overflow");
+    var db_need = h5policy_checked_add_u64(db_prefix + 4UL, elems, 0xffffffffffffffffUL,
+                                           "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                           dblk_addr#B, object,
+                                           "fixed array data block size overflow");
+    if (!h5policy_checked_addr_range(dblk_addr, db_need, file_size,
+                                     "fixed array data block body outside file",
+                                     dblk_addr#B, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, dblk_addr#B, 4UL) != H5POLICY_FADB_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", dblk_addr#B, object,
+                                "fixed array data block signature mismatch");
+            return ctx;
+        }
+
+    var i = 0UL;
+    while (i < nelmts)
+        {
+            var elem_off = dblk_addr + db_prefix + (i * raw_elmt_size);
+            var caddr_raw = h5policy_msg_bytes(ios, profile, elem_off#B, o);
+            var caddr = bytes_to_u64_le(caddr_raw);
+            if (!h5policy_msg_addr_is_undef(caddr_raw) && caddr >= file_size)
+                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt", elem_off#B, object,
+                                    "chunk data address outside file");
+            i = i + 1UL;
+        }
+
+    return ctx;
+}
+
 fun h5policy_validate_layout_payload = (int ios,
                                         H5PolicyLimits profile,
                                         H5WalkContext ctx,
@@ -1212,6 +1313,32 @@ fun h5policy_validate_layout_payload = (int ios,
                                                                             idx_addr4,
                                                                             payload_off + idx_addr_rel#B,
                                                                             object);
+                                    else if (idx_type == 3UL
+                                             && idx_addr4 != 0UL
+                                             && idx_addr4 != 0xffffffffffffffffUL)
+                                        ctx = h5policy_walk_fixed_array_chunks(ios, profile, ctx,
+                                                                               idx_addr4,
+                                                                               payload_off + idx_addr_rel#B,
+                                                                               object);
+                                    else if (idx_type == 1UL)
+                                        {
+                                            /* Single Chunk: the address field is
+                                               the one chunk's data address.  */
+                                            if (idx_addr4 != 0UL
+                                                && idx_addr4 != 0xffffffffffffffffUL)
+                                                {
+                                                    ctx.chunk_index_count =
+                                                        h5policy_checked_add_u64(ctx.chunk_index_count, 1UL,
+                                                                                 profile.max_chunk_count,
+                                                                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
+                                                                                 payload_off + idx_addr_rel#B, object,
+                                                                                 "chunk count exceeds the selected profile limit");
+                                                    if (idx_addr4 >= (iosize(ios)/#B))
+                                                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                                                            payload_off + idx_addr_rel#B, object,
+                                                                            "single-chunk data address outside file");
+                                                }
+                                        }
                                     else
                                         ctx = h5policy_note_chunk_index_addr(ctx, profile,
                                                                              idx_addr4,
