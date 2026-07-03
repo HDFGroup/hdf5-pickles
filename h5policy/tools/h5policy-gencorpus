@@ -188,14 +188,23 @@ def generate(root):
     _make_eof_past_metadata(f"{root}/malformed/eof_past_metadata.h5")
     _make_bad_snod_cache_type(f"{root}/malformed/bad_snod_cache_type.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
+    _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_bad_message_flag_combination(
         f"{root}/malformed/bad_message_flag_combination.h5")
     _make_bad_link_info_max_corder(
         f"{root}/malformed/bad_link_info_max_corder.h5")
     _make_bad_v1_reference_count(
         f"{root}/malformed/bad_v1_reference_count.h5")
+    _make_bad_object_header_message_count(
+        f"{root}/malformed/bad_object_header_message_count.h5")
     _make_bad_layout_rank_mismatch(
         f"{root}/malformed/bad_layout_rank_mismatch.h5")
+    _make_bad_dataspace_maxdim(
+        f"{root}/malformed/bad_dataspace_maxdim.h5")
+    _make_bad_external_link_info(
+        f"{root}/malformed/bad_external_link_info.h5")
+    _make_bad_dataset_storage_overflow(
+        f"{root}/malformed/bad_dataset_storage_overflow.h5")
 
 
 def _make_bad_compound(path):
@@ -369,6 +378,23 @@ def _make_bad_heap_segment(path):
     _patch(path, bytes(raw))
 
 
+def _make_bad_heap_free_list(path):
+    """Old-style group whose local heap free-list head points outside the heap
+    data segment; libhdf5 rejects this while initializing the local heap."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    heap = raw.find(b"HEAP")
+    if heap < 0:
+        raise RuntimeError("could not locate the local heap")
+    # HEAP(4) + version(1) + reserved(3) + data-segment size(length), then the
+    # free-list head offset(length).  Point it well past the small data segment.
+    struct.pack_into("<Q", raw, heap + 16, 0x1000)
+    _patch(path, bytes(raw))
+
+
 def _make_bad_message_flag_combination(path):
     """Old-style group whose symbol-table message has an invalid object-header
     flag combination: WAS_UNKNOWN without MARK_IF_UNKNOWN.  libhdf5 rejects
@@ -431,6 +457,25 @@ def _make_bad_v1_reference_count(path):
     _patch(path, bytes(raw))
 
 
+def _make_bad_object_header_message_count(path):
+    """v1 object header whose prefix under-declares the number of messages in
+    the chunk; libhdf5 rejects this as a bad object-header message count."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    snod = raw.find(b"SNOD")
+    if snod < 0:
+        raise RuntimeError("could not locate the symbol table node")
+    soff = raw[13]
+    ohdr = struct.unpack_from("<Q", raw, snod + 8 + soff)[0]
+    if raw[ohdr] != 1:
+        raise RuntimeError("expected a v1 dataset object header")
+    struct.pack_into("<H", raw, ohdr + 2, 1)
+    _patch(path, bytes(raw))
+
+
 def _make_bad_layout_rank_mismatch(path):
     """Old chunked dataset whose v1 dataspace rank does not match the legacy
     chunked layout dimensionality.  libhdf5 rejects this when opening the
@@ -449,6 +494,71 @@ def _make_bad_layout_rank_mismatch(path):
     if off < 0:
         raise RuntimeError("could not locate the dataspace message prefix")
     raw[off + 9] = 0
+    _patch(path, bytes(raw))
+
+
+def _make_bad_dataspace_maxdim(path):
+    """Dataset whose current dataspace dimension is larger than the encoded
+    maximum dimension; libhdf5 rejects this when opening the dataspace."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", shape=(10,), maxshape=(10,), dtype="i4")
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    prefix = struct.pack("<HHB3x", 0x01, 24, 0)
+    off = raw.find(prefix)
+    while off >= 0 and raw[off + 8:off + 11] != b"\x01\x01\x01":
+        off = raw.find(prefix, off + 1)
+    if off < 0:
+        raise RuntimeError("could not locate the max-dimension dataspace")
+    struct.pack_into("<Q", raw, off + 24, 5)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_external_link_info(path):
+    """External link whose user-data length is smaller than the minimum
+    external-link encoding.  libhdf5 rejects this before link traversal policy
+    is relevant."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="latest") as h:
+        h["ext"] = h5py.ExternalLink("other.h5", "/x")
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+
+    payload = b"\x01\x08\x40\x03ext\x0d\x00\x00other.h5\x00/x\x00"
+    off = raw.find(payload)
+    if off < 0:
+        raise RuntimeError("could not locate the external link payload")
+    struct.pack_into("<H", raw, off + 7, 0)
+
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate the containing object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_dataset_storage_overflow(path):
+    """Contiguous dataset whose dataspace element count overflows when
+    multiplied by the datatype size.  libhdf5 rejects this while initializing
+    the dataset's storage."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", shape=(4,), dtype="i8")
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+
+    # v1 object-header dataspace message: prefix(8), then version/rank/header,
+    # then current and max dimensions as 8-byte lengths.
+    prefix = struct.pack("<HHB3x", 0x01, 24, 0)
+    off = raw.find(prefix)
+    while off >= 0 and raw[off + 8:off + 10] != b"\x01\x01":
+        off = raw.find(prefix, off + 1)
+    if off < 0:
+        raise RuntimeError("could not locate the dataspace message prefix")
+    huge_dim = 0x4000_0000_0000_0000
+    struct.pack_into("<Q", raw, off + 16, huge_dim)
+    struct.pack_into("<Q", raw, off + 24, huge_dim)
     _patch(path, bytes(raw))
 
 

@@ -20,8 +20,11 @@ type H5WalkContext = struct
     uint<64> chunk_index_count;
     uint<8> has_dataspace;
     uint<8> has_datatype;
+    uint<8> has_dataset_layout;
     uint<8> has_fill_value;
     uint<8> has_legacy_chunked_layout;
+    uint<8> dataset_element_count_overflowed;
+    uint<8> dataset_dim_exceeds_max;
 };
 
 var h5policy_visited_ohdrs = uint<64>[]();
@@ -34,6 +37,7 @@ var h5policy_pending_paths = string[]();
 var h5policy_pending_index = 0UL;
 
 var h5policy_current_object_depth = 0UL;
+var h5policy_current_object_msg_count = 0UL;
 var h5policy_dense_handled = 0;
 var H5POLICY_H5S_MAX_RANK = 32UL;
 var H5POLICY_LAYOUT_MAX_DIMS = 33UL;  /* H5O_LAYOUT_NDIMS = H5S_MAX_RANK + 1 */
@@ -48,6 +52,7 @@ fun h5policy_reset_traversal_state = void:
     h5policy_pending_paths = string[]();
     h5policy_pending_index = 0UL;
     h5policy_current_object_depth = 0UL;
+    h5policy_current_object_msg_count = 0UL;
 }
 
 fun h5policy_seen_u64 = (uint<64>[] values, uint<64> value) int:
@@ -144,8 +149,11 @@ fun h5policy_new_walk_context = H5WalkContext:
         chunk_index_count = 0UL,
         has_dataspace = 0UB,
         has_datatype = 0UB,
+        has_dataset_layout = 0UB,
         has_fill_value = 0UB,
-        has_legacy_chunked_layout = 0UB
+        has_legacy_chunked_layout = 0UB,
+        dataset_element_count_overflowed = 0UB,
+        dataset_dim_exceeds_max = 0UB
     };
 }
 
@@ -316,6 +324,36 @@ fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
 {
     if (ctx.has_dataspace != 0UB && ctx.has_datatype != 0UB)
         {
+            if (ctx.has_dataset_layout != 0UB
+                && ctx.dataset_dim_exceeds_max != 0UB)
+                {
+                    h5policy_emit_error("H5_CORRUPT_DATASPACE_DIMENSION_EXCEEDS_MAX",
+                                        "corrupt", loc, object,
+                                        "dataspace current dimension exceeds maximum dimension");
+                    ctx.dataset_dim_exceeds_max = 0UB;
+                }
+
+            if (ctx.dataset_element_count_overflowed != 0UB)
+                {
+                    ctx.logical_dataset_bytes = 0xffffffffffffffffUL;
+                    if (ctx.logical_dataset_bytes > ctx.max_logical_dataset_bytes_seen)
+                        ctx.max_logical_dataset_bytes_seen = ctx.logical_dataset_bytes;
+                    return ctx;
+                }
+
+            if (ctx.has_dataset_layout != 0UB
+                && ctx.dataset_element_count != 0UL
+                && ctx.datatype_size > 0xffffffffffffffffUL / ctx.dataset_element_count)
+                {
+                    h5policy_emit_error("H5_CORRUPT_DATASET_STORAGE_OVERFLOW",
+                                        "corrupt", loc, object,
+                                        "size of dataset storage overflowed");
+                    ctx.logical_dataset_bytes = 0xffffffffffffffffUL;
+                    if (ctx.logical_dataset_bytes > ctx.max_logical_dataset_bytes_seen)
+                        ctx.max_logical_dataset_bytes_seen = ctx.logical_dataset_bytes;
+                    return ctx;
+                }
+
             ctx.logical_dataset_bytes =
                 h5policy_checked_mul_u64(ctx.dataset_element_count,
                                          ctx.datatype_size,
@@ -373,7 +411,10 @@ fun h5policy_validate_dataspace_payload = (int ios,
     var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL) as uint<8>;
     var ndims = 0UL;
     var dim_rel = 0UL;
+    var flags = 0UL;
     var element_count = 1UL;
+    var element_count_overflowed = 0UB;
+    var dim_exceeds_max = 0UB;
 
     if (version == 1UB)
         {
@@ -384,6 +425,7 @@ fun h5policy_validate_dataspace_payload = (int ios,
                 return ctx;
 
             ndims = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+            flags = h5policy_msg_u64_at(ios, profile, payload_off + 2#B, 1UL);
             dim_rel = 8UL;
         }
     else if (version == 2UB)
@@ -395,6 +437,7 @@ fun h5policy_validate_dataspace_payload = (int ios,
                 return ctx;
 
             ndims = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+            flags = h5policy_msg_u64_at(ios, profile, payload_off + 2#B, 1UL);
             var space_type = h5policy_msg_u64_at(ios, profile,
                                                  payload_off + 3#B, 1UL);
             if (space_type > 2UL)
@@ -448,6 +491,15 @@ fun h5policy_validate_dataspace_payload = (int ios,
                                    "dataspace dimensions overrun the message"))
         return ctx;
 
+    var has_max_dims = (flags & 1UL) != 0UL;
+    var max_dim_rel = dim_rel + dims_bytes;
+    if (has_max_dims
+        && !h5policy_payload_range_ok(msg_size, max_dim_rel, dims_bytes,
+                                      "H5_CORRUPT_DATASPACE_MESSAGE_TOO_SMALL",
+                                      payload_off, object,
+                                      "dataspace maximum dimensions overrun the message"))
+        return ctx;
+
     if (element_count != 0UL)
         {
             var i = 0UL;
@@ -458,13 +510,28 @@ fun h5policy_validate_dataspace_payload = (int ios,
                                                   + (dim_rel
                                                      + i * (global_sizeof_lengths as uint<64>))#B,
                                                   global_sizeof_lengths as uint<64>);
-                    element_count =
-                        h5policy_checked_mul_u64(element_count, dim,
-                                                 profile.max_logical_dataset_bytes,
-                                                 "H5_RESOURCE_LOGICAL_DATASET_BYTES",
-                                                 "resource",
-                                                 payload_off, object,
-                                                 "dataspace element count exceeds the selected profile limit");
+                    if (has_max_dims)
+                        {
+                            var max_dim = h5policy_msg_u64_at(ios, profile,
+                                                              payload_off
+                                                              + (max_dim_rel
+                                                                 + i * (global_sizeof_lengths as uint<64>))#B,
+                                                              global_sizeof_lengths as uint<64>);
+                            if (max_dim != 0xffffffffffffffffUL
+                                && dim > max_dim)
+                                dim_exceeds_max = 1UB;
+                        }
+                    if (element_count != 0UL
+                        && dim > 0xffffffffffffffffUL / element_count)
+                        {
+                            h5policy_emit_error("H5_RESOURCE_LOGICAL_DATASET_BYTES",
+                                                "resource", payload_off, object,
+                                                "dataspace element count exceeds representable bounds");
+                            element_count = 0xffffffffffffffffUL;
+                            element_count_overflowed = 1UB;
+                        }
+                    else if (element_count_overflowed == 0UB)
+                        element_count = element_count * dim;
                     i = i + 1UL;
                 }
         }
@@ -472,6 +539,8 @@ fun h5policy_validate_dataspace_payload = (int ios,
     ctx.has_dataspace = 1UB;
     ctx.dataspace_rank = ndims;
     ctx.dataset_element_count = element_count;
+    ctx.dataset_element_count_overflowed = element_count_overflowed;
+    ctx.dataset_dim_exceeds_max = dim_exceeds_max;
     ctx = h5policy_update_legacy_chunked_layout_rank(ctx, payload_off, object);
     return h5policy_update_logical_dataset_size(ctx, profile,
                                                 payload_off, object);
@@ -1426,6 +1495,8 @@ fun h5policy_validate_layout_payload = (int ios,
     var layout_class = 0UL;
     var file_size = h5policy_ceiling(ios);
 
+    ctx.has_dataset_layout = 1UB;
+
     if (version == 1UL || version == 2UL)
         {
             if (!h5policy_payload_range_ok(msg_size, 0UL, 8UL,
@@ -1767,7 +1838,8 @@ fun h5policy_validate_layout_payload = (int ios,
                             "corrupt", payload_off, object,
                             "unknown data layout class");
 
-    return ctx;
+    return h5policy_update_logical_dataset_size(ctx, profile,
+                                                payload_off, object);
 }
 
 fun h5policy_validate_filter_pipeline_payload = (int ios,
@@ -1997,6 +2069,22 @@ fun h5policy_validate_link_payload = (int ios,
     else if (link_type == 64UL)
         {
             h5policy_note_external_link;
+            if (!h5policy_payload_range_ok(msg_size, cur, 2UL,
+                                           "H5_CORRUPT_EXTERNAL_LINK_MESSAGE_TOO_SMALL",
+                                           payload_off + cur#B, object,
+                                           "external link value length is missing"))
+                return;
+            var ext_len = h5policy_msg_u64_at(ios, profile,
+                                              payload_off + cur#B, 2UL);
+            if (ext_len < 3UL)
+                h5policy_emit_error("H5_CORRUPT_EXTERNAL_LINK_INFO_TOO_SMALL",
+                                    "corrupt", payload_off + cur#B, object,
+                                    "external link information length is too small");
+            else if (!h5policy_payload_range_ok(msg_size, cur + 2UL, ext_len,
+                                                "H5_CORRUPT_EXTERNAL_LINK_MESSAGE_TOO_SMALL",
+                                                payload_off + cur#B, object,
+                                                "external link value overruns the link message"))
+                return;
             if (profile.allow_external_links == 0UB)
                 h5policy_emit_error("H5_POLICY_EXTERNAL_LINK", "policy",
                                     payload_off, object,
@@ -2510,6 +2598,70 @@ fun h5policy_heap_name = (int ios, H5PolicyLimits profile,
     return h5policy_string_from_payload(ios, profile, abs#B, cap);
 }
 
+fun h5policy_validate_local_heap_free_list = (int ios,
+                                              H5PolicyLimits profile,
+                                              uint<64> data_seg_addr,
+                                              uint<64> data_seg_size,
+                                              uint<64> free_block,
+                                              off64 loc,
+                                              string object) void:
+{
+    var l = global_sizeof_lengths as uint<64>;
+    var node_size = 2UL * l;
+    var seen = uint<64>[]();
+
+    while (free_block != 1UL)
+        {
+            if (h5policy_seen_u64(seen, free_block))
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", loc, object,
+                                        "local heap free list contains a cycle");
+                    return;
+                }
+            seen += [free_block];
+
+            if (free_block > 0xffffffffffffffffUL - node_size)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", loc, object,
+                                        "local heap free-block offset overflows");
+                    return;
+                }
+
+            if (free_block + node_size > data_seg_size)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", loc, object,
+                                        "local heap free-block header is outside the data segment");
+                    return;
+                }
+
+            var block_off = data_seg_addr + free_block;
+            var next_free = h5policy_msg_u64_at(ios, profile, block_off#B, l);
+            var block_size = h5policy_msg_u64_at(ios, profile,
+                                                 block_off#B + l#B, l);
+
+            if (next_free == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", block_off#B, object,
+                                        "local heap free-block size is zero");
+                    return;
+                }
+
+            if (block_size > data_seg_size || free_block > data_seg_size - block_size)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", block_off#B, object,
+                                        "local heap free block extends outside the data segment");
+                    return;
+                }
+
+            free_block = next_free;
+        }
+}
+
 /* Validate a local heap header and return its data-segment address (or the
    undef sentinel on error, after emitting).  */
 fun h5policy_local_heap_data_addr = (int ios, H5PolicyLimits profile,
@@ -2536,6 +2688,8 @@ fun h5policy_local_heap_data_addr = (int ios, H5PolicyLimits profile,
     /* Data segment size (bounds link-name offsets) is the first length field. */
     h5policy_heap_data_seg_size = h5policy_msg_u64_at(ios, profile,
                                                       heap_addr#B + 8#B, l);
+    var free_block = h5policy_msg_u64_at(ios, profile,
+                                         heap_addr#B + (8UL + l)#B, l);
     var data_seg_addr = h5policy_msg_u64_at(ios, profile,
                                             heap_addr#B + (8UL + (2UL * l))#B, o);
 
@@ -2546,6 +2700,12 @@ fun h5policy_local_heap_data_addr = (int ios, H5PolicyLimits profile,
                                              h5policy_heap_data_seg_size, file_size,
                                              "local heap data segment outside file",
                                              loc, object);
+    if (!seg_ok)
+        return 0xffffffffffffffffUL;
+
+    h5policy_validate_local_heap_free_list(ios, profile, data_seg_addr,
+                                           h5policy_heap_data_seg_size,
+                                           free_block, loc, object);
     return data_seg_addr;
 }
 
@@ -3299,29 +3459,49 @@ fun h5policy_validate_message_payload = (int ios,
                                          string object) H5WalkContext:
 {
     if (m_type == 0x01UL)
-        return h5policy_validate_dataspace_payload(ios, profile, ctx,
-                                                   payload_off, msg_size,
-                                                   object);
+        {
+            if (ctx.has_dataspace != 0UB)
+                return ctx;
+            return h5policy_validate_dataspace_payload(ios, profile, ctx,
+                                                       payload_off, msg_size,
+                                                       object);
+        }
     if (m_type == 0x02UL)
         h5policy_validate_linfo_payload(ios, profile, payload_off,
                                         msg_size, object);
     if (m_type == 0x03UL)
-        return h5policy_validate_dtype_payload(ios, profile, ctx,
-                                               payload_off, msg_size,
-                                               object);
+        {
+            if (ctx.has_datatype != 0UB)
+                return ctx;
+            return h5policy_validate_dtype_payload(ios, profile, ctx,
+                                                   payload_off, msg_size,
+                                                   object);
+        }
     if (m_type == 0x04UL)
-        return h5policy_validate_fill_payload(ios, profile, ctx, payload_off,
-                                              msg_size, object, 1);
+        {
+            if (ctx.has_fill_value != 0UB)
+                return ctx;
+            return h5policy_validate_fill_payload(ios, profile, ctx, payload_off,
+                                                  msg_size, object, 1);
+        }
     else if (m_type == 0x05UL)
-        return h5policy_validate_fill_payload(ios, profile, ctx, payload_off,
-                                              msg_size, object, 0);
+        {
+            if (ctx.has_fill_value != 0UB)
+                return ctx;
+            return h5policy_validate_fill_payload(ios, profile, ctx, payload_off,
+                                                  msg_size, object, 0);
+        }
     else if (m_type == 0x06UL)
         h5policy_validate_link_payload(ios, profile, payload_off,
                                        msg_size, object);
     else if (m_type == 0x08UL)
-        return h5policy_validate_layout_payload(ios, profile, ctx,
-                                                payload_off, msg_size,
-                                                object);
+        {
+            if (ctx.has_dataset_layout != 0UB)
+                return ctx;
+            return h5policy_validate_layout_payload(ios, profile, ctx,
+                                                    payload_off, msg_size,
+                                                    object);
+        }
     else if (m_type == 0x0bUL)
         h5policy_validate_filter_pipeline_payload(ios, profile,
                                                   payload_off, msg_size,
@@ -3638,6 +3818,8 @@ fun h5policy_validate_msg_chunk = (int ios,
 
             i = i + (prefix_bytes as uint<64>) + m_size;
             msg_count = msg_count + 1UL;
+            h5policy_current_object_msg_count =
+                h5policy_current_object_msg_count + 1UL;
         }
 
     return ctx;
