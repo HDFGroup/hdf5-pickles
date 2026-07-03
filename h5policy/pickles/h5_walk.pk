@@ -841,6 +841,126 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
     return ctx;
 }
 
+var H5POLICY_BTHD_SIG = [0x42UB, 0x54UB, 0x48UB, 0x44UB];   /* "BTHD" */
+var H5POLICY_BTLF_SIG = [0x42UB, 0x54UB, 0x4cUB, 0x46UB];   /* "BTLF" */
+var H5POLICY_BTIN_SIG = [0x42UB, 0x54UB, 0x49UB, 0x4eUB];   /* "BTIN" */
+
+/* Validate a version-2 B-tree chunk index (v4 layout index type 5).  The
+   checksummed header gives the total record count (= chunk count) directly, so
+   we enforce it against max_chunk_count without walking, validate the header
+   and root node, and -- when the root is a leaf -- bounds-check each chunk
+   address.  Deep trees are validated at the root under the count budget (the
+   audit's "validate the index root under a budget"); the variable-width
+   internal-node child pointers are not decoded.  */
+fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                                     uint<64> hdr_addr, off64 loc,
+                                     string object) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var file_size = iosize(ios)/#B;
+    var hdr_size = 22UL + o + el;
+
+    if (!h5policy_checked_addr_range(hdr_addr, hdr_size, file_size,
+                                     "v2 B-tree header outside file", loc, object))
+        return ctx;
+
+    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL) != H5POLICY_BTHD_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                hdr_addr#B, object,
+                                "v2 B-tree header signature mismatch");
+            return ctx;
+        }
+
+    var hdr_body = h5policy_msg_bytes(ios, profile, hdr_addr#B, hdr_size - 4UL);
+    var hdr_stored = lookup3_u32_le(h5policy_msg_bytes(ios, profile,
+                                                       hdr_addr#B + (hdr_size - 4UL)#B,
+                                                       4UL));
+    if (lookup3_hashlittle(hdr_body, 0) != hdr_stored)
+        h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM", "corrupt",
+                            hdr_addr#B, object,
+                            "v2 B-tree header checksum mismatch");
+
+    var record_type = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 5#B, 1UL);
+    var record_size = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 10#B, 2UL);
+    var depth = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 12#B, 2UL);
+    var root_raw = h5policy_msg_bytes(ios, profile, hdr_addr#B + 16#B, o);
+    var root_addr = bytes_to_u64_le(root_raw);
+    var num_root = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (16UL + o)#B, 2UL);
+    var total_nrec = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (18UL + o)#B, el);
+
+    if (record_type != 10UL && record_type != 11UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNKNOWN_CHUNK_INDEX_TYPE", "corrupt",
+                                hdr_addr#B, object,
+                                "v2 B-tree chunk index has an unexpected record type");
+            return ctx;
+        }
+
+    /* Total record count == chunk count: enforce the resource budget. */
+    ctx.chunk_index_count =
+        h5policy_checked_add_u64(ctx.chunk_index_count, total_nrec,
+                                 profile.max_chunk_count,
+                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
+                                 hdr_addr#B, object,
+                                 "chunk count exceeds the selected profile limit");
+
+    ctx = h5policy_account_metadata(ctx, profile, hdr_size, hdr_addr#B, object);
+
+    if (h5policy_msg_addr_is_undef(root_raw))
+        return ctx;
+    if (root_addr >= file_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                hdr_addr#B, object,
+                                "v2 B-tree root node outside file");
+            return ctx;
+        }
+
+    if (depth == 0UL)
+        {
+            var recs_bytes = h5policy_checked_mul_u64(num_root, record_size,
+                                                      0xffffffffffffffffUL,
+                                                      "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                                      root_addr#B, object,
+                                                      "v2 B-tree leaf size overflow");
+            var need = h5policy_checked_add_u64(6UL, recs_bytes, 0xffffffffffffffffUL,
+                                                "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                                root_addr#B, object,
+                                                "v2 B-tree leaf size overflow");
+            if (!h5policy_checked_addr_range(root_addr, need, file_size,
+                                             "v2 B-tree leaf outside file",
+                                             root_addr#B, object))
+                return ctx;
+            if (h5policy_msg_bytes(ios, profile, root_addr#B, 4UL) != H5POLICY_BTLF_SIG)
+                {
+                    h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                        root_addr#B, object,
+                                        "v2 B-tree leaf signature mismatch");
+                    return ctx;
+                }
+            var i = 0UL;
+            while (i < num_root)
+                {
+                    var rec_off = root_addr + 6UL + (i * record_size);
+                    var caddr_raw = h5policy_msg_bytes(ios, profile, rec_off#B, o);
+                    var caddr = bytes_to_u64_le(caddr_raw);
+                    if (!h5policy_msg_addr_is_undef(caddr_raw) && caddr >= file_size)
+                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                            rec_off#B, object,
+                                            "chunk data address outside file");
+                    i = i + 1UL;
+                }
+        }
+    else if (h5policy_msg_bytes(ios, profile, root_addr#B, 4UL) != H5POLICY_BTIN_SIG)
+        h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                            root_addr#B, object,
+                            "v2 B-tree internal node signature mismatch");
+
+    return ctx;
+}
+
 fun h5policy_validate_layout_payload = (int ios,
                                         H5PolicyLimits profile,
                                         H5WalkContext ctx,
@@ -1084,10 +1204,18 @@ fun h5policy_validate_layout_payload = (int ios,
                                     var idx_addr4 = h5policy_msg_u64_at(ios, profile,
                                                                         payload_off + idx_addr_rel#B,
                                                                         global_sizeof_offsets as uint<64>);
-                                    ctx = h5policy_note_chunk_index_addr(ctx, profile,
-                                                                         idx_addr4,
-                                                                         payload_off + idx_addr_rel#B,
-                                                                         object);
+                                    if (idx_type == 5UL
+                                        && idx_addr4 != 0UL
+                                        && idx_addr4 != 0xffffffffffffffffUL)
+                                        ctx = h5policy_walk_v2_btree_chunks(ios, profile, ctx,
+                                                                            idx_addr4,
+                                                                            payload_off + idx_addr_rel#B,
+                                                                            object);
+                                    else
+                                        ctx = h5policy_note_chunk_index_addr(ctx, profile,
+                                                                             idx_addr4,
+                                                                             payload_off + idx_addr_rel#B,
+                                                                             object);
                                 }
                         }
                 }
