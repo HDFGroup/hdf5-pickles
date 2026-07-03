@@ -226,6 +226,18 @@ def generate(root):
         f"{root}/malformed/bad_dataset_storage_overflow.h5")
     _make_bad_ext_address(f"{root}/malformed/bad_ext_address.h5")
     _make_bad_btree_key(f"{root}/malformed/bad_btree_key.h5")
+    _make_bad_dense_checksum(f"{root}/malformed/bad_dense_frhp_checksum.h5",
+                             "FRHP")
+    _make_bad_dense_checksum(f"{root}/malformed/bad_dense_fhdb_checksum.h5",
+                             "FHDB")
+    _make_bad_dense_checksum(f"{root}/malformed/bad_dense_fhib_checksum.h5",
+                             "FHIB")
+    _make_bad_dense_checksum(f"{root}/malformed/bad_dense_bthd_checksum.h5",
+                             "BTHD")
+    _make_bad_dense_checksum(f"{root}/malformed/bad_dense_btlf_checksum.h5",
+                             "BTLF")
+    _make_bad_dense_checksum(f"{root}/malformed/bad_dense_btin_checksum.h5",
+                             "BTIN")
 
 
 def _make_bad_ext_address(path):
@@ -369,6 +381,161 @@ def _fix_v2_ohdr_checksum(raw, ohdr_off):
     chksum_off = cursor + size_width + chunk_size
     struct.pack_into("<I", raw, chksum_off,
                      _jenkins_lookup3()(bytes(raw[ohdr_off:chksum_off])))
+
+
+def _bytes_for_bits(nbits):
+    return (nbits + 7) // 8
+
+
+def _floor_log2(value):
+    return value.bit_length() - 1 if value > 0 else 0
+
+
+def _bt2_nrec_bytes(node_size, record_size, offset_size):
+    nbytes = 1
+    prev = 0
+    while nbytes != prev:
+        prev = nbytes
+        ptr_size = offset_size + nbytes
+        if node_size < 10 + ptr_size or record_size + ptr_size == 0:
+            return nbytes
+        max_nrec = (node_size - 10 - ptr_size) // (record_size + ptr_size)
+        nbytes = 1
+        thresh = 256
+        while max_nrec >= thresh:
+            nbytes += 1
+            thresh *= 256
+    return nbytes
+
+
+def _bt2_subtree_bytes(node_size, record_size, level, offset_size):
+    if level == 0 or record_size == 0 or node_size < 10:
+        return 0
+    nrec_bytes = _bt2_nrec_bytes(node_size, record_size, offset_size)
+    cum_max = (node_size - 10) // record_size
+    subtree_bytes = 0
+    for _ in range(1, level + 1):
+        ptr_size = offset_size + nrec_bytes + subtree_bytes
+        if node_size < 10 + ptr_size or record_size + ptr_size == 0:
+            return subtree_bytes
+        max_int = (node_size - 10 - ptr_size) // (record_size + ptr_size)
+        cum_max = ((max_int + 1) * cum_max) + max_int
+        subtree_bytes = 1
+        thresh = 256
+        while cum_max >= thresh:
+            subtree_bytes += 1
+            thresh *= 256
+    return subtree_bytes
+
+
+def _dense_frhp_info(raw):
+    off_size = raw[9]
+    len_size = raw[10]
+    frhp = raw.find(b"FRHP")
+    if frhp < 0:
+        raise RuntimeError("could not locate dense fractal heap header")
+    filter_len = struct.unpack_from("<H", raw, frhp + 7)[0]
+    flags = raw[frhp + 9]
+    dtable = frhp + 14 + (10 * len_size) + (2 * off_size)
+    width = struct.unpack_from("<H", raw, dtable)[0]
+    start = int.from_bytes(raw[dtable + 2:dtable + 2 + len_size], "little")
+    max_direct = int.from_bytes(
+        raw[dtable + 2 + len_size:dtable + 2 + 2 * len_size], "little")
+    max_heap_bits = struct.unpack_from("<H", raw, dtable + 2 + 2 * len_size)[0]
+    root = int.from_bytes(
+        raw[dtable + 6 + 2 * len_size:dtable + 6 + 2 * len_size + off_size],
+        "little")
+    curr_rows = struct.unpack_from(
+        "<H", raw, dtable + 6 + 2 * len_size + off_size)[0]
+    header_body = 14 + (2 * off_size) + (10 * len_size) \
+        + (8 + 2 * len_size + off_size)
+    if filter_len:
+        header_body += len_size + 4 + filter_len
+    return dict(off_size=off_size, len_size=len_size, frhp=frhp,
+                filter_len=filter_len, flags=flags, width=width, start=start,
+                max_direct=max_direct, max_heap_bits=max_heap_bits, root=root,
+                curr_rows=curr_rows, heap_off_size=_bytes_for_bits(max_heap_bits),
+                frhp_checksum=frhp + header_body)
+
+
+def _dense_iblock_size(info, nrows):
+    max_direct_rows = _floor_log2(info["max_direct"]) \
+        - _floor_log2(info["start"]) + 2
+    width = info["width"]
+    if nrows <= max_direct_rows:
+        ndir = nrows * width
+        nindir = 0
+    else:
+        ndir = max_direct_rows * width
+        nindir = (nrows - max_direct_rows) * width
+    dir_entry = info["off_size"] if info["filter_len"] == 0 \
+        else info["off_size"] + info["len_size"] + 4
+    return 5 + info["off_size"] + info["heap_off_size"] \
+        + ndir * dir_entry + nindir * info["off_size"] + 4
+
+
+def _dense_bthd_info(raw):
+    off_size = raw[9]
+    len_size = raw[10]
+    bthd = raw.find(b"BTHD")
+    if bthd < 0:
+        raise RuntimeError("could not locate dense v2 B-tree header")
+    node_size = struct.unpack_from("<I", raw, bthd + 6)[0]
+    record_size = struct.unpack_from("<H", raw, bthd + 10)[0]
+    depth = struct.unpack_from("<H", raw, bthd + 12)[0]
+    root = int.from_bytes(raw[bthd + 16:bthd + 16 + off_size], "little")
+    nroot = struct.unpack_from("<H", raw, bthd + 16 + off_size)[0]
+    return dict(off_size=off_size, len_size=len_size, bthd=bthd,
+                node_size=node_size, record_size=record_size, depth=depth,
+                root=root, nroot=nroot,
+                checksum=bthd + 22 + off_size + len_size - 4)
+
+
+def _dense_checksum_offset(raw, block):
+    if block == "FRHP":
+        return _dense_frhp_info(raw)["frhp_checksum"]
+    if block == "FHDB":
+        info = _dense_frhp_info(raw)
+        fhdb = raw.find(b"FHDB")
+        if fhdb < 0:
+            raise RuntimeError("could not locate dense fractal heap direct block")
+        return fhdb + 5 + info["off_size"] + info["heap_off_size"]
+    if block == "FHIB":
+        info = _dense_frhp_info(raw)
+        fhib = raw.find(b"FHIB")
+        if fhib < 0:
+            raise RuntimeError("could not locate dense fractal heap indirect block")
+        return fhib + _dense_iblock_size(info, info["curr_rows"]) - 4
+    bt = _dense_bthd_info(raw)
+    if block == "BTHD":
+        return bt["checksum"]
+    if block == "BTLF":
+        btlf = raw.find(b"BTLF")
+        if btlf < 0:
+            raise RuntimeError("could not locate dense v2 B-tree leaf")
+        return btlf + 6 + bt["nroot"] * bt["record_size"]
+    if block == "BTIN":
+        if raw[bt["root"]:bt["root"] + 4] != b"BTIN":
+            raise RuntimeError("dense v2 B-tree root is not an internal node")
+        nrec_bytes = _bt2_nrec_bytes(bt["node_size"], bt["record_size"],
+                                     bt["off_size"])
+        sub_bytes = _bt2_subtree_bytes(bt["node_size"], bt["record_size"],
+                                       bt["depth"] - 1, bt["off_size"]) \
+            if bt["depth"] > 1 else 0
+        ptr_size = bt["off_size"] + nrec_bytes + sub_bytes
+        return bt["root"] + 6 + bt["nroot"] * bt["record_size"] \
+            + (bt["nroot"] + 1) * ptr_size
+    raise RuntimeError(f"unknown dense checksum block {block}")
+
+
+def _make_bad_dense_checksum(path, block):
+    """Flip one stored checksum byte in dense link/attribute metadata."""
+    root = os.path.dirname(os.path.dirname(path))
+    base_name = "dense_attribute.h5" if block == "BTIN" else "dense_links.h5"
+    raw = bytearray(open(os.path.join(root, "valid", base_name), "rb").read())
+    off = _dense_checksum_offset(raw, block)
+    raw[off] ^= 0x01
+    _patch(path, bytes(raw))
 
 
 def _make_bad_base_address(path):
