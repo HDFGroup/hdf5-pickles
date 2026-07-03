@@ -108,42 +108,26 @@ differential, and fuzzing workflow.
 
 ## Core Pickles
 
-- [`pickles/common.pk`](pickles/common.pk): shared helpers and common definitions.
-- [`pickles/superblock.pk`](pickles/superblock.pk): HDF5 superblock definitions.
-- [`pickles/messages.pk`](pickles/messages.pk): object header message definitions.
-- [`pickles/ohdr.pk`](pickles/ohdr.pk): object header definitions.
-- [`pickles/btree.pk`](pickles/btree.pk): umbrella loader for version 1 and
-  version 2 B-tree definitions.
-- [`pickles/v1_btree.pk`](pickles/v1_btree.pk): version 1 B-tree and symbol table
-  node definitions.
-- [`pickles/v2_btree.pk`](pickles/v2_btree.pk): version 2 B-tree definitions.
-- [`pickles/farray.pk`](pickles/farray.pk): fixed array chunk index definitions.
-- [`pickles/earray.pk`](pickles/earray.pk): extensible array chunk index
-  definitions.
-- [`pickles/fheap.pk`](pickles/fheap.pk): fractal heap definitions.
-- [`pickles/lookup3.pk`](pickles/lookup3.pk): lookup3/Jenkins checksum helpers.
-- [`h5policy/pickles/`](h5policy/pickles/): policy-oriented validators and
-  bounded walkers layered on the core format definitions.
+- [`pickles/common.pk`](pickles/common.pk): shared helpers and common definitions
+- [`pickles/superblock.pk`](pickles/superblock.pk): HDF5 superblock definitions
+- [`pickles/messages.pk`](pickles/messages.pk): object header message definitions
+- [`pickles/ohdr.pk`](pickles/ohdr.pk): object header definitions
+- [`pickles/btree.pk`](pickles/btree.pk): umbrella loader for version 1 and version 2 B-tree definitions
+- [`pickles/v1_btree.pk`](pickles/v1_btree.pk): version 1 B-tree and symbol table node definitions
+- [`pickles/v2_btree.pk`](pickles/v2_btree.pk): version 2 B-tree definitions
+- [`pickles/farray.pk`](pickles/farray.pk): fixed array chunk index definitions
+- [`pickles/earray.pk`](pickles/earray.pk): extensible array chunk index definitions
+- [`pickles/lookup3.pk`](pickles/lookup3.pk): implementation of the lookup3 hash function used for checksums
 
-## Other Tools And Docs
+### Documentation
 
-- [`TOOLS.md`](TOOLS.md): `h5markers` marker scanner and `h5explain` interactive
-  explorer.
-- [`TUTORIAL.md`](TUTORIAL.md): guided GNU poke sessions using the repository
-  pickles and example files.
-- [`MARKERS.md`](MARKERS.md): known HDF5 and Onion on-disk markers.
-- [`docs/`](docs/): generated and source documentation for selected pickle
-  definitions.
-- [`examples/`](examples/): sample HDF5 files and GNU poke sessions.
+- [`MARKERS.md`](MARKERS.md): list of known on-disk markers in HDF5 and Onion files
+- [`TOOLS.md`](TOOLS.md): documentation for tools included in this repository, including the marker scanner and interactive explorer
+- [`TUTORIAL.md`](TUTORIAL.md): step-by-step tutorial for using the pickles and tools in this repository
 
-## Requirements
+### Examples
 
-- GNU poke for the pickles and `h5policy`.
-- Python 3 with `h5py` for corpus generation, tests, differential comparison,
-  and fuzzing.
-- Optional libhdf5 command-line tools (`h5dump`, `h5debug`) for stronger
-  differential signals.
-- CMake and a C++17 compiler for `h5markers`.
+- [`examples/`](examples/): example HDF5 files and GNU poke sessions demonstrating the use of the pickles and tools in this repository
 
 ## Acknowledgments
 

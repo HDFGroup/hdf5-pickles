@@ -117,3 +117,40 @@ if(POKE_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0)
 else()
     message(STATUS "h5policy regression test skipped (needs poke and python3 h5py)")
 endif()
+
+# ---- emacs-check target ------------------------------------------------------
+
+set(EMACS_EXECUTABLE "emacs" CACHE STRING "Emacs executable used by emacs-check")
+set(EMACS_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/emacs/hdf5-poke-core.el"
+    "${CMAKE_CURRENT_SOURCE_DIR}/emacs/hdf5-poke-ui.el"
+    "${CMAKE_CURRENT_SOURCE_DIR}/emacs/hdf5-poke.el"
+)
+set(EMACS_BYTE_COMPILE_DIR "${CMAKE_CURRENT_BINARY_DIR}/emacs-byte-compile")
+set(EMACS_BYTE_COMPILE_DEST_EXPR
+    "(setq byte-compile-dest-file-function (lambda (file) (expand-file-name (concat (file-name-nondirectory file) \"c\") \"${EMACS_BYTE_COMPILE_DIR}\")))"
+)
+set(EMACS_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/tests/fixtures")
+
+add_custom_target(emacs-check
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "${EMACS_BYTE_COMPILE_DIR}"
+            "${EMACS_FIXTURE_DIR}"
+    COMMAND "${EMACS_EXECUTABLE}" -Q --batch -L "${CMAKE_CURRENT_SOURCE_DIR}/emacs"
+            --eval "${EMACS_BYTE_COMPILE_DEST_EXPR}"
+            -f batch-byte-compile ${EMACS_SOURCES}
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/make_hdf5_fixtures.py"
+            "${EMACS_FIXTURE_DIR}"
+    COMMAND "${EMACS_EXECUTABLE}" -Q --batch
+            -l "${CMAKE_CURRENT_SOURCE_DIR}/tests/hdf5-poke-test.el"
+            -f ert-run-tests-batch-and-exit
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "HDF5_POKE_TEST_FIXTURES=${EMACS_FIXTURE_DIR}"
+            "${EMACS_EXECUTABLE}" -Q --batch
+            -l "${CMAKE_CURRENT_SOURCE_DIR}/tests/hdf5-poke-process-test.el"
+            -f ert-run-tests-batch-and-exit
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Running Emacs byte compilation and ERT tests"
+    VERBATIM
+    USES_TERMINAL
+)
