@@ -10,13 +10,18 @@ type H5WalkContext = struct
     uint<64> link_depth;
     uint<64> dtype_depth;
     uint<64> max_rank_seen;
+    uint<64> dataspace_rank;
     uint<64> dataset_element_count;
     uint<64> datatype_size;
+    uint<64> fill_value_size;
+    uint<64> legacy_chunked_layout_ndims;
     uint<64> logical_dataset_bytes;
     uint<64> max_logical_dataset_bytes_seen;
     uint<64> chunk_index_count;
     uint<8> has_dataspace;
     uint<8> has_datatype;
+    uint<8> has_fill_value;
+    uint<8> has_legacy_chunked_layout;
 };
 
 var h5policy_visited_ohdrs = uint<64>[]();
@@ -129,13 +134,18 @@ fun h5policy_new_walk_context = H5WalkContext:
         link_depth = 0UL,
         dtype_depth = 0UL,
         max_rank_seen = 0UL,
+        dataspace_rank = 0UL,
         dataset_element_count = 0UL,
         datatype_size = 0UL,
+        fill_value_size = 0UL,
+        legacy_chunked_layout_ndims = 0UL,
         logical_dataset_bytes = 0UL,
         max_logical_dataset_bytes_seen = 0UL,
         chunk_index_count = 0UL,
         has_dataspace = 0UB,
-        has_datatype = 0UB
+        has_datatype = 0UB,
+        has_fill_value = 0UB,
+        has_legacy_chunked_layout = 0UB
     };
 }
 
@@ -321,6 +331,32 @@ fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
     return ctx;
 }
 
+fun h5policy_update_legacy_chunked_layout_rank = (H5WalkContext ctx,
+                                                 off64 loc,
+                                                 string object) H5WalkContext:
+{
+    if (ctx.has_dataspace != 0UB && ctx.has_legacy_chunked_layout != 0UB
+        && ctx.legacy_chunked_layout_ndims != ctx.dataspace_rank + 1UL)
+        h5policy_emit_error("H5_CORRUPT_LAYOUT_RANK_MISMATCH",
+                            "corrupt", loc, object,
+                            "legacy chunked layout dimensionality does not match dataspace rank");
+
+    return ctx;
+}
+
+fun h5policy_update_fill_value_size = (H5WalkContext ctx,
+                                       off64 loc,
+                                       string object) H5WalkContext:
+{
+    if (ctx.has_fill_value != 0UB && ctx.has_datatype != 0UB
+        && ctx.fill_value_size != ctx.datatype_size)
+        h5policy_emit_error("H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH",
+                            "corrupt", loc, object,
+                            "fill value size does not match the dataset datatype size");
+
+    return ctx;
+}
+
 fun h5policy_validate_dataspace_payload = (int ios,
                                            H5PolicyLimits profile,
                                            H5WalkContext ctx,
@@ -434,7 +470,9 @@ fun h5policy_validate_dataspace_payload = (int ios,
         }
 
     ctx.has_dataspace = 1UB;
+    ctx.dataspace_rank = ndims;
     ctx.dataset_element_count = element_count;
+    ctx = h5policy_update_legacy_chunked_layout_rank(ctx, payload_off, object);
     return h5policy_update_logical_dataset_size(ctx, profile,
                                                 payload_off, object);
 }
@@ -876,6 +914,7 @@ fun h5policy_validate_dtype_payload = (int ios,
 
     ctx.has_datatype = 1UB;
     ctx.datatype_size = elm_size;
+    ctx = h5policy_update_fill_value_size(ctx, payload_off, object);
     return h5policy_update_logical_dataset_size(ctx, profile,
                                                 payload_off, object);
 }
@@ -1403,6 +1442,11 @@ fun h5policy_validate_layout_payload = (int ios,
                                     "layout dimensionality is out of range");
             if (layout_class == CHUNKED as uint<64>)
                 {
+                    ctx.has_legacy_chunked_layout = 1UB;
+                    ctx.legacy_chunked_layout_ndims = ndims;
+                    ctx = h5policy_update_legacy_chunked_layout_rank(ctx,
+                                                                     payload_off + 1#B,
+                                                                     object);
                     var idx_addr = h5policy_msg_u64_at(ios, profile,
                                                        payload_off + 8#B,
                                                        global_sizeof_offsets as uint<64>);
@@ -1491,6 +1535,11 @@ fun h5policy_validate_layout_payload = (int ios,
                                 h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
                                                     "corrupt", payload_off + 2#B, object,
                                                     "layout dimensionality is out of range");
+                            ctx.has_legacy_chunked_layout = 1UB;
+                            ctx.legacy_chunked_layout_ndims = ndims3;
+                            ctx = h5policy_update_legacy_chunked_layout_rank(ctx,
+                                                                             payload_off + 2#B,
+                                                                             object);
                             var idx_addr3 = h5policy_msg_u64_at(ios, profile,
                                                                 payload_off + 3#B,
                                                                 global_sizeof_offsets as uint<64>);
@@ -2714,12 +2763,14 @@ fun h5policy_validate_stab_payload = (int ios,
 
 fun h5policy_validate_fill_payload = (int ios,
                                       H5PolicyLimits profile,
+                                      H5WalkContext ctx,
                                       offset<uint<64>,B> payload_off,
                                       uint<64> msg_size,
                                       string object,
-                                      int old_fill) void:
+                                      int old_fill) H5WalkContext:
 {
     var fill_size = 0UL;
+    var fill_defined = 0;
 
     if (old_fill)
         {
@@ -2727,13 +2778,14 @@ fun h5policy_validate_fill_payload = (int ios,
                                            "H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL",
                                            payload_off, object,
                                            "old fill-value message is too small"))
-                return;
+                return ctx;
             fill_size = h5policy_msg_u64_at(ios, profile, payload_off, 4UL);
+            fill_defined = (fill_size != 0UL);
             if (!h5policy_payload_range_ok(msg_size, 4UL, fill_size,
                                            "H5_CORRUPT_FILL_VALUE_OVERRUNS_MESSAGE",
                                            payload_off, object,
                                            "old fill value overruns the message"))
-                return;
+                return ctx;
         }
     else
         {
@@ -2741,7 +2793,7 @@ fun h5policy_validate_fill_payload = (int ios,
                                            "H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL",
                                            payload_off, object,
                                            "fill-value message is too small"))
-                return;
+                return ctx;
 
             var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
             if (version == 1UL || version == 2UL)
@@ -2750,7 +2802,7 @@ fun h5policy_validate_fill_payload = (int ios,
                                                    "H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL",
                                                    payload_off, object,
                                                    "fill-value v1/v2 message is too small"))
-                        return;
+                        return ctx;
                     var defined = h5policy_msg_u64_at(ios, profile,
                                                       payload_off + 3#B, 1UL);
                     if (defined != 0UL)
@@ -2759,16 +2811,17 @@ fun h5policy_validate_fill_payload = (int ios,
                                                            "H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL",
                                                            payload_off, object,
                                                            "fill-value size field is missing"))
-                                return;
+                                return ctx;
                             fill_size = h5policy_msg_u64_at(ios, profile,
                                                             payload_off + 4#B,
                                                             4UL);
+                            fill_defined = (fill_size != 0UL);
                             if (!h5policy_payload_range_ok(msg_size, 8UL,
                                                            fill_size,
                                                            "H5_CORRUPT_FILL_VALUE_OVERRUNS_MESSAGE",
                                                            payload_off, object,
                                                            "fill value overruns the message"))
-                                return;
+                                return ctx;
                         }
                 }
             else if (version == 3UL)
@@ -2777,7 +2830,7 @@ fun h5policy_validate_fill_payload = (int ios,
                                                    "H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL",
                                                    payload_off, object,
                                                    "fill-value v3 message is too small"))
-                        return;
+                        return ctx;
                     var flags = h5policy_msg_u64_at(ios, profile,
                                                     payload_off + 1#B, 1UL);
                     if ((flags & 0x20UL) != 0UL)
@@ -2786,16 +2839,17 @@ fun h5policy_validate_fill_payload = (int ios,
                                                            "H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL",
                                                            payload_off, object,
                                                            "fill-value size field is missing"))
-                                return;
+                                return ctx;
                             fill_size = h5policy_msg_u64_at(ios, profile,
                                                             payload_off + 2#B,
                                                             4UL);
+                            fill_defined = 1;
                             if (!h5policy_payload_range_ok(msg_size, 6UL,
                                                            fill_size,
                                                            "H5_CORRUPT_FILL_VALUE_OVERRUNS_MESSAGE",
                                                            payload_off, object,
                                                            "fill value overruns the message"))
-                                return;
+                                return ctx;
                         }
                 }
             else
@@ -2809,6 +2863,15 @@ fun h5policy_validate_fill_payload = (int ios,
         h5policy_emit_error("H5_RESOURCE_SINGLE_ALLOCATION_BYTES",
                             "resource", payload_off, object,
                             "fill value exceeds the selected profile limit");
+
+    if (fill_defined)
+        {
+            ctx.has_fill_value = 1UB;
+            ctx.fill_value_size = fill_size;
+            ctx = h5policy_update_fill_value_size(ctx, payload_off, object);
+        }
+
+    return ctx;
 }
 
 fun h5policy_validate_attribute_payload = (int ios,
@@ -3247,11 +3310,11 @@ fun h5policy_validate_message_payload = (int ios,
                                                payload_off, msg_size,
                                                object);
     if (m_type == 0x04UL)
-        h5policy_validate_fill_payload(ios, profile, payload_off,
-                                       msg_size, object, 1);
+        return h5policy_validate_fill_payload(ios, profile, ctx, payload_off,
+                                              msg_size, object, 1);
     else if (m_type == 0x05UL)
-        h5policy_validate_fill_payload(ios, profile, payload_off,
-                                       msg_size, object, 0);
+        return h5policy_validate_fill_payload(ios, profile, ctx, payload_off,
+                                              msg_size, object, 0);
     else if (m_type == 0x06UL)
         h5policy_validate_link_payload(ios, profile, payload_off,
                                        msg_size, object);
@@ -3451,6 +3514,12 @@ fun h5policy_validate_msg_chunk = (int ios,
                                         "object-header message payload overruns chunk");
                     return ctx;
                 }
+
+            if (version == 1UB && m_type == 0x16UL)
+                h5policy_emit_error("H5_CORRUPT_REFERENCE_COUNT_IN_V1_OBJECT_HEADER",
+                                    "corrupt",
+                                    chunk_off + i#B, object,
+                                    "object header version does not support reference count messages");
 
             h5policy_validate_message_policy(m_type, profile,
                                              chunk_off + i#B, object);
