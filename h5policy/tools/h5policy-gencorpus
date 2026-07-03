@@ -188,6 +188,10 @@ def generate(root):
     _make_eof_past_metadata(f"{root}/malformed/eof_past_metadata.h5")
     _make_bad_snod_cache_type(f"{root}/malformed/bad_snod_cache_type.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
+    _make_bad_message_flag_combination(
+        f"{root}/malformed/bad_message_flag_combination.h5")
+    _make_bad_link_info_max_corder(
+        f"{root}/malformed/bad_link_info_max_corder.h5")
 
 
 def _make_bad_compound(path):
@@ -279,6 +283,23 @@ def _fix_sb_checksum(raw):
                      _jenkins_lookup3()(bytes(raw[:chksum_off])))
 
 
+def _fix_v2_ohdr_checksum(raw, ohdr_off):
+    """Recompute a v2 object header's trailing Jenkins checksum in place."""
+    assert raw[ohdr_off:ohdr_off + 4] == b"OHDR", "not a v2 object header"
+    assert raw[ohdr_off + 4] == 2, "object header is not version 2"
+    flags = raw[ohdr_off + 5]
+    cursor = ohdr_off + 6
+    if flags & (1 << 5):
+        cursor += 16
+    if flags & (1 << 4):
+        cursor += 4
+    size_width = 1 << (flags & 3)
+    chunk_size = int.from_bytes(raw[cursor:cursor + size_width], "little")
+    chksum_off = cursor + size_width + chunk_size
+    struct.pack_into("<I", raw, chksum_off,
+                     _jenkins_lookup3()(bytes(raw[ohdr_off:chksum_off])))
+
+
 def _make_bad_base_address(path):
     """v2/v3 superblock whose base address does not equal the superblock's own
     location (0 with no userblock).  libhdf5 measures the EOA relative to base,
@@ -341,6 +362,50 @@ def _make_bad_heap_segment(path):
         raise RuntimeError("could not locate the local heap")
     # HEAP(4) + version(1) + reserved(3) then the data-segment size (a length).
     struct.pack_into("<Q", raw, heap + 8, 0x0000_0100_0000_0000)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_message_flag_combination(path):
+    """Old-style group whose symbol-table message has an invalid object-header
+    flag combination: WAS_UNKNOWN without MARK_IF_UNKNOWN.  libhdf5 rejects
+    this while decoding the object header."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    # v1 object-header message prefix: type(2), size(2), flags(1), reserved(3).
+    prefix = struct.pack("<HHB", 0x11, 16, 0)  # symbol-table message, no flags
+    off = raw.find(prefix)
+    if off < 0:
+        raise RuntimeError("could not locate the symbol-table message prefix")
+    raw[off + 4] = 0x20                         # WAS_UNKNOWN without MARK_IF_UNKNOWN
+    _patch(path, bytes(raw))
+
+
+def _make_bad_link_info_max_corder(path):
+    """Tracked-order compact group whose link-info message has a negative
+    signed max creation order.  libhdf5 rejects this in H5O__linfo_decode."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        g = h.create_group("g", track_order=True)
+        g.create_group("a")
+        g.create_group("b")
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+
+    # Link-info payload for the tracked/indexed group:
+    # version(0), flags(track+index), max_corder(2), then three undef addresses.
+    payload = b"\x00\x03" + struct.pack("<Q", 2) + (b"\xff" * 24)
+    off = raw.find(payload)
+    if off < 0:
+        raise RuntimeError("could not locate the tracked link-info payload")
+    struct.pack_into("<Q", raw, off + 2, 0x8000_0000_0000_0000)
+
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate the containing object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 
 

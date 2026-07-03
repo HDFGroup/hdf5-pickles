@@ -30,6 +30,8 @@ var h5policy_pending_index = 0UL;
 
 var h5policy_current_object_depth = 0UL;
 var h5policy_dense_handled = 0;
+var H5POLICY_H5S_MAX_RANK = 32UL;
+var H5POLICY_LAYOUT_MAX_DIMS = 33UL;  /* H5O_LAYOUT_NDIMS = H5S_MAX_RANK + 1 */
 
 fun h5policy_reset_traversal_state = void:
 {
@@ -364,6 +366,11 @@ fun h5policy_validate_dataspace_payload = (int ios,
                                     "corrupt", payload_off, object,
                                     "dataspace v2 has an invalid space type");
 
+            if (space_type != 1UL && ndims > 0UL)
+                h5policy_emit_error("H5_CORRUPT_DATASPACE_INVALID_RANK",
+                                    "corrupt", payload_off, object,
+                                    "scalar/null dataspace has nonzero rank");
+
             if (space_type == 0UL)
                 ndims = 0UL;
             if (space_type == 2UL)
@@ -381,6 +388,11 @@ fun h5policy_validate_dataspace_payload = (int ios,
 
     if (ndims > ctx.max_rank_seen)
         ctx.max_rank_seen = ndims;
+
+    if (ndims > H5POLICY_H5S_MAX_RANK)
+        h5policy_emit_error("H5_CORRUPT_DATASPACE_RANK_TOO_LARGE",
+                            "corrupt", payload_off, object,
+                            "dataspace rank exceeds HDF5's maximum rank");
 
     if (ndims > profile.max_rank)
         h5policy_emit_error("H5_RESOURCE_DATASPACE_RANK",
@@ -569,6 +581,50 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
                         h5policy_emit_error("H5_CORRUPT_DATATYPE_UNUSED_BITS",
                                             "corrupt", blob_off, object,
                                             "numeric datatype has an unusually large number of unused bits");
+
+                    var size_bits = elm_size * 8UL;
+                    if (ctype == 1UL)
+                        {
+                            var class_flags = flags .>> 8;
+                            var sign = (class_flags .>> 8) & 0xffUL;
+                            var epos = h5policy_msg_u64_at(ios, profile,
+                                                           blob_off + 12#B, 1UL);
+                            var esize = h5policy_msg_u64_at(ios, profile,
+                                                            blob_off + 13#B, 1UL);
+                            var mpos = h5policy_msg_u64_at(ios, profile,
+                                                           blob_off + 14#B, 1UL);
+                            var msize = h5policy_msg_u64_at(ios, profile,
+                                                            blob_off + 15#B, 1UL);
+
+                            if (sign >= size_bits)
+                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_SIGN",
+                                                    "corrupt", blob_off, object,
+                                                    "floating-point sign bit is out of bounds");
+                            if (esize == 0UL)
+                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_EXPONENT",
+                                                    "corrupt", blob_off, object,
+                                                    "floating-point exponent size is zero");
+                            else if (epos >= size_bits)
+                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_EXPONENT",
+                                                    "corrupt", blob_off, object,
+                                                    "floating-point exponent range is out of bounds");
+                            else if (esize > size_bits - epos)
+                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_EXPONENT",
+                                                    "corrupt", blob_off, object,
+                                                    "floating-point exponent range is out of bounds");
+                            if (msize == 0UL)
+                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA",
+                                                    "corrupt", blob_off, object,
+                                                    "floating-point mantissa size is zero");
+                            else if (mpos >= size_bits)
+                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA",
+                                                    "corrupt", blob_off, object,
+                                                    "floating-point mantissa range is out of bounds");
+                            else if (msize > size_bits - mpos)
+                                h5policy_emit_error("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA",
+                                                    "corrupt", blob_off, object,
+                                                    "floating-point mantissa range is out of bounds");
+                        }
                 }
 
             return used + props;
@@ -592,6 +648,11 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
             var rank = h5policy_msg_u64_at(ios, profile, blob_off + used#B, 1UL);
             used = used + 1UL;
 
+            if (rank == 0UL || rank > H5POLICY_H5S_MAX_RANK)
+                h5policy_emit_error("H5_CORRUPT_DATATYPE_ARRAY_RANK",
+                                    "corrupt", blob_off, object,
+                                    "array datatype rank is out of range");
+
             if (version == 2UL)
                 {
                     if (!h5policy_dtype_room(3UL, avail, used, blob_off, object))
@@ -605,6 +666,25 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
                                                 "array dimension byte count overflow");
             if (!h5policy_dtype_room(dims, avail, used, blob_off, object))
                 return 0UL;
+            var nelem = 1UL;
+            var ai = 0UL;
+            while (ai < rank)
+                {
+                    var dim = h5policy_msg_u64_at(ios, profile,
+                                                  blob_off + (used + ai * 4UL)#B,
+                                                  4UL);
+                    if (dim == 0UL)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_ARRAY_DIMENSION",
+                                            "corrupt", blob_off, object,
+                                            "array datatype dimension is zero");
+                    else
+                        nelem = h5policy_checked_mul_u64(nelem, dim,
+                                                         0xffffffffffffffffUL,
+                                                         "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                         "corrupt", blob_off, object,
+                                                         "array datatype element count overflow");
+                    ai = ai + 1UL;
+                }
             used = used + dims;
 
             if (version == 2UL)
@@ -614,10 +694,22 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
                     used = used + dims;          /* permutation indices */
                 }
 
+            var child_off = blob_off + used#B;
             var child = h5policy_dtype_check(ios, profile, blob_off + used#B,
                                              avail - used, object, depth + 1UL);
             if (child == 0UL)
                 return 0UL;
+            var child_size = h5policy_msg_u64_at(ios, profile,
+                                                 child_off + 4#B, 4UL);
+            var expected_size = h5policy_checked_mul_u64(child_size, nelem,
+                                                         0xffffffffffffffffUL,
+                                                         "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                         "corrupt", blob_off, object,
+                                                         "array datatype size calculation overflow");
+            if (elm_size != expected_size)
+                h5policy_emit_error("H5_CORRUPT_DATATYPE_ARRAY_SIZE",
+                                    "corrupt", blob_off, object,
+                                    "array datatype size does not match its dimensions and base type");
             return used + child;
         }
 
@@ -634,6 +726,10 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
                                              avail - used, object, depth + 1UL);
             if (child == 0UL)
                 return 0UL;
+            if (base_elm != elm_size)
+                h5policy_emit_error("H5_CORRUPT_DATATYPE_ENUM_BASE_SIZE",
+                                    "corrupt", blob_off, object,
+                                    "enum datatype size does not match its base type");
             used = used + child;
 
             var m = 0UL;
@@ -642,6 +738,10 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
                     var nlen = h5policy_dtype_name_len(ios, profile,
                                                        blob_off + used#B,
                                                        avail - used);
+                    if (nlen == 0UL)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_ENUM_NAME_EMPTY",
+                                            "corrupt", blob_off + used#B, object,
+                                            "enum datatype member name is empty");
                     var adv = version >= 3UL
                               ? (nlen + 1UL)
                               : h5policy_round_up_8(nlen + 1UL);
@@ -690,6 +790,9 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
                                 : 4UL;
                     if (!h5policy_dtype_room(off_w, avail, used, blob_off, object))
                         return 0UL;
+                    var member_off = h5policy_msg_u64_at(ios, profile,
+                                                         blob_off + used#B,
+                                                         off_w);
                     used = used + off_w;
 
                     if (version == 1UL)
@@ -698,15 +801,49 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
                             if (!h5policy_dtype_room(28UL, avail, used,
                                                      blob_off, object))
                                 return 0UL;
+                            var ndims = h5policy_msg_u64_at(ios, profile,
+                                                            blob_off + used#B,
+                                                            1UL);
+                            if (ndims > 4UL)
+                                h5policy_emit_error("H5_CORRUPT_DATATYPE_ARRAY_RANK",
+                                                    "corrupt", blob_off + used#B,
+                                                    object,
+                                                    "compound member array rank is out of range");
+                            else if (ndims > 0UL)
+                                {
+                                    var di = 0UL;
+                                    while (di < ndims)
+                                        {
+                                            var dim = h5policy_msg_u64_at(ios, profile,
+                                                                          blob_off
+                                                                          + (used + 12UL + di * 4UL)#B,
+                                                                          4UL);
+                                            if (dim == 0UL)
+                                                h5policy_emit_error("H5_CORRUPT_DATATYPE_ARRAY_DIMENSION",
+                                                                    "corrupt",
+                                                                    blob_off
+                                                                    + (used + 12UL + di * 4UL)#B,
+                                                                    object,
+                                                                    "compound member array dimension is zero");
+                                            di = di + 1UL;
+                                        }
+                                }
                             used = used + 28UL;
                         }
 
+                    var child_off = blob_off + used#B;
                     var child = h5policy_dtype_check(ios, profile,
                                                      blob_off + used#B,
                                                      avail - used, object,
                                                      depth + 1UL);
                     if (child == 0UL)
                         return 0UL;
+                    var child_size = h5policy_msg_u64_at(ios, profile,
+                                                         child_off + 4#B, 4UL);
+                    if (member_off > elm_size || child_size > elm_size - member_off)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_BOUNDS",
+                                            "corrupt", child_off, object,
+                                            "compound member type extends outside its parent type");
                     used = used + child;
                     m = m + 1UL;
                 }
@@ -1260,6 +1397,10 @@ fun h5policy_validate_layout_payload = (int ios,
 
             var ndims = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
             layout_class = h5policy_msg_u64_at(ios, profile, payload_off + 2#B, 1UL);
+            if (ndims == 0UL || ndims > H5POLICY_LAYOUT_MAX_DIMS)
+                h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
+                                    "corrupt", payload_off + 1#B, object,
+                                    "layout dimensionality is out of range");
             if (layout_class == CHUNKED as uint<64>)
                 {
                     var idx_addr = h5policy_msg_u64_at(ios, profile,
@@ -1346,6 +1487,10 @@ fun h5policy_validate_layout_payload = (int ios,
                         {
                             var ndims3 = h5policy_msg_u64_at(ios, profile,
                                                              payload_off + 2#B, 1UL);
+                            if (ndims3 == 0UL || ndims3 > H5POLICY_LAYOUT_MAX_DIMS)
+                                h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
+                                                    "corrupt", payload_off + 2#B, object,
+                                                    "layout dimensionality is out of range");
                             var idx_addr3 = h5policy_msg_u64_at(ios, profile,
                                                                 payload_off + 3#B,
                                                                 global_sizeof_offsets as uint<64>);
@@ -1411,6 +1556,10 @@ fun h5policy_validate_layout_payload = (int ios,
                 {
                     var ndims4 = h5policy_msg_u64_at(ios, profile,
                                                      payload_off + 3#B, 1UL);
+                    if (ndims4 == 0UL || ndims4 > H5POLICY_LAYOUT_MAX_DIMS)
+                        h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
+                                            "corrupt", payload_off + 3#B, object,
+                                            "layout dimensionality is out of range");
                     var enc = h5policy_msg_u64_at(ios, profile,
                                                   payload_off + 4#B, 1UL);
                     var dims_rel4 = 5UL;
@@ -2208,11 +2357,40 @@ fun h5policy_validate_linfo_payload = (int ios,
                                    "link-info message is too small"))
         return;
 
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
     var flags = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
     var cur = 2UL;
 
+    if (version != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_LINK_INFO_VERSION",
+                                "corrupt", payload_off, object,
+                                "unsupported link-info message version");
+            return;
+        }
+
+    if ((flags & ~3UL) != 0UL)
+        h5policy_emit_error("H5_CORRUPT_LINK_INFO_FLAGS",
+                            "corrupt", payload_off + 1#B, object,
+                            "link-info message has invalid flag bits");
+
     if ((flags & 1UL) != 0UL)
-        cur = cur + 8UL;
+        {
+            if (!h5policy_payload_range_ok(msg_size, cur, 8UL,
+                                           "H5_CORRUPT_LINK_INFO_MESSAGE_TOO_SMALL",
+                                           payload_off + cur#B, object,
+                                           "link-info max creation order is missing"))
+                return;
+
+            var max_corder = h5policy_msg_u64_at(ios, profile,
+                                                 payload_off + cur#B, 8UL);
+            if ((max_corder & 0x8000000000000000UL) != 0UL)
+                h5policy_emit_error("H5_CORRUPT_LINK_INFO_NEGATIVE_MAX_CORDER",
+                                    "corrupt", payload_off + cur#B, object,
+                                    "link-info max creation order is negative");
+
+            cur = cur + 8UL;
+        }
 
     var min_size = cur + (2UL * (global_sizeof_offsets as uint<64>));
     if ((flags & 2UL) != 0UL)
@@ -3109,6 +3287,18 @@ fun h5policy_validate_message_payload = (int ios,
     return ctx;
 }
 
+fun h5policy_message_is_shareable = (uint<64> m_type) int:
+{
+    if (m_type == 0x01UL) return 1;  /* dataspace */
+    if (m_type == 0x03UL) return 1;  /* datatype */
+    if (m_type == 0x04UL) return 1;  /* old fill value */
+    if (m_type == 0x05UL) return 1;  /* fill value */
+    if (m_type == 0x09UL) return 1;  /* bogus-valid */
+    if (m_type == 0x0bUL) return 1;  /* filter pipeline */
+    if (m_type == 0x0cUL) return 1;  /* attribute */
+    return 0;
+}
+
 fun h5policy_known_message_id = (uint<64> m_type) int:
 {
     if (m_type <= 0x09UL) return 1;
@@ -3180,6 +3370,34 @@ fun h5policy_validate_message_policy = (uint<64> m_type,
         }
 }
 
+fun h5policy_validate_message_flags = (uint<64> m_type,
+                                       uint<8> flags,
+                                       off64 loc,
+                                       string object) void:
+{
+    if ((flags & 0x02UB) != 0UB && (flags & 0x04UB) != 0UB)
+        h5policy_emit_error("H5_CORRUPT_MESSAGE_FLAG_COMBINATION",
+                            "corrupt", loc, object,
+                            "object-header message is both shared and marked do-not-share");
+
+    if ((flags & 0x20UB) != 0UB && (flags & 0x08UB) != 0UB)
+        h5policy_emit_error("H5_CORRUPT_MESSAGE_FLAG_COMBINATION",
+                            "corrupt", loc, object,
+                            "object-header message has incompatible unknown-message flags");
+
+    if ((flags & 0x20UB) != 0UB && (flags & 0x10UB) == 0UB)
+        h5policy_emit_error("H5_CORRUPT_MESSAGE_FLAG_COMBINATION",
+                            "corrupt", loc, object,
+                            "object-header message was-unknown flag requires mark-if-unknown");
+
+    if (h5policy_known_message_id(m_type)
+        && ((flags & 0x02UB) != 0UB || (flags & 0x40UB) != 0UB)
+        && !h5policy_message_is_shareable(m_type))
+        h5policy_emit_error("H5_CORRUPT_MESSAGE_FLAG_UNSHAREABLE",
+                            "corrupt", loc, object,
+                            "object-header message of unshareable class is marked shared/shareable");
+}
+
 fun h5policy_validate_msg_chunk = (int ios,
                                    H5PolicyLimits profile,
                                    H5WalkContext ctx,
@@ -3236,6 +3454,8 @@ fun h5policy_validate_msg_chunk = (int ios,
 
             h5policy_validate_message_policy(m_type, profile,
                                              chunk_off + i#B, object);
+            h5policy_validate_message_flags(m_type, m_flags,
+                                            chunk_off + i#B, object);
 
             ctx = h5policy_validate_message_payload(ios, profile, ctx,
                                                     m_type, payload_off,
