@@ -1,9 +1,286 @@
 /* h5_dispatch.pk - Object-header message dispatch and policy.  Split out of h5_walk.pk; loaded after it.  */
 
+type H5PolicyMsgRef = struct
+{
+    uint<8> found;
+    offset<uint<64>,B> payload_off;
+    uint<64> msg_size;
+    uint<8> flags;
+};
+
+fun h5policy_msg_ref_none = H5PolicyMsgRef:
+{
+    return H5PolicyMsgRef
+    {
+        found = 0UB,
+        payload_off = 0UL#B,
+        msg_size = 0UL,
+        flags = 0UB
+    };
+}
+
+fun h5policy_find_message_in_chunk = (int ios,
+                                      H5PolicyLimits profile,
+                                      uint<8> version,
+                                      int prefix_bytes,
+                                      int crt_order_tracked,
+                                      offset<uint<64>,B> chunk_off,
+                                      uint<64> chunk_size,
+                                      uint<64> wanted_type,
+                                      off64 loc,
+                                      string object) H5PolicyMsgRef:
+{
+    var i = 0UL;
+    var old_version = global_version;
+    var old_crt_tracked = global_crt_tracked;
+
+    global_version = version;
+    global_crt_tracked = crt_order_tracked;
+    while (i < chunk_size)
+        {
+            if ((chunk_size - i) < (prefix_bytes as uint<64>))
+                {
+                    global_version = old_version;
+                    global_crt_tracked = old_crt_tracked;
+                    return h5policy_msg_ref_none;
+                }
+
+            var prefix = h5policy_map_msg_prefix(ios, profile, chunk_off + i#B);
+            var m_type = 0UL;
+            var m_size = 0UL;
+            var m_flags = 0UB;
+
+            if (version == 1UB)
+                {
+                    m_type = prefix.v1_msg_prefix.msg_type as uint<64>;
+                    m_size = prefix.v1_msg_prefix.msg_size as uint<64>;
+                    m_flags = prefix.v1_msg_prefix.msg_flags;
+                }
+            else
+                {
+                    m_type = prefix.v2_msg_prefix.msg_type as uint<64>;
+                    m_size = prefix.v2_msg_prefix.msg_size as uint<64>;
+                    m_flags = prefix.v2_msg_prefix.msg_flags;
+                }
+
+            var payload_off = chunk_off + i#B + (prefix_bytes as uint<64>)#B;
+            var remaining = chunk_size - i - (prefix_bytes as uint<64>);
+
+            if (m_size > remaining)
+                {
+                    h5policy_emit_error("H5_CORRUPT_MESSAGE_OVERRUNS_CHUNK",
+                                        "corrupt", payload_off, object,
+                                        "object-header message payload overruns chunk");
+                    global_version = old_version;
+                    global_crt_tracked = old_crt_tracked;
+                    return h5policy_msg_ref_none;
+                }
+
+            if (m_type == wanted_type)
+                {
+                    global_version = old_version;
+                    global_crt_tracked = old_crt_tracked;
+                    return H5PolicyMsgRef
+                    {
+                        found = 1UB,
+                        payload_off = payload_off,
+                        msg_size = m_size,
+                        flags = m_flags
+                    };
+                }
+
+            i = i + (prefix_bytes as uint<64>) + m_size;
+        }
+
+    global_version = old_version;
+    global_crt_tracked = old_crt_tracked;
+    return h5policy_msg_ref_none;
+}
+
+fun h5policy_find_message_in_ohdr = (int ios,
+                                     H5PolicyLimits profile,
+                                     uint<64> obj_addr,
+                                     uint<64> wanted_type,
+                                     off64 loc,
+                                     string object) H5PolicyMsgRef:
+{
+    var file_size = h5policy_ceiling(ios);
+
+    if (!h5policy_checked_addr_range(obj_addr, 4UL, file_size,
+                                     "shared-message object header outside file",
+                                     loc, object))
+        return h5policy_msg_ref_none;
+
+    var root_off = obj_addr#B;
+    var sig = h5policy_msg_bytes(ios, profile, root_off, 4UL);
+
+    if (sig == V2_SIG)
+        {
+            var version = h5policy_msg_u64_at(ios, profile,
+                                              root_off + 4#B, 1UL) as uint<8>;
+            var flags = h5policy_msg_u64_at(ios, profile,
+                                            root_off + 5#B, 1UL) as uint<8>;
+            if (version != 2UB)
+                {
+                    h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
+                                        "corrupt", root_off, object,
+                                        "shared-message object header has an unsupported version byte");
+                    return h5policy_msg_ref_none;
+                }
+
+            var cursor = root_off + 6#B;
+            if ((flags & (1U <<. 5)) != 0U)
+                cursor = cursor + 16#B;
+            if ((flags & (1U <<. 4)) != 0U)
+                cursor = cursor + 4#B;
+
+            var size_width = 1UL <<. (flags & 3U);
+            var chunk_size = h5policy_msg_u64_at(ios, profile,
+                                                 cursor, size_width);
+            var chunk_off = cursor + size_width#B;
+            var header_bytes = ((chunk_off - root_off)/#B) as uint<64>;
+            var total_without_checksum =
+                h5policy_checked_add_u64(header_bytes, chunk_size,
+                                         0xffffffffffffffffUL,
+                                         "H5_CORRUPT_LENGTH_OVERFLOW",
+                                         "corrupt", root_off, object,
+                                         "shared-message object-header size overflow");
+            var total_size =
+                h5policy_checked_add_u64(total_without_checksum, 4UL,
+                                         0xffffffffffffffffUL,
+                                         "H5_CORRUPT_LENGTH_OVERFLOW",
+                                         "corrupt", root_off, object,
+                                         "shared-message object-header checksum size overflow");
+
+            if (!h5policy_checked_addr_range(obj_addr, total_size, file_size,
+                                             "shared-message object header outside file",
+                                             root_off, object))
+                return h5policy_msg_ref_none;
+
+            var crt_order_tracked = ((flags & 4U) != 0U);
+            var prefix_bytes = crt_order_tracked ? (V2_PREFIX_BYTES + 2) : V2_PREFIX_BYTES;
+
+            return h5policy_find_message_in_chunk(ios, profile, version,
+                                                  prefix_bytes,
+                                                  crt_order_tracked,
+                                                  chunk_off, chunk_size,
+                                                  wanted_type, loc, object);
+        }
+
+    var version1 = h5policy_msg_u64_at(ios, profile,
+                                       root_off, 1UL) as uint<8>;
+    if (version1 != 1UB)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
+                                "corrupt", root_off, object,
+                                "shared-message object header is neither v1 nor v2");
+            return h5policy_msg_ref_none;
+        }
+
+    var chunk_size1 = h5policy_msg_u64_at(ios, profile,
+                                          root_off + 8#B, 4UL);
+    var total_size1 =
+        h5policy_checked_add_u64(16UL, chunk_size1,
+                                 0xffffffffffffffffUL,
+                                 "H5_CORRUPT_LENGTH_OVERFLOW",
+                                 "corrupt", root_off, object,
+                                 "shared-message object-header size overflow");
+    if (!h5policy_checked_addr_range(obj_addr, total_size1, file_size,
+                                     "shared-message object header outside file",
+                                     root_off, object))
+        return h5policy_msg_ref_none;
+
+    return h5policy_find_message_in_chunk(ios, profile, version1,
+                                          V1_PREFIX_BYTES, 0,
+                                          root_off + 16#B, chunk_size1, wanted_type,
+                                          loc, object);
+}
+
+fun h5policy_resolve_shared_message = (int ios,
+                                       H5PolicyLimits profile,
+                                       uint<64> m_type,
+                                       offset<uint<64>,B> payload_off,
+                                       uint<64> msg_size,
+                                       string object) H5PolicyMsgRef:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var l = global_sizeof_lengths as uint<64>;
+
+    if (msg_size < 1UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_SHARED_MESSAGE_TOO_SMALL",
+                                "corrupt", payload_off, object,
+                                "shared object-header message is too small");
+            return h5policy_msg_ref_none;
+        }
+
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
+    var share_type = 2UL;       /* v1/v2 both point at a committed object header. */
+    var loc_rel = 0UL;
+
+    if (version == 1UL)
+        loc_rel = 8UL + l;
+    else if (version == 2UL)
+        loc_rel = 2UL;
+    else if (version == 3UL)
+        {
+            if (msg_size < 2UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_SHARED_MESSAGE_TOO_SMALL",
+                                        "corrupt", payload_off, object,
+                                        "shared object-header message is too small");
+                    return h5policy_msg_ref_none;
+                }
+            share_type = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+            loc_rel = 2UL;
+        }
+    else
+        {
+            h5policy_emit_error("H5_CORRUPT_SHARED_MESSAGE_VERSION",
+                                "corrupt", payload_off, object,
+                                "unsupported shared object-header message version");
+            return h5policy_msg_ref_none;
+        }
+
+    if (share_type != 2UL)
+        {
+            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                "unsupported", payload_off, object,
+                                "shared object-header message is not stored in a committed object header");
+            return h5policy_msg_ref_none;
+        }
+
+    if (loc_rel > msg_size || o > msg_size - loc_rel)
+        {
+            h5policy_emit_error("H5_CORRUPT_SHARED_MESSAGE_TOO_SMALL",
+                                "corrupt", payload_off, object,
+                                "shared object-header message address overruns the payload");
+            return h5policy_msg_ref_none;
+        }
+
+    var obj_addr = h5policy_msg_u64_at(ios, profile, payload_off + loc_rel#B, o);
+    var ref = h5policy_find_message_in_ohdr(ios, profile, obj_addr,
+                                            m_type, payload_off, object);
+    if (ref.found == 0UB)
+        h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                            "unsupported", payload_off, object,
+                            "shared committed object header does not expose the requested message");
+    else if ((ref.flags & 0x02UB) != 0UB)
+        {
+            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                "unsupported", ref.payload_off, object,
+                                "nested shared object-header message resolution is not covered yet");
+            return h5policy_msg_ref_none;
+        }
+
+    return ref;
+}
+
 fun h5policy_validate_message_payload = (int ios,
                                          H5PolicyLimits profile,
                                          H5WalkContext ctx,
                                          uint<64> m_type,
+                                         uint<8> m_flags,
                                          offset<uint<64>,B> payload_off,
                                          uint<64> msg_size,
                                          string object) H5WalkContext:
@@ -23,6 +300,20 @@ fun h5policy_validate_message_payload = (int ios,
         {
             if (ctx.has_datatype != 0UB)
                 return ctx;
+            if ((m_flags & 0x02UB) != 0UB)
+                {
+                    var ref = h5policy_resolve_shared_message(ios, profile,
+                                                              m_type,
+                                                              payload_off,
+                                                              msg_size,
+                                                              object);
+                    if (ref.found == 0UB)
+                        return ctx;
+                    return h5policy_validate_dtype_payload(ios, profile, ctx,
+                                                           ref.payload_off,
+                                                           ref.msg_size,
+                                                           object);
+                }
             return h5policy_validate_dtype_payload(ios, profile, ctx,
                                                    payload_off, msg_size,
                                                    object);
@@ -227,7 +518,7 @@ fun h5policy_validate_msg_chunk = (int ios,
                                             chunk_off + i#B, object);
 
             ctx = h5policy_validate_message_payload(ios, profile, ctx,
-                                                    m_type, payload_off,
+                                                    m_type, m_flags, payload_off,
                                                     m_size, object);
 
             if (m_type == 0x10UL)
