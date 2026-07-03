@@ -65,7 +65,7 @@ TOOL_DEFS = [
     ("h5repack", [], True),        # read + rewrite
 ]
 # h5debug is a developer tool (not hardened); include only if asked by name.
-OPTIONAL_TOOLS = {"h5debug": ([], False), "h5copy": (["-i"], True)}
+OPTIONAL_TOOLS = {"h5debug": ([], False)}
 
 CRASH_MARKERS = ("Segmentation fault", "munmap_chunk", "double free",
                  "corrupted", "stack smashing", "AddressSanitizer",
@@ -116,13 +116,44 @@ def run_tool(name, args, needs_out, path, repack_out, timeout):
     err = (p.stderr or "") + (p.stdout or "")
     if p.returncode < 0:                       # killed by a signal
         sig = -p.returncode
-        line = _fault_line(err) or SIGNAMES.get(sig, f"sig{sig}")
-        return "SIGNAL", f"{name}:{SIGNAMES.get(sig, sig)}:{line}", err[-500:]
+        func = _gdb_faulting_func(cmd) or _fault_line(err) or SIGNAMES.get(sig, sig)
+        return "SIGNAL", f"{name}:{SIGNAMES.get(sig, sig)}:{func}", \
+            (func + "\n" + err[-400:])
     for mk in CRASH_MARKERS:
         if mk in err:
-            line = _fault_line(err) or mk
-            return "MARKER", f"{name}:marker:{line}", err[-500:]
+            func = _gdb_faulting_func(cmd) or _fault_line(err) or mk
+            return "MARKER", f"{name}:marker:{func}", (func + "\n" + err[-400:])
     return None, "", ""
+
+
+def _gdb_faulting_func(cmd):
+    """Faulting HDF5 function from a gdb backtrace (for a precise crash
+    signature).  Prefers the first H5* frame -- the library culprit -- over
+    libc unwinding frames (abort/raise/malloc_printerr).  Empty if no gdb."""
+    if not shutil.which("gdb"):
+        return ""
+    try:
+        p = subprocess.run(
+            ["gdb", "-q", "-batch", "-ex", "run", "-ex", "bt", "-ex", "quit",
+             "--args"] + cmd, capture_output=True, text=True,
+            errors="replace", timeout=40)
+    except Exception:
+        return ""
+    funcs = []
+    for ln in p.stdout.splitlines():
+        m = re.match(r"#\d+\s+(?:0x[0-9a-fA-F]+ in )?(\w+)", ln.strip())
+        if m:
+            funcs.append(m.group(1))
+    for f in funcs:
+        if f.startswith("H5"):
+            return f
+    libc = {"abort", "raise", "__GI_abort", "__GI_raise", "__libc_message",
+            "malloc_printerr", "__pthread_kill", "_int_free", "cfree",
+            "__assert_fail", "__assert_fail_base"}
+    for f in funcs:
+        if f not in libc:
+            return f
+    return funcs[0] if funcs else ""
 
 
 def _fault_line(err):
