@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Structure-aware fuzzer for h5policy, with libhdf5 as the oracle.
+
+h5policy is a metadata preflight oracle for *hostile* HDF5 files.  Its whole
+contract is that no matter what bytes it is fed, it renders a bounded, checked
+decision -- accept / reject_corrupt / reject_* / unsupported_coverage_gap -- and
+never crashes, hangs, or (the dangerous direction) accepts a file that libhdf5
+rejects.  This tool stresses that contract by mutating valid seed files and
+cross-checking each mutant against libhdf5.
+
+For each mutant we classify (severity high -> low):
+
+  HANG          h5policy exceeded the timeout            -- budget escape / DoS
+  CRASH         unknown exit code / unparseable output   -- poke traceback leaked
+  FALSE_ACCEPT  libhdf5 rejects but h5policy accepts      -- soundness (invariant A')
+  INTERNAL      graceful internal_error (exit 70)         -- should be corrupt/gap
+  FALSE_REJECT  libhdf5 opens but h5policy reject_corrupt -- over-strict (advisory)
+  OK            both agree / benign corruption            -- discarded
+
+HANG, CRASH and FALSE_ACCEPT are hard findings (non-zero exit); the others are
+advisory.  Interesting mutants are written to the findings dir as self-contained
+repro files (feed one straight back to `h5policy --profile forensic --json`).
+
+Mutation strategies (`--strategy`, repeatable; default: all):
+
+  bitflip     flip a few random bits anywhere
+  interesting overwrite a few bytes with boundary values (0x00 0xFF 0x7F 0x80 ..)
+  truncate    cut the file short at a random offset (short-read / EOF handling)
+  super       structure-aware: corrupt a v2/v3 superblock address field
+              (root OH / EOF / extension / base) and REPAIR the checksum so the
+              mutation survives the superblock gate and reaches deep validators
+
+Usage:
+  h5policy-fuzz [--seeds DIR|FILE ...] [--iters N] [--seed S]
+                [--strategy S ...] [--out DIR] [--timeout SEC]
+                [--save-advisory] [--quiet]
+
+Determinism: a given --seed reproduces the same mutant stream.  Every saved
+finding is a complete file, so it reproduces regardless.
+"""
+import argparse
+import glob
+import importlib.util
+import os
+import random
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TESTS = os.path.normpath(os.path.join(HERE, "..", "tests"))
+
+
+def _load(name, path):
+    # These helpers have no .py extension, so name a source loader explicitly.
+    import importlib.machinery
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+# Reuse the differential harness's oracle so classification stays identical to
+# the regression suite, and the CVE builder's vetted Jenkins lookup3.
+_diff = _load("h5policy_diff", os.path.join(HERE, "h5policy-diff"))
+_cve = _load("cve_builder",
+             os.path.join(TESTS, "cve", "make_cve_2020_10812.py"))
+introspect = _diff.introspect
+KNOWN_EXITS = _diff.KNOWN_EXITS
+H5POLICY = _diff.H5POLICY
+jenkins_lookup3 = _cve.jenkins_lookup3
+
+HDF5_MAGIC = bytes([0x89, 0x48, 0x44, 0x46, 0x0D, 0x0A, 0x1A, 0x0A])
+INTERESTING = [0x00, 0x01, 0x7F, 0x80, 0xFF, 0xFE, 0x08, 0x10, 0x20, 0x40]
+ACCEPTING = {"accept", "accept_with_warnings"}
+# Severity order for reporting / exit status.
+#
+# FALSE_ACCEPT (libhdf5 cleanly rejects, h5policy accepts) is a hard soundness
+# bug.  ACCEPT_VS_CRASH (libhdf5 *crashes/hangs* on a file h5policy accepts) is
+# kept separate and advisory: a crashing oracle cannot be trusted as ground
+# truth, and the divergence usually reflects a libhdf5 memory bug rather than a
+# missing h5policy rule -- though it is real residual risk worth recording.
+SEVERITY = ["HANG", "CRASH", "FALSE_ACCEPT", "ACCEPT_VS_CRASH",
+            "INTERNAL", "FALSE_REJECT", "OK"]
+HARD = {"HANG", "CRASH", "FALSE_ACCEPT"}
+ALWAYS_SAVE = HARD | {"ACCEPT_VS_CRASH"}
+
+import json  # noqa: E402  (after _load so a missing h5py fails there first)
+
+
+# --------------------------------------------------------------------------- #
+# Mutators.  Each takes (bytes, rng) and returns a new bytearray (or None to
+# skip -- e.g. `super` on a v0/v1 superblock).
+# --------------------------------------------------------------------------- #
+def mut_bitflip(data, rng):
+    b = bytearray(data)
+    if not b:
+        return None
+    for _ in range(rng.randint(1, 4)):
+        i = rng.randrange(len(b))
+        b[i] ^= 1 << rng.randrange(8)
+    return b
+
+
+def mut_interesting(data, rng):
+    b = bytearray(data)
+    if not b:
+        return None
+    for _ in range(rng.randint(1, 4)):
+        b[rng.randrange(len(b))] = rng.choice(INTERESTING)
+    return b
+
+
+def mut_truncate(data, rng):
+    if len(data) < 16:
+        return None
+    return bytearray(data[:rng.randrange(8, len(data))])
+
+
+def mut_super(data, rng):
+    """Corrupt a v2/v3 superblock address field and repair the checksum.
+
+    Layout from offset 12 (sizes in `soff` bytes): base, extension, EOF, root
+    object header, then a 4-byte Jenkins checksum.  Repairing the checksum lets
+    the mutated pointer survive the superblock gate, so h5policy's object-header
+    and extension walkers are exercised against the mutation directly.
+    """
+    b = bytearray(data)
+    if b[:8] != HDF5_MAGIC or b[8] not in (2, 3):
+        return None
+    soff = b[9]
+    if soff not in (2, 4, 8):
+        return None
+    chksum_off = 12 + 4 * soff
+    if len(b) < chksum_off + 4:
+        return None
+    field = rng.choice(["base", "ext", "eof", "root"])
+    off = 12 + {"base": 0, "ext": 1, "eof": 2, "root": 3}[field] * soff
+    how = rng.choice(["past_eof", "midfile", "delta", "wild"])
+    if how == "past_eof":
+        val = len(b) + rng.choice([1, 8, 0x1000, 0x1_0000_0000])
+    elif how == "midfile":
+        val = rng.randrange(len(b))
+    elif how == "delta":
+        cur = int.from_bytes(b[off:off + soff], "little")
+        val = (cur + rng.choice([-8, -1, 1, 8, 16])) & ((1 << (8 * soff)) - 1)
+    else:  # wild
+        val = rng.getrandbits(8 * soff)
+    b[off:off + soff] = (val & ((1 << (8 * soff)) - 1)).to_bytes(soff, "little")
+    # Repair the superblock checksum over everything preceding it.
+    b[chksum_off:chksum_off + 4] = \
+        jenkins_lookup3(bytes(b[:chksum_off])).to_bytes(4, "little")
+    return b
+
+
+MUTATORS = {
+    "bitflip": mut_bitflip,
+    "interesting": mut_interesting,
+    "truncate": mut_truncate,
+    "super": mut_super,
+}
+
+
+# --------------------------------------------------------------------------- #
+def run_h5policy(path, timeout):
+    """(report|None, rc, note).  rc == 'TIMEOUT' / 'UNKNOWN' flag crashes."""
+    try:
+        proc = subprocess.run(
+            [H5POLICY, "--profile", "forensic", "--json", path],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "TIMEOUT", "exceeded timeout"
+    rc = proc.returncode
+    if rc not in KNOWN_EXITS:
+        return None, rc, (proc.stderr.strip()[:300] or "unknown exit")
+    try:
+        return json.loads(proc.stdout), rc, ""
+    except (json.JSONDecodeError, ValueError):
+        return None, rc, "unparseable JSON output"
+
+
+def oracle(path, timeout):
+    """Run the libhdf5 introspection OUT OF PROCESS.
+
+    libhdf5 is not crash-safe on hostile input -- it can segfault or hang while
+    reading crafted metadata (the very reason a preflight oracle exists).  Since
+    introspect() drives libhdf5 in-process via h5py, we isolate it in a child so
+    such a crash can't take the fuzzer down.  A crashed/timed-out oracle is read
+    as opens=False: libhdf5 could not accept the bytes, the strongest possible
+    "reject" signal -- so if h5policy accepts the same file, it is a false accept.
+    """
+    hard_reject = dict(opens=False, ext_links=0, max_logical=0, max_rank=0)
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--introspect", path],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {**hard_reject, "oracle": "timeout"}
+    if proc.returncode != 0:  # nonzero incl. negative (killed by signal)
+        return {**hard_reject, "oracle": f"crash rc={proc.returncode}"}
+    try:
+        return json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return {**hard_reject, "oracle": "unparseable"}
+
+
+def classify(report, rc, ref):
+    if rc == "TIMEOUT":
+        return "HANG"
+    if report is None:
+        return "CRASH"
+    decision = report.get("decision")
+    if decision == "internal_error" or rc == 70:
+        return "INTERNAL"
+    if not ref["opens"] and decision in ACCEPTING:
+        # An oracle that crashed or hung is not trustworthy ground truth: treat
+        # h5policy's accept as advisory residual risk, not a hard rule violation.
+        why = str(ref.get("oracle", ""))
+        if why.startswith("crash") or why == "timeout":
+            return "ACCEPT_VS_CRASH"
+        return "FALSE_ACCEPT"
+    if ref["opens"] and decision == "reject_corrupt":
+        return "FALSE_REJECT"
+    return "OK"
+
+
+def collect_seeds(spec):
+    seeds = []
+    for s in spec:
+        if os.path.isdir(s):
+            seeds += sorted(glob.glob(os.path.join(s, "**", "*.h5"),
+                                      recursive=True))
+        elif os.path.isfile(s):
+            seeds.append(s)
+    return seeds
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--seeds", nargs="+",
+                    default=[os.path.join(TESTS, "valid")],
+                    help="seed files/dirs (default: tests/valid)")
+    ap.add_argument("--iters", type=int, default=200)
+    ap.add_argument("--seed", type=int, default=1337, help="RNG seed")
+    ap.add_argument("--strategy", action="append", choices=list(MUTATORS),
+                    help="restrict strategies (repeatable; default: all)")
+    ap.add_argument("--out", default=os.path.join(TESTS, "fuzz-findings"),
+                    help="dir for saved findings")
+    ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--save-advisory", action="store_true",
+                    help="also save INTERNAL / FALSE_REJECT mutants")
+    ap.add_argument("--max-save", type=int, default=25,
+                    help="cap saved mutants per bucket")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--introspect", metavar="FILE",
+                    help=argparse.SUPPRESS)  # internal: out-of-process oracle
+    args = ap.parse_args()
+
+    if args.introspect:  # child invocation: emit the libhdf5 facts and exit
+        print(json.dumps(introspect(args.introspect)))
+        return 0
+
+    seeds = collect_seeds(args.seeds)
+    if not seeds:
+        ap.error(f"no seed *.h5 files found under {args.seeds}")
+    strategies = args.strategy or list(MUTATORS)
+    rng = random.Random(args.seed)
+    os.makedirs(args.out, exist_ok=True)
+
+    counts = {b: 0 for b in SEVERITY}
+    saved = {b: 0 for b in SEVERITY}
+    seed_bytes = {p: open(p, "rb").read() for p in seeds}
+    mutant = os.path.join(args.out, ".mutant.h5")
+
+    for it in range(args.iters):
+        sp = rng.choice(seeds)
+        strat = rng.choice(strategies)
+        m = MUTATORS[strat](seed_bytes[sp], rng)
+        if m is None:
+            continue
+        with open(mutant, "wb") as f:
+            f.write(m)
+        report, rc, note = run_h5policy(mutant, args.timeout)
+        ref = oracle(mutant, args.timeout)
+        bucket = classify(report, rc, ref)
+        counts[bucket] += 1
+        if bucket == "OK":
+            continue
+
+        decision = (report or {}).get("decision", f"rc={rc}")
+        hard = bucket in HARD
+        if (bucket in ALWAYS_SAVE or args.save_advisory) and saved[bucket] < args.max_save:
+            base = os.path.splitext(os.path.basename(sp))[0]
+            stem = f"{bucket.lower()}_{base}_{strat}_{it:05d}"
+            dst = os.path.join(args.out, stem + ".h5")
+            os.replace(mutant, dst)
+            with open(dst, "wb") as f:
+                f.write(m)  # .mutant.h5 was consumed by os.replace
+            with open(os.path.join(args.out, stem + ".txt"), "w") as f:
+                f.write(f"bucket   {bucket}\nseed     {os.path.relpath(sp)}\n"
+                        f"strategy {strat}\niter     {it}\nrng_seed {args.seed}\n"
+                        f"h5policy {decision} (rc={rc})\n"
+                        f"libhdf5  opens={ref['opens']}"
+                        f"{' (' + ref['oracle'] + ')' if ref.get('oracle') else ''}\n"
+                        f"note     {note}\n"
+                        f"repro    h5policy --profile forensic --json {stem}.h5\n")
+            saved[bucket] += 1
+        if not args.quiet:
+            tag = "!!" if hard else "  "
+            print(f"{tag} [{bucket:12}] seed={os.path.basename(sp):28} "
+                  f"strat={strat:11} -> {decision} (rc={rc}) "
+                  f"libhdf5_opens={ref['opens']}")
+
+    if os.path.exists(mutant):
+        os.unlink(mutant)
+
+    print("\n=== fuzz summary ({} iters, rng_seed={}) ===".format(
+        args.iters, args.seed))
+    for b in SEVERITY:
+        mark = " <== HARD" if b in HARD and counts[b] else ""
+        print(f"  {b:12} {counts[b]:6}"
+              f"{'  saved ' + str(saved[b]) if saved[b] else '':>10}{mark}")
+    hard_total = sum(counts[b] for b in HARD)
+    print(f"\nfindings dir: {os.path.relpath(args.out)}")
+    print(f"hard findings: {hard_total}")
+    return 1 if hard_total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

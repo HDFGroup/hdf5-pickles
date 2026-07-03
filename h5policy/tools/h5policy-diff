@@ -109,13 +109,36 @@ def introspect(path):
     return facts
 
 
+def introspect_isolated(path):
+    """introspect() in a child process, so a libhdf5 crash can't kill us.
+
+    libhdf5 is not crash-safe on hostile input; since introspect() drives it
+    in-process via h5py, we fork a child.  A crashed/timed-out child means
+    libhdf5 could not accept the bytes -- read as opens=False, the same signal
+    as a clean rejection (the strongest form of "libhdf5 rejects").
+    """
+    hard_reject = dict(opens=False, ext_links=0, max_logical=0, max_rank=0)
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--introspect", path],
+            capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return hard_reject
+    if proc.returncode != 0:
+        return hard_reject
+    try:
+        return json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return hard_reject
+
+
 def check(path):
     """Return (hard_failures, warnings, lines) for one file."""
     fails, warns, lines = [], [], []
     report, _ = run_h5policy(path)
     decision = report["decision"]
     feat = report.get("features", {})
-    ref = introspect(path)
+    ref = introspect_isolated(path)
     h5dump_rc = reference_rc("h5dump", path)
     h5debug_rc = reference_rc("h5debug", path)
 
@@ -172,12 +195,21 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="*", help="HDF5 files")
     ap.add_argument("--dir", help="check every *.h5 under this directory")
+    ap.add_argument("--introspect", metavar="FILE",
+                    help=argparse.SUPPRESS)  # internal: out-of-process oracle
     args = ap.parse_args()
+
+    if args.introspect:  # child invocation: emit libhdf5 facts and exit
+        print(json.dumps(introspect(args.introspect)))
+        return 0
 
     files = list(args.paths)
     if args.dir:
         files += sorted(glob.glob(os.path.join(args.dir, "**", "*.h5"),
                                   recursive=True))
+    # fuzz-findings/ is ephemeral h5policy-fuzz scratch (and may hold files that
+    # crash libhdf5); it is not part of the curated regression corpus.
+    files = [f for f in files if "fuzz-findings" not in f.split(os.sep)]
     if not files:
         ap.error("no files given (pass files or --dir)")
 

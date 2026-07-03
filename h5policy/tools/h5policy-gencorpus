@@ -182,6 +182,12 @@ def generate(root):
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
     _make_bad_unused_bits(f"{root}/malformed/bad_unused_bits.h5")
+    # Structure-aware fuzzer finds (h5policy-fuzz), each a distinct soundness
+    # gap where h5policy used to accept a file libhdf5 rejects.
+    _make_bad_base_address(f"{root}/malformed/bad_base_address.h5")
+    _make_eof_past_metadata(f"{root}/malformed/eof_past_metadata.h5")
+    _make_bad_snod_cache_type(f"{root}/malformed/bad_snod_cache_type.h5")
+    _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
 
 
 def _make_bad_compound(path):
@@ -246,6 +252,95 @@ def _make_bad_unused_bits(path):
             break
     else:
         raise RuntimeError("could not locate the int32 datatype header")
+    _patch(path, bytes(raw))
+
+
+def _jenkins_lookup3():
+    """Borrow the vetted Jenkins lookup3 from the CVE seed builder, so the
+    superblock-field fixtures below can repair the v2/v3 superblock checksum."""
+    import importlib.machinery
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.normpath(
+        os.path.join(here, "..", "tests", "cve", "make_cve_2020_10812.py"))
+    loader = importlib.machinery.SourceFileLoader("cve_builder_gc", path)
+    spec = importlib.util.spec_from_loader("cve_builder_gc", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod.jenkins_lookup3
+
+
+def _fix_sb_checksum(raw):
+    """Recompute the v2/v3 superblock's trailing Jenkins checksum in place."""
+    assert raw[8] in (2, 3), "not a v2/v3 superblock"
+    soff = raw[9]
+    chksum_off = 12 + 4 * soff
+    struct.pack_into("<I", raw, chksum_off,
+                     _jenkins_lookup3()(bytes(raw[:chksum_off])))
+
+
+def _make_bad_base_address(path):
+    """v2/v3 superblock whose base address does not equal the superblock's own
+    location (0 with no userblock).  libhdf5 measures the EOA relative to base,
+    so a wrong base shifts every address -- 'actual len exceeds EOA'."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="latest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"), track_times=False)
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    assert raw[8] in (2, 3) and raw[9] == 8, "expected a v3 superblock, 8-byte offsets"
+    struct.pack_into("<Q", raw, 12, 0x8)          # base address 8, superblock at 0
+    _fix_sb_checksum(raw)
+    _patch(path, bytes(raw))
+
+
+def _make_eof_past_metadata(path):
+    """v2/v3 superblock whose declared EOF equals the root object header address,
+    so the root header lies at/after the declared end-of-file.  libhdf5 rejects
+    any address >= EOA; h5policy must use the declared EOF (not the physical
+    size) as its address ceiling."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="latest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"), track_times=False)
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    assert raw[8] in (2, 3) and raw[9] == 8, "expected a v3 superblock, 8-byte offsets"
+    root = struct.unpack_from("<Q", raw, 12 + 3 * 8)[0]
+    struct.pack_into("<Q", raw, 12 + 2 * 8, root)  # EOF := root addr (root now >= EOF)
+    _fix_sb_checksum(raw)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_snod_cache_type(path):
+    """Old-style group whose first symbol-table entry declares an unknown cache
+    type (>2); libhdf5: 'unknown symbol table entry cache type'."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    snod = raw.find(b"SNOD")
+    if snod < 0:
+        raise RuntimeError("could not locate the symbol table node")
+    soff = raw[13]                                 # v0 superblock: size of offsets
+    # Entry 0 cache type is 4 bytes after the 8-byte SNOD header + name + address.
+    struct.pack_into("<I", raw, snod + 8 + 2 * soff, 0x10)   # cache type -> 16
+    _patch(path, bytes(raw))
+
+
+def _make_bad_heap_segment(path):
+    """Old-style group whose local heap declares a ~1 TB data-segment size, far
+    past the file; libhdf5 rejects the oversized heap segment."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    heap = raw.find(b"HEAP")
+    if heap < 0:
+        raise RuntimeError("could not locate the local heap")
+    # HEAP(4) + version(1) + reserved(3) then the data-segment size (a length).
+    struct.pack_into("<Q", raw, heap + 8, 0x0000_0100_0000_0000)
     _patch(path, bytes(raw))
 
 

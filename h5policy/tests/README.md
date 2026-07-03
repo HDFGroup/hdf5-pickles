@@ -49,6 +49,34 @@ conservative, correct choice for a security oracle. Run standalone with:
 ../tools/h5policy-diff --dir .        # or: ../tools/h5policy-diff FILE ...
 ```
 
+## Structure-aware fuzzing
+
+`../tools/h5policy-fuzz` mutates the valid seeds and cross-checks each mutant
+against libhdf5, hunting the cases the curated corpus can't enumerate: crashes,
+hangs, and — the dangerous direction — files h5policy **accepts** that libhdf5
+**rejects**.  It is a soak/exploration tool, run on demand (not part of
+`run.sh`, which stays fast and deterministic):
+
+```sh
+../tools/h5policy-fuzz --iters 500 --seed 20260703 \
+    --seeds valid cve            # deterministic; --strategy to restrict
+```
+
+Mutators include a **structure-aware** `super` strategy that corrupts a
+superblock address field and *repairs the Jenkins checksum* so the mutation
+reaches the deep validators (not just the superblock gate).  The libhdf5 oracle
+runs **out of process**, so a libhdf5 crash on hostile input can't take the
+fuzzer down; such a crash is read as the strongest possible "reject".
+
+Findings are bucketed by severity — `HANG` / `CRASH` / `FALSE_ACCEPT` are hard
+(non-zero exit); `ACCEPT_VS_CRASH` (h5policy accepts a file that *crashes*
+libhdf5 — an unreliable oracle, usually a libhdf5 memory bug) and `FALSE_REJECT`
+(over-strict, the safe direction) are advisory.  Mutants land in the git-ignored
+`fuzz-findings/`.  A found soundness gap is **promoted** into a curated
+`malformed/` fixture (via a `gencorpus` generator + `expected/*.yml`) so it
+becomes a permanent regression guard — `bad_base_address`, `eof_past_metadata`,
+`bad_snod_cache_type` and `bad_heap_segment` came from this loop.
+
 ## Fixtures
 
 The `*.h5` files are **generated**, not committed, by
