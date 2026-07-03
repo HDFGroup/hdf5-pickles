@@ -64,9 +64,20 @@ hangs, and — the dangerous direction — files h5policy **accepts** that libhd
 
 Mutators include a **structure-aware** `super` strategy that corrupts a
 superblock address field and *repairs the Jenkins checksum* so the mutation
-reaches the deep validators (not just the superblock gate).  The libhdf5 oracle
-runs **out of process**, so a libhdf5 crash on hostile input can't take the
-fuzzer down; such a crash is read as the strongest possible "reject".
+reaches the deep validators (not just the superblock gate), and a `dict`
+strategy that splices real HDF5 format tokens (`OHDR`/`FRHP`/`BTHD`/… signatures,
+message-type and version bytes) at 8-byte-aligned offsets so a mutant *becomes* a
+structure the deep validators recognise.  The libhdf5 oracle runs **out of
+process**, so a libhdf5 crash on hostile input can't take the fuzzer down; such a
+crash is read as the strongest possible "reject".
+
+**Coverage-guided mode** (`--guided`) uses h5policy's own finding codes as a
+coverage map: a mutant that reaches a new code is bred back into the seed pool so
+mutations compound (a `dict`-placed header that a later `super` mutation points
+the root at).  `--coverage-only` skips the oracle to measure reach quickly for
+A/B experiments, and `--show-coverage` lists the codes reached.  In practice the
+dictionary is the reliable win for breadth of validator paths; guiding helps most
+for *depth* (stacking mutations toward deeper structures).
 
 Findings are bucketed by severity — `HANG` / `CRASH` / `FALSE_ACCEPT` are hard
 (non-zero exit); `ACCEPT_VS_CRASH` (h5policy accepts a file that *crashes*

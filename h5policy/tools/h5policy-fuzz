@@ -29,6 +29,14 @@ Mutation strategies (`--strategy`, repeatable; default: all):
   super       structure-aware: corrupt a v2/v3 superblock address field
               (root OH / EOF / extension / base) and REPAIR the checksum so the
               mutation survives the superblock gate and reaches deep validators
+  dict        splice real HDF5 format tokens (OHDR/FRHP/BTHD/... signatures,
+              message-type and version bytes) at 8-byte-aligned offsets so a
+              mutant becomes a structure the deep validators recognise
+
+Coverage: h5policy's own finding codes are used as a coverage map.  --guided
+breeds mutants that reach a new code back into the seed pool so mutations
+compound (a `dict`-placed header a later `super` mutation points the root at).
+--coverage-only skips the libhdf5 oracle to measure reach fast (A/B experiments).
 
 Usage:
   h5policy-fuzz [--seeds DIR|FILE ...] [--iters N] [--seed S]
@@ -125,7 +133,7 @@ def mut_super(data, rng):
     and extension walkers are exercised against the mutation directly.
     """
     b = bytearray(data)
-    if b[:8] != HDF5_MAGIC or b[8] not in (2, 3):
+    if len(b) < 12 or b[:8] != HDF5_MAGIC or b[8] not in (2, 3):
         return None
     soff = b[9]
     if soff not in (2, 4, 8):
@@ -152,11 +160,46 @@ def mut_super(data, rng):
     return b
 
 
+# A dictionary of real HDF5 format tokens (AFL-style).  Splicing these lets a
+# mutant *become* a structure h5policy recognises -- a fractal-heap or v2-btree
+# header, a symbol-table node -- so the corresponding deep validator actually
+# runs, instead of waiting for random bytes to spell a 4-byte signature.
+DICT = [
+    b"OHDR", b"OCHK", b"TREE", b"SNOD", b"HEAP",          # ohdr / v1-btree / group
+    b"FRHP", b"FHDB", b"FHIB",                            # fractal heap
+    b"BTHD", b"BTLF", b"BTIN",                            # v2 btree
+    b"FAHD", b"FADB", b"EAHD", b"EAIB", b"EASB", b"EADB", # fixed / extensible array
+    b"FSHD", b"FSSE", b"GCOL", b"SMTB",                   # free-space / global heap / SOHM
+    HDF5_MAGIC,
+    b"\x00", b"\x01", b"\x02", b"\x03", b"\x04",          # version / small-count bytes
+    bytes([0x06]), bytes([0x08]), bytes([0x0b]),         # msg types: link, layout, filter
+    bytes([0x0c]), bytes([0x10]), bytes([0x11]),         # attribute, continuation, symtab
+    bytes([0x15]), bytes([0x18]),                        # attr-info, metadata-cache-image
+]
+
+
+def mut_dict(data, rng):
+    """Overwrite one or two spots with dictionary tokens, preferring 8-byte
+    alignment (HDF5 structures are 8-aligned, so an address is more likely to
+    land on an aligned token and get interpreted as that structure)."""
+    b = bytearray(data)
+    if len(b) < 16:
+        return None
+    for _ in range(rng.randint(1, 2)):
+        tok = rng.choice(DICT)
+        off = rng.randrange(0, len(b) - len(tok) + 1)
+        if rng.random() < 0.75:
+            off -= off % 8
+        b[off:off + len(tok)] = tok
+    return b
+
+
 MUTATORS = {
     "bitflip": mut_bitflip,
     "interesting": mut_interesting,
     "truncate": mut_truncate,
     "super": mut_super,
+    "dict": mut_dict,
 }
 
 
@@ -203,6 +246,46 @@ def oracle(path, timeout):
         return {**hard_reject, "oracle": "unparseable"}
 
 
+def cov_tokens(report):
+    """A coverage fingerprint of one h5policy run.
+
+    We can't get poke edge-coverage AFL-style, but h5policy's own output is a
+    usable coverage map: each distinct *finding code* is a distinct validator
+    branch that reached an emit, and the structure metrics tell us which walkers
+    ran.  A mutant that adds a token here reached somewhere new -- the signal the
+    guided loop breeds from.  Finding codes are the crisp part; the coarse
+    structure/feature flags reward first-time reach of a walker that emits
+    nothing on success.
+    """
+    if report is None:
+        return {"CRASH"}
+    toks = {"dec:" + str(report.get("decision"))}
+    for f in report.get("findings", []):
+        c = f.get("code")
+        if c:
+            toks.add("code:" + c)
+    feat = report.get("features", {})
+    for k in ("external_links", "external_storage", "vds",
+              "dynamic_filters", "unknown_messages"):
+        if feat.get(k):
+            toks.add("feat:" + k)
+    m = report.get("metrics", {})
+    for key, flag in (("visited_continuations", "conts"),
+                      ("visited_btree_refs", "btrees"),
+                      ("chunk_index_refs", "chunks"),
+                      ("object_header_chunk_count", "ohdrchunks"),
+                      ("attribute_count", "attrs")):
+        if m.get(key, 0) > 0:
+            toks.add("struct:" + flag)
+    # Log-bucket the wider counts so "reached many more objects" also counts as
+    # new coverage without exploding the token set.
+    for key in ("object_count", "chunk_index_refs", "visited_object_headers"):
+        v = m.get(key, 0)
+        if v > 0:
+            toks.add(f"{key}~2^{v.bit_length()}")
+    return toks
+
+
 def classify(report, rc, ref):
     if rc == "TIMEOUT":
         return "HANG"
@@ -211,6 +294,8 @@ def classify(report, rc, ref):
     decision = report.get("decision")
     if decision == "internal_error" or rc == 70:
         return "INTERNAL"
+    if ref is None:              # coverage-only run: no oracle consulted
+        return "OK"
     if not ref["opens"] and decision in ACCEPTING:
         # An oracle that crashed or hung is not trustworthy ground truth: treat
         # h5policy's accept as advisory residual risk, not a hard rule violation.
@@ -252,6 +337,16 @@ def main():
                     help="also save INTERNAL / FALSE_REJECT mutants")
     ap.add_argument("--max-save", type=int, default=25,
                     help="cap saved mutants per bucket")
+    ap.add_argument("--guided", action="store_true",
+                    help="coverage-guided: feed mutants that reach new coverage "
+                         "back into the seed pool so mutations compound")
+    ap.add_argument("--max-pool", type=int, default=400,
+                    help="cap on bred corpus entries under --guided")
+    ap.add_argument("--coverage-only", action="store_true",
+                    help="skip the libhdf5 oracle; only measure reached coverage "
+                         "(much faster -- for A/B coverage experiments)")
+    ap.add_argument("--show-coverage", action="store_true",
+                    help="list every distinct finding code reached at the end")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--introspect", metavar="FILE",
                     help=argparse.SUPPRESS)  # internal: out-of-process oracle
@@ -271,18 +366,46 @@ def main():
     counts = {b: 0 for b in SEVERITY}
     saved = {b: 0 for b in SEVERITY}
     seed_bytes = {p: open(p, "rb").read() for p in seeds}
-    mutant = os.path.join(args.out, ".mutant.h5")
+    # Per-process temp path so concurrent fuzzer runs (A/B experiments, parallel
+    # soaks) don't clobber each other's mutant mid-test.
+    mutant = os.path.join(args.out, f".mutant.{os.getpid()}.h5")
+
+    # Coverage-guided corpus: the pool starts as the seed files; under --guided,
+    # a mutant that reaches a new coverage token is bred back in, so later
+    # mutations stack on top of already-interesting inputs (e.g. a `dict`-placed
+    # OHDR that a later `super` mutation then points the root at).
+    pool = [(os.path.basename(p), seed_bytes[p]) for p in seeds]
+    n_seeds = len(pool)
+    global_cov = set()
+    interesting = 0
+    cov_curve = []
 
     for it in range(args.iters):
-        sp = rng.choice(seeds)
+        label, base = rng.choice(pool)
         strat = rng.choice(strategies)
-        m = MUTATORS[strat](seed_bytes[sp], rng)
+        m = MUTATORS[strat](base, rng)
         if m is None:
             continue
         with open(mutant, "wb") as f:
             f.write(m)
         report, rc, note = run_h5policy(mutant, args.timeout)
-        ref = oracle(mutant, args.timeout)
+
+        # Coverage bookkeeping (independent of the oracle).
+        toks = cov_tokens(report)
+        if toks - global_cov:
+            global_cov |= toks
+            interesting += 1
+            if args.guided:
+                entry = (f"g{it:05d}", bytes(m))
+                if len(pool) < n_seeds + args.max_pool:
+                    pool.append(entry)
+                else:                       # keep seeds; evict a bred entry
+                    pool[n_seeds + rng.randrange(args.max_pool)] = entry
+        if it % 25 == 0:
+            cov_curve.append((it, sum(1 for t in global_cov
+                                      if t.startswith("code:"))))
+
+        ref = None if args.coverage_only else oracle(mutant, args.timeout)
         bucket = classify(report, rc, ref)
         counts[bucket] += 1
         if bucket == "OK":
@@ -291,36 +414,57 @@ def main():
         decision = (report or {}).get("decision", f"rc={rc}")
         hard = bucket in HARD
         if (bucket in ALWAYS_SAVE or args.save_advisory) and saved[bucket] < args.max_save:
-            base = os.path.splitext(os.path.basename(sp))[0]
-            stem = f"{bucket.lower()}_{base}_{strat}_{it:05d}"
+            stem = f"{bucket.lower()}_{label}_{strat}_{it:05d}"
             dst = os.path.join(args.out, stem + ".h5")
             os.replace(mutant, dst)
             with open(dst, "wb") as f:
                 f.write(m)  # .mutant.h5 was consumed by os.replace
+            opens = (ref or {}).get("opens", "unknown")
+            why = (ref or {}).get("oracle")
             with open(os.path.join(args.out, stem + ".txt"), "w") as f:
-                f.write(f"bucket   {bucket}\nseed     {os.path.relpath(sp)}\n"
+                f.write(f"bucket   {bucket}\nseed     {label}\n"
                         f"strategy {strat}\niter     {it}\nrng_seed {args.seed}\n"
                         f"h5policy {decision} (rc={rc})\n"
-                        f"libhdf5  opens={ref['opens']}"
-                        f"{' (' + ref['oracle'] + ')' if ref.get('oracle') else ''}\n"
+                        f"libhdf5  opens={opens}"
+                        f"{' (' + why + ')' if why else ''}\n"
                         f"note     {note}\n"
                         f"repro    h5policy --profile forensic --json {stem}.h5\n")
             saved[bucket] += 1
         if not args.quiet:
             tag = "!!" if hard else "  "
-            print(f"{tag} [{bucket:12}] seed={os.path.basename(sp):28} "
+            opens = "-" if ref is None else ref["opens"]
+            print(f"{tag} [{bucket:12}] src={label:22} "
                   f"strat={strat:11} -> {decision} (rc={rc}) "
-                  f"libhdf5_opens={ref['opens']}")
+                  f"libhdf5_opens={opens}")
 
     if os.path.exists(mutant):
         os.unlink(mutant)
 
-    print("\n=== fuzz summary ({} iters, rng_seed={}) ===".format(
-        args.iters, args.seed))
+    print("\n=== fuzz summary ({} iters, rng_seed={}{}{}) ===".format(
+        args.iters, args.seed,
+        ", guided" if args.guided else "",
+        ", coverage-only" if args.coverage_only else ""))
     for b in SEVERITY:
         mark = " <== HARD" if b in HARD and counts[b] else ""
         print(f"  {b:12} {counts[b]:6}"
               f"{'  saved ' + str(saved[b]) if saved[b] else '':>10}{mark}")
+
+    codes = sorted(t[len("code:"):] for t in global_cov if t.startswith("code:"))
+    print("\n=== coverage ===")
+    print(f"  distinct finding codes reached: {len(codes)}")
+    print(f"  distinct coverage tokens:       {len(global_cov)}")
+    print(f"  interesting mutants:            {interesting}")
+    if args.guided:
+        print(f"  corpus pool:                    {len(pool)} "
+              f"({n_seeds} seeds + {len(pool) - n_seeds} bred)")
+    if cov_curve:
+        print("  code-coverage curve:            "
+              + " ".join(f"{it}:{n}" for it, n in cov_curve))
+    if args.show_coverage:
+        print("  codes:")
+        for c in codes:
+            print(f"    {c}")
+
     hard_total = sum(counts[b] for b in HARD)
     print(f"\nfindings dir: {os.path.relpath(args.out)}")
     print(f"hard findings: {hard_total}")
