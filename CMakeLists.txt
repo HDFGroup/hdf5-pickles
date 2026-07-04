@@ -113,9 +113,15 @@ if(POKE_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0)
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
     set_tests_properties(h5policy_regression PROPERTIES TIMEOUT 300)
+    add_test(
+        NAME h5patch_regression
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/run.sh"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(h5patch_regression PROPERTIES TIMEOUT 120)
     message(STATUS "h5policy regression test enabled (poke: ${POKE_EXECUTABLE})")
 else()
-    message(STATUS "h5policy regression test skipped (needs poke and python3 h5py)")
+    message(STATUS "h5policy/h5patch regression tests skipped (needs poke and python3 h5py)")
 endif()
 
 # ---- emacs-check target ------------------------------------------------------

@@ -1,0 +1,459 @@
+/* h5_patch.pk - h5patch repair planner and applier.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+load "h5_policy.pk";
+
+var h5patch_file_name = "";
+var h5patch_aggressive = 0;
+
+var h5patch_super_found = 0;
+var h5patch_super_off = 0UL#B;
+
+var h5patch_action_kinds = string[]();
+var h5patch_action_structures = string[]();
+var h5patch_action_target_offsets = uint<64>[]();
+var h5patch_action_write_offsets = uint<64>[]();
+var h5patch_action_sizes = uint<64>[]();
+var h5patch_action_old_hex = string[]();
+var h5patch_action_new_hex = string[]();
+var h5patch_action_reasons = string[]();
+var h5patch_action_confidences = string[]();
+
+fun h5patch_reset_actions = void:
+{
+    h5patch_action_kinds = string[]();
+    h5patch_action_structures = string[]();
+    h5patch_action_target_offsets = uint<64>[]();
+    h5patch_action_write_offsets = uint<64>[]();
+    h5patch_action_sizes = uint<64>[]();
+    h5patch_action_old_hex = string[]();
+    h5patch_action_new_hex = string[]();
+    h5patch_action_reasons = string[]();
+    h5patch_action_confidences = string[]();
+}
+
+fun h5patch_byte_hex = (byte b) string:
+{
+    return h5policy_hex_nibble(((b as uint<8>) .>> 4) & 0xfUB)
+           + h5policy_hex_nibble((b as uint<8>) & 0xfUB);
+}
+
+fun h5patch_bytes_hex = (byte[] raw) string:
+{
+    var out = "";
+    var i = 0UL;
+
+    while (i < raw'length)
+        {
+            out = out + h5patch_byte_hex(raw[i]);
+            i = i + 1UL;
+        }
+
+    return out;
+}
+
+fun h5patch_u32_le_bytes = (uint<32> value) byte[]:
+{
+    return [ (value & 0xffU) as byte,
+             ((value .>> 8) & 0xffU) as byte,
+             ((value .>> 16) & 0xffU) as byte,
+             ((value .>> 24) & 0xffU) as byte ];
+}
+
+fun h5patch_add_action = (string kind, string structure, uint<64> target_off,
+                          offset<uint<64>,B> write_off, byte[] old_bytes,
+                          byte[] new_bytes, string reason,
+                          string confidence) void:
+{
+    if (old_bytes == new_bytes)
+        return;
+
+    h5patch_action_kinds += [kind];
+    h5patch_action_structures += [structure];
+    h5patch_action_target_offsets += [target_off];
+    h5patch_action_write_offsets += [(write_off/#B) as uint<64>];
+    h5patch_action_sizes += [new_bytes'length];
+    h5patch_action_old_hex += [h5patch_bytes_hex(old_bytes)];
+    h5patch_action_new_hex += [h5patch_bytes_hex(new_bytes)];
+    h5patch_action_reasons += [reason];
+    h5patch_action_confidences += [confidence];
+}
+
+fun h5patch_plausible_superblock_at = (int ios, offset<uint<64>,B> off) int:
+{
+    if ((off/#B + 16UL) > iosize(ios)/#B)
+        return 0;
+
+    var version = byte @ ios : off + 8#B;
+    if (version == 0UB || version == 1UB)
+        {
+            var free_vers = byte @ ios : off + 9#B;
+            var root_vers = byte @ ios : off + 10#B;
+            var reserved = byte @ ios : off + 11#B;
+            var shared_vers = byte @ ios : off + 12#B;
+            var off_size = byte @ ios : off + 13#B;
+            var len_size = byte @ ios : off + 14#B;
+
+            return free_vers == 0UB && root_vers == 0UB && reserved == 0UB
+                   && shared_vers == 0UB
+                   && h5policy_width_supported(off_size)
+                   && h5policy_width_supported(len_size);
+        }
+
+    if (version == 2UB || version == 3UB)
+        {
+            var off_size2 = byte @ ios : off + 9#B;
+            var len_size2 = byte @ ios : off + 10#B;
+            return h5policy_width_supported(off_size2)
+                   && h5policy_width_supported(len_size2);
+        }
+
+    return 0;
+}
+
+fun h5patch_locate_superblock = (int ios) void:
+{
+    h5patch_super_found = 0;
+    h5patch_super_off = 0UL#B;
+
+    if (h5policy_signature_at(ios, 0UL#B))
+        {
+            h5patch_super_found = 1;
+            h5patch_super_off = 0UL#B;
+            return;
+        }
+
+    var pos = 512UL;
+    var file_size = iosize(ios)/#B;
+    while (pos + 8UL <= file_size)
+        {
+            if (h5policy_signature_at(ios, pos#B))
+                {
+                    h5patch_super_found = 1;
+                    h5patch_super_off = pos#B;
+                    return;
+                }
+            pos = pos * 2UL;
+        }
+
+    if (h5patch_plausible_superblock_at(ios, 0UL#B))
+        {
+            h5patch_super_found = 1;
+            h5patch_super_off = 0UL#B;
+        }
+}
+
+fun h5patch_collect_policy_findings = (int ios) void:
+{
+    h5policy_reset_findings;
+    h5policy_nonstrict = 1;
+    h5policy_continue = 1;
+    h5policy_walk_deadline = 0L;
+
+    try
+        {
+            h5policy_locate_superblock(ios);
+            if (!h5policy_super_found)
+                {
+                    h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE",
+                                        "corrupt", 0UL#B, "superblock",
+                                        "HDF5 signature was not found at a valid superblock offset");
+                    return;
+                }
+
+            var profile = H5_FORENSIC;
+            var ctx = h5policy_new_walk_context;
+            var sb = h5policy_map_super(ios, profile, h5policy_super_off);
+            ctx = h5policy_validate_superblock(ios, sb, profile,
+                                               ctx, h5policy_super_off);
+
+            var root_addr = h5policy_root_addr(sb);
+            var ext_addr = h5policy_super_ext_addr(sb);
+            if ((root_addr/#B) < (iosize(ios)/#B))
+                ctx = h5policy_walk_reachable_metadata(ios, profile, ctx,
+                                                       root_addr, ext_addr);
+        }
+    catch (Exception e)
+        {
+            if (h5policy_exit_rank < h5policy_class_rank("corrupt"))
+                h5policy_emit_error("H5_CORRUPT_MAPPING_FAILED",
+                                    "corrupt", 0UL#B, "metadata",
+                                    "metadata mapping failed while planning repair ("
+                                    + e.name + ")");
+        }
+}
+
+fun h5patch_bad_checksum_finding_at = (uint<64> off) int:
+{
+    var i = 0UL;
+
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[i] == "H5_CORRUPT_BAD_CHECKSUM"
+                && h5policy_finding_offsets[i] == off)
+                return 1;
+            i = i + 1UL;
+        }
+
+    return 0;
+}
+
+fun h5patch_plan_signature = (int ios, int apply) void:
+{
+    if (h5patch_super_found && h5patch_super_off == 0UL#B
+        && !h5policy_signature_at(ios, 0UL#B)
+        && h5patch_plausible_superblock_at(ios, 0UL#B))
+        {
+            var old = byte[8] @ ios : 0UL#B;
+            h5patch_add_action("replace_bytes", "superblock", 0UL,
+                               0UL#B, old, H5POLICY_SIGNATURE,
+                               "restore missing or corrupt HDF5 file signature",
+                               "high");
+            if (apply)
+                byte[8] @ ios : 0UL#B = H5POLICY_SIGNATURE;
+        }
+}
+
+fun h5patch_plan_superblock_repairs = (int ios, int apply) void:
+{
+    if (!h5patch_super_found || !h5policy_signature_at(ios, h5patch_super_off))
+        return;
+    if ((h5patch_super_off/#B + 16UL) > iosize(ios)/#B)
+        return;
+
+    var version = byte @ ios : h5patch_super_off + 8#B;
+    if (version != 2UB && version != 3UB)
+        return;
+
+    var off_size = byte @ ios : h5patch_super_off + 9#B;
+    if (!h5policy_width_supported(off_size))
+        return;
+
+    var flags_off = h5patch_super_off + 11#B;
+    var checksum_off = h5patch_super_off + (12UL + 4UL * (off_size as uint<64>))#B;
+    if ((checksum_off/#B + 4UL) > iosize(ios)/#B)
+        return;
+
+    var flags = byte @ ios : flags_off;
+    if (flags != 0UB)
+        {
+            h5patch_add_action("set_uint_le", "superblock_v2_v3",
+                               (h5patch_super_off/#B) as uint<64>,
+                               flags_off, [flags], [0UB],
+                               "clear stale superblock file consistency flags",
+                               "medium");
+            if (apply)
+                byte @ ios : flags_off = 0UB;
+        }
+
+    var body = byte[(checksum_off - h5patch_super_off)/#B] @ ios : h5patch_super_off;
+    if (!apply && flags != 0UB)
+        body[11UL] = 0UB;
+
+    var stored = byte[4] @ ios : checksum_off;
+    var calc = h5patch_u32_le_bytes(lookup3_hashlittle(body, 0));
+    if (stored != calc)
+        {
+            h5patch_add_action("recompute_checksum", "superblock_v2_v3",
+                               (h5patch_super_off/#B) as uint<64>,
+                               checksum_off, stored, calc,
+                               "recompute v2/v3 superblock checksum",
+                               "high");
+            if (apply)
+                byte[4] @ ios : checksum_off = calc;
+        }
+}
+
+fun h5patch_v2_ohdr_checksum_off = (int ios, offset<uint<64>,B> off) offset<uint<64>,B>:
+{
+    if ((off/#B + 6UL) > iosize(ios)/#B)
+        return 0UL#B;
+    if ((byte[4] @ ios : off) != V2_SIG)
+        return 0UL#B;
+    if ((byte @ ios : off + 4#B) != 2UB)
+        return 0UL#B;
+
+    var flags = byte @ ios : off + 5#B;
+    var cursor = off + 6#B;
+
+    if ((flags & (1U <<. 5)) != 0U)
+        cursor = cursor + 16#B;
+    if ((flags & (1U <<. 4)) != 0U)
+        cursor = cursor + 4#B;
+
+    var size_width = 1UL <<. (flags & 3U);
+    if ((cursor/#B + size_width) > iosize(ios)/#B)
+        return 0UL#B;
+
+    var chunk_size = bytes_to_u64_le(byte[size_width] @ ios : cursor);
+    var checksum_off = cursor + size_width#B + chunk_size#B;
+    if ((checksum_off/#B + 4UL) > iosize(ios)/#B)
+        return 0UL#B;
+
+    return checksum_off;
+}
+
+fun h5patch_plan_one_object_header = (int ios, uint<64> off, int apply,
+                                      string confidence) void:
+{
+    var root_off = off#B;
+    var checksum_off = h5patch_v2_ohdr_checksum_off(ios, root_off);
+    if (checksum_off == 0UL#B)
+        return;
+
+    var body = byte[(checksum_off - root_off)/#B] @ ios : root_off;
+    var stored = byte[4] @ ios : checksum_off;
+    var calc = h5patch_u32_le_bytes(lookup3_hashlittle(body, 0));
+
+    if (stored != calc)
+        {
+            h5patch_add_action("recompute_checksum", "object_header_v2",
+                               off, checksum_off, stored, calc,
+                               "recompute v2 object-header checksum",
+                               confidence);
+            if (apply)
+                byte[4] @ ios : checksum_off = calc;
+        }
+}
+
+fun h5patch_plan_object_header_checksums = (int ios, int apply) void:
+{
+    var i = 0UL;
+
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[i] == "H5_CORRUPT_BAD_CHECKSUM")
+                h5patch_plan_one_object_header(ios, h5policy_finding_offsets[i],
+                                               apply, "high");
+            i = i + 1UL;
+        }
+
+    /* Aggressive full-file scanning will live here once the conservative
+       reachable-object repair path has more corpus mileage.  */
+}
+
+fun h5patch_collect_actions = (int ios, int apply) void:
+{
+    h5patch_reset_actions;
+    h5patch_locate_superblock(ios);
+    h5patch_collect_policy_findings(ios);
+
+    h5patch_plan_signature(ios, apply);
+    h5patch_plan_superblock_repairs(ios, apply);
+    h5patch_plan_object_header_checksums(ios, apply);
+}
+
+fun h5patch_print_action = (uint<64> i) void:
+{
+    printf("    {\n");
+    printf("      \"id\": \"h5patch-%u64d\",\n", i + 1UL);
+    printf("      \"kind\": ");
+    h5policy_print_json_string(h5patch_action_kinds[i]);
+    printf(",\n");
+    printf("      \"target\": {\n");
+    printf("        \"structure\": ");
+    h5policy_print_json_string(h5patch_action_structures[i]);
+    printf(",\n");
+    printf("        \"offset\": %u64d\n", h5patch_action_target_offsets[i]);
+    printf("      },\n");
+    printf("      \"preconditions\": [\n");
+    printf("        { \"offset\": %u64d, \"size\": %u64d, \"equals_hex\": ",
+           h5patch_action_write_offsets[i], h5patch_action_sizes[i]);
+    h5policy_print_json_string(h5patch_action_old_hex[i]);
+    printf(" }\n");
+    printf("      ],\n");
+    printf("      \"writes\": [\n");
+    printf("        { \"offset\": %u64d, \"size\": %u64d, \"old_hex\": ",
+           h5patch_action_write_offsets[i], h5patch_action_sizes[i]);
+    h5policy_print_json_string(h5patch_action_old_hex[i]);
+    printf(", \"new_hex\": ");
+    h5policy_print_json_string(h5patch_action_new_hex[i]);
+    printf(" }\n");
+    printf("      ],\n");
+    printf("      \"reason\": ");
+    h5policy_print_json_string(h5patch_action_reasons[i]);
+    printf(",\n");
+    printf("      \"confidence\": ");
+    h5policy_print_json_string(h5patch_action_confidences[i]);
+    printf("\n");
+    printf("    }");
+}
+
+fun h5patch_print_plan_json = (int ios) void:
+{
+    printf("{\n");
+    printf("  \"format\": \"h5patch-plan-v1\",\n");
+    printf("  \"tool\": { \"name\": \"h5patch\", \"version\": \"0.1\", \"implementation\": \"gnu-poke\" },\n");
+    printf("  \"input\": {\n");
+    printf("    \"path\": ");
+    h5policy_print_json_string(h5patch_file_name);
+    printf(",\n");
+    printf("    \"size\": %u64d,\n", iosize(ios)/#B);
+    printf("    \"superblock_offset\": ");
+    if (h5patch_super_found)
+        printf("%u64d\n", (h5patch_super_off/#B) as uint<64>);
+    else
+        printf("null\n");
+    printf("  },\n");
+    printf("  \"policy\": { \"validator\": \"h5policy\", \"profile\": \"forensic\", \"pre_decision\": ");
+    h5policy_print_json_string(h5policy_decision);
+    printf(" },\n");
+    printf("  \"goal\": \"restore-consistent-metadata\",\n");
+    printf("  \"actions\": [\n");
+
+    var i = 0UL;
+    while (i < h5patch_action_kinds'length)
+        {
+            h5patch_print_action(i);
+            if (i + 1UL < h5patch_action_kinds'length)
+                printf(",");
+            printf("\n");
+            i = i + 1UL;
+        }
+
+    printf("  ],\n");
+    printf("  \"verification\": { \"tool\": \"h5policy\", \"profile\": \"untrusted-strict\", \"expected_decisions\": [\"accept\", \"accept_with_warnings\"] },\n");
+    printf("  \"summary\": { \"action_count\": %u64d, \"would_modify\": ",
+           h5patch_action_kinds'length);
+    if (h5patch_action_kinds'length > 0UL)
+        printf("true");
+    else
+        printf("false");
+    printf(" }\n");
+    printf("}\n");
+}
+
+fun h5patch_run_plan = void:
+{
+    var ios = open(h5patch_file_name, IOS_M_RDONLY);
+    h5patch_collect_actions(ios, 0);
+    h5patch_print_plan_json(ios);
+    close(ios);
+    printf("__H5PATCH_EXIT_CODE=0\n");
+}
+
+fun h5patch_run_apply = void:
+{
+    var ios = open(h5patch_file_name, IOS_M_RDWR);
+    h5patch_collect_actions(ios, 1);
+    close(ios);
+    printf("{\n");
+    printf("  \"applied_actions\": %u64d\n", h5patch_action_kinds'length);
+    printf("}\n");
+    printf("__H5PATCH_EXIT_CODE=0\n");
+}

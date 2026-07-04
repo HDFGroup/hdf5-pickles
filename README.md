@@ -3,7 +3,9 @@
 `H5Lens` is a machine-readable description of HDF5 on-disk metadata using
 [GNU poke](https://www.jemarch.net/poke/) pickles. It is both a format
 exploration kit and the home of `h5policy`, an independent metadata preflight
-oracle for hostile or untrusted HDF5 files.
+oracle for hostile or untrusted HDF5 files.  It also includes the early
+`h5patch` repair planner for proposing and applying conservative metadata
+repairs.
 
 ## What's Here
 
@@ -11,6 +13,8 @@ oracle for hostile or untrusted HDF5 files.
   GNU poke.
 - [`h5policy/`](h5policy/) contains the policy oracle, focused validators,
   security profiles, regression corpus, differential harness, and fuzzing tools.
+- [`h5patch/`](h5patch/) contains the experimental metadata repair planner,
+  JSON patch-plan format, apply workflow, and repair tests.
 - [`tools/`](tools/) contains repository-level helpers such as the marker scanner
   and interactive `h5explain` workflow.
 - [`docs/`](docs/) contains YAML format notes and generated Markdown reference
@@ -36,6 +40,13 @@ Try the regression suite:
 ```sh
 cd h5policy/tests
 ./run.sh
+```
+
+Create a what-if metadata repair plan:
+
+```sh
+./h5patch/tools/h5patch plan damaged.h5 -o repair.plan.json
+./h5patch/tools/h5patch explain repair.plan.json
 ```
 
 Build the marker scanner and generated format docs:
@@ -66,6 +77,17 @@ Use [`h5policy/README.md`](h5policy/README.md) for profile behavior, exit codes,
 coverage, checksum notes, and CLI examples. Use
 [`h5policy/tests/README.md`](h5policy/tests/README.md) for the corpus,
 differential harness, and fuzzing workflow.
+
+## h5patch In Under A Minute
+
+`h5patch` plans byte-level repairs for damaged HDF5 metadata, applies only an
+approved JSON plan, writes an audit log, and verifies the result with
+`h5policy`. Planning is a what-if operation: it does not modify the input file.
+
+The first repair catalog is intentionally narrow and high-confidence: HDF5
+signature restoration, stale v2/v3 superblock flags, v2/v3 superblock
+checksums, and reachable v2 object-header checksums. See
+[`h5patch/README.md`](h5patch/README.md) for the plan format and workflow.
 
 ## Acknowledgments
 
