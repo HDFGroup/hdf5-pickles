@@ -81,6 +81,20 @@ fun h5patch_u16_le_bytes = (uint<64> value) byte[]:
              ((value .>> 8) & 0xffUL) as byte ];
 }
 
+fun h5patch_u64_le_bytes = (uint<64> value, uint<64> width) byte[]:
+{
+    var out = byte[]();
+    var i = 0UL;
+
+    while (i < width)
+        {
+            out += [((value .>> (i * 8UL)) & 0xffUL) as byte];
+            i = i + 1UL;
+        }
+
+    return out;
+}
+
 fun h5patch_add_action = (string kind, string structure, uint<64> target_off,
                           offset<uint<64>,B> write_off, byte[] old_bytes,
                           byte[] new_bytes, string reason,
@@ -269,7 +283,7 @@ fun h5patch_plan_superblock_repairs = (int ios, int apply) void:
 
     var body = byte[(checksum_off - h5patch_super_off)/#B] @ ios : h5patch_super_off;
     if (!apply && flags != 0UB)
-        body[11UL] = 0UB;
+        body = body[0UL:11UL] + [0UB] + body[12UL:body'length];
 
     var stored = byte[4] @ ios : checksum_off;
     var calc = h5patch_u32_le_bytes(lookup3_hashlittle(body, 0));
@@ -422,6 +436,197 @@ fun h5patch_plan_v1_object_header_message_counts = (int ios, int apply) void:
         }
 }
 
+fun h5patch_object_header_signature_at = (int ios, uint<64> addr) int:
+{
+    if (addr + 4UL > iosize(ios)/#B)
+        return 0;
+    if ((byte[4] @ ios : addr#B) == V2_SIG)
+        return 1;
+    if ((byte @ ios : addr#B) == 1UB)
+        return 1;
+    return 0;
+}
+
+fun h5patch_snod_entry_plausible = (int ios, uint<64> eoff) int:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var file_size = iosize(ios)/#B;
+
+    if (eoff + (2UL * o) + 24UL > file_size)
+        return 0;
+
+    var cache_type = bytes_to_u64_le(byte[4] @ ios : (eoff + (2UL * o))#B);
+    if (cache_type > 2UL)
+        return 0;
+
+    /* Hard links and cached group entries carry an object-header address; use
+       that as the conservative signal that the entry is still live.  Soft-link
+       entries are intentionally not resurrected from trailing slack. */
+    if (cache_type == 2UL)
+        return 0;
+
+    var ohdr_raw = byte[o] @ ios : (eoff + o)#B;
+    if (h5policy_msg_addr_is_undef(ohdr_raw))
+        return 0;
+
+    return h5patch_object_header_signature_at(ios, bytes_to_u64_le(ohdr_raw));
+}
+
+fun h5patch_count_contiguous_snod_entries = (int ios, uint<64> snod_addr,
+                                             uint<64> capacity) uint<64>:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var ent_size = (2UL * o) + 24UL;
+    var count = 0UL;
+
+    while (count < capacity)
+        {
+            var eoff = snod_addr + 8UL + (count * ent_size);
+            if (!h5patch_snod_entry_plausible(ios, eoff))
+                return count;
+            count = count + 1UL;
+        }
+
+    return count;
+}
+
+fun h5patch_plan_one_snod_count = (int ios, uint<64> snod_addr, int apply) void:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var file_size = iosize(ios)/#B;
+    var capacity = 2UL * h5policy_super_stab_leaf_k;
+    var ent_size = (2UL * o) + 24UL;
+    var total = 8UL + (capacity * ent_size);
+
+    if (capacity == 0UL || snod_addr + total > file_size)
+        return;
+    if ((byte[4] @ ios : snod_addr#B) != H5POLICY_SNOD_SIG)
+        return;
+    if ((byte @ ios : (snod_addr + 4UL)#B) != 1UB)
+        return;
+    if ((byte @ ios : (snod_addr + 5UL)#B) != 0UB)
+        return;
+
+    var declared_bytes = byte[2] @ ios : (snod_addr + 6UL)#B;
+    var declared = bytes_to_u64_le(declared_bytes);
+    var actual = h5patch_count_contiguous_snod_entries(ios, snod_addr, capacity);
+
+    if (actual > 0UL && actual <= capacity && actual != declared)
+        {
+            var new_bytes = h5patch_u16_le_bytes(actual);
+            h5patch_add_action("set_uint_le", "symbol_table_node",
+                               snod_addr, (snod_addr + 6UL)#B,
+                               declared_bytes, new_bytes,
+                               "rewrite SNOD symbol count to the contiguous valid entry count",
+                               declared > capacity ? "high" : "medium");
+            if (apply)
+                byte[2] @ ios : (snod_addr + 6UL)#B = new_bytes;
+        }
+}
+
+fun h5patch_plan_snod_counts = (int ios, int apply) void:
+{
+    var file_size = iosize(ios)/#B;
+    var pos = 0UL;
+
+    while (pos + 8UL <= file_size)
+        {
+            if ((byte[4] @ ios : pos#B) == H5POLICY_SNOD_SIG)
+                h5patch_plan_one_snod_count(ios, pos, apply);
+            pos = pos + 1UL;
+        }
+}
+
+fun h5patch_plan_one_depth0_bthd_count = (int ios, uint<64> hdr_addr,
+                                          int apply) void:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var file_size = iosize(ios)/#B;
+    var hdr_size = 22UL + o + el;
+
+    if (hdr_addr + hdr_size > file_size)
+        return;
+    if ((byte[4] @ ios : hdr_addr#B) != H5POLICY_BTHD_SIG)
+        return;
+    if ((byte @ ios : (hdr_addr + 4UL)#B) != 0UB)
+        return;
+
+    var record_type = byte @ ios : (hdr_addr + 5UL)#B;
+    var node_size = bytes_to_u64_le(byte[4] @ ios : (hdr_addr + 6UL)#B);
+    var record_size = bytes_to_u64_le(byte[2] @ ios : (hdr_addr + 10UL)#B);
+    var depth = bytes_to_u64_le(byte[2] @ ios : (hdr_addr + 12UL)#B);
+    var root_raw = byte[o] @ ios : (hdr_addr + 16UL)#B;
+    var root_addr = bytes_to_u64_le(root_raw);
+    var num_root = bytes_to_u64_le(byte[2] @ ios : (hdr_addr + 16UL + o)#B);
+    var total_off = hdr_addr + 18UL + o;
+    var total_bytes = byte[el] @ ios : total_off#B;
+    var total = bytes_to_u64_le(total_bytes);
+
+    if (record_type < 1UB || record_type > 11UB || depth != 0UL
+        || record_size == 0UL || node_size < 10UL
+        || h5policy_msg_addr_is_undef(root_raw)
+        || root_addr + 6UL > file_size)
+        return;
+    if ((byte[4] @ ios : root_addr#B) != H5POLICY_BTLF_SIG)
+        return;
+    if ((byte @ ios : (root_addr + 4UL)#B) != 0UB
+        || (byte @ ios : (root_addr + 5UL)#B) != record_type)
+        return;
+    if (num_root > ((node_size - 10UL) / record_size))
+        return;
+    if (root_addr + 6UL + (num_root * record_size) + 4UL > file_size)
+        return;
+
+    if (total != num_root)
+        {
+            var new_total = h5patch_u64_le_bytes(num_root, el);
+            h5patch_add_action("set_uint_le", "v2_btree_header",
+                               hdr_addr, total_off#B, total_bytes, new_total,
+                               "rewrite depth-0 v2 B-tree total record count to the root record count",
+                               "high");
+            if (apply)
+                byte[el] @ ios : total_off#B = new_total;
+        }
+
+    var body = byte[hdr_size - 4UL] @ ios : hdr_addr#B;
+    if (!apply && total != num_root)
+        {
+            var new_total2 = h5patch_u64_le_bytes(num_root, el);
+            var rel = total_off - hdr_addr;
+            if (rel + el < body'length)
+                body = body[0UL:rel] + new_total2 + body[rel + el:body'length];
+            else
+                body = body[0UL:rel] + new_total2;
+        }
+
+    var stored = byte[4] @ ios : (hdr_addr + hdr_size - 4UL)#B;
+    var calc = h5patch_u32_le_bytes(lookup3_hashlittle(body, 0));
+    if (stored != calc)
+        {
+            h5patch_add_action("recompute_checksum", "v2_btree_header",
+                               hdr_addr, (hdr_addr + hdr_size - 4UL)#B,
+                               stored, calc,
+                               "recompute v2 B-tree header checksum",
+                               h5patch_bad_checksum_finding_at(hdr_addr) ? "high" : "medium");
+            if (apply)
+                byte[4] @ ios : (hdr_addr + hdr_size - 4UL)#B = calc;
+        }
+}
+
+fun h5patch_plan_depth0_bthd_counts = (int ios, int apply) void:
+{
+    var file_size = iosize(ios)/#B;
+    var pos = 0UL;
+
+    while (pos + 4UL <= file_size)
+        {
+            if ((byte[4] @ ios : pos#B) == H5POLICY_BTHD_SIG)
+                h5patch_plan_one_depth0_bthd_count(ios, pos, apply);
+            pos = pos + 1UL;
+        }
+}
+
 fun h5patch_collect_actions = (int ios, int apply) void:
 {
     h5patch_reset_actions;
@@ -432,6 +637,8 @@ fun h5patch_collect_actions = (int ios, int apply) void:
     h5patch_plan_superblock_repairs(ios, apply);
     h5patch_plan_object_header_checksums(ios, apply);
     h5patch_plan_v1_object_header_message_counts(ios, apply);
+    h5patch_plan_snod_counts(ios, apply);
+    h5patch_plan_depth0_bthd_counts(ios, apply);
 }
 
 fun h5patch_print_action = (uint<64> i) void:

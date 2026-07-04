@@ -60,6 +60,38 @@ def corrupt_first_ohdr_checksum(path):
         fh.write(raw)
 
 
+def corrupt_first_snod_count(path):
+    raw = bytearray(open(path, "rb").read())
+    off = raw.find(b"SNOD")
+    if off < 0:
+        raise AssertionError("fixture lacks a symbol table node")
+    raw[off + 6:off + 8] = (0xFFFF).to_bytes(2, "little")
+    with open(path, "wb") as fh:
+        fh.write(raw)
+
+
+def corrupt_depth0_bthd_total_count(path):
+    raw = bytearray(open(path, "rb").read())
+    off_size = raw[9]
+    len_size = raw[10]
+    off = raw.find(b"BTHD")
+    while off >= 0:
+        if off + 22 + off_size + len_size <= len(raw):
+            depth = int.from_bytes(raw[off + 12:off + 14], "little")
+            root = int.from_bytes(raw[off + 16:off + 16 + off_size], "little")
+            if depth == 0 and raw[root:root + 4] == b"BTLF":
+                total_off = off + 18 + off_size
+                total = int.from_bytes(raw[total_off:total_off + len_size], "little")
+                raw[total_off:total_off + len_size] = (total + 1).to_bytes(
+                    len_size, "little"
+                )
+                with open(path, "wb") as fh:
+                    fh.write(raw)
+                return
+        off = raw.find(b"BTHD", off + 1)
+    raise AssertionError("fixture lacks a depth-0 v2 B-tree header")
+
+
 def test_signature_repair(tmp):
     src = os.path.join(REPO, "h5policy", "tests", "valid", "empty.h5")
     damaged = os.path.join(tmp, "bad_signature.h5")
@@ -113,11 +145,49 @@ def test_v1_object_header_message_count_repair(tmp):
     assert_accept(repaired)
 
 
+def test_snod_symbol_count_repair(tmp):
+    src = os.path.join(REPO, "h5policy", "tests", "valid", "old_style_group.h5")
+    damaged = os.path.join(tmp, "bad_snod_count.h5")
+    repaired = os.path.join(tmp, "snod_count_repaired.h5")
+    plan = os.path.join(tmp, "snod_count.plan.json")
+    shutil.copyfile(src, damaged)
+    corrupt_first_snod_count(damaged)
+
+    run([H5PATCH, "plan", damaged, "-o", plan])
+    spec = json.load(open(plan))
+    assert any(a["target"]["structure"] == "symbol_table_node" for a in spec["actions"])
+
+    run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+    assert_accept(repaired)
+
+
+def test_depth0_btree_total_count_repair(tmp):
+    src = os.path.join(REPO, "h5policy", "tests", "valid", "dense_links.h5")
+    damaged = os.path.join(tmp, "bad_bthd_total_count.h5")
+    repaired = os.path.join(tmp, "bthd_total_count_repaired.h5")
+    plan = os.path.join(tmp, "bthd_total_count.plan.json")
+    shutil.copyfile(src, damaged)
+    corrupt_depth0_bthd_total_count(damaged)
+
+    run([H5PATCH, "plan", damaged, "-o", plan])
+    spec = json.load(open(plan))
+    assert any(
+        a["target"]["structure"] == "v2_btree_header"
+        and a["kind"] == "set_uint_le"
+        for a in spec["actions"]
+    )
+
+    run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+    assert_accept(repaired)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="h5patch-test-") as tmp:
         test_signature_repair(tmp)
         test_object_header_checksum_repair(tmp)
         test_v1_object_header_message_count_repair(tmp)
+        test_snod_symbol_count_repair(tmp)
+        test_depth0_btree_total_count_repair(tmp)
     print("h5patch tests passed")
 
 

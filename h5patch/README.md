@@ -72,7 +72,11 @@ repairs:
 - recompute v2/v3 superblock Jenkins checksums;
 - recompute reachable v2 object-header Jenkins checksums reported by
   `h5policy`;
-- rewrite flagged v1 object-header message counts to the counted message total.
+- rewrite flagged v1 object-header message counts to the counted message total;
+- rewrite symbol-table node (`SNOD`) symbol counts to the contiguous valid entry
+  count;
+- rewrite depth-0 v2 B-tree header total-record counts to the root-record
+  count, resealing the B-tree header checksum when needed.
 
 Future repair classes can add B-tree rebuilds, orphan pruning, continuation
 chunk repair, and chunk-index reconstruction behind the same plan/apply/log
