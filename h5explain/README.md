@@ -35,6 +35,8 @@ Inspection:
 
 ```text
 explain
+explain (N)
+explain_msg (N)
 info
 msgs
 cur
@@ -45,7 +47,9 @@ dump
 h5dump
 ```
 
-Type `help` at the prompt for the full command descriptions.
+Use `msgs` to list object-header messages, then `explain (N)` or
+`explain_msg (N)` to explain message `N` in the current object header.  Type
+`help` at the prompt for the full command descriptions.
 
 ## Layout
 

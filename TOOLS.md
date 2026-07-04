@@ -78,9 +78,9 @@ TREE            0x00000000000001DF (479)
 
 **Navigation commands:** `root`, `h5super`, `cd ("NAME")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
 
-**Inspection commands:** `explain`, `info`, `msgs`, `cur`, `ls` / `links`, `traverse`, `dump`, `h5dump`
+**Inspection commands:** `explain`, `explain (N)`, `explain_msg (N)`, `info`, `msgs`, `cur`, `ls` / `links`, `traverse`, `dump`, `h5dump`
 
-Type `help` at the prompt for a full description of each command.
+Use `msgs` to list object-header messages, then `explain (N)` or `explain_msg (N)` to explain message `N` in the current object header. Type `help` at the prompt for a full description of each command.
 
 `traverse` is the only command that recursively walks chunk indexes. Ordinary navigation and `info` map the current primitive only, so large chunk indexes are not traversed accidentally.
 
