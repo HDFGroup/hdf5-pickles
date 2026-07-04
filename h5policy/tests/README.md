@@ -31,24 +31,27 @@ if `poke` or `python3` + `h5py` are unavailable.
 ## Differential harness
 
 `../tools/h5policy-diff` cross-checks h5policy's independent parse against
-libhdf5, catching field-offset bugs that the corpus alone can miss:
+`libhdf5`, catching field-offset bugs that the corpus alone can miss:
 
-- **h5py** is the structural reference — does libhdf5 open the bytes, and what
-  external links / dataset shapes / on-disk datatype sizes does it report;
-- **h5dump** / **h5debug** are independent "does libhdf5 accept these bytes"
+- **h5py** is the structural reference — does `libhdf5` open the bytes, and what
+  external links, dataset shapes, and `H5Tget_size` values does it report;
+- **h5dump** / **h5debug** are independent "does `libhdf5` accept these bytes"
   signals (optional; skipped if not on `PATH`).
 
-It fails if h5policy accepts a file that libhdf5 structurally rejects, calls a
-structurally valid file corrupt with no deeper libhdf5 evidence, disagrees on
+It fails if h5policy accepts a file that `libhdf5` structurally rejects, calls a
+structurally valid file corrupt with no deeper `libhdf5` evidence, disagrees on
 external references, or over-counts a dataset's **rank**. A `reject_corrupt` on a
 file that h5py can structurally traverse is downgraded to an `A+` warning when a
-bounded, out-of-process libhdf5 probe also errors while inspecting attributes,
-reading small datasets, or running optional libhdf5 tools; those eager catches
-are security-useful, not hard false positives. The logical-**bytes** comparison
-is advisory: h5policy reads the declared on-disk element size, which for padded
-compounds (and VLEN) legitimately differs from libhdf5's packed `H5Tget_size` —
-using the larger declared size is the conservative, correct choice for a
-security oracle. Run standalone with:
+bounded, out-of-process `libhdf5` probe also errors while inspecting attributes,
+reading small datasets, or running optional `libhdf5` tools; those eager catches
+are security-useful, not hard false positives.
+
+The logical-**bytes** comparison is warning-level rather than a hard failure:
+h5policy now tracks logical dataset bytes separately from raw storage bytes, so
+covered datatype cases should match `libhdf5`'s `H5Tget_size` view while layout
+and fill checks can still use on-disk storage size. Remaining `WARN C` mismatches
+are treated as coverage or semantic-accounting work items, not as corpus
+failures. Run standalone with:
 
 ```sh
 ../tools/h5policy-diff --dir .        # or: ../tools/h5policy-diff FILE ...
@@ -57,8 +60,8 @@ security oracle. Run standalone with:
 ## Structure-aware fuzzing
 
 `../tools/h5policy-fuzz` mutates the valid seeds and cross-checks each mutant
-against libhdf5, hunting the cases the curated corpus can't enumerate: crashes,
-hangs, and — the dangerous direction — files h5policy **accepts** that libhdf5
+against `libhdf5`, hunting the cases the curated corpus can't enumerate: crashes,
+hangs, and — the dangerous direction — files h5policy **accepts** that `libhdf5`
 **rejects**.  It is a soak/exploration tool, run on demand (not part of
 `run.sh`, which stays fast and deterministic):
 
@@ -72,8 +75,8 @@ superblock address field and *repairs the Jenkins checksum* so the mutation
 reaches the deep validators (not just the superblock gate), and a `dict`
 strategy that splices real HDF5 format tokens (`OHDR`/`FRHP`/`BTHD`/… signatures,
 message-type and version bytes) at 8-byte-aligned offsets so a mutant *becomes* a
-structure the deep validators recognise.  The libhdf5 oracle runs **out of
-process**, so a libhdf5 crash on hostile input can't take the fuzzer down; such a
+structure the deep validators recognise.  The `libhdf5` oracle runs **out of
+process**, so a `libhdf5` crash on hostile input can't take the fuzzer down; such a
 crash is read as the strongest possible "reject".
 
 **Coverage-guided mode** (`--guided`) uses h5policy's own finding codes as a
@@ -86,7 +89,7 @@ for *depth* (stacking mutations toward deeper structures).
 
 Findings are bucketed by severity — `HANG` / `CRASH` / `FALSE_ACCEPT` are hard
 (non-zero exit); `ACCEPT_VS_CRASH` (h5policy accepts a file that *crashes*
-libhdf5 — an unreliable oracle, usually a libhdf5 memory bug) and `FALSE_REJECT`
+`libhdf5` — an unreliable oracle, usually a `libhdf5` memory bug) and `FALSE_REJECT`
 (over-strict, the safe direction) are advisory.  Mutants land in the git-ignored
 `fuzz-findings/`.  A found soundness gap is **promoted** into a curated
 `malformed/` fixture (via a `gencorpus` generator + `expected/*.yml`) so it
@@ -103,5 +106,5 @@ The `*.h5` files are **generated**, not committed, by
 ```
 
 Valid fixtures are written with `libver=latest`; malformed fixtures are
-byte-patched from a valid base so we make no assumption about libhdf5 accepting
-them.  `cve/` is reserved for minimized CVE seeds (see `h5policy.md` §12).
+byte-patched from a valid base so we make no assumption about `libhdf5` accepting
+them.  `cve/` is reserved for minimized CVE seeds.

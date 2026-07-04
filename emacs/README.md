@@ -103,14 +103,12 @@ arrives after a timeout is ignored safely.
 
 ## Tests
 
-Run parser and renderer tests, process-level smoke tests against generated HDF5 fixtures:
+Run parser and renderer tests, and process-level smoke tests against generated
+HDF5 fixtures:
 
 ```sh
-
 cmake -S . -B build
-
 cmake --build build --target emacs-check
-
 ```
 
 Fixture generation requires `h5py` and `numpy`; the process tests require GNU poke.
