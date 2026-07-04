@@ -34,6 +34,7 @@ pwd
 Inspection:
 
 ```text
+explain
 info
 msgs
 cur

@@ -519,7 +519,8 @@ fun h5explain_banner = void:
     printf("  back                       return to the previous location\n");
     printf("  pwd                        show current label, offset, and kind\n\n");
     printf("Inspection:\n");
-    printf("  info                       explain the current primitive\n");
+    printf("  explain                    describe what the current primitive means\n");
+    printf("  info                       show structural details for the current primitive\n");
     printf("  msgs                       decode object header messages (OHDR only)\n");
     printf("  cur                        return the current mapped value (raw poke struct)\n");
     printf("  ls or links                list hard links when current primitive is a group header\n");
@@ -561,6 +562,337 @@ fun cur = any:
         return h5explain_map_ea_dblock(h5explain_cur_off);
 
     return h5explain_map_raw(h5explain_cur_off);
+}
+
+fun h5explain_bt2_record_type_name = (uint<8> record_type) string:
+{
+    if (record_type == 5UB) return "dense link name index";
+    if (record_type == 6UB) return "dense link creation-order index";
+    if (record_type == 10UB) return "non-filtered chunk index";
+    if (record_type == 11UB) return "filtered chunk index";
+    return "record type handled by the generic v2 B-tree decoder";
+}
+
+fun h5explain_array_client_name = (uint<8> client_id) string:
+{
+    if (client_id == 0UB) return "non-filtered dataset chunks";
+    if (client_id == 1UB) return "filtered dataset chunks";
+    return "client class not yet described by h5explain";
+}
+
+fun h5explain_cb_count_msg = (uint<64> m_type,
+                              offset<uint<64>,B> payload_off,
+                              uint<64> m_size) uint<64>:
+{
+    return 1UL;
+}
+
+fun h5explain_print_current_heading = void:
+{
+    var value = cur;
+
+    printf("Current: %s at %v", h5explain_kind_name(h5explain_cur_kind),
+           h5explain_cur_off);
+    if (h5explain_cur_label != "") printf(" [%s]", h5explain_cur_label);
+    printf("\n");
+    printf("Extent: %v, mapping: %s\n\n",
+           value'size, value'strict ? "strict" : "non-strict");
+}
+
+fun h5explain_explain_super = void:
+{
+    var sb = h5explain_map_super(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  The superblock is the file's entry point. It establishes address\n");
+    printf("  widths, file bounds, consistency flags, and the root object header.\n\n");
+
+    printf("Key fields:\n");
+    printf("  version=%v\n", sb.super_vers);
+    if (sb.super_vers < 2UB) {
+        printf("  sizeof_offsets=%v, sizeof_lengths=%v\n",
+               sb.super.v0_v1.sizeof_offsets, sb.super.v0_v1.sizeof_lengths);
+        printf("  base_addr=%v\n", bytes_to_off(sb.super.v0_v1.base_addr_raw));
+        printf("  eof_addr=%v\n", bytes_to_off(sb.super.v0_v1.eof_addr_raw));
+        printf("  root_object_header=%v\n",
+               bytes_to_off(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw));
+        printf("  status_flags=%v\n", sb.super.v0_v1.status_flags);
+        printf("  old_style_group_k=(leaf=%v, internal=%v)\n",
+               sb.super.v0_v1.stab_leaf_k, sb.super.v0_v1.stab_internal_k);
+    } else {
+        printf("  sizeof_offsets=%v, sizeof_lengths=%v\n",
+               sb.super.v2_v3.sizeof_offsets, sb.super.v2_v3.sizeof_lengths);
+        printf("  base_addr=%v\n", bytes_to_off(sb.super.v2_v3.base_addr_raw));
+        printf("  eof_addr=%v\n", bytes_to_off(sb.super.v2_v3.eof_addr_raw));
+        printf("  extension_addr=%v\n", bytes_to_off(sb.super.v2_v3.ext_addr_raw));
+        printf("  root_object_header=%v\n", bytes_to_off(sb.super.v2_v3.root_obj_addr_raw));
+        if (sb.super_vers == 2UB)
+            printf("  status_flags=%v\n", sb.super.v2_v3.status_flags.v2_flags);
+        else
+            printf("  status_flags=%v\n", sb.super.v2_v3.status_flags.v3_flags);
+        printf("  checksum=%v\n", sb.super.v2_v3.chksum);
+    }
+
+    printf("\nWhy it matters:\n");
+    printf("  Everything reachable in the file is interpreted using these sizes and\n");
+    printf("  addresses. Bad EOF/base/root values usually mean the rest of the file\n");
+    printf("  will be misread or unreachable.\n\n");
+
+    printf("Next:\n");
+    printf("  root                       jump to the root object header\n");
+    printf("  cur                        inspect the mapped superblock struct\n");
+    printf("  h5dump                     hex-dump exactly this superblock\n");
+}
+
+fun h5explain_explain_ohdr = void:
+{
+    var hdr = h5explain_map_ohdr(h5explain_cur_off);
+    h5explain_load_ohdr_ctx(h5explain_cur_off);
+    var msg_count = h5explain_walk_msg_chunk(h5explain_ctx_version,
+                                             h5explain_ctx_pfx,
+                                             h5explain_ctx_chunk_off,
+                                             h5explain_ctx_chunk_size,
+                                             h5explain_cb_count_msg);
+
+    printf("What it is:\n");
+    printf("  An object header is the metadata record for one HDF5 object: group,\n");
+    printf("  dataset, committed datatype, or another object-like node.\n\n");
+
+    printf("Key fields:\n");
+    if (hdr.sig_peek == V2_SIG) {
+        printf("  version=%v\n", hdr._ohdr.v2.version);
+        printf("  flags=%v\n", hdr._ohdr.v2.flags);
+        printf("  chunk0_size=%u64d\n", bytes_to_u64_le(hdr._ohdr.v2.chunk0_size));
+        printf("  message_prefix_bytes=%v\n", h5explain_ctx_pfx);
+        printf("  reachable_messages=%u64d\n", msg_count);
+        printf("  checksum=%v\n", hdr._ohdr.v2.chksum);
+    } else {
+        printf("  version=%v\n", hdr._ohdr.v1.version);
+        printf("  declared_message_count=%v\n", hdr._ohdr.v1.msg_cnt);
+        printf("  reachable_messages=%u64d\n", msg_count);
+        printf("  object_reference_count=%v\n", hdr._ohdr.v1.obj_ref_cnt);
+        printf("  message_chunk_size=%v\n", hdr._ohdr.v1.obj_hdr_size);
+    }
+
+    printf("\nWhy it matters:\n");
+    printf("  Object-header messages describe the object's datatype, dataspace,\n");
+    printf("  storage layout, filters, links, attributes, and continuation chunks.\n");
+    printf("  If this header is wrong, the object may point at the wrong metadata or\n");
+    printf("  raw data.\n\n");
+
+    printf("Next:\n");
+    printf("  msgs                       decode the object-header messages\n");
+    printf("  links                      list hard links if this object is a group\n");
+    printf("  cur                        inspect the raw object-header struct\n");
+}
+
+fun h5explain_explain_v1_btree = void:
+{
+    var tree = h5explain_map_v1_btree(h5explain_cur_off);
+
+    printf("What it is:\n");
+    if (tree.node_type == 0UB)
+        printf("  A version 1 B-tree for an old-style group symbol table.\n");
+    else
+        printf("  A version 1 B-tree for raw dataset chunks.\n");
+    printf("  It maps sorted keys to child pointers or chunk addresses.\n\n");
+
+    printf("Key fields:\n");
+    printf("  node_type=%v (%s)\n", tree.node_type,
+           tree.node_type == 0UB ? "group symbol table" : "raw chunk index");
+    printf("  node_level=%v (%s)\n", tree.node_level,
+           tree.node_level == 0UB ? "leaf" : "internal");
+    printf("  entries_used=%v\n", tree.entries_used);
+    printf("  left_sibling=%v\n", bytes_to_off(tree.left_sib_raw));
+    printf("  right_sibling=%v\n", bytes_to_off(tree.right_sib_raw));
+
+    printf("\nWhy it matters:\n");
+    printf("  This is an older HDF5 index. For groups it leads to SNOD symbol-table\n");
+    printf("  nodes and local-heap names. For chunked datasets it leads to raw chunk\n");
+    printf("  storage records.\n\n");
+
+    printf("Next:\n");
+    printf("  traverse                   recursively print this B-tree\n");
+    printf("  cur                        inspect this node only\n");
+}
+
+fun h5explain_explain_v2_btree_hdr = void:
+{
+    var hdr = h5explain_map_v2_btree_hdr(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A version 2 B-tree header. It describes the tree shape and record\n");
+    printf("  layout; the actual records live in the root node and its children.\n\n");
+
+    printf("Key fields:\n");
+    printf("  record_type=%v (%s)\n", hdr.record_type,
+           h5explain_bt2_record_type_name(hdr.record_type));
+    printf("  node_size=%v, record_size=%v\n", hdr.node_size, hdr.record_size);
+    printf("  depth=%v (%s)\n", hdr.depth,
+           hdr.depth == 0UH ? "root is a leaf" : "root is internal");
+    printf("  root_addr=%v\n", bytes_to_off(hdr.root_addr_raw));
+    printf("  root_records=%v\n", hdr.num_root_records);
+    printf("  total_records=%u64d\n", bytes_to_u64_le(hdr.total_nrec_raw));
+    printf("  checksum=%v\n", hdr.chksum);
+
+    printf("\nWhy it matters:\n");
+    printf("  V2 B-trees index dense links/attributes and several chunk-index\n");
+    printf("  layouts. The record type tells you what each record means.\n\n");
+
+    printf("Next:\n");
+    printf("  traverse                   recursively print the tree\n");
+    printf("  go (%v, \"v2 btree root\") inspect the root node directly\n",
+           bytes_to_off(hdr.root_addr_raw));
+    printf("  cur                        inspect the header struct\n");
+}
+
+fun h5explain_explain_v2_btree_node = void:
+{
+    printf("What it is:\n");
+    if (h5explain_cur_kind == H5EX_KIND_V2_BTREE_LEAF)
+        printf("  A version 2 B-tree leaf node. It stores records directly.\n\n");
+    else
+        printf("  A version 2 B-tree internal node. It stores separator records and child pointers.\n\n");
+
+    printf("Why it matters:\n");
+    printf("  The header determines the record type and width. Enter through BTHD\n");
+    printf("  when possible so h5explain can set those decoding parameters first.\n\n");
+
+    printf("Next:\n");
+    printf("  info                       print this node's decoded records\n");
+    printf("  cur                        inspect the raw node struct\n");
+}
+
+fun h5explain_explain_snod = void:
+{
+    var snod = h5explain_map_snod(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A symbol-table node for an old-style group. It stores link entries\n");
+    printf("  whose names live in a local heap.\n\n");
+
+    printf("Key fields:\n");
+    printf("  num_symbols=%v\n", snod.num_symbols);
+
+    printf("\nWhy it matters:\n");
+    printf("  In old-style groups, a type-0 v1 B-tree points at SNOD leaves, and\n");
+    printf("  each SNOD entry points onward to an object header.\n\n");
+
+    printf("Next:\n");
+    printf("  info                       print the symbol entries\n");
+    printf("  cur                        inspect the raw SNOD struct\n");
+}
+
+fun h5explain_explain_lheap = void:
+{
+    var heap = h5explain_map_lheap(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A local heap. Old-style groups use it to store variable-length link\n");
+    printf("  names referenced by symbol-table nodes.\n\n");
+
+    printf("Key fields:\n");
+    printf("  data_segment_addr=%v\n", bytes_to_off(heap.data_seg_addr_raw));
+    printf("  data_segment_size=%u64d\n", bytes_to_u64_le(heap.data_seg_size_raw));
+    printf("  free_list_head=%u64d\n", bytes_to_u64_le(heap.free_list_head_raw));
+
+    printf("\nNext:\n");
+    printf("  dump                       hex-dump around the heap header\n");
+    printf("  cur                        inspect the local-heap struct\n");
+}
+
+fun h5explain_explain_fa = void:
+{
+    var fa = h5explain_map_fa_hdr(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A fixed-array chunk index. It is used when the chunk population has a\n");
+    printf("  fixed bounded element count.\n\n");
+
+    printf("Key fields:\n");
+    printf("  client_id=%v (%s)\n", fa.client_id, h5explain_array_client_name(fa.client_id));
+    printf("  raw_element_size=%v\n", fa.raw_elmt_size);
+    printf("  elements=%u64d\n", bytes_to_u64_le(fa.nelmts_raw));
+    printf("  data_block_addr=%v\n", bytes_to_off(fa.dblk_addr_raw));
+    printf("  pages=%u64d\n", global_fa_npages);
+    printf("  checksum=%v\n", fa.chksum);
+
+    printf("\nWhy it matters:\n");
+    printf("  Each fixed-array element points at a chunk or filtered chunk record.\n");
+    printf("  Paged arrays add page checksums after the data-block prefix.\n\n");
+
+    printf("Next:\n");
+    printf("  traverse                   print the data block and pages\n");
+    printf("  go (%v, \"fixed array data block\") inspect the data block directly\n",
+           bytes_to_off(fa.dblk_addr_raw));
+    printf("  cur                        inspect the fixed-array header\n");
+}
+
+fun h5explain_explain_ea = void:
+{
+    var ea = h5explain_map_ea_hdr(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  An extensible-array chunk index. It is used for chunked datasets with\n");
+    printf("  an unlimited dimension and grows through index, secondary, and data blocks.\n\n");
+
+    printf("Key fields:\n");
+    printf("  client_id=%v (%s)\n", ea.client_id, h5explain_array_client_name(ea.client_id));
+    printf("  raw_element_size=%v\n", ea.raw_elmt_size);
+    printf("  elements=%u64d\n", bytes_to_u64_le(ea.nelmts_raw));
+    printf("  index_block_addr=%v\n", bytes_to_off(ea.idx_blk_addr_raw));
+    printf("  max_elements_bits=%v\n", ea.max_nelmts_bits);
+    printf("  secondary_blocks=%u64d\n", global_ea_nsblks);
+    printf("  checksum=%v\n", ea.chksum);
+
+    printf("\nWhy it matters:\n");
+    printf("  The header defines the growth geometry. The index block then fans out\n");
+    printf("  to direct data blocks and secondary blocks that hold chunk records.\n\n");
+
+    printf("Next:\n");
+    printf("  traverse                   print the reachable EA blocks\n");
+    printf("  go (%v, \"extensible array index block\") inspect the index block directly\n",
+           bytes_to_off(ea.idx_blk_addr_raw));
+    printf("  cur                        inspect the extensible-array header\n");
+}
+
+fun h5explain_explain_raw = void:
+{
+    printf("What it is:\n");
+    printf("  h5explain did not recognize a supported HDF5 metadata signature at\n");
+    printf("  this offset. It is treating the location as raw bytes.\n\n");
+
+    printf("Next:\n");
+    printf("  dump                       hex-dump bytes at this offset\n");
+    printf("  go (OFF#B, \"label\")       try a nearby known metadata address\n");
+    printf("  h5super                    return to the superblock\n");
+}
+
+fun explain = void:
+{
+    h5explain_print_current_heading;
+
+    if (h5explain_cur_kind == H5EX_KIND_SUPER)
+        h5explain_explain_super;
+    else if (h5explain_cur_kind == H5EX_KIND_OHDR)
+        h5explain_explain_ohdr;
+    else if (h5explain_cur_kind == H5EX_KIND_V1_BTREE)
+        h5explain_explain_v1_btree;
+    else if (h5explain_cur_kind == H5EX_KIND_V2_BTREE_HDR)
+        h5explain_explain_v2_btree_hdr;
+    else if (h5explain_cur_kind == H5EX_KIND_V2_BTREE_INTERNAL
+             || h5explain_cur_kind == H5EX_KIND_V2_BTREE_LEAF)
+        h5explain_explain_v2_btree_node;
+    else if (h5explain_cur_kind == H5EX_KIND_SNOD)
+        h5explain_explain_snod;
+    else if (h5explain_cur_kind == H5EX_KIND_LHEAP)
+        h5explain_explain_lheap;
+    else if (h5explain_cur_kind == H5EX_KIND_FA_HDR)
+        h5explain_explain_fa;
+    else if (h5explain_cur_kind == H5EX_KIND_EA_HDR)
+        h5explain_explain_ea;
+    else
+        h5explain_explain_raw;
 }
 
 /* Dispatch to type-specific printing; for OHDR and B-tree headers this adds
