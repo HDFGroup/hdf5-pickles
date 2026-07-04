@@ -5,7 +5,7 @@
 ;;; Code:
 
 (require 'ert)
-(load-file (expand-file-name "../emacs/hdf5-poke.el"
+(load-file (expand-file-name "../hdf5-poke.el"
                              (file-name-directory
                               (or load-file-name buffer-file-name))))
 
