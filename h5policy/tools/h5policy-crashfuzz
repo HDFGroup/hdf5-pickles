@@ -40,8 +40,6 @@ Usage:
                      [--timeout SEC] [--out DIR] [--max-save N] [--quiet]
 """
 import argparse
-import glob
-import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -65,9 +63,12 @@ def _load(name, path):
     return mod
 
 
-# Reuse the mutation engine (bitflip / interesting / truncate / super / dict).
-_fuzz = _load("h5policy_fuzz", os.path.join(HERE, "h5policy-fuzz"))
-MUTATORS = _fuzz.MUTATORS
+# Reuse the shared engine: mutation strategies (bitflip / interesting /
+# truncate / super / dict / struct), seed loading, and the guided corpus.
+_lib = _load("h5policy_fuzzlib", os.path.join(HERE, "h5policy-fuzzlib"))
+MUTATORS = _lib.MUTATORS
+load_corpus = _lib.load_corpus
+mutant_path = _lib.mutant_path
 
 # (name, fixed args, needs an output-file argument).  Read-oriented tools that
 # fully parse the file; h5repack/h5copy also rewrite, exercising encode paths.
@@ -238,10 +239,7 @@ def main():
     tools = selected_tools(args.tools.split(",") if args.tools else None)
     if not tools:
         ap.error("no HDF5 tools found on PATH")
-    seeds = []
-    for s in args.seeds:
-        seeds += (sorted(glob.glob(os.path.join(s, "**", "*.h5"), recursive=True))
-                  if os.path.isdir(s) else [s])
+    seeds, corpus = load_corpus(args.seeds)
     if not seeds:
         ap.error("no seed *.h5 files found")
     strategies = args.strategy or list(MUTATORS)
@@ -253,9 +251,7 @@ def main():
         print("tools (libhdf5 " + ", ".join(sorted({v for v in tv.values()}))
               + "): " + " ".join(tool_label(n, a) for n, a, _ in tools))
 
-    pool = [(os.path.basename(p), open(p, "rb").read()) for p in seeds]
-    n_seeds = len(pool)
-    mutant = os.path.join(args.out, f".mutant.{os.getpid()}.h5")
+    mutant = mutant_path(args.out)
     repack_out = os.path.join(args.out, f".repack.{os.getpid()}.h5")
     behaviours = set()                 # (tool, rc) seen -> guided novelty
     sig_count = {}                     # crash signature -> saved count
@@ -263,7 +259,7 @@ def main():
     tool_runs = 0
 
     for it in range(args.iters):
-        label, base = rng.choice(pool)
+        label, base = corpus.pick(rng)
         strat = rng.choice(strategies)
         m = MUTATORS[strat](base, rng)
         if m is None:
@@ -306,8 +302,8 @@ def main():
                 print(f"{tag} CRASH {hit[0][1]}  (h5policy={decision}) "
                       f"src={label} strat={strat}")
 
-        if args.guided and novel and len(pool) < n_seeds + 500:
-            pool.append((f"g{it:05d}", bytes(m)))
+        if args.guided and novel:
+            corpus.breed(f"g{it:05d}", m, rng, 500)
 
     for tmp in (mutant, repack_out):
         if os.path.exists(tmp):

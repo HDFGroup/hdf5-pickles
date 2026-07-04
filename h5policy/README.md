@@ -118,6 +118,8 @@ Checksum coverage includes the HDF5 Jenkins checksums used by:
   h5policy, using `libhdf5` via `h5py` as the oracle.
 - [`tools/h5policy-crashfuzz`](tools/h5policy-crashfuzz): mutates files against
   installed HDF5 tools and triages crashers with h5policy.
+- [`tools/h5policy-fuzzlib`](tools/h5policy-fuzzlib): shared fuzzing engine
+  (mutation strategies, seed loading, guided corpus) imported by both fuzzers.
 - [`tools/h5policy-gencorpus`](tools/h5policy-gencorpus): regenerates the valid,
   malformed, policy, resource, coverage, and CVE regression fixtures.
 

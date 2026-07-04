@@ -68,7 +68,6 @@ Determinism: a given --seed reproduces the same mutant stream.  Every saved
 finding is a complete file, so it reproduces regardless.
 """
 import argparse
-import glob
 import importlib.util
 import os
 import random
@@ -88,19 +87,19 @@ def _load(name, path):
     loader.exec_module(mod)
     return mod
 
-# Reuse the differential harness's structural oracle, and the CVE builder's
-# vetted Jenkins lookup3.  The curated diff harness adds a deeper A+ evidence
-# probe for over-strict corrupt rejects; the fuzzer keeps that bucket advisory.
+# The shared engine -- mutation strategies, seed loading, and the guided corpus
+# -- lives in h5policy-fuzzlib, so this harness and h5policy-crashfuzz share it
+# without depending on each other.  The structural oracle and known-exit set
+# come from the differential harness.
+_lib = _load("h5policy_fuzzlib", os.path.join(HERE, "h5policy-fuzzlib"))
 _diff = _load("h5policy_diff", os.path.join(HERE, "h5policy-diff"))
-_cve = _load("cve_builder",
-             os.path.join(TESTS, "cve", "make_cve_2020_10812.py"))
+MUTATORS = _lib.MUTATORS
+load_corpus = _lib.load_corpus
+mutant_path = _lib.mutant_path
 introspect = _diff.introspect
 KNOWN_EXITS = _diff.KNOWN_EXITS
 H5POLICY = _diff.H5POLICY
-jenkins_lookup3 = _cve.jenkins_lookup3
 
-HDF5_MAGIC = bytes([0x89, 0x48, 0x44, 0x46, 0x0D, 0x0A, 0x1A, 0x0A])
-INTERESTING = [0x00, 0x01, 0x7F, 0x80, 0xFF, 0xFE, 0x08, 0x10, 0x20, 0x40]
 ACCEPTING = {"accept", "accept_with_warnings"}
 # Severity order for reporting / exit status.
 #
@@ -115,244 +114,6 @@ HARD = {"HANG", "CRASH", "FALSE_ACCEPT"}
 ALWAYS_SAVE = HARD | {"ACCEPT_VS_CRASH"}
 
 import json  # noqa: E402  (after _load so a missing h5py fails there first)
-
-
-# --------------------------------------------------------------------------- #
-# Mutators.  Each takes (bytes, rng) and returns a new bytearray (or None to
-# skip -- e.g. `super` on a v0/v1 superblock).
-# --------------------------------------------------------------------------- #
-def mut_bitflip(data, rng):
-    b = bytearray(data)
-    if not b:
-        return None
-    for _ in range(rng.randint(1, 4)):
-        i = rng.randrange(len(b))
-        b[i] ^= 1 << rng.randrange(8)
-    return b
-
-
-def mut_interesting(data, rng):
-    b = bytearray(data)
-    if not b:
-        return None
-    for _ in range(rng.randint(1, 4)):
-        b[rng.randrange(len(b))] = rng.choice(INTERESTING)
-    return b
-
-
-def mut_truncate(data, rng):
-    if len(data) < 16:
-        return None
-    return bytearray(data[:rng.randrange(8, len(data))])
-
-
-def mut_super(data, rng):
-    """Corrupt a v2/v3 superblock address field and repair the checksum.
-
-    Layout from offset 12 (sizes in `soff` bytes): base, extension, EOF, root
-    object header, then a 4-byte Jenkins checksum.  Repairing the checksum lets
-    the mutated pointer survive the superblock gate, so h5policy's object-header
-    and extension walkers are exercised against the mutation directly.
-    """
-    b = bytearray(data)
-    if len(b) < 12 or b[:8] != HDF5_MAGIC or b[8] not in (2, 3):
-        return None
-    soff = b[9]
-    if soff not in (2, 4, 8):
-        return None
-    chksum_off = 12 + 4 * soff
-    if len(b) < chksum_off + 4:
-        return None
-    field = rng.choice(["base", "ext", "eof", "root"])
-    off = 12 + {"base": 0, "ext": 1, "eof": 2, "root": 3}[field] * soff
-    how = rng.choice(["past_eof", "midfile", "delta", "wild"])
-    if how == "past_eof":
-        val = len(b) + rng.choice([1, 8, 0x1000, 0x1_0000_0000])
-    elif how == "midfile":
-        val = rng.randrange(len(b))
-    elif how == "delta":
-        cur = int.from_bytes(b[off:off + soff], "little")
-        val = (cur + rng.choice([-8, -1, 1, 8, 16])) & ((1 << (8 * soff)) - 1)
-    else:  # wild
-        val = rng.getrandbits(8 * soff)
-    b[off:off + soff] = (val & ((1 << (8 * soff)) - 1)).to_bytes(soff, "little")
-    # Repair the superblock checksum over everything preceding it.
-    b[chksum_off:chksum_off + 4] = \
-        jenkins_lookup3(bytes(b[:chksum_off])).to_bytes(4, "little")
-    return b
-
-
-# A dictionary of real HDF5 format tokens (AFL-style).  Splicing these lets a
-# mutant *become* a structure h5policy recognises -- a fractal-heap or v2-btree
-# header, a symbol-table node -- so the corresponding deep validator actually
-# runs, instead of waiting for random bytes to spell a 4-byte signature.
-DICT = [
-    b"OHDR", b"OCHK", b"TREE", b"SNOD", b"HEAP",          # ohdr / v1-btree / group
-    b"FRHP", b"FHDB", b"FHIB",                            # fractal heap
-    b"BTHD", b"BTLF", b"BTIN",                            # v2 btree
-    b"FAHD", b"FADB", b"EAHD", b"EAIB", b"EASB", b"EADB", # fixed / extensible array
-    b"FSHD", b"FSSE", b"GCOL", b"SMTB",                   # free-space / global heap / SOHM
-    HDF5_MAGIC,
-    b"\x00", b"\x01", b"\x02", b"\x03", b"\x04",          # version / small-count bytes
-    bytes([0x06]), bytes([0x08]), bytes([0x0b]),         # msg types: link, layout, filter
-    bytes([0x0c]), bytes([0x10]), bytes([0x11]),         # attribute, continuation, symtab
-    bytes([0x15]), bytes([0x18]),                        # attr-info, metadata-cache-image
-]
-
-
-def mut_dict(data, rng):
-    """Overwrite one or two spots with dictionary tokens, preferring 8-byte
-    alignment (HDF5 structures are 8-aligned, so an address is more likely to
-    land on an aligned token and get interpreted as that structure)."""
-    b = bytearray(data)
-    if len(b) < 16:
-        return None
-    for _ in range(rng.randint(1, 2)):
-        tok = rng.choice(DICT)
-        off = rng.randrange(0, len(b) - len(tok) + 1)
-        if rng.random() < 0.75:
-            off -= off % 8
-        b[off:off + len(tok)] = tok
-    return b
-
-
-# Self-delimiting, checksummed HDF5 structures whose byte extent we can compute
-# exactly.  This is the gap the other mutators leave: a bitflip *inside* one of
-# these blocks breaks its trailing Jenkins checksum, so the mutant dies at the
-# checksum gate and the deep validator it was aimed at never runs.  `struct`
-# edits a field inside the block and REPAIRS the trailing checksum -- the same
-# move `super` makes for the superblock, generalised -- so the mutation survives
-# the gate and the object-header / chunk-index walker actually validates it.
-#
-# Extents mirror the pickles exactly (verified against every block in the seed
-# corpus -- 1082/1082 recompute to the stored checksum):
-#   OHDR  self-describing via flags + size-of-chunk-0   (h5_dispatch.pk)
-#   BTHD  22 + O + L    v2 B-tree header                (h5_chunkindex.pk)
-#   FAHD  12 + O + L    fixed-array header
-#   EAHD  16 + 6L + O   extensible-array header
-#   FRHP  22 + 3O + 12L (+ L+4+filter_len if filtered)  (h5_dense_links.pk)
-#         fractal-heap header; filter_len is a 2-byte field at off+7
-# where O/L are the superblock size-of-offsets / size-of-lengths.  The trailing
-# 4 bytes are lookup3_hashlittle(body, 0) over everything before them.
-CKSUM_SIGS = (b"OHDR", b"BTHD", b"FAHD", b"EAHD", b"FRHP")
-
-
-def superblock_ol(b):
-    """(size_of_offsets, size_of_lengths) from the superblock, or None."""
-    if len(b) < 24 or b[:8] != HDF5_MAGIC:
-        return None
-    v = b[8]
-    if v in (0, 1):
-        return b[13], b[14]
-    if v in (2, 3):
-        return b[9], b[10]
-    return None
-
-
-def cksum_extent(b, off, o, l):
-    """End offset of the checksummed block at `off`, or None if it does not lie
-    wholly within the file.  The checksum span is [off, end - 4)."""
-    sig = bytes(b[off:off + 4])
-    if sig == b"OHDR":
-        if off + 6 > len(b) or b[off + 4] != 2:      # only v2 object headers
-            return None
-        flags = b[off + 5]
-        cur = off + 6 + (16 if flags & 0x20 else 0) + (4 if flags & 0x10 else 0)
-        sw = 1 << (flags & 3)                         # size-of-chunk-0 width
-        if cur + sw > len(b):
-            return None
-        end = cur + sw + int.from_bytes(b[cur:cur + sw], "little") + 4
-    elif sig == b"BTHD":
-        end = off + 22 + o + l
-    elif sig == b"FAHD":
-        end = off + 12 + o + l
-    elif sig == b"EAHD":
-        end = off + 16 + 6 * l + o
-    elif sig == b"FRHP":
-        if off + 9 > len(b):
-            return None
-        filter_len = int.from_bytes(b[off + 7:off + 9], "little")
-        end = off + 22 + 3 * o + 12 * l + (l + 4 + filter_len if filter_len else 0) + 4
-    else:
-        return None
-    if end > len(b) or end - 4 <= off + 4:
-        return None
-    return end
-
-
-def cksum_blocks(b, o, l):
-    """All checksummed blocks in the file as (start, end, signature)."""
-    blocks = []
-    for sig in CKSUM_SIGS:
-        i = b.find(sig)
-        while i != -1:
-            end = cksum_extent(b, i, o, l)
-            if end is not None:
-                blocks.append((i, end, sig))
-            i = b.find(sig, i + 1)
-    return blocks
-
-
-def mutable_offsets(b, start, end, sig):
-    """Body offsets we may corrupt while keeping the block self-consistent.
-
-    Never the 4-byte signature or the trailing checksum.  For OHDR and FRHP we
-    also skip the fields that determine the block's own extent (OHDR: flags byte
-    + size-of-chunk-0; FRHP: the 2-byte I/O-filter length at off+7): changing
-    them would move the checksum span h5policy re-derives, so the repaired
-    checksum would mismatch -- wasting the mutation at the gate instead of
-    reaching the validator.  The fixed-extent blocks (BTHD/FAHD/EAHD) size
-    themselves from the superblock, so any body byte is fair game there.
-    """
-    lo, hi = start + 4, end - 4
-    if sig == b"OHDR":
-        flags = b[start + 5]
-        cur = start + 6 + (16 if flags & 0x20 else 0) + (4 if flags & 0x10 else 0)
-        sw = 1 << (flags & 3)
-        forbid = {start + 5} | set(range(cur, cur + sw))
-    elif sig == b"FRHP":
-        forbid = {start + 7, start + 8}
-    else:
-        return range(lo, hi)
-    return [i for i in range(lo, hi) if i not in forbid]
-
-
-def mut_struct(data, rng):
-    """Corrupt a field inside a checksummed block and repair the block's
-    trailing checksum, so the mutation reaches the deep validator behind it."""
-    b = bytearray(data)
-    ol = superblock_ol(b)
-    if ol is None:
-        return None
-    blocks = cksum_blocks(b, *ol)
-    if not blocks:
-        return None
-    start, end, sig = rng.choice(blocks)
-    pool = mutable_offsets(b, start, end, sig)
-    if not pool:
-        return None
-    for _ in range(rng.randint(1, 3)):
-        i = rng.choice(pool)
-        how = rng.choice(["interesting", "delta", "wild"])
-        if how == "interesting":
-            b[i] = rng.choice(INTERESTING)
-        elif how == "delta":
-            b[i] = (b[i] + rng.choice([-8, -1, 1, 8])) & 0xFF
-        else:
-            b[i] = rng.getrandbits(8)
-    # Repair the block's trailing Jenkins checksum over its (now-mutated) body.
-    b[end - 4:end] = jenkins_lookup3(bytes(b[start:end - 4])).to_bytes(4, "little")
-    return b
-
-
-MUTATORS = {
-    "bitflip": mut_bitflip,
-    "interesting": mut_interesting,
-    "truncate": mut_truncate,
-    "super": mut_super,
-    "dict": mut_dict,
-    "struct": mut_struct,
-}
 
 
 # --------------------------------------------------------------------------- #
@@ -460,17 +221,6 @@ def classify(report, rc, ref):
     return "OK"
 
 
-def collect_seeds(spec):
-    seeds = []
-    for s in spec:
-        if os.path.isdir(s):
-            seeds += sorted(glob.glob(os.path.join(s, "**", "*.h5"),
-                                      recursive=True))
-        elif os.path.isfile(s):
-            seeds.append(s)
-    return seeds
-
-
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -508,7 +258,7 @@ def main():
         print(json.dumps(introspect(args.introspect)))
         return 0
 
-    seeds = collect_seeds(args.seeds)
+    seeds, corpus = load_corpus(args.seeds)
     if not seeds:
         ap.error(f"no seed *.h5 files found under {args.seeds}")
     strategies = args.strategy or list(MUTATORS)
@@ -517,23 +267,18 @@ def main():
 
     counts = {b: 0 for b in SEVERITY}
     saved = {b: 0 for b in SEVERITY}
-    seed_bytes = {p: open(p, "rb").read() for p in seeds}
-    # Per-process temp path so concurrent fuzzer runs (A/B experiments, parallel
-    # soaks) don't clobber each other's mutant mid-test.
-    mutant = os.path.join(args.out, f".mutant.{os.getpid()}.h5")
+    mutant = mutant_path(args.out)
 
     # Coverage-guided corpus: the pool starts as the seed files; under --guided,
     # a mutant that reaches a new coverage token is bred back in, so later
     # mutations stack on top of already-interesting inputs (e.g. a `dict`-placed
     # OHDR that a later `super` mutation then points the root at).
-    pool = [(os.path.basename(p), seed_bytes[p]) for p in seeds]
-    n_seeds = len(pool)
     global_cov = set()
     interesting = 0
     cov_curve = []
 
     for it in range(args.iters):
-        label, base = rng.choice(pool)
+        label, base = corpus.pick(rng)
         strat = rng.choice(strategies)
         m = MUTATORS[strat](base, rng)
         if m is None:
@@ -548,11 +293,7 @@ def main():
             global_cov |= toks
             interesting += 1
             if args.guided:
-                entry = (f"g{it:05d}", bytes(m))
-                if len(pool) < n_seeds + args.max_pool:
-                    pool.append(entry)
-                else:                       # keep seeds; evict a bred entry
-                    pool[n_seeds + rng.randrange(args.max_pool)] = entry
+                corpus.breed(f"g{it:05d}", m, rng, args.max_pool, evict=True)
         if it % 25 == 0:
             cov_curve.append((it, sum(1 for t in global_cov
                                       if t.startswith("code:"))))
@@ -607,8 +348,9 @@ def main():
     print(f"  distinct coverage tokens:       {len(global_cov)}")
     print(f"  interesting mutants:            {interesting}")
     if args.guided:
-        print(f"  corpus pool:                    {len(pool)} "
-              f"({n_seeds} seeds + {len(pool) - n_seeds} bred)")
+        n_seeds, n_pool = corpus.n_seeds, len(corpus.pool)
+        print(f"  corpus pool:                    {n_pool} "
+              f"({n_seeds} seeds + {n_pool - n_seeds} bred)")
     if cov_curve:
         print("  code-coverage curve:            "
               + " ".join(f"{it}:{n}" for it, n in cov_curve))

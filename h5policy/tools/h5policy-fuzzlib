@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 The HDF Group.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Shared fuzzing engine for h5policy-fuzz and h5policy-crashfuzz.
+
+Both tools mutate valid HDF5 seed files and breed interesting mutants back into
+a corpus; they differ only in what they put under test and how they judge a
+mutant (h5policy-fuzz cross-checks h5policy against libhdf5 for *soundness*;
+h5policy-crashfuzz drives the installed CLI tools looking for *crashes*).  That
+shared substrate lives here so neither front-end depends on the other:
+
+  * the mutation engine -- bitflip / interesting / truncate / super / dict /
+    struct -- and its structural helpers (MUTATORS);
+  * seed collection (collect_seeds / load_corpus);
+  * the coverage/behaviour-guided input pool (Corpus), whose novelty test is the
+    caller's -- the corpus only manages the pool;
+  * a per-process mutant scratch path (mutant_path).
+"""
+import glob
+import importlib.machinery
+import importlib.util
+import os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TESTS = os.path.normpath(os.path.join(HERE, "..", "tests"))
+
+
+def _load(name, path):
+    # These helpers have no .py extension, so name a source loader explicitly.
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# The checksum-repairing mutators (super / struct) need the CVE builder's vetted
+# Jenkins lookup3 to re-seal a block after an interior edit.
+jenkins_lookup3 = _load(
+    "cve_builder", os.path.join(TESTS, "cve", "make_cve_2020_10812.py")
+).jenkins_lookup3
+
+HDF5_MAGIC = bytes([0x89, 0x48, 0x44, 0x46, 0x0D, 0x0A, 0x1A, 0x0A])
+INTERESTING = [0x00, 0x01, 0x7F, 0x80, 0xFF, 0xFE, 0x08, 0x10, 0x20, 0x40]
+
+# --------------------------------------------------------------------------- #
+# Mutators.  Each takes (bytes, rng) and returns a new bytearray (or None to
+# skip -- e.g. `super` on a v0/v1 superblock).
+# --------------------------------------------------------------------------- #
+def mut_bitflip(data, rng):
+    b = bytearray(data)
+    if not b:
+        return None
+    for _ in range(rng.randint(1, 4)):
+        i = rng.randrange(len(b))
+        b[i] ^= 1 << rng.randrange(8)
+    return b
+
+
+def mut_interesting(data, rng):
+    b = bytearray(data)
+    if not b:
+        return None
+    for _ in range(rng.randint(1, 4)):
+        b[rng.randrange(len(b))] = rng.choice(INTERESTING)
+    return b
+
+
+def mut_truncate(data, rng):
+    if len(data) < 16:
+        return None
+    return bytearray(data[:rng.randrange(8, len(data))])
+
+
+def mut_super(data, rng):
+    """Corrupt a v2/v3 superblock address field and repair the checksum.
+
+    Layout from offset 12 (sizes in `soff` bytes): base, extension, EOF, root
+    object header, then a 4-byte Jenkins checksum.  Repairing the checksum lets
+    the mutated pointer survive the superblock gate, so h5policy's object-header
+    and extension walkers are exercised against the mutation directly.
+    """
+    b = bytearray(data)
+    if len(b) < 12 or b[:8] != HDF5_MAGIC or b[8] not in (2, 3):
+        return None
+    soff = b[9]
+    if soff not in (2, 4, 8):
+        return None
+    chksum_off = 12 + 4 * soff
+    if len(b) < chksum_off + 4:
+        return None
+    field = rng.choice(["base", "ext", "eof", "root"])
+    off = 12 + {"base": 0, "ext": 1, "eof": 2, "root": 3}[field] * soff
+    how = rng.choice(["past_eof", "midfile", "delta", "wild"])
+    if how == "past_eof":
+        val = len(b) + rng.choice([1, 8, 0x1000, 0x1_0000_0000])
+    elif how == "midfile":
+        val = rng.randrange(len(b))
+    elif how == "delta":
+        cur = int.from_bytes(b[off:off + soff], "little")
+        val = (cur + rng.choice([-8, -1, 1, 8, 16])) & ((1 << (8 * soff)) - 1)
+    else:  # wild
+        val = rng.getrandbits(8 * soff)
+    b[off:off + soff] = (val & ((1 << (8 * soff)) - 1)).to_bytes(soff, "little")
+    # Repair the superblock checksum over everything preceding it.
+    b[chksum_off:chksum_off + 4] = \
+        jenkins_lookup3(bytes(b[:chksum_off])).to_bytes(4, "little")
+    return b
+
+
+# A dictionary of real HDF5 format tokens (AFL-style).  Splicing these lets a
+# mutant *become* a structure h5policy recognises -- a fractal-heap or v2-btree
+# header, a symbol-table node -- so the corresponding deep validator actually
+# runs, instead of waiting for random bytes to spell a 4-byte signature.
+DICT = [
+    b"OHDR", b"OCHK", b"TREE", b"SNOD", b"HEAP",          # ohdr / v1-btree / group
+    b"FRHP", b"FHDB", b"FHIB",                            # fractal heap
+    b"BTHD", b"BTLF", b"BTIN",                            # v2 btree
+    b"FAHD", b"FADB", b"EAHD", b"EAIB", b"EASB", b"EADB", # fixed / extensible array
+    b"FSHD", b"FSSE", b"GCOL", b"SMTB",                   # free-space / global heap / SOHM
+    HDF5_MAGIC,
+    b"\x00", b"\x01", b"\x02", b"\x03", b"\x04",          # version / small-count bytes
+    bytes([0x06]), bytes([0x08]), bytes([0x0b]),         # msg types: link, layout, filter
+    bytes([0x0c]), bytes([0x10]), bytes([0x11]),         # attribute, continuation, symtab
+    bytes([0x15]), bytes([0x18]),                        # attr-info, metadata-cache-image
+]
+
+
+def mut_dict(data, rng):
+    """Overwrite one or two spots with dictionary tokens, preferring 8-byte
+    alignment (HDF5 structures are 8-aligned, so an address is more likely to
+    land on an aligned token and get interpreted as that structure)."""
+    b = bytearray(data)
+    if len(b) < 16:
+        return None
+    for _ in range(rng.randint(1, 2)):
+        tok = rng.choice(DICT)
+        off = rng.randrange(0, len(b) - len(tok) + 1)
+        if rng.random() < 0.75:
+            off -= off % 8
+        b[off:off + len(tok)] = tok
+    return b
+
+
+# Self-delimiting, checksummed HDF5 structures whose byte extent we can compute
+# exactly.  This is the gap the other mutators leave: a bitflip *inside* one of
+# these blocks breaks its trailing Jenkins checksum, so the mutant dies at the
+# checksum gate and the deep validator it was aimed at never runs.  `struct`
+# edits a field inside the block and REPAIRS the trailing checksum -- the same
+# move `super` makes for the superblock, generalised -- so the mutation survives
+# the gate and the object-header / chunk-index walker actually validates it.
+#
+# Extents mirror the pickles exactly (verified against every block in the seed
+# corpus -- 1082/1082 recompute to the stored checksum):
+#   OHDR  self-describing via flags + size-of-chunk-0   (h5_dispatch.pk)
+#   BTHD  22 + O + L    v2 B-tree header                (h5_chunkindex.pk)
+#   FAHD  12 + O + L    fixed-array header
+#   EAHD  16 + 6L + O   extensible-array header
+#   FRHP  22 + 3O + 12L (+ L+4+filter_len if filtered)  (h5_dense_links.pk)
+#         fractal-heap header; filter_len is a 2-byte field at off+7
+# where O/L are the superblock size-of-offsets / size-of-lengths.  The trailing
+# 4 bytes are lookup3_hashlittle(body, 0) over everything before them.
+CKSUM_SIGS = (b"OHDR", b"BTHD", b"FAHD", b"EAHD", b"FRHP")
+
+
+def superblock_ol(b):
+    """(size_of_offsets, size_of_lengths) from the superblock, or None."""
+    if len(b) < 24 or b[:8] != HDF5_MAGIC:
+        return None
+    v = b[8]
+    if v in (0, 1):
+        return b[13], b[14]
+    if v in (2, 3):
+        return b[9], b[10]
+    return None
+
+
+def cksum_extent(b, off, o, l):
+    """End offset of the checksummed block at `off`, or None if it does not lie
+    wholly within the file.  The checksum span is [off, end - 4)."""
+    sig = bytes(b[off:off + 4])
+    if sig == b"OHDR":
+        if off + 6 > len(b) or b[off + 4] != 2:      # only v2 object headers
+            return None
+        flags = b[off + 5]
+        cur = off + 6 + (16 if flags & 0x20 else 0) + (4 if flags & 0x10 else 0)
+        sw = 1 << (flags & 3)                         # size-of-chunk-0 width
+        if cur + sw > len(b):
+            return None
+        end = cur + sw + int.from_bytes(b[cur:cur + sw], "little") + 4
+    elif sig == b"BTHD":
+        end = off + 22 + o + l
+    elif sig == b"FAHD":
+        end = off + 12 + o + l
+    elif sig == b"EAHD":
+        end = off + 16 + 6 * l + o
+    elif sig == b"FRHP":
+        if off + 9 > len(b):
+            return None
+        filter_len = int.from_bytes(b[off + 7:off + 9], "little")
+        end = off + 22 + 3 * o + 12 * l + (l + 4 + filter_len if filter_len else 0) + 4
+    else:
+        return None
+    if end > len(b) or end - 4 <= off + 4:
+        return None
+    return end
+
+
+def cksum_blocks(b, o, l):
+    """All checksummed blocks in the file as (start, end, signature)."""
+    blocks = []
+    for sig in CKSUM_SIGS:
+        i = b.find(sig)
+        while i != -1:
+            end = cksum_extent(b, i, o, l)
+            if end is not None:
+                blocks.append((i, end, sig))
+            i = b.find(sig, i + 1)
+    return blocks
+
+
+def mutable_offsets(b, start, end, sig):
+    """Body offsets we may corrupt while keeping the block self-consistent.
+
+    Never the 4-byte signature or the trailing checksum.  For OHDR and FRHP we
+    also skip the fields that determine the block's own extent (OHDR: flags byte
+    + size-of-chunk-0; FRHP: the 2-byte I/O-filter length at off+7): changing
+    them would move the checksum span h5policy re-derives, so the repaired
+    checksum would mismatch -- wasting the mutation at the gate instead of
+    reaching the validator.  The fixed-extent blocks (BTHD/FAHD/EAHD) size
+    themselves from the superblock, so any body byte is fair game there.
+    """
+    lo, hi = start + 4, end - 4
+    if sig == b"OHDR":
+        flags = b[start + 5]
+        cur = start + 6 + (16 if flags & 0x20 else 0) + (4 if flags & 0x10 else 0)
+        sw = 1 << (flags & 3)
+        forbid = {start + 5} | set(range(cur, cur + sw))
+    elif sig == b"FRHP":
+        forbid = {start + 7, start + 8}
+    else:
+        return range(lo, hi)
+    return [i for i in range(lo, hi) if i not in forbid]
+
+
+def mut_struct(data, rng):
+    """Corrupt a field inside a checksummed block and repair the block's
+    trailing checksum, so the mutation reaches the deep validator behind it."""
+    b = bytearray(data)
+    ol = superblock_ol(b)
+    if ol is None:
+        return None
+    blocks = cksum_blocks(b, *ol)
+    if not blocks:
+        return None
+    start, end, sig = rng.choice(blocks)
+    pool = mutable_offsets(b, start, end, sig)
+    if not pool:
+        return None
+    for _ in range(rng.randint(1, 3)):
+        i = rng.choice(pool)
+        how = rng.choice(["interesting", "delta", "wild"])
+        if how == "interesting":
+            b[i] = rng.choice(INTERESTING)
+        elif how == "delta":
+            b[i] = (b[i] + rng.choice([-8, -1, 1, 8])) & 0xFF
+        else:
+            b[i] = rng.getrandbits(8)
+    # Repair the block's trailing Jenkins checksum over its (now-mutated) body.
+    b[end - 4:end] = jenkins_lookup3(bytes(b[start:end - 4])).to_bytes(4, "little")
+    return b
+
+
+MUTATORS = {
+    "bitflip": mut_bitflip,
+    "interesting": mut_interesting,
+    "truncate": mut_truncate,
+    "super": mut_super,
+    "dict": mut_dict,
+    "struct": mut_struct,
+}
+
+
+def collect_seeds(spec):
+    seeds = []
+    for s in spec:
+        if os.path.isdir(s):
+            seeds += sorted(glob.glob(os.path.join(s, "**", "*.h5"),
+                                      recursive=True))
+        elif os.path.isfile(s):
+            seeds.append(s)
+    return seeds
+
+
+# --------------------------------------------------------------------------- #
+# Coverage/behaviour-guided input pool, shared by both front-ends.
+# --------------------------------------------------------------------------- #
+class Corpus:
+    """A guided input pool: seeds plus bred mutants.
+
+    The pool starts as the seed files.  Under guided mode a mutant that showed
+    new reach is bred back in, so later mutations stack on already-interesting
+    inputs (e.g. a `dict`-placed OHDR that a later `super` mutation points the
+    root at).  What counts as "new reach" is the caller's call -- h5policy-fuzz
+    uses new h5policy coverage tokens, h5policy-crashfuzz uses new (tool, rc)
+    behaviours; the corpus only owns the pool and never evicts a seed.
+    """
+
+    def __init__(self, entries):
+        # entries: list of (label, bytes)
+        self.pool = list(entries)
+        self.n_seeds = len(self.pool)
+
+    def pick(self, rng):
+        return rng.choice(self.pool)
+
+    def breed(self, label, data, rng, max_bred, evict=False):
+        """Add a bred mutant, capping the bred set at `max_bred`.  When full,
+        either stop growing (evict=False) or replace a random *bred* entry
+        (evict=True) -- a seed is never displaced."""
+        entry = (label, bytes(data))
+        if len(self.pool) < self.n_seeds + max_bred:
+            self.pool.append(entry)
+        elif evict:
+            self.pool[self.n_seeds + rng.randrange(max_bred)] = entry
+
+
+def load_corpus(spec):
+    """collect_seeds + read each into a Corpus, labelled by basename.
+
+    Returns (paths, corpus) so the caller can report/error on an empty corpus.
+    """
+    paths = collect_seeds(spec)
+    return paths, Corpus([(os.path.basename(p), open(p, "rb").read())
+                          for p in paths])
+
+
+def mutant_path(out_dir):
+    """Per-process scratch path so concurrent runs (A/B experiments, parallel
+    soaks) don't clobber each other's mutant mid-test."""
+    return os.path.join(out_dir, f".mutant.{os.getpid()}.h5")
