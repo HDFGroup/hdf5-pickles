@@ -47,6 +47,12 @@ Mutation strategies (`--strategy`, repeatable; default: all):
   dict        splice real HDF5 format tokens (OHDR/FRHP/BTHD/... signatures,
               message-type and version bytes) at 8-byte-aligned offsets so a
               mutant becomes a structure the deep validators recognise
+  struct      structure-aware: corrupt a field INSIDE a checksummed block
+              (v2 object header, v2-btree / fixed-array / extensible-array
+              header) and REPAIR that block's trailing Jenkins checksum, so the
+              mutation survives the block's own gate and reaches the deep
+              validator -- the one place an interior bitflip cannot, since it
+              would break the checksum and be rejected before the walker runs
 
 Coverage: h5policy's own finding codes are used as a coverage map.  --guided
 breeds mutants that reach a new code back into the seed pool so mutations
@@ -210,12 +216,142 @@ def mut_dict(data, rng):
     return b
 
 
+# Self-delimiting, checksummed HDF5 structures whose byte extent we can compute
+# exactly.  This is the gap the other mutators leave: a bitflip *inside* one of
+# these blocks breaks its trailing Jenkins checksum, so the mutant dies at the
+# checksum gate and the deep validator it was aimed at never runs.  `struct`
+# edits a field inside the block and REPAIRS the trailing checksum -- the same
+# move `super` makes for the superblock, generalised -- so the mutation survives
+# the gate and the object-header / chunk-index walker actually validates it.
+#
+# Extents mirror the pickles exactly (verified against every block in the seed
+# corpus -- 1082/1082 recompute to the stored checksum):
+#   OHDR  self-describing via flags + size-of-chunk-0   (h5_dispatch.pk)
+#   BTHD  22 + O + L    v2 B-tree header                (h5_chunkindex.pk)
+#   FAHD  12 + O + L    fixed-array header
+#   EAHD  16 + 6L + O   extensible-array header
+#   FRHP  22 + 3O + 12L (+ L+4+filter_len if filtered)  (h5_dense_links.pk)
+#         fractal-heap header; filter_len is a 2-byte field at off+7
+# where O/L are the superblock size-of-offsets / size-of-lengths.  The trailing
+# 4 bytes are lookup3_hashlittle(body, 0) over everything before them.
+CKSUM_SIGS = (b"OHDR", b"BTHD", b"FAHD", b"EAHD", b"FRHP")
+
+
+def superblock_ol(b):
+    """(size_of_offsets, size_of_lengths) from the superblock, or None."""
+    if len(b) < 24 or b[:8] != HDF5_MAGIC:
+        return None
+    v = b[8]
+    if v in (0, 1):
+        return b[13], b[14]
+    if v in (2, 3):
+        return b[9], b[10]
+    return None
+
+
+def cksum_extent(b, off, o, l):
+    """End offset of the checksummed block at `off`, or None if it does not lie
+    wholly within the file.  The checksum span is [off, end - 4)."""
+    sig = bytes(b[off:off + 4])
+    if sig == b"OHDR":
+        if off + 6 > len(b) or b[off + 4] != 2:      # only v2 object headers
+            return None
+        flags = b[off + 5]
+        cur = off + 6 + (16 if flags & 0x20 else 0) + (4 if flags & 0x10 else 0)
+        sw = 1 << (flags & 3)                         # size-of-chunk-0 width
+        if cur + sw > len(b):
+            return None
+        end = cur + sw + int.from_bytes(b[cur:cur + sw], "little") + 4
+    elif sig == b"BTHD":
+        end = off + 22 + o + l
+    elif sig == b"FAHD":
+        end = off + 12 + o + l
+    elif sig == b"EAHD":
+        end = off + 16 + 6 * l + o
+    elif sig == b"FRHP":
+        if off + 9 > len(b):
+            return None
+        filter_len = int.from_bytes(b[off + 7:off + 9], "little")
+        end = off + 22 + 3 * o + 12 * l + (l + 4 + filter_len if filter_len else 0) + 4
+    else:
+        return None
+    if end > len(b) or end - 4 <= off + 4:
+        return None
+    return end
+
+
+def cksum_blocks(b, o, l):
+    """All checksummed blocks in the file as (start, end, signature)."""
+    blocks = []
+    for sig in CKSUM_SIGS:
+        i = b.find(sig)
+        while i != -1:
+            end = cksum_extent(b, i, o, l)
+            if end is not None:
+                blocks.append((i, end, sig))
+            i = b.find(sig, i + 1)
+    return blocks
+
+
+def mutable_offsets(b, start, end, sig):
+    """Body offsets we may corrupt while keeping the block self-consistent.
+
+    Never the 4-byte signature or the trailing checksum.  For OHDR and FRHP we
+    also skip the fields that determine the block's own extent (OHDR: flags byte
+    + size-of-chunk-0; FRHP: the 2-byte I/O-filter length at off+7): changing
+    them would move the checksum span h5policy re-derives, so the repaired
+    checksum would mismatch -- wasting the mutation at the gate instead of
+    reaching the validator.  The fixed-extent blocks (BTHD/FAHD/EAHD) size
+    themselves from the superblock, so any body byte is fair game there.
+    """
+    lo, hi = start + 4, end - 4
+    if sig == b"OHDR":
+        flags = b[start + 5]
+        cur = start + 6 + (16 if flags & 0x20 else 0) + (4 if flags & 0x10 else 0)
+        sw = 1 << (flags & 3)
+        forbid = {start + 5} | set(range(cur, cur + sw))
+    elif sig == b"FRHP":
+        forbid = {start + 7, start + 8}
+    else:
+        return range(lo, hi)
+    return [i for i in range(lo, hi) if i not in forbid]
+
+
+def mut_struct(data, rng):
+    """Corrupt a field inside a checksummed block and repair the block's
+    trailing checksum, so the mutation reaches the deep validator behind it."""
+    b = bytearray(data)
+    ol = superblock_ol(b)
+    if ol is None:
+        return None
+    blocks = cksum_blocks(b, *ol)
+    if not blocks:
+        return None
+    start, end, sig = rng.choice(blocks)
+    pool = mutable_offsets(b, start, end, sig)
+    if not pool:
+        return None
+    for _ in range(rng.randint(1, 3)):
+        i = rng.choice(pool)
+        how = rng.choice(["interesting", "delta", "wild"])
+        if how == "interesting":
+            b[i] = rng.choice(INTERESTING)
+        elif how == "delta":
+            b[i] = (b[i] + rng.choice([-8, -1, 1, 8])) & 0xFF
+        else:
+            b[i] = rng.getrandbits(8)
+    # Repair the block's trailing Jenkins checksum over its (now-mutated) body.
+    b[end - 4:end] = jenkins_lookup3(bytes(b[start:end - 4])).to_bytes(4, "little")
+    return b
+
+
 MUTATORS = {
     "bitflip": mut_bitflip,
     "interesting": mut_interesting,
     "truncate": mut_truncate,
     "super": mut_super,
     "dict": mut_dict,
+    "struct": mut_struct,
 }
 
 
