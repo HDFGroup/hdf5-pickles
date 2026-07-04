@@ -15,8 +15,11 @@ repairs.
   security profiles, regression corpus, differential harness, and fuzzing tools.
 - [`h5patch/`](h5patch/) contains the experimental metadata repair planner,
   JSON patch-plan format, apply workflow, and repair tests.
-- [`tools/`](tools/) contains repository-level helpers such as the marker scanner
-  and interactive `h5explain` workflow.
+- [`h5explain/`](h5explain/) contains the interactive GNU poke explorer for
+  byte-level HDF5 metadata navigation.
+- [`src/`](src/) contains the marker scanner implementation.
+- [`tools/`](tools/) collects top-level command symlinks and repository helper
+  scripts such as the documentation generator.
 - [`docs/`](docs/) contains YAML format notes and generated Markdown reference
   pages.
 - [`emacs/`](emacs/) contains an Emacs front end for inspecting HDF5 files
@@ -32,7 +35,7 @@ repairs.
 Run `h5policy` against an HDF5 file:
 
 ```sh
-./h5policy/tools/h5policy --profile untrusted-strict --json file.h5
+./tools/h5policy --profile untrusted-strict --json file.h5
 ```
 
 Try the regression suite:
@@ -45,8 +48,8 @@ cd h5policy/tests
 Create a what-if metadata repair plan:
 
 ```sh
-./h5patch/tools/h5patch plan damaged.h5 -o repair.plan.json
-./h5patch/tools/h5patch explain repair.plan.json
+./tools/h5patch plan damaged.h5 -o repair.plan.json
+./tools/h5patch explain repair.plan.json
 ```
 
 Build the marker scanner and generated format docs:
@@ -60,10 +63,11 @@ cmake --build build --target docs
 Explore the sample file interactively:
 
 ```sh
-POKE_LOAD_PATH=$PWD/pickles poke file.h5
+./tools/h5explain file.h5
 ```
 
-See [`TUTORIAL.md`](TUTORIAL.md) for a guided GNU poke walkthrough.
+See [`h5explain/README.md`](h5explain/README.md) for interactive navigation
+commands and [`TUTORIAL.md`](TUTORIAL.md) for a guided GNU poke walkthrough.
 
 ## h5policy In Under A Minute
 

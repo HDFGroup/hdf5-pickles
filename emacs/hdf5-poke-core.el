@@ -44,7 +44,7 @@
   '("hdf5_poke_emacs")
   "Pickle modules loaded when a new poke session starts.
 
-The command layer from `pickles/h5explain.pk' is deliberately not loaded."
+The command layer from `h5explain/pickles/h5explain.pk' is deliberately not loaded."
   :type '(repeat string))
 
 (defcustom hdf5-poke-no-init-file t
