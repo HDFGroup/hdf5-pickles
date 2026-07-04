@@ -71,7 +71,8 @@ repairs:
 - clear stale v2/v3 superblock file-consistency flags;
 - recompute v2/v3 superblock Jenkins checksums;
 - recompute reachable v2 object-header Jenkins checksums reported by
-  `h5policy`.
+  `h5policy`;
+- rewrite flagged v1 object-header message counts to the counted message total.
 
 Future repair classes can add B-tree rebuilds, orphan pruning, continuation
 chunk repair, and chunk-index reconstruction behind the same plan/apply/log

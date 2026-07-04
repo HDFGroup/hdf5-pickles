@@ -96,10 +96,28 @@ def test_object_header_checksum_repair(tmp):
     assert_accept(repaired)
 
 
+def test_v1_object_header_message_count_repair(tmp):
+    src = os.path.join(
+        REPO, "h5policy", "tests", "malformed", "bad_object_header_message_count.h5"
+    )
+    damaged = os.path.join(tmp, "bad_message_count.h5")
+    repaired = os.path.join(tmp, "message_count_repaired.h5")
+    plan = os.path.join(tmp, "message_count.plan.json")
+    shutil.copyfile(src, damaged)
+
+    run([H5PATCH, "plan", damaged, "-o", plan])
+    spec = json.load(open(plan))
+    assert any(a["target"]["structure"] == "object_header_v1" for a in spec["actions"])
+
+    run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+    assert_accept(repaired)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="h5patch-test-") as tmp:
         test_signature_repair(tmp)
         test_object_header_checksum_repair(tmp)
+        test_v1_object_header_message_count_repair(tmp)
     print("h5patch tests passed")
 
 
