@@ -211,6 +211,8 @@ def generate(root):
     _patch(f"{root}/malformed/bad_superblock_version.h5",
            raw[:8] + b"\xff" + raw[9:])
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
+    _make_bad_reference_datatype_version(
+        f"{root}/malformed/bad_reference_datatype_version.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
     _make_bad_unused_bits(f"{root}/malformed/bad_unused_bits.h5")
     # Structure-aware fuzzer finds (h5policy-fuzz), each a distinct soundness
@@ -219,18 +221,31 @@ def generate(root):
     _make_eof_past_metadata(f"{root}/malformed/eof_past_metadata.h5")
     _make_eof_truncates_data(f"{root}/malformed/eof_truncates_data.h5")
     _make_bad_snod_cache_type(f"{root}/malformed/bad_snod_cache_type.h5")
+    _make_bad_snod_version(f"{root}/malformed/bad_snod_version.h5")
+    _make_bad_snod_empty_name(f"{root}/malformed/bad_snod_empty_name.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_bad_message_flag_combination(
         f"{root}/malformed/bad_message_flag_combination.h5")
     _make_bad_link_info_max_corder(
         f"{root}/malformed/bad_link_info_max_corder.h5")
+    _make_bad_link_info_trailing_bytes(
+        f"{root}/malformed/bad_link_info_trailing_bytes.h5",
+        f"{root}/valid/chunk_ext_array.h5")
     _make_bad_v1_reference_count(
         f"{root}/malformed/bad_v1_reference_count.h5")
     _make_bad_object_header_message_count(
         f"{root}/malformed/bad_object_header_message_count.h5")
+    _make_bad_object_header_short_chunk(
+        f"{root}/malformed/bad_object_header_short_chunk.h5")
     _make_bad_layout_rank_mismatch(
         f"{root}/malformed/bad_layout_rank_mismatch.h5")
+    _make_bad_duplicate_dataspace_message(
+        f"{root}/malformed/bad_duplicate_dataspace_message.h5",
+        f"{root}/valid/chunk_ext_array.h5")
+    _make_bad_ext_array_without_unlimited_dim(
+        f"{root}/malformed/bad_ext_array_without_unlimited_dim.h5",
+        f"{root}/valid/chunk_ext_array.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
     _make_bad_compact_layout_overrun(
@@ -247,6 +262,9 @@ def generate(root):
         f"{root}/malformed/bad_dataset_storage_overflow.h5")
     _make_bad_ext_address(f"{root}/malformed/bad_ext_address.h5")
     _make_bad_btree_key(f"{root}/malformed/bad_btree_key.h5")
+    _make_bad_group_btree_declared_size(
+        f"{root}/malformed/bad_group_btree_declared_size.h5",
+        f"{root}/valid/compact_layout.h5")
     _make_bad_dense_checksum(f"{root}/malformed/bad_dense_frhp_checksum.h5",
                              "FRHP")
     _make_bad_dense_checksum(f"{root}/malformed/bad_dense_fhdb_checksum.h5",
@@ -298,6 +316,18 @@ def _make_bad_btree_key(path):
     _patch(path, bytes(raw))
 
 
+def _make_bad_group_btree_declared_size(path, base_path):
+    """Old-style group whose superblock group-B-tree K value makes the root
+    B-tree node's declared allocation run past EOA.  h5policy used to size the
+    node from entries_used only; libhdf5 sizes it from the superblock K."""
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError("expected a v0 superblock fixture")
+    # v0 superblock bytes 18..19 are the symbol-table internal-node K.
+    struct.pack_into("<H", raw, 18, 0x0210)
+    _patch(path, bytes(raw))
+
+
 def _make_bad_compound(path):
     """Compound datatype patched to declare zero members (libhdf5: 'invalid
     number of members: 0').  Built on a v1 object header (no checksum) so the
@@ -316,6 +346,30 @@ def _make_bad_compound(path):
                 and struct.unpack_from("<H", raw, i + 1)[0] == 2
                 and struct.unpack_from("<I", raw, i + 4)[0] == 8):
             struct.pack_into("<H", raw, i + 1, 0)
+            break
+    else:
+        raise RuntimeError("could not locate the compound datatype header")
+    _patch(path, bytes(raw))
+
+
+def _make_bad_reference_datatype_version(path):
+    """Datatype header patched to class reference with an unsupported version.
+
+    Found by h5policy-fuzz: dictionary-splicing ``GCOL`` over a compound
+    datatype header made a version-4 reference datatype that libhdf5 rejects and
+    h5policy used to accept.
+    """
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", shape=(2,),
+                         dtype=np.dtype([("aa", np.int32), ("bb", np.int32)]))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    for i in range(len(raw) - 8):
+        if ((raw[i] & 0x0F) == 6
+                and struct.unpack_from("<H", raw, i + 1)[0] == 2
+                and struct.unpack_from("<I", raw, i + 4)[0] == 8):
+            raw[i:i + 4] = b"GCOL"
             break
     else:
         raise RuntimeError("could not locate the compound datatype header")
@@ -626,6 +680,41 @@ def _make_bad_snod_cache_type(path):
     _patch(path, bytes(raw))
 
 
+def _make_bad_snod_version(path):
+    """Old-style group whose symbol-table node has an unsupported version.
+
+    Found by h5policy-fuzz: flipping SNOD version 1 -> 0 made libhdf5 reject the
+    file while h5policy accepted it.
+    """
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    snod = raw.find(b"SNOD")
+    if snod < 0:
+        raise RuntimeError("could not locate the symbol table node")
+    raw[snod + 4] = 0                             # SNOD version must be 1
+    _patch(path, bytes(raw))
+
+
+def _make_bad_snod_empty_name(path):
+    """Old-style group whose first SNOD entry points into the heap at an empty
+    link name.  libhdf5 rejects this as an invalid link name."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    snod = raw.find(b"SNOD")
+    if snod < 0:
+        raise RuntimeError("could not locate the symbol table node")
+    # The generated heap stores "d\0" at offset 8; offset 12 is inside the
+    # zero-filled heap area and decodes as an empty name.
+    struct.pack_into("<Q", raw, snod + 8, 12)
+    _patch(path, bytes(raw))
+
+
 def _make_bad_heap_segment(path):
     """Old-style group whose local heap declares a ~1 TB data-segment size, far
     past the file; libhdf5 rejects the oversized heap segment."""
@@ -656,6 +745,48 @@ def _make_bad_heap_free_list(path):
     # HEAP(4) + version(1) + reserved(3) + data-segment size(length), then the
     # free-list head offset(length).  Point it well past the small data segment.
     struct.pack_into("<Q", raw, heap + 16, 0x1000)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_duplicate_dataspace_message(path, base_path):
+    """Dataset object header whose layout message type is rewritten as
+    dataspace, with the v2 object-header checksum repaired.
+
+    The payload is still a layout payload, so libhdf5 rejects it while decoding
+    the duplicate dataspace message's version byte.  Found by the
+    checksum-repairing `struct` mutator.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    # v2 message prefix: type=layout(0x08), size=22, flags=0, then layout v4
+    # payload: version=4, class=chunked, ndims=3.
+    pat = b"\x08\x16\x00\x00\x04\x02\x00\x03"
+    off = raw.find(pat)
+    if off < 0:
+        raise RuntimeError("could not locate the layout message prefix")
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate containing object header")
+    raw[off] = 0x01                                # layout -> dataspace
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_ext_array_without_unlimited_dim(path, base_path):
+    """Extensible-array chunk index whose dataspace no longer declares an
+    unlimited max dimension.  Found by h5policy-fuzz by clearing the dataspace
+    'max dimensions present' flag and repairing the v2 object-header checksum."""
+    raw = bytearray(open(base_path, "rb").read())
+    # v2 message prefix: type=dataspace(0x01), size=36, flags=0, then
+    # dataspace v2, rank=2, flags=max-dims-present, class=simple.
+    pat = b"\x01\x24\x00\x00\x02\x02\x01\x01"
+    off = raw.find(pat)
+    if off < 0:
+        raise RuntimeError("could not locate the dataspace message prefix")
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate containing object header")
+    raw[off + 6] = 0                              # max dimensions not present
+    _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 
 
@@ -703,6 +834,25 @@ def _make_bad_link_info_max_corder(path):
     _patch(path, bytes(raw))
 
 
+def _make_bad_link_info_trailing_bytes(path, base_path):
+    """Root link-info message whose size is inflated to swallow following
+    object-header messages.  The repaired checksum lets the malformed payload
+    reach semantic validation."""
+    raw = bytearray(open(base_path, "rb").read())
+    # v2 message prefix: type=link-info(0x02), size=18, flags=0, payload
+    # version=0, flags=0, then two undefined addresses.
+    pat = b"\x02\x12\x00\x00\x00\x00" + (b"\xff" * 16)
+    off = raw.find(pat)
+    if off < 0:
+        raise RuntimeError("could not locate the root link-info message")
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate containing object header")
+    raw[off + 1] = 0x62                           # swallow following messages
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
 def _make_bad_v1_reference_count(path):
     """Old-style object header with a reference-count message.  Reference-count
     messages are only valid in v2 object headers; libhdf5 rejects them while
@@ -737,6 +887,26 @@ def _make_bad_object_header_message_count(path):
     if raw[ohdr] != 1:
         raise RuntimeError("expected a v1 dataset object header")
     struct.pack_into("<H", raw, ohdr + 2, 1)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_object_header_short_chunk(path):
+    """v1 object header whose declared chunk size is too short to contain the
+    declared message count.  Found by h5policy-fuzz from a malformed datatype
+    seed with a dictionary splice into the object-header chunk-size field."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="earliest") as h:
+        h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+    prefix = struct.pack("<HHB3x", 0x11, 16, 0)  # root symbol-table message
+    off = raw.find(prefix)
+    if off < 0:
+        raise RuntimeError("could not locate the symbol-table message prefix")
+    ohdr = off - 16
+    if ohdr < 0 or raw[ohdr] != 1:
+        raise RuntimeError("expected a v1 root object header")
+    struct.pack_into("<I", raw, ohdr + 8, 2)
     _patch(path, bytes(raw))
 
 
