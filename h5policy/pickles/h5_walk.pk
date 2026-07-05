@@ -43,6 +43,8 @@ type H5WalkContext = struct
     uint<64> compact_layout_size;
     uint<64> contiguous_layout_size;
     uint<64> legacy_chunked_layout_ndims;
+    uint<64> chunk_dataset_element_count;
+    uint<64> chunk_logical_bytes;
     uint<64> logical_dataset_bytes;
     uint<64> max_logical_dataset_bytes_seen;
     uint<64> chunk_index_count;
@@ -53,6 +55,7 @@ type H5WalkContext = struct
     uint<8> has_compact_layout;
     uint<8> has_contiguous_layout;
     uint<8> has_legacy_chunked_layout;
+    uint<8> has_chunked_layout;
     uint<8> dataset_element_count_overflowed;
     uint<8> dataset_dim_exceeds_max;
     uint<8> dataspace_has_max_dims;
@@ -208,6 +211,8 @@ fun h5policy_new_walk_context = H5WalkContext:
         compact_layout_size = 0UL,
         contiguous_layout_size = 0UL,
         legacy_chunked_layout_ndims = 0UL,
+        chunk_dataset_element_count = 0UL,
+        chunk_logical_bytes = 0UL,
         logical_dataset_bytes = 0UL,
         max_logical_dataset_bytes_seen = 0UL,
         chunk_index_count = 0UL,
@@ -218,6 +223,7 @@ fun h5policy_new_walk_context = H5WalkContext:
         has_compact_layout = 0UB,
         has_contiguous_layout = 0UB,
         has_legacy_chunked_layout = 0UB,
+        has_chunked_layout = 0UB,
         dataset_element_count_overflowed = 0UB,
         dataset_dim_exceeds_max = 0UB,
         dataspace_has_max_dims = 0UB,
@@ -418,6 +424,80 @@ fun h5policy_note_chunk_index_addr = (H5WalkContext ctx,
     return ctx;
 }
 
+fun h5policy_percent_exceeded = (uint<64> numer,
+                                 uint<64> denom,
+                                 uint<64> percent) int:
+{
+    if (denom == 0UL || percent == 0UL)
+        return 0;
+
+    var base = (denom / 100UL) * percent;
+    var rem = ((denom % 100UL) * percent) / 100UL;
+    return numer > base + rem;
+}
+
+fun h5policy_check_metadata_ratio = (H5WalkContext ctx,
+                                     H5PolicyLimits profile,
+                                     uint<64> file_size) void:
+{
+    if (profile.metadata_ratio_reject_percent != 0UL
+        && ctx.metadata_seen > profile.metadata_ratio_reject_min_bytes
+        && h5policy_percent_exceeded(ctx.metadata_seen, file_size,
+                                     profile.metadata_ratio_reject_percent))
+        h5policy_emit_error("H5_RESOURCE_METADATA_RATIO", "resource",
+                            0UL#B, "metadata",
+                            "reachable metadata exceeds the selected profile's file-size ratio");
+    else if (profile.metadata_ratio_warn_percent != 0UL
+             && ctx.metadata_seen > profile.metadata_ratio_warn_min_bytes
+             && h5policy_percent_exceeded(ctx.metadata_seen, file_size,
+                                          profile.metadata_ratio_warn_percent))
+        h5policy_emit_warning("H5_ADVISORY_METADATA_RATIO",
+                              0UL#B, "metadata",
+                              "reachable metadata is a large fraction of the file size");
+}
+
+fun h5policy_update_chunk_resource_pressure = (H5WalkContext ctx,
+                                               H5PolicyLimits profile,
+                                               off64 loc,
+                                               string object) H5WalkContext:
+{
+    if (ctx.has_chunked_layout == 0UB
+        || ctx.has_dataspace == 0UB
+        || ctx.has_datatype == 0UB
+        || ctx.dataset_element_count_overflowed != 0UB
+        || ctx.chunk_dataset_element_count == 0UL
+        || ctx.datatype_logical_size == 0UL)
+        return ctx;
+
+    if (ctx.chunk_dataset_element_count
+        > 0xffffffffffffffffUL / ctx.datatype_logical_size)
+        ctx.chunk_logical_bytes = 0xffffffffffffffffUL;
+    else
+        ctx.chunk_logical_bytes =
+            ctx.chunk_dataset_element_count * ctx.datatype_logical_size;
+
+    if (profile.min_logical_chunk_bytes != 0UL
+        && ctx.chunk_logical_bytes < profile.min_logical_chunk_bytes
+        && ctx.dataset_element_count != 0UL)
+        {
+            var adjusted = ctx.dataset_element_count;
+            if (ctx.dataset_element_count
+                <= 0xffffffffffffffffUL - (ctx.chunk_dataset_element_count - 1UL))
+                adjusted = ctx.dataset_element_count
+                           + ctx.chunk_dataset_element_count - 1UL;
+            else
+                adjusted = 0xffffffffffffffffUL;
+
+            var nchunks = adjusted / ctx.chunk_dataset_element_count;
+            if (nchunks > profile.min_logical_chunk_count)
+                h5policy_emit_error("H5_RESOURCE_CHUNK_TOO_SMALL", "resource",
+                                    loc, object,
+                                    "logical chunk size is too small for the estimated chunk count");
+        }
+
+    return ctx;
+}
+
 /* Cross-message dataset check.  Dataspace, datatype, layout, and fill-value
    messages can arrive in any object-header order, so every validator calls back
    here after updating its part of ctx.  The function is idempotent and only
@@ -472,6 +552,9 @@ fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
                                          "logical dataset byte budget exceeded");
             if (ctx.logical_dataset_bytes > ctx.max_logical_dataset_bytes_seen)
                 ctx.max_logical_dataset_bytes_seen = ctx.logical_dataset_bytes;
+
+            ctx = h5policy_update_chunk_resource_pressure(ctx, profile,
+                                                          loc, object);
 
             if (ctx.has_dataset_layout != 0UB
                 && ctx.has_compact_layout != 0UB

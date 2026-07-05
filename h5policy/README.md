@@ -82,6 +82,9 @@ Examples:
   `trusted-fast` and `legacy`.
 - A very large logical dataset can be rejected by `untrusted-strict` resource
   budgets while remaining structurally valid.
+- `untrusted-strict` also rejects denial-of-service resource shapes such as
+  many very small logical chunks, and high reachable-metadata-to-file-size
+  ratios after an absolute metadata floor.
 - `forensic` favors complete reporting over early exit, but still never follows
   external references or decodes payload data.
 
