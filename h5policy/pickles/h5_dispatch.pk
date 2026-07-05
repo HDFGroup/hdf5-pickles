@@ -16,6 +16,13 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* The dispatcher is the object-header message boundary.  It decides which
+   payload validators run, which policy features are counted or denied, how
+   shared messages are resolved, and how continuation chunks are followed.  */
+
+/* Small reference to a message payload, used when resolving shared messages.
+   A zero `found` bit lets callers distinguish "not resolved" from a real
+   message at offset zero.  */
 type H5PolicyMsgRef = struct
 {
     uint<8> found;
@@ -24,6 +31,7 @@ type H5PolicyMsgRef = struct
     uint<8> flags;
 };
 
+/* Sentinel result for failed or unsupported shared-message lookups.  */
 fun h5policy_msg_ref_none = H5PolicyMsgRef:
 {
     return H5PolicyMsgRef
@@ -35,6 +43,11 @@ fun h5policy_msg_ref_none = H5PolicyMsgRef:
     };
 }
 
+/* Search one object-header chunk for a message type without fully validating
+   the chunk.  Shared-message resolution needs this lightweight scan to find the
+   target payload inside a committed datatype/object header.  Global prefix
+   state is saved and restored because msg_prefix layout depends on object
+   header version and creation-order tracking.  */
 fun h5policy_find_message_in_chunk = (int ios,
                                       H5PolicyLimits profile,
                                       uint<8> version,
@@ -113,6 +126,10 @@ fun h5policy_find_message_in_chunk = (int ios,
     return h5policy_msg_ref_none;
 }
 
+/* Locate a message type inside a committed object header used by a shared
+   message.  The code supports v1 and v2 object headers, checks the enclosing
+   object bounds, and leaves full semantic validation to the eventual payload
+   validator.  */
 fun h5policy_find_message_in_ohdr = (int ios,
                                      H5PolicyLimits profile,
                                      uint<64> obj_addr,
@@ -132,6 +149,9 @@ fun h5policy_find_message_in_ohdr = (int ios,
 
     if (sig == V2_SIG)
         {
+            /* Shared committed object headers use the same v2 prefix layout as
+               ordinary object headers: optional time fields, optional creation
+               order, variable chunk-size width, then message data and checksum. */
             var version = h5policy_msg_u64_at(ios, profile,
                                               root_off + 4#B, 1UL) as uint<8>;
             var flags = h5policy_msg_u64_at(ios, profile,
@@ -183,6 +203,9 @@ fun h5policy_find_message_in_ohdr = (int ios,
                                                   wanted_type, loc, object);
         }
 
+    /* No OHDR signature means try the v1 object-header form.  v1 has a fixed
+       16-byte prefix and no checksum, so the chunk range is bounded by its
+       declared chunk size.  */
     var version1 = h5policy_msg_u64_at(ios, profile,
                                        root_off, 1UL) as uint<8>;
     if (version1 != 1UB)
@@ -212,6 +235,10 @@ fun h5policy_find_message_in_ohdr = (int ios,
                                           loc, object);
 }
 
+/* Resolve an object-header message marked "shared".  h5policy currently covers
+   the committed-object-header representation; heap/table shared-message
+   storage is reported as a coverage gap so the decision is conservative rather
+   than silently accepting an unvalidated indirection.  */
 fun h5policy_resolve_shared_message = (int ios,
                                        H5PolicyLimits profile,
                                        uint<64> m_type,
@@ -234,6 +261,9 @@ fun h5policy_resolve_shared_message = (int ios,
     var share_type = 2UL;       /* v1/v2 both point at a committed object header. */
     var loc_rel = 0UL;
 
+    /* Shared-message payload versions differ mostly in where the address lives.
+       Version 3 also names the storage type; only type 2, committed object
+       header storage, is resolved in this phase.  */
     if (version == 1UL)
         loc_rel = 8UL + l;
     else if (version == 2UL)
@@ -283,6 +313,9 @@ fun h5policy_resolve_shared_message = (int ios,
                             "shared committed object header does not expose the requested message");
     else if ((ref.flags & 0x02UB) != 0UB)
         {
+            /* A shared target that is itself shared would require nested shared
+               message resolution and cycle detection; report the gap instead of
+               following an unbounded indirection chain.  */
             h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
                                 "unsupported", ref.payload_off, object,
                                 "nested shared object-header message resolution is not covered yet");
@@ -292,6 +325,11 @@ fun h5policy_resolve_shared_message = (int ios,
     return ref;
 }
 
+/* Dispatch a decoded message prefix to the specialized payload validator.
+   Messages that define dataset semantics update ctx; informational or policy
+   messages may only emit findings.  Duplicate dataspace/datatype/layout/fill
+   messages are still parsed for corruption, but the first one wins for the
+   cross-message dataset context.  */
 fun h5policy_validate_message_payload = (int ios,
                                          H5PolicyLimits profile,
                                          H5WalkContext ctx,
@@ -303,6 +341,9 @@ fun h5policy_validate_message_payload = (int ios,
 {
     if (m_type == 0x01UL)
         {
+            /* Dataspace is one of the four messages that form the dataset
+               semantic quartet.  A duplicate is still parsed for corruption,
+               but it does not replace the first dataspace in ctx.  */
             if (ctx.has_dataspace != 0UB)
                 {
                     var ignored_dataspace_ctx =
@@ -316,12 +357,21 @@ fun h5policy_validate_message_payload = (int ios,
                                                        object);
         }
     if (m_type == 0x02UL)
+        /* Link-info switches a group from compact link messages to dense
+           fractal-heap/v2-B-tree storage.  It can enqueue more object headers
+           through the dense-link walker.  */
         h5policy_validate_linfo_payload(ios, profile, payload_off,
                                         msg_size, object);
     if (m_type == 0x03UL)
         {
+            /* Datatypes may be inline or shared.  Shared datatypes are resolved
+               before validation so the storage-size facts in ctx reflect the
+               committed datatype payload, not the small shared-message wrapper. */
             if (ctx.has_datatype != 0UB)
                 {
+                    /* Duplicate datatype messages are not allowed to overwrite
+                       the dataset context, but parsing them still catches
+                       malformed duplicate payloads and shared-message targets. */
                     if ((m_flags & 0x02UB) != 0UB)
                         {
                             var dup_ref = h5policy_resolve_shared_message(ios,
@@ -372,6 +422,9 @@ fun h5policy_validate_message_payload = (int ios,
         }
     if (m_type == 0x04UL)
         {
+            /* Old fill-value message.  As with datatypes, duplicates are parsed
+               but the first fill-value fact remains the one used for the
+               dataset-level size check.  */
             if (ctx.has_fill_value != 0UB)
                 {
                     var ignored_old_fill_ctx =
@@ -385,6 +438,9 @@ fun h5policy_validate_message_payload = (int ios,
         }
     else if (m_type == 0x05UL)
         {
+            /* New fill-value message.  The validator reports the declared fill
+               byte count, which is compared with datatype storage size when both
+               messages are available.  */
             if (ctx.has_fill_value != 0UB)
                 {
                     var ignored_fill_ctx =
@@ -397,10 +453,15 @@ fun h5policy_validate_message_payload = (int ios,
                                                   msg_size, object, 0);
         }
     else if (m_type == 0x06UL)
+        /* Compact link message.  Hard links enqueue child object headers; soft,
+           external, and user-defined links are bounded and classified.  */
         h5policy_validate_link_payload(ios, profile, payload_off,
                                        msg_size, object);
     else if (m_type == 0x08UL)
         {
+            /* Layout describes storage.  Duplicate layouts are parsed for
+               corruption and filter/index policy, but do not replace the first
+               layout facts used for size consistency checks.  */
             if (ctx.has_dataset_layout != 0UB)
                 {
                     var ignored_layout_ctx =
@@ -414,33 +475,49 @@ fun h5policy_validate_message_payload = (int ios,
                                                     object);
         }
     else if (m_type == 0x0bUL)
+        /* Filter pipelines are policy surface, not data processing.  h5policy
+           validates descriptors and records decode/plugin requirements without
+           invoking any filter code.  */
         h5policy_validate_filter_pipeline_payload(ios, profile,
                                                   payload_off, msg_size,
                                                   object);
     else if (m_type == 0x0cUL)
+        /* Attribute messages contain nested datatype/dataspace messages and
+           count against the selected attribute budget.  */
         return h5policy_validate_attribute_payload(ios, profile, ctx,
                                                    payload_off, msg_size,
                                                    object);
     else if (m_type == 0x0fUL)
+        /* Shared-message tables are a distinct storage mechanism from the
+           committed-object-header shared messages resolved above.  */
         h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
                             "unsupported", payload_off, object,
                             "shared object-header message table traversal is not covered yet");
     else if (m_type == 0x15UL)
+        /* Attribute-info is the dense-attribute equivalent of link-info.  */
         return h5policy_validate_ainfo_payload(ios, profile, ctx, payload_off,
                                                msg_size, object);
     else if (m_type == 0x17UL)
+        /* File-space info is opened by libhdf5 but only shallowly classified in
+           this phase.  */
         h5policy_validate_fsinfo_payload(ios, profile, payload_off,
                                          msg_size, object);
     else if (m_type == 0x18UL)
+        /* Metadata cache image points at another metadata serialization; bounds
+           are checked, contents remain a coverage gap.  */
         h5policy_validate_mdci_payload(ios, profile, payload_off,
                                        msg_size, object);
     else if (m_type == 0x11UL)
+        /* Symbol-table messages are the old-style group entry point.  */
         return h5policy_validate_stab_payload(ios, profile, ctx, payload_off,
                                               msg_size, object);
 
     return ctx;
 }
 
+/* The HDF5 format allows only selected message classes to be shared.  These
+   checks are separate from the profile policy because an illegal share flag is
+   structural corruption even when unknown messages are otherwise allowed.  */
 fun h5policy_message_is_shareable = (uint<64> m_type) int:
 {
     if (m_type == 0x01UL) return 1;  /* dataspace */
@@ -453,6 +530,9 @@ fun h5policy_message_is_shareable = (uint<64> m_type) int:
     return 0;
 }
 
+/* Known IDs include all object-header message IDs assigned through the current
+   range, including ones h5policy treats as unsupported coverage rather than
+   decoding in this phase.  */
 fun h5policy_known_message_id = (uint<64> m_type) int:
 {
     if (m_type <= 0x09UL) return 1;
@@ -460,6 +540,9 @@ fun h5policy_known_message_id = (uint<64> m_type) int:
     return 0;
 }
 
+/* Apply profile-level policy to a message class before payload validation.
+   This is where "feature seen" counters are updated so the JSON report can
+   explain why a file was rejected or accepted with warnings.  */
 fun h5policy_validate_message_policy = (uint<64> m_type,
                                         H5PolicyLimits profile,
                                         off64 loc,
@@ -494,6 +577,9 @@ fun h5policy_validate_message_policy = (uint<64> m_type,
         }
 }
 
+/* Object-header flags can be corrupt independently of the message payload.
+   Incompatible unknown-message and sharing bits are rejected here before any
+   message-specific parser has to reason about them.  */
 fun h5policy_validate_message_flags = (uint<64> m_type,
                                        uint<8> flags,
                                        off64 loc,
@@ -504,6 +590,9 @@ fun h5policy_validate_message_flags = (uint<64> m_type,
                             "corrupt", loc, object,
                             "object-header message is both shared and marked do-not-share");
 
+    /* Unknown-message handling uses a small flag protocol: mark-if-unknown,
+       fail-if-unknown, and was-unknown.  Incompatible combinations are a
+       structural finding before any payload-specific logic runs.  */
     if ((flags & 0x20UB) != 0UB && (flags & 0x08UB) != 0UB)
         h5policy_emit_error("H5_CORRUPT_MESSAGE_FLAG_COMBINATION",
                             "corrupt", loc, object,
@@ -517,11 +606,18 @@ fun h5policy_validate_message_flags = (uint<64> m_type,
     if (h5policy_known_message_id(m_type)
         && ((flags & 0x02UB) != 0UB || (flags & 0x40UB) != 0UB)
         && !h5policy_message_is_shareable(m_type))
+        /* Known unshareable messages cannot opt into sharing or "shareable"
+           state.  Unknown messages are handled by policy because their
+           shareability is not known to this validator.  */
         h5policy_emit_error("H5_CORRUPT_MESSAGE_FLAG_UNSHAREABLE",
                             "corrupt", loc, object,
                             "object-header message of unshareable class is marked shared/shareable");
 }
 
+/* Validate one object-header message chunk.  The chunk may be the root chunk or
+   a continuation chunk.  The loop stops cleanly on the permitted trailing gap,
+   validates each prefix/payload pair, and follows continuation messages under
+   chunk-count and visited-continuation budgets.  */
 fun h5policy_validate_msg_chunk = (int ios,
                                    H5PolicyLimits profile,
                                    H5WalkContext ctx,
@@ -535,6 +631,8 @@ fun h5policy_validate_msg_chunk = (int ios,
     var msg_count = 0UL;
     var file_size = h5policy_ceiling(ios);
 
+    /* msg_prefix is a union controlled by global_version.  Set it once for the
+       chunk and restore through callers when needed.  */
     global_version = version;
 
     while (i < chunk_size)
@@ -567,6 +665,8 @@ fun h5policy_validate_msg_chunk = (int ios,
             var payload_off = chunk_off + i#B + (prefix_bytes as uint<64>)#B;
             var remaining = chunk_size - i - (prefix_bytes as uint<64>);
 
+            /* A message claiming more bytes than remain would otherwise cause
+               the payload validator to read outside this chunk.  */
             if (m_size > remaining)
                 {
                     h5policy_emit_error("H5_CORRUPT_MESSAGE_OVERRUNS_CHUNK",
@@ -613,6 +713,10 @@ fun h5policy_validate_msg_chunk = (int ios,
                                             "object-header continuation chunk has zero size");
                     else
                         {
+                            /* Continuations are ordinary object-header chunks
+                               living elsewhere in the file.  They get their
+                               own bounds, cycle, metadata-budget, signature,
+                               and checksum checks before recursive parsing.  */
                             var ok = h5policy_checked_addr_range(cont_addr,
                                                                  cont_size,
                                                                  file_size,
@@ -685,6 +789,10 @@ fun h5policy_validate_msg_chunk = (int ios,
                                                         }
                                                 }
 
+                                            /* Empty continuations are already
+                                               corrupt above; this guard keeps
+                                               the recursive call focused on
+                                               chunks with a message region.  */
                                             if (cont_msg_size > 0UL)
                                                 ctx = h5policy_validate_msg_chunk(ios, profile, ctx,
                                                                                   version,

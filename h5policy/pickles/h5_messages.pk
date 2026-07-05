@@ -16,6 +16,14 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* This file covers object-header messages that are not large storage graphs:
+   fill values, attributes, file-space info, and metadata cache image pointers.
+   Each parser validates message-local bounds and updates only the context facts
+   needed by later cross-message checks.  */
+
+/* Fill values have an old dedicated message and several versions of the newer
+   fill-value message.  h5policy only needs the declared fill byte count, which
+   is compared later with datatype storage size.  */
 fun h5policy_validate_fill_payload = (int ios,
                                       H5PolicyLimits profile,
                                       H5WalkContext ctx,
@@ -29,6 +37,8 @@ fun h5policy_validate_fill_payload = (int ios,
 
     if (old_fill)
         {
+            /* The old message is just a 32-bit size followed by that many fill
+               bytes.  A zero size means no defined fill value.  */
             if (!h5policy_payload_range_ok(msg_size, 0UL, 4UL,
                                            "H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL",
                                            payload_off, object,
@@ -53,6 +63,8 @@ fun h5policy_validate_fill_payload = (int ios,
             var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
             if (version == 1UL || version == 2UL)
                 {
+                    /* v1/v2 keep the "defined" flag in byte 3 and, when set,
+                       place a 32-bit size followed by the value bytes.  */
                     if (!h5policy_payload_range_ok(msg_size, 0UL, 4UL,
                                                    "H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL",
                                                    payload_off, object,
@@ -81,6 +93,8 @@ fun h5policy_validate_fill_payload = (int ios,
                 }
             else if (version == 3UL)
                 {
+                    /* v3 encodes presence in flags; bit 5 means the explicit
+                       fill value and size field are present.  */
                     if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
                                                    "H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL",
                                                    payload_off, object,
@@ -119,6 +133,9 @@ fun h5policy_validate_fill_payload = (int ios,
                             "resource", payload_off, object,
                             "fill value exceeds the selected profile limit");
 
+    /* Only a defined fill value participates in the datatype-size consistency
+       check.  Undefined fill policy bytes may still be present in the message,
+       but they do not represent a concrete fill payload.  */
     if (fill_defined)
         {
             ctx.has_fill_value = 1UB;
@@ -129,6 +146,9 @@ fun h5policy_validate_fill_payload = (int ios,
     return ctx;
 }
 
+/* Attribute messages embed their own datatype and dataspace messages, followed
+   by attribute data bytes.  A separate attribute-local context prevents those
+   embedded messages from becoming the parent dataset's datatype/dataspace.  */
 fun h5policy_validate_attribute_payload = (int ios,
                                            H5PolicyLimits profile,
                                            H5WalkContext ctx,
@@ -170,6 +190,8 @@ fun h5policy_validate_attribute_payload = (int ios,
                             "attribute name is empty");
 
     var stored_name_size = version == 1UL ? align8(name_size) : name_size;
+    /* Version 1 aligns the name/type/space payload sections; later versions use
+       the declared sizes directly.  */
     var stored_dtype_size = version == 1UL ? align8(dtype_size) : dtype_size;
     var stored_dspace_size = version == 1UL ? align8(dspace_size) : dspace_size;
     var total = h5policy_checked_add_u64(cur, stored_name_size,
@@ -198,6 +220,8 @@ fun h5policy_validate_attribute_payload = (int ios,
     var dspace_off = dtype_off + stored_dtype_size#B;
     var attr_ctx = h5policy_new_walk_context;
 
+    /* Shared attribute datatype/dataspace messages are recognized but not yet
+       resolved, so they become coverage gaps rather than being trusted.  */
     if (version >= 2UL && (flags & 1UL) != 0UL)
         h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
                             "unsupported", dtype_off, object,
@@ -219,6 +243,9 @@ fun h5policy_validate_attribute_payload = (int ios,
     var attr_data_size = msg_size - total;
     if (profile.max_single_allocation_bytes != 0UL
         && attr_data_size > profile.max_single_allocation_bytes)
+        /* Attribute raw value bytes are embedded in metadata, so a single huge
+           attribute can force a consumer allocation even though h5policy does
+           not deserialize the value.  */
         h5policy_emit_error("H5_RESOURCE_SINGLE_ALLOCATION_BYTES",
                             "resource", payload_off, object,
                             "attribute payload exceeds the selected profile limit");
@@ -226,6 +253,9 @@ fun h5policy_validate_attribute_payload = (int ios,
     return ctx;
 }
 
+/* File-space-info messages describe free-space managers.  Phase 2 validates
+   the envelope and obvious scalar corruption, then reports a semantic coverage
+   gap because full free-space manager traversal is not implemented here.  */
 fun h5policy_validate_fsinfo_payload = (int ios,
                                         H5PolicyLimits profile,
                                         offset<uint<64>,B> payload_off,
@@ -245,6 +275,8 @@ fun h5policy_validate_fsinfo_payload = (int ios,
                                         payload_off
                                         + (3UL + (global_sizeof_lengths as uint<64>))#B,
                                         global_sizeof_lengths as uint<64>);
+    /* A zero page size is an immediate scalar inconsistency independent of the
+       deeper free-space manager structures that are not decoded in this phase. */
     if (page_size == 0UL)
         h5policy_emit_error("H5_CORRUPT_FREE_SPACE_PAGE_SIZE",
                             "corrupt", payload_off, object,
@@ -255,6 +287,9 @@ fun h5policy_validate_fsinfo_payload = (int ios,
                         "free-space manager semantic validation is a Phase 2 stub");
 }
 
+/* Metadata cache image messages name a cached metadata image.  h5policy bounds
+   the image extent but does not decode the cache image contents, which are a
+   separate metadata serialization format.  */
 fun h5policy_validate_mdci_payload = (int ios,
                                       H5PolicyLimits profile,
                                       offset<uint<64>,B> payload_off,
@@ -278,6 +313,8 @@ fun h5policy_validate_mdci_payload = (int ios,
                                          + (1UL + (global_sizeof_offsets as uint<64>))#B,
                                          global_sizeof_lengths as uint<64>);
 
+    /* Undefined means no cache image.  A defined image is only range-checked;
+       decoding its entries would be a separate metadata-cache parser.  */
     if (!h5policy_msg_addr_is_undef(addr_raw))
         {
             var ok = h5policy_checked_addr_range(image_addr, image_size,

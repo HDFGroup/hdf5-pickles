@@ -16,6 +16,16 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* Dense attributes mirror dense links: an attribute-info message points to a
+   fractal heap of serialized attribute messages and a name-indexed v2 B-tree of
+   records.  The shared fractal-heap and v2 B-tree helpers live in
+   h5_dense_links.pk; this file adds the attribute-specific record handling and
+   threads H5WalkContext so attribute budgets are enforced.  */
+
+/* Type-8 dense-attribute records store the heap ID at the start of each record.
+   The resolved heap object is an attribute message payload, so it is validated
+   with a fresh attribute-local datatype/dataspace context and the parent
+   context receives only the attribute count/resource updates.  */
 /* One v2 B-tree leaf of dense-attribute (type-8) records: resolve each
    fractal-heap object and validate it as an attribute message.  Type-8 records
    place the heap id at record offset 0.  */
@@ -37,6 +47,10 @@ fun h5policy_dense_attr_records = (int ios, H5PolicyLimits profile, H5WalkContex
             var id_flags = h5policy_msg_u64_at(ios, profile, id_off#B, 1UL);
             if (((id_flags .>> 4) & 3UL) == 0UL)
                 {
+                    /* Managed heap IDs are the covered form: flags byte,
+                       heap-object offset, heap-object length.  Other ID classes
+                       are left unprocessed and surface as a dense-storage
+                       coverage gap through the caller.  */
                     var heap_obj_off = h5policy_msg_u64_at(ios, profile,
                                                            id_off#B + 1#B, off_size);
                     var heap_obj_len = h5policy_msg_u64_at(ios, profile,
@@ -64,6 +78,9 @@ fun h5policy_dense_attr_records = (int ios, H5PolicyLimits profile, H5WalkContex
     return ctx;
 }
 
+/* Validate one dense-attribute B-tree leaf before processing records.  The
+   shape mirrors dense-link leaves: signature, payload records, and a trailing
+   checksum.  */
 fun h5policy_dense_leaf_attrs = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
                                  uint<64> leaf_addr, uint<64> nrec, uint<64> record_size,
                                  uint<64> fheap_root, uint<64> curr_root_rows,
@@ -198,6 +215,8 @@ fun h5policy_dense_attrs_node = (int ios, H5PolicyLimits profile, H5WalkContext 
     var j = 0UL;
     while (j < nrec + 1UL)
         {
+            /* Internal child pointers follow all records and use the same
+               variable-width counters as dense-link v2 B-tree nodes.  */
             var ptr_off = ptr_base + (j * ptr_size);
             var child_raw = h5policy_msg_bytes(ios, profile, ptr_off#B, o);
             var child_addr = bytes_to_u64_le(child_raw);
@@ -224,6 +243,9 @@ fun h5policy_walk_dense_attrs = (int ios, H5PolicyLimits profile, H5WalkContext 
     var file_size = h5policy_ceiling(ios);
     h5policy_dense_handled = 0;
 
+    /* First validate the heap header and derive ID widths.  Filtered heaps are
+       outside the covered subset, because resolving their object bytes would
+       require filter semantics rather than pure metadata mapping.  */
     if (!h5policy_checked_addr_range(fheap_addr, 10UL, file_size,
                                      "fractal heap header outside file", loc, object))
         return ctx;
@@ -261,6 +283,9 @@ fun h5policy_walk_dense_attrs = (int ios, H5PolicyLimits profile, H5WalkContext 
     if (h5policy_msg_addr_is_undef(root_raw) || start_size == 0UL || table_width == 0UL)
         return ctx;
 
+    /* Then validate the name-indexed v2 B-tree root.  Attribute creation-order
+       indexes are intentionally ignored here; the name index is enough to
+       enumerate every dense attribute payload.  */
     var bt_hdr = 22UL + o + el;
     if (!h5policy_checked_addr_range(btree_addr, bt_hdr, file_size,
                                      "dense attribute v2 B-tree header outside file", loc, object))
@@ -291,6 +316,9 @@ fun h5policy_walk_dense_attrs = (int ios, H5PolicyLimits profile, H5WalkContext 
     return ctx;
 }
 
+/* Attribute-info messages point at dense attribute storage.  Missing heap/tree
+   addresses are simply absent dense storage; defined but unsupported storage is
+   reported as a coverage gap after h5policy_walk_dense_attrs declines it.  */
 fun h5policy_validate_ainfo_payload = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
                                        offset<uint<64>,B> payload_off,
                                        uint<64> msg_size, string object) H5WalkContext:

@@ -18,12 +18,36 @@
 
 load "h5_policy.pk";
 
+/* h5patch is deliberately smaller than a general HDF5 editor.  It does not
+   infer missing user data, reorder objects, or invent new metadata trees.
+   Instead, each catalog entry below proposes a byte-for-byte repair whose
+   precondition can be recorded in JSON and checked again by the shell driver.
+
+   The same planning routines run in two modes:
+
+     apply == 0  - emit a what-if action list and leave the file untouched.
+     apply != 0  - record the same actions, then perform the byte writes.
+
+   Keeping plan and apply in one path makes the reviewed plan match the write
+   logic as closely as GNU poke allows.  */
+
+/* Inputs supplied by h5patch/tools/h5patch before calling h5patch_run_plan or
+   h5patch_run_apply.  h5patch_aggressive is reserved for future catalog items
+   that may scan beyond metadata already identified by h5policy.  */
 var h5patch_file_name = "";
 var h5patch_aggressive = 0;
 
+/* Superblock discovery state shared by the repair planners and the JSON
+   envelope.  The offset is a byte offset, using poke's explicit unit type so
+   accidental arithmetic in bits cannot slip in.  */
 var h5patch_super_found = 0;
 var h5patch_super_off = 0UL#B;
 
+/* The plan is held as parallel vectors because GNU poke records are less
+   convenient to append to and print as JSON.  Each index describes one action:
+   what kind of repair it is, which structure it targets, the exact write
+   offset and size, the old bytes required as a precondition, the new bytes,
+   and the user-facing reason/confidence fields.  */
 var h5patch_action_kinds = string[]();
 var h5patch_action_structures = string[]();
 var h5patch_action_target_offsets = uint<64>[]();
@@ -34,6 +58,8 @@ var h5patch_action_new_hex = string[]();
 var h5patch_action_reasons = string[]();
 var h5patch_action_confidences = string[]();
 
+/* Start each plan from a clean action table.  This matters when a poke session
+   calls plan/apply helpers more than once.  */
 fun h5patch_reset_actions = void:
 {
     h5patch_action_kinds = string[]();
@@ -47,6 +73,9 @@ fun h5patch_reset_actions = void:
     h5patch_action_confidences = string[]();
 }
 
+/* JSON plans represent byte preconditions and writes as hex strings.  The
+   helpers below keep the encoding local and lowercase, matching h5policy's
+   JSON style while avoiding any dependence on printf byte-array formatting.  */
 fun h5patch_byte_hex = (byte b) string:
 {
     return h5policy_hex_nibble(((b as uint<8>) .>> 4) & 0xfUB)
@@ -67,6 +96,10 @@ fun h5patch_bytes_hex = (byte[] raw) string:
     return out;
 }
 
+/* HDF5 metadata stores most scalar fields in file little-endian order.  These
+   helpers construct the exact replacement byte vectors used in plan JSON and
+   in apply mode, so the displayed plan and the write path cannot disagree on
+   endian conversion.  */
 fun h5patch_u32_le_bytes = (uint<32> value) byte[]:
 {
     return [ (value & 0xffU) as byte,
@@ -95,6 +128,10 @@ fun h5patch_u64_le_bytes = (uint<64> value, uint<64> width) byte[]:
     return out;
 }
 
+/* Append a normalized action unless it would be a no-op.  target_off names the
+   owning structure for humans, while write_off is the exact byte range to
+   patch.  old_bytes are preserved as apply preconditions by the shell wrapper,
+   and also make plan diffs auditable.  */
 fun h5patch_add_action = (string kind, string structure, uint<64> target_off,
                           offset<uint<64>,B> write_off, byte[] old_bytes,
                           byte[] new_bytes, string reason,
@@ -114,6 +151,14 @@ fun h5patch_add_action = (string kind, string structure, uint<64> target_off,
     h5patch_action_confidences += [confidence];
 }
 
+/* A missing signature at byte 0 can still leave enough superblock body fields
+   to identify the file.  This predicate only checks fixed, low-risk fields
+   that differ across random data: version bytes, reserved bytes, and supported
+   offset/length widths.
+
+   Returning true here does not repair anything by itself.  It only permits a
+   later signature action if the candidate is at the canonical byte-0 location.
+   Alternate userblock offsets still require the real signature.  */
 fun h5patch_plausible_superblock_at = (int ios, offset<uint<64>,B> off) int:
 {
     if ((off/#B + 16UL) > iosize(ios)/#B)
@@ -146,6 +191,11 @@ fun h5patch_plausible_superblock_at = (int ios, offset<uint<64>,B> off) int:
     return 0;
 }
 
+/* Locate the HDF5 superblock using the same legal positions h5policy uses:
+   byte 0 first, then userblock offsets at 512, 1024, 2048, and so on.  The
+   fallback plausibility check is intentionally limited to byte 0 because
+   restoring a missing signature inside an arbitrary userblock would be too
+   speculative.  */
 fun h5patch_locate_superblock = (int ios) void:
 {
     h5patch_super_found = 0;
@@ -178,6 +228,13 @@ fun h5patch_locate_superblock = (int ios) void:
         }
 }
 
+/* h5policy is the oracle for reachable metadata.  h5patch runs it in forensic,
+   non-strict, continue-after-corruption mode so that one damaged structure does
+   not prevent later, independent repair candidates from being discovered.
+
+   Findings collected here are not blindly applied.  Later catalog functions
+   still re-read the target bytes, validate local structure invariants, and
+   compute replacement values from the current file image.  */
 fun h5patch_collect_policy_findings = (int ios) void:
 {
     h5policy_reset_findings;
@@ -218,6 +275,9 @@ fun h5patch_collect_policy_findings = (int ios) void:
         }
 }
 
+/* Some file-wide scans can find plausible structures that h5policy did not
+   reach.  When a matching h5policy checksum finding exists at the same offset,
+   the repair can be reported with higher confidence.  */
 fun h5patch_bad_checksum_finding_at = (uint<64> off) int:
 {
     var i = 0UL;
@@ -233,6 +293,9 @@ fun h5patch_bad_checksum_finding_at = (uint<64> off) int:
     return 0;
 }
 
+/* Restore the leading eight-byte HDF5 signature only when the superblock body
+   at byte 0 is otherwise plausible.  This catches common "first bytes zeroed"
+   damage without blessing arbitrary data as an HDF5 file.  */
 fun h5patch_plan_signature = (int ios, int apply) void:
 {
     if (h5patch_super_found && h5patch_super_off == 0UL#B
@@ -249,6 +312,13 @@ fun h5patch_plan_signature = (int ios, int apply) void:
         }
 }
 
+/* Version 2 and 3 superblocks include one byte of file consistency flags and a
+   Jenkins lookup3 checksum over the superblock body.  Interrupted writers can
+   leave stale flags or an old checksum after nearby bytes are corrected.
+
+   If planning only, the checksum is computed over the body as it would look
+   after any planned flag clear.  In apply mode, the flag write happens first,
+   so reading the body from the file already sees the same bytes.  */
 fun h5patch_plan_superblock_repairs = (int ios, int apply) void:
 {
     if (!h5patch_super_found || !h5policy_signature_at(ios, h5patch_super_off))
@@ -299,6 +369,10 @@ fun h5patch_plan_superblock_repairs = (int ios, int apply) void:
         }
 }
 
+/* Return the checksum field offset for a version-2 object header, or 0 when
+   the header cannot be mapped safely.  The layout is self-describing: optional
+   access/change time fields and creation-order fields are controlled by flag
+   bits, then the chunk-0 size field has a width encoded in the low flag bits.  */
 fun h5patch_v2_ohdr_checksum_off = (int ios, offset<uint<64>,B> off) offset<uint<64>,B>:
 {
     if ((off/#B + 6UL) > iosize(ios)/#B)
@@ -328,6 +402,9 @@ fun h5patch_v2_ohdr_checksum_off = (int ios, offset<uint<64>,B> off) offset<uint
     return checksum_off;
 }
 
+/* Reseal exactly one v2 object header.  The caller supplies confidence because
+   a h5policy-reported bad checksum is stronger evidence than a future
+   aggressive scan would be.  */
 fun h5patch_plan_one_object_header = (int ios, uint<64> off, int apply,
                                       string confidence) void:
 {
@@ -351,6 +428,10 @@ fun h5patch_plan_one_object_header = (int ios, uint<64> off, int apply,
         }
 }
 
+/* Conservative object-header checksum repair is driven by h5policy findings.
+   That keeps the catalog focused on metadata already reached from the
+   superblock/root graph instead of scanning for every accidental OHDR-looking
+   byte pattern in raw data.  */
 fun h5patch_plan_object_header_checksums = (int ios, int apply) void:
 {
     var i = 0UL;
@@ -367,6 +448,9 @@ fun h5patch_plan_object_header_checksums = (int ios, int apply) void:
        reachable-object repair path has more corpus mileage.  */
 }
 
+/* Collect only the offsets relevant to v1 object-header recounting.  Keeping
+   this as a small helper makes the repair loop below about recount mechanics,
+   not finding-table plumbing.  */
 fun h5patch_message_count_finding_offsets = uint<64>[]:
 {
     var offsets = uint<64>[]();
@@ -382,6 +466,13 @@ fun h5patch_message_count_finding_offsets = uint<64>[]:
     return offsets;
 }
 
+/* A v1 object header stores a declared message count near the front of the
+   header.  When h5policy can still walk the messages and records that the
+   declared count is wrong, h5patch asks h5policy's raw validator to recount the
+   messages in non-strict forensic mode and patches only the two count bytes.
+
+   The bounds below keep the write in the v1 field width, require at least one
+   message, and avoid turning an unmappable or ambiguous header into a repair.  */
 fun h5patch_plan_v1_object_header_message_counts = (int ios, int apply) void:
 {
     var offsets = h5patch_message_count_finding_offsets;
@@ -397,6 +488,8 @@ fun h5patch_plan_v1_object_header_message_counts = (int ios, int apply) void:
                     var declared_bytes = byte[2] @ ios : root_off + 2#B;
                     var declared = bytes_to_u64_le(declared_bytes);
 
+                    /* The recount uses a fresh traversal context so earlier
+                       findings do not affect the per-header count.  */
                     h5policy_reset_traversal_state;
                     h5policy_nonstrict = 1;
                     h5policy_continue = 1;
@@ -436,6 +529,9 @@ fun h5patch_plan_v1_object_header_message_counts = (int ios, int apply) void:
         }
 }
 
+/* A deliberately small object-header recognizer used by legacy group repairs.
+   Version 2 headers have an OHDR signature; version 1 headers begin with the
+   version byte.  Deeper validation is left to h5policy.  */
 fun h5patch_object_header_signature_at = (int ios, uint<64> addr) int:
 {
     if (addr + 4UL > iosize(ios)/#B)
@@ -447,6 +543,10 @@ fun h5patch_object_header_signature_at = (int ios, uint<64> addr) int:
     return 0;
 }
 
+/* Symbol table nodes belong to old-style HDF5 groups.  Their entry count can
+   be corrupted while the entry records themselves remain present.  A candidate
+   entry is accepted only if it is in bounds, has a supported cache type, and
+   points to a plausible object header.  */
 fun h5patch_snod_entry_plausible = (int ios, uint<64> eoff) int:
 {
     var o = global_sizeof_offsets as uint<64>;
@@ -472,6 +572,9 @@ fun h5patch_snod_entry_plausible = (int ios, uint<64> eoff) int:
     return h5patch_object_header_signature_at(ios, bytes_to_u64_le(ohdr_raw));
 }
 
+/* Count only the contiguous live-looking prefix of a SNOD.  Stopping at the
+   first implausible entry avoids resurrecting stale entries that may still be
+   present in trailing node capacity after deletes or failed rewrites.  */
 fun h5patch_count_contiguous_snod_entries = (int ios, uint<64> snod_addr,
                                              uint<64> capacity) uint<64>:
 {
@@ -490,6 +593,10 @@ fun h5patch_count_contiguous_snod_entries = (int ios, uint<64> snod_addr,
     return count;
 }
 
+/* Repair one symbol-table node count.  The capacity comes from the superblock
+   leaf-node K value, and every fixed field is checked before reading entries.
+   A declared count beyond capacity is high-confidence corruption; otherwise a
+   mismatch is still useful but reported as medium confidence.  */
 fun h5patch_plan_one_snod_count = (int ios, uint<64> snod_addr, int apply) void:
 {
     var o = global_sizeof_offsets as uint<64>;
@@ -524,6 +631,9 @@ fun h5patch_plan_one_snod_count = (int ios, uint<64> snod_addr, int apply) void:
         }
 }
 
+/* SNODs are small and have a distinctive signature, so the current catalog
+   scans the whole file for them.  Each candidate is still validated by
+   h5patch_plan_one_snod_count before an action is emitted.  */
 fun h5patch_plan_snod_counts = (int ios, int apply) void:
 {
     var file_size = iosize(ios)/#B;
@@ -537,6 +647,13 @@ fun h5patch_plan_snod_counts = (int ios, int apply) void:
         }
 }
 
+/* Depth-0 v2 B-tree headers duplicate the root leaf's record count in a total
+   record count field.  If the root is a leaf and the header otherwise maps
+   cleanly, the root count is the most local source of truth.
+
+   This repair intentionally ignores deeper trees.  Internal-node accounting
+   needs traversal over multiple nodes and would deserve a separate catalog item
+   with stronger consistency checks.  */
 fun h5patch_plan_one_depth0_bthd_count = (int ios, uint<64> hdr_addr,
                                           int apply) void:
 {
@@ -563,6 +680,8 @@ fun h5patch_plan_one_depth0_bthd_count = (int ios, uint<64> hdr_addr,
     var total_bytes = byte[el] @ ios : total_off#B;
     var total = bytes_to_u64_le(total_bytes);
 
+    /* These guards establish that the header and root leaf agree on version,
+       type, sizes, and bounds before any count is trusted.  */
     if (record_type < 1UB || record_type > 11UB || depth != 0UL
         || record_size == 0UL || node_size < 10UL
         || h5policy_msg_addr_is_undef(root_raw)
@@ -589,6 +708,9 @@ fun h5patch_plan_one_depth0_bthd_count = (int ios, uint<64> hdr_addr,
                 byte[el] @ ios : total_off#B = new_total;
         }
 
+    /* In plan mode, compute the checksum against the hypothetical body that
+       includes the planned total-count rewrite.  In apply mode the rewrite has
+       already happened, so the file body can be hashed directly.  */
     var body = byte[hdr_size - 4UL] @ ios : hdr_addr#B;
     if (!apply && total != num_root)
         {
@@ -614,6 +736,9 @@ fun h5patch_plan_one_depth0_bthd_count = (int ios, uint<64> hdr_addr,
         }
 }
 
+/* Full-file BTHD scanning is limited to depth-0 repairs and each hit is
+   revalidated before use.  This recovers simple stale-total cases even when
+   h5policy stopped earlier in the graph.  */
 fun h5patch_plan_depth0_bthd_counts = (int ios, int apply) void:
 {
     var file_size = iosize(ios)/#B;
@@ -627,6 +752,9 @@ fun h5patch_plan_depth0_bthd_counts = (int ios, int apply) void:
         }
 }
 
+/* The catalog pipeline is ordered from global structure to localized repairs.
+   Some later checksum repairs intentionally see earlier planned writes through
+   their apply flag handling, so the order is part of the behavior.  */
 fun h5patch_collect_actions = (int ios, int apply) void:
 {
     h5patch_reset_actions;
@@ -641,6 +769,9 @@ fun h5patch_collect_actions = (int ios, int apply) void:
     h5patch_plan_depth0_bthd_counts(ios, apply);
 }
 
+/* Emit one action in the stable plan schema.  Preconditions and writes share
+   the same old-byte range so external applicators can refuse to patch if the
+   reviewed input no longer matches.  */
 fun h5patch_print_action = (uint<64> i) void:
 {
     printf("    {\n");
@@ -677,6 +808,9 @@ fun h5patch_print_action = (uint<64> i) void:
     printf("    }");
 }
 
+/* Print the canonical JSON envelope consumed by the shell wrapper.  h5patch
+   keeps JSON generation here instead of in shell so offsets, byte strings, and
+   policy state come from the same poke process that inspected the file.  */
 fun h5patch_print_plan_json = (int ios) void:
 {
     printf("{\n");
@@ -721,6 +855,9 @@ fun h5patch_print_plan_json = (int ios) void:
     printf("}\n");
 }
 
+/* Entry point for `h5patch plan`.  It opens the file read-only, emits the full
+   plan JSON, and prints a private sentinel line so the shell wrapper can
+   separate structured output from poke diagnostics.  */
 fun h5patch_run_plan = void:
 {
     var ios = open(h5patch_file_name, IOS_M_RDONLY);
@@ -730,6 +867,9 @@ fun h5patch_run_plan = void:
     printf("__H5PATCH_EXIT_CODE=0\n");
 }
 
+/* Entry point for `h5patch apply`.  The shell wrapper has already regenerated
+   and compared the approved plan before this point.  The poke side reruns the
+   same catalog in apply mode so each emitted action corresponds to a write.  */
 fun h5patch_run_apply = void:
 {
     var ios = open(h5patch_file_name, IOS_M_RDWR);

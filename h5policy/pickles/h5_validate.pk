@@ -16,10 +16,19 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* h5_validate.pk connects raw HDF5 structures to the policy walk.  It locates
+   the legal superblock root, establishes the file address ceiling, validates
+   object-header containers, and hands message chunks to the dispatcher.  */
+
+/* Superblock discovery state is global because the JSON report and h5patch both
+   need to know whether a legal superblock offset was found.  */
 var H5POLICY_SIGNATURE = [0x89UB, 'H', 'D', 'F', '\r', '\n', 0x1aUB, '\n'];
 var h5policy_super_found = 0;
 var h5policy_super_off = 0UL#B;
 
+/* Generic all-ones sentinel test for optional superblock addresses.  Message
+   code has a width-aware twin in h5_walk.pk; this helper is used before the
+   reachable metadata walk has fully started.  */
 fun h5policy_addr_is_undef = (byte[] raw) int:
 {
     var n = 0UL;
@@ -33,11 +42,15 @@ fun h5policy_addr_is_undef = (byte[] raw) int:
     return 1;
 }
 
+/* Restrict offset and length sizes to widths the shared pickle definitions can
+   safely interpret throughout the policy code.  */
 fun h5policy_width_supported = (uint<8> width) int:
 {
     return width == 2UB || width == 4UB || width == 8UB;
 }
 
+/* Signature probes are strict byte reads.  If the eight-byte magic is not fully
+   inside the file image, that candidate offset is not a superblock.  */
 fun h5policy_signature_at = (int ios, offset<uint<64>,B> off) int:
 {
     if ((off/#B + 8UL) > iosize(ios)/#B)
@@ -45,6 +58,9 @@ fun h5policy_signature_at = (int ios, offset<uint<64>,B> off) int:
     return (byte[8] @ ios : off) == H5POLICY_SIGNATURE;
 }
 
+/* Legal superblock offsets are byte 0 or userblock offsets at powers of two
+   starting at 512.  h5policy does not scan arbitrary offsets because false
+   positives would change the trusted root of the metadata graph.  */
 fun h5policy_locate_superblock = (int ios) void:
 {
     h5policy_super_found = 0;
@@ -71,6 +87,9 @@ fun h5policy_locate_superblock = (int ios) void:
         }
 }
 
+/* Superblock and byte mapping wrappers mirror the message mapping wrappers:
+   strict profiles reject malformed mappings immediately, while forensic mode
+   maps non-strictly so nearby fields can still be classified.  */
 fun h5policy_map_super = (int ios, H5PolicyLimits profile,
                           offset<uint<64>,B> off) superblock:
 {
@@ -95,6 +114,9 @@ fun h5policy_read_u64_le_at = (int ios, H5PolicyLimits profile,
     return bytes_to_u64_le(h5policy_map_bytes(ios, profile, off, size));
 }
 
+/* Address checks use the current ceiling, not always the physical file size.
+   h5policy_validate_superblock sets h5policy_eof from the declared EOA, and
+   later walks reject metadata beyond that boundary.  */
 fun h5policy_addr_in_file = (uint<64> addr, uint<64> file_size,
                              string code, off64 loc,
                              string object, string message) int:
@@ -108,6 +130,9 @@ fun h5policy_addr_in_file = (uint<64> addr, uint<64> file_size,
     return 1;
 }
 
+/* Optional addresses are valid when undefined or in range.  Defined but
+   out-of-file values are findings even when the referenced structure is not
+   otherwise decoded by this phase.  */
 fun h5policy_validate_optional_addr = (byte[] raw, uint<64> file_size,
                                        off64 loc, string object,
                                        string message) void:
@@ -121,6 +146,8 @@ fun h5policy_validate_optional_addr = (byte[] raw, uint<64> file_size,
         }
 }
 
+/* v0/v1 superblocks have no superblock-extension object header.  Return the
+   undefined-address sentinel so the reachable walk can treat "none" uniformly. */
 fun h5policy_super_ext_addr = (superblock sb) uint<64>:
 {
     if (sb.super_vers < 2UB)
@@ -128,6 +155,8 @@ fun h5policy_super_ext_addr = (superblock sb) uint<64>:
     return bytes_to_u64_le(sb.super.v2_v3.ext_addr_raw);
 }
 
+/* Root object headers live in different superblock fields across versions, but
+   downstream traversal wants one byte offset.  */
 fun h5policy_root_addr = (superblock sb) offset<uint<64>,B>:
 {
     if (sb.super_vers < 2UB)
@@ -135,6 +164,9 @@ fun h5policy_root_addr = (superblock sb) offset<uint<64>,B>:
     return bytes_to_off(sb.super.v2_v3.root_obj_addr_raw);
 }
 
+/* Validate the fields that define the rest of the address space: offset/length
+   widths, K values for legacy indexes, declared EOA, root and optional metadata
+   addresses, and v2/v3 checksum integrity.  */
 fun h5policy_validate_superblock = (int ios, superblock sb,
                                     H5PolicyLimits profile,
                                     H5WalkContext ctx,
@@ -245,6 +277,9 @@ fun h5policy_validate_superblock = (int ios, superblock sb,
     return ctx;
 }
 
+/* Validate one object header at a known byte offset.  The per-object dataset
+   scratch fields are cleared before parsing so messages from a previous object
+   do not affect cross-message checks for this one.  */
 fun h5policy_validate_ohdr_raw = (int ios,
                                   H5PolicyLimits profile,
                                   H5WalkContext ctx,
@@ -280,6 +315,8 @@ fun h5policy_validate_ohdr_raw = (int ios,
 
     ctx = h5policy_count_object(ctx, profile, root_off, object);
 
+    /* Version-2 object headers are self-describing: optional creation/access
+       metadata, chunk-0 size width, message data, and a trailing checksum.  */
     if (sig == V2_SIG)
         {
             var version = h5policy_read_u64_le_at(ios, profile,
@@ -352,6 +389,9 @@ fun h5policy_validate_ohdr_raw = (int ios,
             return ctx;
         }
 
+    /* Version-1 headers have a fixed 16-byte prefix and no checksum.  Their
+       declared message count is cross-checked against the actual chunk walk;
+       h5patch uses the same counter to plan count repairs.  */
     var version1 = h5policy_read_u64_le_at(ios, profile, root_off, 1UL) as uint<8>;
     if (version1 != 1UB)
         {
@@ -398,6 +438,10 @@ fun h5policy_validate_ohdr_raw = (int ios,
     return ctx;
 }
 
+/* Walk every reachable object header from the root graph.  A bounded BFS keeps
+   link traversal deterministic, allows duplicate hard links to be deduplicated,
+   and gives continue-after-corruption mode a single place to decide whether to
+   keep draining queued objects.  */
 fun h5policy_walk_reachable_metadata = (int ios,
                                         H5PolicyLimits profile,
                                         H5WalkContext ctx,
@@ -420,6 +464,10 @@ fun h5policy_walk_reachable_metadata = (int ios,
         h5policy_enqueue_ohdr(profile, ext_addr, 0UL, "/<superblock-extension>",
                               ext_addr#B, "/<superblock-extension>");
 
+    /* pending_index advances monotonically through the queue.  New hard links
+       discovered while validating an object are appended and picked up later,
+       which gives breadth-first traversal without mutating already visited
+       entries.  */
     while (h5policy_pending_index < h5policy_pending_ohdrs'length)
         {
             var addr = h5policy_pending_ohdrs[h5policy_pending_index];

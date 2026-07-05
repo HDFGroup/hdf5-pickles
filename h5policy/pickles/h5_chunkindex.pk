@@ -16,6 +16,10 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* Chunk indexes can be large and deeply nested, so this file validates enough
+   structure to count chunks, enforce resource limits, and reject out-of-file
+   chunk addresses without reading or decompressing chunk payloads.  */
+
 /* Walk a v1 (type-1, raw-data-chunk) B-tree chunk index: count chunks against
    max_chunk_count, verify each chunk's address+size lies in the file, and bound
    recursion by max_btree_depth and a visited set.  `ndims` is the chunk
@@ -29,6 +33,9 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
     var o = global_sizeof_offsets as uint<64>;
     var file_size = h5policy_ceiling(ios);
 
+    /* The recursive v1 B-tree walker is the only chunk-index path that follows
+       arbitrary tree depth today.  The profile depth limit and visited set
+       bound both normal nesting and corrupt cycles.  */
     if (btree_depth > profile.max_btree_depth)
         {
             h5policy_emit_error("H5_CORRUPT_BTREE_DEPTH_EXCEEDED", "corrupt",
@@ -37,6 +44,9 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
             return ctx;
         }
 
+    /* A repeated node address means either a cycle or shared child in a place
+       where the on-disk B-tree should be a tree.  Stop at the first repeat to
+       keep traversal bounded and avoid double-counting chunks.  */
     if (!h5policy_mark_visited_btree(btree_addr))
         return ctx;
 
@@ -65,6 +75,8 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
 
     var node_level = h5policy_msg_u64_at(ios, profile, btree_addr#B + 5#B, 1UL);
     var entries_used = h5policy_msg_u64_at(ios, profile, btree_addr#B + 6#B, 2UL);
+    /* Type-1 v1 B-tree keys start with chunk byte size and filter mask, then
+       one 64-bit chunk offset per chunk dimension.  */
     var offs_bytes = h5policy_checked_mul_u64(ndims, 8UL, 0xffffffffffffffffUL,
                                               "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
                                               btree_addr#B, object,
@@ -117,6 +129,9 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
 
             if (node_level > 0UL)
                 {
+                    /* Internal nodes point at more v1 B-tree nodes.  Undefined
+                       children are skipped; defined children recurse with the
+                       same layout dimensionality and an incremented depth.  */
                     if (!h5policy_msg_addr_is_undef(child_raw))
                         ctx = h5policy_walk_chunk_btree(ios, profile, ctx,
                                                         child_addr, ndims,
@@ -150,6 +165,9 @@ var H5POLICY_BTHD_SIG = [0x42UB, 0x54UB, 0x48UB, 0x44UB];   /* "BTHD" */
 var H5POLICY_BTLF_SIG = [0x42UB, 0x54UB, 0x4cUB, 0x46UB];   /* "BTLF" */
 var H5POLICY_BTIN_SIG = [0x42UB, 0x54UB, 0x49UB, 0x4eUB];   /* "BTIN" */
 
+/* v2 B-tree chunk indexes here cover record types used by chunked dataset
+   storage.  The header's total record count is trusted only after signature,
+   size, checksum, and record-type checks.  */
 /* Validate a version-2 B-tree chunk index (v4 layout index type 5).  The
    checksummed header gives the total record count (= chunk count) directly, so
    we enforce it against max_chunk_count without walking, validate the header
@@ -195,6 +213,9 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
     var num_root = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (16UL + o)#B, 2UL);
     var total_nrec = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (18UL + o)#B, el);
 
+    /* Chunk-index v2 B-trees use specific record types for filtered and
+       unfiltered chunk records.  Other record types may be valid H5B2 users,
+       but they are not dataset chunk indexes.  */
     if (record_type != 10UL && record_type != 11UL)
         {
             h5policy_emit_error("H5_CORRUPT_UNKNOWN_CHUNK_INDEX_TYPE", "corrupt",
@@ -215,6 +236,8 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
 
     if (h5policy_msg_addr_is_undef(root_raw))
         return ctx;
+    /* A defined root address must at least point inside the file before the
+       depth-specific leaf/internal signature check can be trusted.  */
     if (root_addr >= file_size)
         {
             h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
@@ -225,6 +248,8 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
 
     if (depth == 0UL)
         {
+            /* Depth zero means the root node is a leaf, so every record can be
+               inspected locally for an in-file chunk data address.  */
             var recs_bytes = h5policy_checked_mul_u64(num_root, record_size,
                                                       0xffffffffffffffffUL,
                                                       "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
@@ -269,6 +294,9 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
 var H5POLICY_FAHD_SIG = [0x46UB, 0x41UB, 0x48UB, 0x44UB];   /* "FAHD" */
 var H5POLICY_FADB_SIG = [0x46UB, 0x41UB, 0x44UB, 0x42UB];   /* "FADB" */
 
+/* Fixed arrays are simple when unpaged: one data block, one element per chunk.
+   Paged arrays add an initialization bitmap and per-page checksums, so only
+   initialized pages should be inspected for chunk addresses.  */
 /* Validate a fixed-array chunk index (v4 layout index type 3), used by chunked
    datasets with fixed dimensions.  The checksummed header gives the element
    count (= chunk count) and data-block address; the data block holds one
@@ -306,6 +334,8 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
     var dblk_raw = h5policy_msg_bytes(ios, profile, hdr_addr#B + (8UL + el)#B, o);
     var dblk_addr = bytes_to_u64_le(dblk_raw);
 
+    /* Fixed-array element count is the chunk count.  Count it from the header
+       before deciding whether individual chunk addresses are inline or paged. */
     ctx.chunk_index_count =
         h5policy_checked_add_u64(ctx.chunk_index_count, nelmts,
                                  profile.max_chunk_count,
@@ -326,6 +356,10 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
     var is_paged = page_bits > 0UL && page_bits < 48UL
                    && nelmts > (1UL <<. page_bits);
 
+    /* Extremely large page_bits values are treated as unpaged here because the
+       shift itself would no longer describe a sane in-file page geometry.  */
+    /* Unpaged arrays are a single contiguous data block after a fixed prefix;
+       every element's leading offset-sized field is the chunk address.  */
     if (!is_paged)
         {
             /* Elements stored inline in a single data block. */
@@ -399,6 +433,8 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
     var p = 0UL;
     while (p < npages)
         {
+            /* The page-init bitmap tells which pages have real elements.  Skip
+               uninitialized pages because their bytes are not chunk records.  */
             var page_start = dblk_addr + db_prefix + (p * full_page_bytes);
             var pn = (p == npages - 1UL) ? last_page_nelmts : page_nelmts;
             var bmap = h5policy_msg_u64_at(ios, profile,
@@ -427,6 +463,9 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
 var H5POLICY_EAHD_SIG = [0x45UB, 0x41UB, 0x48UB, 0x44UB];   /* "EAHD" */
 var H5POLICY_EAIB_SIG = [0x45UB, 0x41UB, 0x49UB, 0x42UB];   /* "EAIB" */
 
+/* Extensible arrays grow along an unlimited dimension.  The header provides the
+   total element count for resource accounting; the index block gives inline
+   addresses for the first segment of chunks, which h5policy bounds-checks.  */
 /* Validate an extensible-array chunk index (v4 layout index type 4), used by
    chunked datasets with one unlimited dimension.  The checksummed header gives
    the element count (= chunk count) and index-block address.  The index block
@@ -465,6 +504,8 @@ fun h5policy_walk_ext_array_chunks = (int ios, H5PolicyLimits profile, H5WalkCon
     var idx_raw = h5policy_msg_bytes(ios, profile, hdr_addr#B + (12UL + (6UL * el))#B, o);
     var idx_blk_addr = bytes_to_u64_le(idx_raw);
 
+    /* The extensible-array header's element count is the complete chunk count,
+       even when only the inline index-block entries are decoded below.  */
     ctx.chunk_index_count =
         h5policy_checked_add_u64(ctx.chunk_index_count, nelmts,
                                  profile.max_chunk_count,

@@ -16,6 +16,11 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* Old-style groups predate compact/dense link messages.  A symbol-table
+   message points to a local heap for names and a type-0 v1 B-tree whose leaves
+   are SNOD symbol-table nodes.  This file decodes that path enough to enqueue
+   hard-link targets into the same bounded object-header BFS as modern links. */
+
 /* Bounded, NUL-terminated link name from the local heap data segment. */
 fun h5policy_heap_name = (int ios, H5PolicyLimits profile,
                           uint<64> data_seg_addr, uint<64> name_off,
@@ -34,6 +39,9 @@ fun h5policy_heap_name = (int ios, H5PolicyLimits profile,
     return h5policy_string_from_payload(ios, profile, abs#B, cap);
 }
 
+/* Local heap free lists are metadata too.  A corrupt free-list cycle or block
+   outside the data segment can make libhdf5 reject the file, so the validator
+   checks the list even though h5policy only needs allocated names. */
 fun h5policy_validate_local_heap_free_list = (int ios,
                                               H5PolicyLimits profile,
                                               uint<64> data_seg_addr,
@@ -46,6 +54,9 @@ fun h5policy_validate_local_heap_free_list = (int ios,
     var node_size = 2UL * l;
     var seen = uint<64>[]();
 
+    /* The free-list terminator is 1, matching the legacy heap encoding.  Every
+       other value is an offset into the heap data segment and names a
+       next/size pair.  */
     while (free_block != 1UL)
         {
             if (h5policy_seen_u64(seen, free_block))
@@ -139,6 +150,9 @@ fun h5policy_local_heap_data_addr = (int ios, H5PolicyLimits profile,
     if (!seg_ok)
         return 0xffffffffffffffffUL;
 
+    /* The group walk uses the data segment for names, but validating the free
+       list here catches corrupted heap bookkeeping while the heap header is in
+       hand.  */
     h5policy_validate_local_heap_free_list(ios, profile, data_seg_addr,
                                            h5policy_heap_data_seg_size,
                                            free_block, loc, object);
@@ -156,6 +170,9 @@ fun h5policy_walk_snod = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
     if (!h5policy_mark_visited_btree(snod_addr))
         return ctx;
 
+    /* SNODs use a fixed capacity derived from the superblock leaf K value.  The
+       declared entry count may be smaller, but the address range must cover the
+       full node body because entries are fixed-position slots.  */
     if (!h5policy_checked_addr_range(snod_addr, 8UL, file_size,
                                      "symbol table node outside file",
                                      snod_addr#B, parent_path))
@@ -211,6 +228,9 @@ fun h5policy_walk_snod = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
     var i = 0UL;
     while (i < num)
         {
+            /* Each entry holds a name offset, object-header address, cache
+               metadata, and scratch fields.  h5policy follows only hard-link
+               entries; symbolic links do not point at object headers.  */
             var eoff = snod_addr + 8UL + (i * ent_size);
             var cache_type = h5policy_msg_u64_at(ios, profile,
                                                  eoff#B + (2UL * o)#B, 4UL);
@@ -283,6 +303,9 @@ fun h5policy_walk_group_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
     if (!h5policy_mark_visited_btree(btree_addr))
         return ctx;
 
+    /* Type-0 v1 B-tree capacity comes from the superblock internal K value.
+       Keys are heap offsets and children are either lower B-tree nodes or SNOD
+       leaves depending on node_level.  */
     var hdr = 8UL + (2UL * o);
     if (!h5policy_checked_addr_range(btree_addr, hdr, file_size,
                                      "group B-tree node outside file",
@@ -364,6 +387,9 @@ fun h5policy_walk_group_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
 
             if (!h5policy_msg_addr_is_undef(child_raw))
                 {
+                    /* Internal nodes recurse through the same key/child shape;
+                       leaf children are SNOD addresses.  Both paths share the
+                       visited-B-tree set so cycles are stopped consistently.  */
                     if (node_level > 0UL)
                         ctx = h5policy_walk_group_btree(ios, profile, ctx,
                                                         child_addr, data_seg_addr,
@@ -380,6 +406,9 @@ fun h5policy_walk_group_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
     return ctx;
 }
 
+/* Symbol-table messages are the object-header entry point for old-style
+   groups.  They contain exactly the v1 B-tree and local-heap addresses needed
+   to start the legacy group traversal.  */
 fun h5policy_validate_stab_payload = (int ios,
                                       H5PolicyLimits profile,
                                       H5WalkContext ctx,
@@ -394,17 +423,25 @@ fun h5policy_validate_stab_payload = (int ios,
                                    "symbol-table message is too small"))
         return ctx;
 
+    /* The message stores B-tree first, heap second.  The heap must be opened
+       first because B-tree keys and SNOD entry names are offsets into it.  */
     var btree_raw = h5policy_msg_bytes(ios, profile, payload_off, o);
     var heap_raw = h5policy_msg_bytes(ios, profile, payload_off + o#B, o);
     var btree_addr = bytes_to_u64_le(btree_raw);
     var heap_addr = bytes_to_u64_le(heap_raw);
 
+    /* Both addresses are required for an old-style group.  Undefined means the
+       group has no traversable symbol table here, so the validator leaves the
+       current context unchanged.  */
     if (h5policy_msg_addr_is_undef(btree_raw) || h5policy_msg_addr_is_undef(heap_raw))
         return ctx;
 
     var file_size = h5policy_ceiling(ios);
     var data_seg_addr = h5policy_local_heap_data_addr(ios, profile, heap_addr,
                                                       file_size, payload_off, object);
+    /* The heap supplies link names while the B-tree/SNOD path supplies object
+       addresses; passing the same parent path keeps discovered children labeled
+       consistently with modern hard-link traversal.  */
     return h5policy_walk_group_btree(ios, profile, ctx, btree_addr, data_seg_addr,
                                      object, h5policy_current_object_depth, 0UL);
 }

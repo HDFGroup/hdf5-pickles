@@ -16,6 +16,12 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* Datatype messages are recursive: compound, enum, variable-length, and array
+   types can embed other datatype messages.  The validator therefore returns the
+   number of bytes consumed and enforces both payload bounds and recursion depth
+   at every nested step.  */
+
+/* Older datatype encodings pad member and enum names to 8 bytes.  */
 fun h5policy_round_up_8 = (uint<64> n) uint<64>:
 {
     var r = n % 8UL;
@@ -56,6 +62,9 @@ fun h5policy_dtype_name_len = (int ios, H5PolicyLimits profile,
 fun h5policy_dtype_room = (uint<64> need, uint<64> avail, uint<64> used,
                            off64 loc, string object) int:
 {
+    /* All datatype property reads go through this relative-bounds check.  Using
+       avail/used rather than absolute file offsets keeps nested blobs confined
+       to the parent message that declared them.  */
     if (need > avail - used)
         {
             h5policy_emit_error("H5_CORRUPT_DATATYPE_MESSAGE_TOO_SMALL",
@@ -106,6 +115,9 @@ fun h5policy_dtype_leaf = (int ios, H5PolicyLimits profile,
 
             if (ctype == 1UL)
                 {
+                    /* Floating-point properties name sign, exponent, and
+                       mantissa bit ranges.  Each range has to fit inside the
+                       declared storage size, independent of host float support. */
                     var class_flags = flags .>> 8;
                     var sign = (class_flags .>> 8) & 0xffUL;
                     var epos = h5policy_msg_u64_at(ios, profile,
@@ -230,6 +242,9 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
             return h5policy_dtype_leaf(ios, profile, blob_off, object,
                                        ctype, elm_size, flags, props, avail, used);
 
+    /* Variable-length datatypes store exactly one inline base datatype.  The
+       heap/global-heap data that variable-length values may reference is raw
+       dataset payload, not metadata walked here.  */
     /* ---- class 9: Variable-Length (single inline base type) ---- */
     if (ctype == 9UL)
         {
@@ -243,6 +258,8 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
     /* ---- class 10: Array (rank + dims [+ v2 reserved/perm] + base type) ---- */
     if (ctype == 10UL)
         {
+            /* Arrays multiply their dimensions by the base datatype storage
+               size.  The declared element size must match that product.  */
             if (!h5policy_dtype_room(1UL, avail, used, blob_off, object))
                 return 0UL;
             var rank = h5policy_msg_u64_at(ios, profile, blob_off + used#B, 1UL);
@@ -289,6 +306,8 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
 
             if (version == 2UL)
                 {
+                    /* v2 array datatypes carry a permutation vector after dims;
+                       newer versions removed it.  */
                     if (!h5policy_dtype_room(dims, avail, used, blob_off, object))
                         return 0UL;
                     used = used + dims;          /* permutation indices */
@@ -316,6 +335,8 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
     /* ---- class 8: Enum (base type, then member names and values) ---- */
     if (ctype == 8UL)
         {
+            /* Enum payloads begin with the base datatype, then all member names,
+               then all member values in base-type storage order.  */
             var num = (flags .>> 8) & 0xffffUL;
 
             if (!h5policy_dtype_room(8UL, avail, used, blob_off, object))
@@ -335,6 +356,8 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
             var m = 0UL;
             while (m < num)
                 {
+                    /* Versions 1/2 align names to 8 bytes; versions 3/4 store
+                       unpadded NUL-terminated names.  */
                     var nlen = h5policy_dtype_name_len(ios, profile,
                                                        blob_off + used#B,
                                                        avail - used);
@@ -365,6 +388,9 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
     /* ---- class 6: Compound (per-member name, offset, and nested type) ---- */
     if (ctype == 6UL)
         {
+            /* Compound members are a sequence of name, byte offset, optional
+               legacy array metadata, and nested datatype.  Each child type must
+               fit within the parent element's declared storage size.  */
             var num = (flags .>> 8) & 0xffffUL;
             var m = 0UL;
 
@@ -388,6 +414,9 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
                     var off_w = version >= 3UL
                                 ? h5policy_v3_memb_off_size(elm_size)
                                 : 4UL;
+                    /* Modern compound datatypes shrink member-offset fields
+                       based on parent element size; older versions always used
+                       four bytes.  */
                     if (!h5policy_dtype_room(off_w, avail, used, blob_off, object))
                         return 0UL;
                     var member_off = h5policy_msg_u64_at(ios, profile,
@@ -454,6 +483,9 @@ fun h5policy_dtype_check = (int ios, H5PolicyLimits profile,
     return used;
 }
 
+/* Public message validator for datatypes.  It stores both raw datatype storage
+   size and logical size because revised references have compact on-disk storage
+   but count as 64-byte logical references in libhdf5-facing metrics.  */
 fun h5policy_validate_dtype_payload = (int ios,
                                        H5PolicyLimits profile,
                                        H5WalkContext ctx,

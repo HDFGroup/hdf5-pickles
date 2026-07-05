@@ -16,6 +16,13 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* h5policy reports two things at once: a stable top-level decision/exit code
+   and a bounded list of findings explaining how that decision was reached.
+   This file owns that state plus JSON escaping/printing for the CLI wrapper. */
+
+/* Exit codes are ordered by h5policy_class_rank, not numeric value.  The
+   numeric values are the process contract; ranks decide which class wins when
+   a file triggers multiple finding classes.  */
 var H5POLICY_EXIT_ACCEPT = 0;
 var H5POLICY_EXIT_WARN = 1;
 var H5POLICY_EXIT_CORRUPT = 2;
@@ -24,6 +31,8 @@ var H5POLICY_EXIT_RESOURCE = 4;
 var H5POLICY_EXIT_UNSUPPORTED = 5;
 var H5POLICY_EXIT_INTERNAL = 70;
 
+/* Parallel vectors keep reporting compatible with GNU poke's simple append and
+   print patterns.  Every index across these arrays is one finding.  */
 var h5policy_finding_severities = string[]();
 var h5policy_finding_codes = string[]();
 var h5policy_finding_classes = string[]();
@@ -81,6 +90,7 @@ var h5policy_feature_external_storage = 0UL;
 var h5policy_feature_vds = 0UL;
 var h5policy_feature_unknown_messages = 0UL;
 var h5policy_feature_dynamic_filters = uint<64>[]();
+
 /* Built-in filters that decode/expand data on read (deflate, szip, n-bit,
    scale-offset).  The file is structurally fine, but a consumer must run decode
    code over attacker-controlled bytes to read the data -- a surface this
@@ -99,6 +109,9 @@ fun h5policy_class_exit_code = (string klass) int:
     return H5POLICY_EXIT_ACCEPT;
 }
 
+/* Class rank is the semantic precedence for mixed findings.  Corruption and
+   internal errors outrank policy/resource decisions, while warnings never
+   override a rejection.  */
 fun h5policy_class_rank = (string klass) int:
 {
     /* Ranks must be distinct so the top-level decision is order-independent:
@@ -115,6 +128,8 @@ fun h5policy_class_rank = (string klass) int:
     return 0;
 }
 
+/* Map the final exit code to the stable JSON decision string.  Consumers should
+   key off this string or the process exit code rather than finding order.  */
 fun h5policy_decision = string:
 {
     if (h5policy_exit_code == H5POLICY_EXIT_WARN) return "accept_with_warnings";
@@ -126,6 +141,8 @@ fun h5policy_decision = string:
     return "accept";
 }
 
+/* Update the process result while still allowing every finding to be stored in
+   continue-after-corruption mode.  */
 fun h5policy_consider_exit = (string klass) void:
 {
     var rank = h5policy_class_rank(klass);
@@ -136,6 +153,9 @@ fun h5policy_consider_exit = (string klass) void:
         }
 }
 
+/* Small dedup helpers for feature and resource reporting.  Arrays are tiny in
+   normal reports; high-volume traversal is bounded elsewhere by the walk
+   budget and finding cap.  */
 fun h5policy_feature_seen_u64 = (uint<64>[] values, uint<64> value) int:
 {
     var i = 0UL;
@@ -164,6 +184,8 @@ fun h5policy_string_seen = (string[] values, string value) int:
     return 0;
 }
 
+/* Feature counters populate the JSON `features` object and also suppress
+   repeated decode-filter advisories for the same filter ID.  */
 fun h5policy_note_external_link = void:
 {
     h5policy_feature_external_links = h5policy_feature_external_links + 1UL;
@@ -200,6 +222,9 @@ fun h5policy_reset_features = void:
     h5policy_feature_decode_filters = uint<64>[]();
 }
 
+/* Reset all per-run report state.  The CLI can reuse a poke process in tests,
+   so stale findings or feature counters must not survive between h5policy_run
+   invocations.  */
 fun h5policy_reset_findings = void:
 {
     h5policy_finding_severities = string[]();
@@ -215,6 +240,9 @@ fun h5policy_reset_findings = void:
     h5policy_reset_features;
 }
 
+/* Store a finding unless the report cap or dedup rules suppress it.  The final
+   decision is updated before suppression so the exit code remains correct even
+   if many repeated resource findings are collapsed.  */
 fun h5policy_emit = (string severity, string code, string klass,
                      off64 loc, string object, string message) void:
 {
@@ -276,6 +304,8 @@ fun h5policy_emit_warning = (string code,
 
 var H5POLICY_HEX_DIGITS = "0123456789abcdef";
 
+/* JSON escaping is local so reports stay valid even when attacker-controlled
+   object names contain control bytes or quotes.  */
 fun h5policy_hex_nibble = (uint<8> n) string:
 {
     return (H5POLICY_HEX_DIGITS[(n & 0xfUB) as uint<64>]) as string;
@@ -336,6 +366,9 @@ fun h5policy_print_json_u64_array = (uint<64>[] values) void:
     printf("]");
 }
 
+/* Emit the canonical machine-readable report.  The `boundary` section is part
+   of the API: it states the operations h5policy did not perform while reaching
+   the decision, which matters for safe use with hostile files.  */
 fun h5policy_print_json_report = (string profile_name, string file_name,
                                   string mapping_mode,
                                   uint<64> metadata_seen,

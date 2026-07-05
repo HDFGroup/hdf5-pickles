@@ -16,6 +16,15 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* This file owns the mutable traversal state that threads through the split
+   validators.  h5policy is metadata-only: it follows object headers, messages,
+   group indexes, and chunk indexes far enough to classify risk, but it never
+   opens external files, runs filters, or reads raw dataset payloads.  */
+
+/* Accumulated facts about the reachable graph and the dataset currently being
+   interpreted.  Message validators update these fields opportunistically; the
+   cross-message checks at the bottom of the file compare dataspace, datatype,
+   layout, and fill-value facts once enough of them are known.  */
 type H5WalkContext = struct
 {
     uint<64> metadata_seen;
@@ -50,15 +59,26 @@ type H5WalkContext = struct
     uint<8> dataspace_has_unlimited_dim;
 };
 
+/* Visited sets are plain arrays because poke keeps this script portable and
+   simple.  The walk budget charges linear membership tests so hostile graphs
+   with many duplicate references still terminate under profile control.  */
 var h5policy_visited_ohdrs = uint<64>[]();
 var h5policy_visited_conts = uint<64>[]();
 var h5policy_visited_btrees = uint<64>[]();
 
+/* Object headers are walked breadth-first.  Link messages enqueue child object
+   headers here; h5policy_walk_reachable_metadata drains the queue while
+   enforcing max link depth and continue-after-corruption policy.  */
 var h5policy_pending_ohdrs = uint<64>[]();
 var h5policy_pending_depths = uint<64>[]();
 var h5policy_pending_paths = string[]();
 var h5policy_pending_index = 0UL;
 
+/* Current-object scratch state.  Message validators use these values for
+   contextual checks that are cheaper to do while a single object header is
+   being parsed, such as v1 message-count repair support and link-depth labels.
+   The superblock K values are defaults until h5policy_validate_superblock reads
+   the real values.  */
 var h5policy_current_object_depth = 0UL;
 var h5policy_current_object_msg_count = 0UL;
 var h5policy_dense_handled = 0;
@@ -68,6 +88,9 @@ var h5policy_super_indexed_internal_k = 32UL;
 var H5POLICY_H5S_MAX_RANK = 32UL;
 var H5POLICY_LAYOUT_MAX_DIMS = 33UL;  /* H5O_LAYOUT_NDIMS = H5S_MAX_RANK + 1 */
 
+/* Reset per-walk state, including the wall-clock budget counters.  This is
+   called by the top-level metadata walk and also by h5patch when it asks
+   h5policy to recount a single object header.  */
 fun h5policy_reset_traversal_state = void:
 {
     h5policy_visited_ohdrs = uint<64>[]();
@@ -83,6 +106,9 @@ fun h5policy_reset_traversal_state = void:
     h5policy_walk_next_check = 0UL;
 }
 
+/* Linear membership helper used by all visited sets.  The tick cost includes
+   the array length because this is O(n), and the walk budget should reflect
+   that cost on adversarial files with many metadata references.  */
 fun h5policy_seen_u64 = (uint<64>[] values, uint<64> value) int:
 {
     h5policy_walk_tick(values'length + 1UL);   /* this membership test costs O(len) */
@@ -98,6 +124,9 @@ fun h5policy_seen_u64 = (uint<64>[] values, uint<64> value) int:
     return 0;
 }
 
+/* Object headers are only marked when dequeued, not when enqueued.  That keeps
+   duplicate pending references cheap to reject while preserving the BFS queue's
+   single source of truth.  */
 fun h5policy_mark_visited_ohdr = (uint<64> addr) int:
 {
     h5policy_visited_ohdrs += [addr];
@@ -129,6 +158,9 @@ fun h5policy_join_path = (string parent, string name) string:
     return parent + "/" + name;
 }
 
+/* Enqueue one object header discovered through a hard link or old-style group
+   record.  Depth is checked before enqueueing so a single deep branch cannot
+   grow the pending list past the selected profile's link traversal limit.  */
 fun h5policy_enqueue_ohdr = (H5PolicyLimits profile,
                              uint<64> addr,
                              uint<64> depth,
@@ -153,6 +185,9 @@ fun h5policy_enqueue_ohdr = (H5PolicyLimits profile,
     h5policy_pending_paths += [path];
 }
 
+/* Build an empty context with all per-dataset flags cleared.  A fresh context
+   is also used for attribute payloads so attribute datatype/dataspace messages
+   do not pollute the parent dataset's cross-message checks.  */
 fun h5policy_new_walk_context = H5WalkContext:
 {
     return H5WalkContext
@@ -190,6 +225,8 @@ fun h5policy_new_walk_context = H5WalkContext:
     };
 }
 
+/* Resource counters are updated through checked arithmetic so over-budget and
+   overflow cases become explicit findings instead of wrapping silently.  */
 fun h5policy_count_object = (H5WalkContext ctx,
                              H5PolicyLimits profile,
                              off64 loc,
@@ -221,6 +258,9 @@ fun h5policy_account_metadata = (H5WalkContext ctx,
     return ctx;
 }
 
+/* These mapping wrappers centralize strict/non-strict behavior.  Strict mode
+   uses ordinary mappings; forensic mode uses @! so corrupt structures can be
+   inspected long enough to collect nearby findings.  */
 fun h5policy_map_msg_prefix = (int ios, H5PolicyLimits profile,
                                offset<uint<64>,B> off) msg_prefix:
 {
@@ -254,6 +294,9 @@ fun h5policy_msg_u64_at = (int ios, H5PolicyLimits profile,
     return bytes_to_u64_le(h5policy_msg_bytes(ios, profile, off, size));
 }
 
+/* All message validators use payload-relative bounds checks before reading
+   variable-length fields.  That keeps malformed size fields from turning into
+   poke map exceptions that would otherwise abort the surrounding analysis.  */
 fun h5policy_payload_range_ok = (uint<64> msg_size,
                                  uint<64> rel,
                                  uint<64> size,
@@ -271,6 +314,9 @@ fun h5policy_payload_range_ok = (uint<64> msg_size,
     return 1;
 }
 
+/* HDF5 undefined addresses are all-ones at the file's configured offset width.
+   Many optional metadata references use this sentinel, so callers pass the raw
+   bytes rather than a widened integer to preserve width-specific semantics.  */
 fun h5policy_msg_addr_is_undef = (byte[] raw) int:
 {
     var n = 0UL;
@@ -284,6 +330,8 @@ fun h5policy_msg_addr_is_undef = (byte[] raw) int:
     return 1;
 }
 
+/* Decode bounded, NUL-terminated names out of metadata payloads.  The caller
+   supplies a validated byte window; this routine never scans beyond it.  */
 fun h5policy_string_from_payload = (int ios, H5PolicyLimits profile,
                                     offset<uint<64>,B> off,
                                     uint<64> size) string:
@@ -303,6 +351,9 @@ fun h5policy_string_from_payload = (int ios, H5PolicyLimits profile,
     return name;
 }
 
+/* Policy treats core filters differently from plugin filters.  Some built-in
+   filters are still advisory because consumers must decode attacker-controlled
+   bytes to read data, but they do not require loading external code.  */
 fun h5policy_core_filter = (uint<64> filter_id) int:
 {
     return filter_id >= 1UL && filter_id <= 6UL;
@@ -328,6 +379,9 @@ fun h5policy_filter_name = (uint<64> filter_id) string:
     return "unknown";
 }
 
+/* Some index formats are counted but not decoded yet.  Record the address once
+   as visited, emit a coverage-gap finding, and keep the caller's resource
+   accounting in sync without recursively chasing an unsupported structure.  */
 fun h5policy_note_btree_addr = (H5PolicyLimits profile,
                                 uint<64> addr,
                                 off64 loc,
@@ -364,6 +418,10 @@ fun h5policy_note_chunk_index_addr = (H5WalkContext ctx,
     return ctx;
 }
 
+/* Cross-message dataset check.  Dataspace, datatype, layout, and fill-value
+   messages can arrive in any object-header order, so every validator calls back
+   here after updating its part of ctx.  The function is idempotent and only
+   emits checks whose prerequisites have been seen.  */
 fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
                                             H5PolicyLimits profile,
                                             off64 loc,
@@ -434,6 +492,9 @@ fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
     return ctx;
 }
 
+/* Legacy chunked layouts encode one extra dimension for the chunk's element
+   size field.  The rank check has to wait until both dataspace and layout are
+   known, so it lives in this shared updater.  */
 fun h5policy_update_legacy_chunked_layout_rank = (H5WalkContext ctx,
                                                  off64 loc,
                                                  string object) H5WalkContext:
@@ -447,6 +508,8 @@ fun h5policy_update_legacy_chunked_layout_rank = (H5WalkContext ctx,
     return ctx;
 }
 
+/* Fill-value payloads should match the datatype storage size.  As with layout
+   checks, this can fire when either message is parsed second.  */
 fun h5policy_update_fill_value_size = (H5WalkContext ctx,
                                        off64 loc,
                                        string object) H5WalkContext:

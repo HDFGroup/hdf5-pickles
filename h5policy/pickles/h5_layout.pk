@@ -16,6 +16,14 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* Layout messages connect logical dataset shape to physical storage.  h5policy
+   validates the metadata envelope and chunk-index references, but it never
+   reads dataset bytes or runs the filter pipeline over raw data.  */
+
+/* Compact layout stores raw element bytes inside the layout message itself.
+   This validator records the embedded byte count for later comparison against
+   dataspace * datatype size, and checks that the embedded data remains inside
+   the message payload.  */
 fun h5policy_validate_compact_layout_data = (int ios,
                                              H5PolicyLimits profile,
                                              H5WalkContext ctx,
@@ -86,6 +94,7 @@ fun h5policy_check_contiguous_extent = (int ios, H5PolicyLimits profile,
         }
     return ctx;
 }
+
 /* v4 chunked layout: validate the chunk dimensions and dispatch on the
    chunk-index type (single/implicit/fixed-array/extensible-array/v2-btree).
    Split out of h5policy_validate_layout_payload.  */
@@ -117,6 +126,9 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyLimits profile,
                                   payload_off, object,
                                   "chunk dimensions overrun the layout message"))
         {
+            /* Chunk dimensions multiply into a per-chunk element count.  That
+               count is used only for budget estimates for implicit indexes; raw
+               chunk data is still not read.  */
             var k = 0UL;
             while (k < ndims4)
                 {
@@ -148,6 +160,9 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyLimits profile,
                                                payload_off + idx_type_rel#B,
                                                1UL);
             var idx_info_len = 0UL;
+            /* Index-type-specific payload before the shared address field.
+               Types 1 and 2 have no extra bytes; fixed/extensible/v2 B-tree
+               indexes carry small creation parameters before the address.  */
             if (idx_type == 1UL)
                 idx_info_len = 0UL;
             else if (idx_type == 2UL)
@@ -176,6 +191,9 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyLimits profile,
                     if (idx_type == 5UL
                         && idx_addr4 != 0UL
                         && idx_addr4 != 0xffffffffffffffffUL)
+                        /* v2 B-tree chunk indexes expose a checksummed header
+                           and a root node; deeper traversal is bounded in the
+                           chunk-index helper.  */
                         ctx = h5policy_walk_v2_btree_chunks(ios, profile, ctx,
                                                             idx_addr4,
                                                             payload_off + idx_addr_rel#B,
@@ -183,6 +201,9 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyLimits profile,
                     else if (idx_type == 3UL
                              && idx_addr4 != 0UL
                              && idx_addr4 != 0xffffffffffffffffUL)
+                        /* Fixed arrays are used when the chunk grid does not
+                           grow.  The walker counts elements as chunks and
+                           verifies initialized chunk addresses.  */
                         ctx = h5policy_walk_fixed_array_chunks(ios, profile, ctx,
                                                                idx_addr4,
                                                                payload_off + idx_addr_rel#B,
@@ -191,6 +212,10 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyLimits profile,
                              && idx_addr4 != 0UL
                              && idx_addr4 != 0xffffffffffffffffUL)
                         {
+                            /* Extensible arrays should accompany an unlimited
+                               dataspace dimension.  If the dataspace has
+                               already been seen and it is bounded, flag the
+                               inconsistency before walking the index root.  */
                             if (ctx.has_dataspace != 0UB
                                 && ctx.dataspace_has_unlimited_dim == 0UB)
                                 h5policy_emit_error("H5_CORRUPT_CHUNK_INDEX_WITHOUT_UNLIMITED_DIM",
@@ -249,6 +274,9 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyLimits profile,
                                 }
                         }
                     else
+                        /* Unknown or currently undecoded index forms are still
+                           counted as one chunk-index reference so profile
+                           budgets and coverage-gap reporting stay honest.  */
                         ctx = h5policy_note_chunk_index_addr(ctx, profile,
                                                              idx_addr4,
                                                              payload_off + idx_addr_rel#B,
@@ -260,6 +288,10 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyLimits profile,
 }
 
 
+/* Top-level layout-message validator.  HDF5 has four layout-message versions,
+   and the meaning of the bytes after version/class changes substantially, so
+   the parser keeps each version branch explicit instead of forcing a generic
+   table-driven decoder.  */
 fun h5policy_validate_layout_payload = (int ios,
                                         H5PolicyLimits profile,
                                         H5WalkContext ctx,
@@ -281,6 +313,8 @@ fun h5policy_validate_layout_payload = (int ios,
 
     if (version == 1UL || version == 2UL)
         {
+            /* v1/v2 layout messages have an 8-byte prefix and encode old-style
+               chunked layouts with a v1 B-tree address plus 32-bit chunk dims. */
             if (!h5policy_payload_range_ok(msg_size, 0UL, 8UL,
                                            "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
                                            payload_off, object,
@@ -295,6 +329,9 @@ fun h5policy_validate_layout_payload = (int ios,
                                     "layout dimensionality is out of range");
             if (layout_class == CHUNKED as uint<64>)
                 {
+                    /* Legacy chunked layout stores dataset-rank-plus-one dims:
+                       the extra dimension carries element size.  The shared
+                       rank updater compares it with the dataspace when known. */
                     ctx.has_legacy_chunked_layout = 1UB;
                     ctx.legacy_chunked_layout_ndims = ndims;
                     ctx = h5policy_update_legacy_chunked_layout_rank(ctx,
@@ -337,6 +374,8 @@ fun h5policy_validate_layout_payload = (int ios,
                 }
             else if (layout_class == COMPACT as uint<64>)
                 {
+                    /* For v1/v2 compact layout, dimensions precede the embedded
+                       data-size field.  The data itself is not interpreted.  */
                     var compact_dims_rel = 8UL;
                     var compact_dims_bytes =
                         h5policy_checked_mul_u64(ndims, 4UL,
@@ -368,6 +407,9 @@ fun h5policy_validate_layout_payload = (int ios,
         }
     else if (version == 3UL)
         {
+            /* v3 separates layout class from dimensionality.  Contiguous and
+               compact layouts share helpers with v4, while chunked v3 still
+               uses the legacy v1 B-tree index.  */
             if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
                                            "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
                                            payload_off, object,
@@ -376,11 +418,16 @@ fun h5policy_validate_layout_payload = (int ios,
 
             layout_class = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
             if (layout_class == CONTIG as uint<64>)
+                /* Contiguous data is a single file extent.  The extent is
+                   bounds-checked but the bytes are never interpreted.  */
                 ctx = h5policy_check_contiguous_extent(ios, profile, ctx,
                                                        payload_off, msg_size,
                                                        file_size, object);
             else if (layout_class == CHUNKED as uint<64>)
                 {
+                    /* The v3 chunked form stores the chunk-index address before
+                       dimensions.  Validate the index, then validate each
+                       declared chunk dimension if the payload is long enough. */
                     if (h5policy_payload_range_ok(msg_size, 0UL,
                                                   3UL + (global_sizeof_offsets as uint<64>),
                                                   "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
@@ -437,12 +484,17 @@ fun h5policy_validate_layout_payload = (int ios,
                         }
                 }
             else if (layout_class == COMPACT as uint<64>)
+                /* v3 compact layout puts the two-byte data-size field directly
+                   after version/class.  */
                 ctx = h5policy_validate_compact_layout_data(ios, profile,
                                                             ctx, payload_off, msg_size,
                                                             2UL, 2UL, object);
         }
     else if (version == 4UL)
         {
+            /* v4 is the modern layout message.  Chunked datasets choose an
+               explicit index type, compact/contiguous reuse small fixed forms,
+               and virtual datasets are a policy feature rather than corruption. */
             if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
                                            "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
                                            payload_off, object,
@@ -451,17 +503,22 @@ fun h5policy_validate_layout_payload = (int ios,
 
             layout_class = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
             if (layout_class == COMPACT as uint<64>)
+                /* v4 compact uses the same compact data encoding as v3.  */
                 ctx = h5policy_validate_compact_layout_data(ios, profile,
                                                             ctx, payload_off, msg_size,
                                                             2UL, 2UL, object);
 
             if (layout_class == CONTIG as uint<64>)
+                /* v4 contiguous uses the same address/size layout as v3.  */
                 ctx = h5policy_check_contiguous_extent(ios, profile, ctx,
                                                        payload_off, msg_size,
                                                        file_size, object);
 
             if (layout_class == VIRTUAL as uint<64>)
                 {
+                    /* A virtual dataset may name other files through VDS
+                       mappings.  h5policy records the feature and lets the
+                       active profile decide whether that indirection is allowed. */
                     h5policy_note_vds;
                     if (profile.allow_vds == 0UB)
                         h5policy_emit_error("H5_POLICY_VDS", "policy",
@@ -474,6 +531,8 @@ fun h5policy_validate_layout_payload = (int ios,
                                              "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
                                              payload_off, object,
                                              "chunked v4 layout message is too small"))
+                    /* v4 chunked layout is delegated because its index-type
+                       matrix is larger than the other v4 classes.  */
                     ctx = h5policy_layout_chunked_v4(ios, profile, ctx,
                                                      payload_off, msg_size, object);
         }
@@ -482,6 +541,8 @@ fun h5policy_validate_layout_payload = (int ios,
                             "corrupt", payload_off, object,
                             "unsupported layout message version");
 
+    /* Layout class values are shared across versions.  Unknown classes are
+       structural corruption even when the version itself was recognized.  */
     if (layout_class > VIRTUAL as uint<64>)
         h5policy_emit_error("H5_CORRUPT_UNKNOWN_LAYOUT_CLASS",
                             "corrupt", payload_off, object,
@@ -491,6 +552,9 @@ fun h5policy_validate_layout_payload = (int ios,
                                                 payload_off, object);
 }
 
+/* Validate the filter-pipeline message envelope.  Filter definitions are
+   metadata; actual decode/decompression is intentionally outside h5policy's
+   boundary and is reported as an advisory or policy finding.  */
 fun h5policy_validate_filter_pipeline_payload = (int ios,
                                                  H5PolicyLimits profile,
                                                  offset<uint<64>,B> payload_off,
@@ -507,6 +571,9 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
     var nfilters = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
     var cur = 0UL;
 
+    /* The filter count is both a structural loop bound and a resource budget.
+       Even after reporting over-budget, continue parsing within the declared
+       count so additional descriptor corruption can be surfaced.  */
     if (nfilters > profile.max_filter_count)
         h5policy_emit_error("H5_RESOURCE_FILTER_COUNT", "resource",
                             payload_off, object,
@@ -527,6 +594,8 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
     var idx = 0UL;
     while (idx < nfilters)
         {
+            /* v1 descriptors include a padded filter name and align odd
+               client-data word counts; v2 removes the optional name.  */
             var desc_header = version == 1UL ? 8UL : 6UL;
 
             if (!h5policy_payload_range_ok(msg_size, cur, desc_header,
@@ -540,6 +609,9 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
             var name_len = 0UL;
             var cd_nelmts = 0UL;
 
+            /* Descriptor headers give enough information to compute the full
+               descriptor extent before reading client data.  v1 includes an
+               optional filter name; v2 identifies filters only by ID.  */
             if (version == 1UL)
                 {
                     name_len = h5policy_msg_u64_at(ios, profile,
@@ -556,6 +628,9 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
 
             if (!h5policy_core_filter(filter_id))
                 {
+                    /* Non-core filters normally require plugin loading by a
+                       consumer, so untrusted profiles can reject them without
+                       inspecting the raw dataset data.  */
                     h5policy_note_dynamic_filter(filter_id);
                     if (profile.allow_dynamic_filters == 0UB)
                         h5policy_emit_error("H5_POLICY_DYNAMIC_FILTER", "policy",
@@ -604,6 +679,8 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                                                  object,
                                                  "filter descriptor size overflow");
             if (version == 1UL && (cd_nelmts % 2UL) != 0UL)
+                /* v1 pads an odd number of 32-bit client-data words by one
+                   additional word.  */
                 desc_size = h5policy_checked_add_u64(desc_size, 4UL,
                                                      0xffffffffffffffffUL,
                                                      "H5_CORRUPT_LENGTH_OVERFLOW",
@@ -618,6 +695,9 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                                            "filter descriptor overruns the pipeline message"))
                 return;
 
+            /* Advance by the computed descriptor size rather than by fields read
+               so malformed names or client-data lengths cannot desynchronize
+               the next descriptor silently.  */
             cur = cur + desc_size;
             idx = idx + 1UL;
         }
