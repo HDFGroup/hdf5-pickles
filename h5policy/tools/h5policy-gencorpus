@@ -232,6 +232,18 @@ def generate(root):
     _make_bad_link_info_trailing_bytes(
         f"{root}/malformed/bad_link_info_trailing_bytes.h5",
         f"{root}/valid/chunk_ext_array.h5")
+    _make_bad_group_info_version(
+        f"{root}/malformed/bad_group_info_version.h5",
+        f"{root}/valid/chunk_implicit.h5")
+    _make_bad_group_info_trailing_bytes(
+        f"{root}/malformed/bad_group_info_trailing_bytes.h5",
+        f"{root}/valid/chunk_implicit.h5")
+    _make_bad_null_message_gap(
+        f"{root}/malformed/bad_null_message_gap.h5",
+        f"{root}/valid/dense_attribute.h5")
+    _make_bad_link_name_charset(
+        f"{root}/malformed/bad_link_name_charset.h5",
+        f"{root}/valid/continuation_chunks.h5")
     _make_bad_v1_reference_count(
         f"{root}/malformed/bad_v1_reference_count.h5")
     _make_bad_object_header_message_count(
@@ -849,6 +861,84 @@ def _make_bad_link_info_trailing_bytes(path, base_path):
     if ohdr < 0:
         raise RuntimeError("could not locate containing object header")
     raw[off + 1] = 0x62                           # swallow following messages
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _find_root_group_info(raw):
+    pat = b"\x0a\x02\x00\x01\x00\x00"  # v2 prefix + payload: version=0, flags=0
+    off = raw.find(pat)
+    if off < 0:
+        raise RuntimeError("could not locate the root group-info message")
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate containing object header")
+    return off, ohdr
+
+
+def _make_bad_group_info_version(path, base_path):
+    """Group-info payload version byte mutated away from zero.  libhdf5 rejects
+    this while decoding the root group creation info."""
+    raw = bytearray(open(base_path, "rb").read())
+    off, ohdr = _find_root_group_info(raw)
+    raw[off + 4] = 8
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_group_info_trailing_bytes(path, base_path):
+    """Group-info message size inflated so the following message bytes become
+    bogus trailing payload.  Found by h5policy-fuzz against a v2 root header."""
+    raw = bytearray(open(base_path, "rb").read())
+    off, ohdr = _find_root_group_info(raw)
+    struct.pack_into("<H", raw, off + 1, 52)
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_null_message_gap(path, base_path):
+    """Object-header NIL message no longer covers the chunk's remaining free
+    space.  The repaired checksum lets the object-header free-space rule fire."""
+    raw = bytearray(open(base_path, "rb").read())
+    off = -1
+    ohdr = -1
+    remaining = 0
+    for i in range(len(raw) - 4):
+        if raw[i] == 0 and struct.unpack_from("<H", raw, i + 1)[0] >= 32 \
+                and raw[i + 3] == 0:
+            candidate_ohdr = raw.rfind(b"OHDR", 0, i)
+            if candidate_ohdr >= 0:
+                flags = raw[candidate_ohdr + 5]
+                cur = candidate_ohdr + 6 + (16 if flags & (1 << 5) else 0) \
+                    + (4 if flags & (1 << 4) else 0)
+                size_width = 1 << (flags & 3)
+                chunk_size = int.from_bytes(raw[cur:cur + size_width], "little")
+                chunk_off = cur + size_width
+                candidate_remaining = chunk_size - (i - chunk_off) - 4
+                if struct.unpack_from("<H", raw, i + 1)[0] == candidate_remaining:
+                    off = i
+                    ohdr = candidate_ohdr
+                    remaining = candidate_remaining
+                    break
+    if off < 0:
+        raise RuntimeError("could not locate a terminal NIL message")
+    struct.pack_into("<H", raw, off + 1, remaining - 1)
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_link_name_charset(path, base_path):
+    """ASCII compact-link name containing a high-bit byte.  h5py/libhdf5 rejects
+    this during link traversal even though the enclosing object header is valid."""
+    raw = bytearray(open(base_path, "rb").read())
+    name = b"dataset_with_a_long_name_00"
+    off = raw.find(name)
+    if off < 0:
+        raise RuntimeError("could not locate the compact link name")
+    raw[off + 6] = 0xff
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate containing object header")
     _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 

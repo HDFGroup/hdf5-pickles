@@ -25,6 +25,127 @@
 /* Compact link messages and dense-heap link objects share the same payload
    layout.  Hard links enqueue object headers; soft links are only bounds
    checked; external and user-defined links become policy findings.  */
+fun h5policy_utf8_cont_byte = (uint<64> b) int:
+{
+    return b >= 0x80UL && b <= 0xbfUL;
+}
+
+fun h5policy_emit_bad_link_charset = (off64 loc, string object,
+                                      string message) void:
+{
+    h5policy_emit_error("H5_CORRUPT_LINK_NAME_CHARSET",
+                        "corrupt", loc, object, message);
+}
+
+fun h5policy_validate_link_name_charset = (int ios,
+                                           H5PolicyLimits profile,
+                                           offset<uint<64>,B> name_off,
+                                           uint<64> name_len,
+                                           uint<64> charset,
+                                           string object) void:
+{
+    if (charset > 1UL)
+        {
+            h5policy_emit_bad_link_charset(name_off, object,
+                                           "link name has an unknown character set");
+            return;
+        }
+
+    var i = 0UL;
+    while (i < name_len)
+        {
+            var b0 = h5policy_msg_u64_at(ios, profile, name_off + i#B, 1UL);
+
+            if (charset == 0UL)
+                {
+                    if (b0 > 0x7fUL)
+                        {
+                            h5policy_emit_bad_link_charset(name_off + i#B, object,
+                                                           "ASCII link name contains a non-ASCII byte");
+                            return;
+                        }
+                    i = i + 1UL;
+                }
+            else if (b0 <= 0x7fUL)
+                i = i + 1UL;
+            else if (b0 >= 0xc2UL && b0 <= 0xdfUL)
+                {
+                    if (i + 1UL >= name_len)
+                        {
+                            h5policy_emit_bad_link_charset(name_off + i#B, object,
+                                                           "UTF-8 link name is truncated");
+                            return;
+                        }
+                    var b1 = h5policy_msg_u64_at(ios, profile,
+                                                  name_off + (i + 1UL)#B, 1UL);
+                    if (!h5policy_utf8_cont_byte(b1))
+                        {
+                            h5policy_emit_bad_link_charset(name_off + i#B, object,
+                                                           "UTF-8 link name has an invalid continuation byte");
+                            return;
+                        }
+                    i = i + 2UL;
+                }
+            else if (b0 >= 0xe0UL && b0 <= 0xefUL)
+                {
+                    if (i + 2UL >= name_len)
+                        {
+                            h5policy_emit_bad_link_charset(name_off + i#B, object,
+                                                           "UTF-8 link name is truncated");
+                            return;
+                        }
+                    var e1 = h5policy_msg_u64_at(ios, profile,
+                                                  name_off + (i + 1UL)#B, 1UL);
+                    var e2 = h5policy_msg_u64_at(ios, profile,
+                                                  name_off + (i + 2UL)#B, 1UL);
+                    if ((b0 == 0xe0UL && (e1 < 0xa0UL || e1 > 0xbfUL))
+                        || (b0 == 0xedUL && (e1 < 0x80UL || e1 > 0x9fUL))
+                        || (b0 != 0xe0UL && b0 != 0xedUL
+                            && !h5policy_utf8_cont_byte(e1))
+                        || !h5policy_utf8_cont_byte(e2))
+                        {
+                            h5policy_emit_bad_link_charset(name_off + i#B, object,
+                                                           "UTF-8 link name has an invalid byte sequence");
+                            return;
+                        }
+                    i = i + 3UL;
+                }
+            else if (b0 >= 0xf0UL && b0 <= 0xf4UL)
+                {
+                    if (i + 3UL >= name_len)
+                        {
+                            h5policy_emit_bad_link_charset(name_off + i#B, object,
+                                                           "UTF-8 link name is truncated");
+                            return;
+                        }
+                    var f1 = h5policy_msg_u64_at(ios, profile,
+                                                  name_off + (i + 1UL)#B, 1UL);
+                    var f2 = h5policy_msg_u64_at(ios, profile,
+                                                  name_off + (i + 2UL)#B, 1UL);
+                    var f3 = h5policy_msg_u64_at(ios, profile,
+                                                  name_off + (i + 3UL)#B, 1UL);
+                    if ((b0 == 0xf0UL && (f1 < 0x90UL || f1 > 0xbfUL))
+                        || (b0 == 0xf4UL && (f1 < 0x80UL || f1 > 0x8fUL))
+                        || (b0 != 0xf0UL && b0 != 0xf4UL
+                            && !h5policy_utf8_cont_byte(f1))
+                        || !h5policy_utf8_cont_byte(f2)
+                        || !h5policy_utf8_cont_byte(f3))
+                        {
+                            h5policy_emit_bad_link_charset(name_off + i#B, object,
+                                                           "UTF-8 link name has an invalid byte sequence");
+                            return;
+                        }
+                    i = i + 4UL;
+                }
+            else
+                {
+                    h5policy_emit_bad_link_charset(name_off + i#B, object,
+                                                   "UTF-8 link name has an invalid leading byte");
+                    return;
+                }
+        }
+}
+
 fun h5policy_validate_link_payload = (int ios,
                                       H5PolicyLimits profile,
                                       offset<uint<64>,B> payload_off,
@@ -41,6 +162,7 @@ fun h5policy_validate_link_payload = (int ios,
     var flags = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
     var cur = 2UL;
     var link_type = 0UL;
+    var charset = 0UL;
 
     /* Optional fields are controlled by flag bits: type, creation order,
        character set, then a variable-width name length.  `cur` tracks the next
@@ -65,7 +187,15 @@ fun h5policy_validate_link_payload = (int ios,
     if ((flags & 4UL) != 0UL)
         cur = cur + 8UL;
     if ((flags & 16UL) != 0UL)
-        cur = cur + 1UL;
+        {
+            if (!h5policy_payload_range_ok(msg_size, cur, 1UL,
+                                           "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                           payload_off + cur#B, object,
+                                           "link character set byte is missing"))
+                return;
+            charset = h5policy_msg_u64_at(ios, profile, payload_off + cur#B, 1UL);
+            cur = cur + 1UL;
+        }
 
     var len_width = 1UL <<. (flags & 3UL);
     if (!h5policy_payload_range_ok(msg_size, cur, len_width,
@@ -95,6 +225,8 @@ fun h5policy_validate_link_payload = (int ios,
                                                  name_off, name_len);
     if (link_name == "")
         link_name = "<unnamed>";
+    h5policy_validate_link_name_charset(ios, profile, name_off, name_len,
+                                        charset, object);
 
     if (link_type == 0UL)
         {
