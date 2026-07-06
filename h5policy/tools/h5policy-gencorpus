@@ -159,6 +159,9 @@ def generate(root):
         for i in range(30):
             d.attrs.create("attribute_number_%02d" % i, np.arange(3, dtype="i8"))
     _write(f"{root}/valid/dense_attribute.h5", _dense_attrs)
+    _make_adjacent_null_messages(
+        f"{root}/valid/adjacent_null_messages.h5",
+        f"{root}/valid/dense_attribute.h5")
 
     # Dense link storage: a group with enough members that its links live in a
     # fractal heap + name-indexed v2 B-tree.  h5policy enumerates them and
@@ -992,6 +995,52 @@ def _make_bad_null_message_gap(path, base_path):
     if off < 0:
         raise RuntimeError("could not locate a terminal NIL message")
     struct.pack_into("<H", raw, off + 1, remaining - 1)
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_adjacent_null_messages(path, base_path):
+    """Split one terminal v2 NIL message into two adjacent NIL messages.
+
+    libhdf5 accepts adjacent NIL messages as long as they collectively leave no
+    chunk gap.  This guards h5policy against requiring each NIL to cover the
+    entire remainder of its chunk.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    off = -1
+    ohdr = -1
+    remaining = 0
+    for i in range(len(raw) - 4):
+        if raw[i] == 0 and struct.unpack_from("<H", raw, i + 1)[0] >= 32 \
+                and raw[i + 3] == 0:
+            candidate_ohdr = raw.rfind(b"OHDR", 0, i)
+            if candidate_ohdr >= 0:
+                flags = raw[candidate_ohdr + 5]
+                cur = candidate_ohdr + 6 + (16 if flags & (1 << 5) else 0) \
+                    + (4 if flags & (1 << 4) else 0)
+                size_width = 1 << (flags & 3)
+                chunk_size = int.from_bytes(raw[cur:cur + size_width], "little")
+                chunk_off = cur + size_width
+                candidate_remaining = chunk_size - (i - chunk_off) - 4
+                if struct.unpack_from("<H", raw, i + 1)[0] == candidate_remaining \
+                        and candidate_remaining >= 24:
+                    off = i
+                    ohdr = candidate_ohdr
+                    remaining = candidate_remaining
+                    break
+    if off < 0:
+        raise RuntimeError("could not locate a splittable terminal NIL message")
+
+    first_size = remaining - 12
+    second_size = 8
+    struct.pack_into("<H", raw, off + 1, first_size)
+    second_off = off + 4 + first_size
+    raw[second_off] = 0
+    struct.pack_into("<H", raw, second_off + 1, second_size)
+    raw[second_off + 3] = 0
+    for j in range(second_size):
+        raw[second_off + 4 + j] = 0
+
     _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 
