@@ -1,0 +1,472 @@
+/* h5_group.pk - Old-style group traversal (local heap, SNOD, v1 btree).  Split out of h5_walk.pk; loaded after it.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* Old-style groups predate compact/dense link messages.  A symbol-table
+   message points to a local heap for names and a type-0 v1 B-tree whose leaves
+   are SNOD symbol-table nodes.  This file decodes that path enough to enqueue
+   hard-link targets into the same bounded object-header BFS as modern links. */
+
+/* Bounded, NUL-terminated link name from the local heap data segment. */
+fun h5policy_heap_name = (int ios, H5PolicyLimits profile,
+                          uint<64> data_seg_addr, uint<64> name_off,
+                          uint<64> file_size) string:
+{
+    if (data_seg_addr == 0xffffffffffffffffUL
+        || name_off > file_size || data_seg_addr > file_size - name_off)
+        return "";
+
+    var abs = data_seg_addr + name_off;
+    if (abs >= file_size)
+        return "";
+
+    var avail = file_size - abs;
+    var cap = avail < H5POLICY_MAX_HEAP_NAME ? avail : H5POLICY_MAX_HEAP_NAME;
+    return h5policy_string_from_payload(ios, profile, abs#B, cap);
+}
+
+/* Local heap free lists are metadata too.  A corrupt free-list cycle or block
+   outside the data segment can make libhdf5 reject the file, so the validator
+   checks the list even though h5policy only needs allocated names. */
+fun h5policy_validate_local_heap_free_list = (int ios,
+                                              H5PolicyLimits profile,
+                                              uint<64> data_seg_addr,
+                                              uint<64> data_seg_size,
+                                              uint<64> free_block,
+                                              off64 loc,
+                                              string object) void:
+{
+    var l = global_sizeof_lengths as uint<64>;
+    var node_size = 2UL * l;
+    var seen = uint<64>[]();
+
+    /* The free-list terminator is 1, matching the legacy heap encoding.  Every
+       other value is an offset into the heap data segment and names a
+       next/size pair.  */
+    while (free_block != 1UL)
+        {
+            if (h5policy_seen_u64(seen, free_block))
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", loc, object,
+                                        "local heap free list contains a cycle");
+                    return;
+                }
+            seen += [free_block];
+
+            if (free_block > 0xffffffffffffffffUL - node_size)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", loc, object,
+                                        "local heap free-block offset overflows");
+                    return;
+                }
+
+            if (free_block + node_size > data_seg_size)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", loc, object,
+                                        "local heap free-block header is outside the data segment");
+                    return;
+                }
+
+            var block_off = data_seg_addr + free_block;
+            var next_free = h5policy_msg_u64_at(ios, profile, block_off#B, l);
+            var block_size = h5policy_msg_u64_at(ios, profile,
+                                                 block_off#B + l#B, l);
+
+            if (next_free == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", block_off#B, object,
+                                        "local heap free-block size is zero");
+                    return;
+                }
+
+            if (block_size > data_seg_size || free_block > data_seg_size - block_size)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_FREE_LIST",
+                                        "corrupt", block_off#B, object,
+                                        "local heap free block extends outside the data segment");
+                    return;
+                }
+
+            free_block = next_free;
+        }
+}
+
+/* Validate a local heap header and return its data-segment address (or the
+   undef sentinel on error, after emitting).  */
+fun h5policy_local_heap_data_addr = (int ios, H5PolicyLimits profile,
+                                     uint<64> heap_addr, uint<64> file_size,
+                                     off64 loc, string object) uint<64>:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var l = global_sizeof_lengths as uint<64>;
+    var hdr_size = 8UL + (2UL * l) + o;
+
+    if (!h5policy_checked_addr_range(heap_addr, hdr_size, file_size,
+                                     "local heap header outside file",
+                                     loc, object))
+        return 0xffffffffffffffffUL;
+
+    if (h5policy_msg_bytes(ios, profile, heap_addr#B, 4UL) != H5POLICY_HEAP_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                heap_addr#B, object,
+                                "local heap signature mismatch");
+            return 0xffffffffffffffffUL;
+        }
+
+    var version = h5policy_msg_u64_at(ios, profile, heap_addr#B + 4#B, 1UL);
+    if (version != 0UL)
+        h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_LOCAL_HEAP_VERSION",
+                            "corrupt", heap_addr#B, object,
+                            "local heap has an unsupported version");
+    var reserved0 = h5policy_msg_u64_at(ios, profile, heap_addr#B + 5#B, 1UL);
+    var reserved1 = h5policy_msg_u64_at(ios, profile, heap_addr#B + 6#B, 1UL);
+    var reserved2 = h5policy_msg_u64_at(ios, profile, heap_addr#B + 7#B, 1UL);
+    if (reserved0 != 0UL || reserved1 != 0UL || reserved2 != 0UL)
+        h5policy_emit_error("H5_CORRUPT_LOCAL_HEAP_RESERVED",
+                            "corrupt", heap_addr#B, object,
+                            "local heap reserved bytes are nonzero");
+
+    /* Data segment size (bounds link-name offsets) is the first length field. */
+    h5policy_heap_data_seg_size = h5policy_msg_u64_at(ios, profile,
+                                                      heap_addr#B + 8#B, l);
+    var free_block = h5policy_msg_u64_at(ios, profile,
+                                         heap_addr#B + (8UL + l)#B, l);
+    var data_seg_addr = h5policy_msg_u64_at(ios, profile,
+                                            heap_addr#B + (8UL + (2UL * l))#B, o);
+
+    /* The data segment stores the link names; libhdf5 requires it to lie within
+       the file and rejects a local heap whose declared segment runs past the
+       EOA.  Without this an inflated data-segment size is silently accepted.  */
+    var seg_ok = h5policy_checked_addr_range(data_seg_addr,
+                                             h5policy_heap_data_seg_size, file_size,
+                                             "local heap data segment outside file",
+                                             loc, object);
+    if (!seg_ok)
+        return 0xffffffffffffffffUL;
+
+    /* The group walk uses the data segment for names, but validating the free
+       list here catches corrupted heap bookkeeping while the heap header is in
+       hand.  */
+    h5policy_validate_local_heap_free_list(ios, profile, data_seg_addr,
+                                           h5policy_heap_data_seg_size,
+                                           free_block, loc, object);
+    return data_seg_addr;
+}
+
+/* One symbol-table node: enqueue each non-symbolic entry's child header. */
+fun h5policy_walk_snod = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                          uint<64> snod_addr, uint<64> data_seg_addr,
+                          string parent_path, uint<64> obj_depth) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var file_size = h5policy_ceiling(ios);
+
+    if (!h5policy_mark_visited_btree(snod_addr))
+        return ctx;
+
+    /* SNODs use a fixed capacity derived from the superblock leaf K value.  The
+       declared entry count may be smaller, but the address range must cover the
+       full node body because entries are fixed-position slots.  */
+    if (!h5policy_checked_addr_range(snod_addr, 8UL, file_size,
+                                     "symbol table node outside file",
+                                     snod_addr#B, parent_path))
+        return ctx;
+
+    if (h5policy_msg_bytes(ios, profile, snod_addr#B, 4UL) != H5POLICY_SNOD_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                snod_addr#B, parent_path,
+                                "symbol table node signature mismatch");
+            return ctx;
+        }
+
+    var version = h5policy_msg_u64_at(ios, profile, snod_addr#B + 4#B, 1UL);
+    if (version != 1UL)
+        h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_SYMBOL_TABLE_NODE_VERSION",
+                            "corrupt", snod_addr#B, parent_path,
+                            "symbol table node has an unsupported version");
+
+    var reserved = h5policy_msg_u64_at(ios, profile, snod_addr#B + 5#B, 1UL);
+    if (reserved != 0UL)
+        h5policy_emit_error("H5_CORRUPT_SYMBOL_TABLE_NODE_RESERVED",
+                            "corrupt", snod_addr#B, parent_path,
+                            "symbol table node reserved byte is nonzero");
+
+    var num = h5policy_msg_u64_at(ios, profile, snod_addr#B + 6#B, 2UL);
+    var snod_capacity =
+        h5policy_checked_mul_u64(2UL, h5policy_super_stab_leaf_k,
+                                 0xffffffffffffffffUL,
+                                 "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                 snod_addr#B, parent_path,
+                                 "symbol table node capacity overflow");
+    if (num > snod_capacity)
+        h5policy_emit_error("H5_CORRUPT_BTREE_NODE_ENTRY_COUNT",
+                            "corrupt", snod_addr#B, parent_path,
+                            "symbol table node uses more entries than its superblock K permits");
+    var ent_size = (2UL * o) + 24UL;
+    var body = h5policy_checked_mul_u64(snod_capacity, ent_size, 0xffffffffffffffffUL,
+                                        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                        snod_addr#B, parent_path,
+                                        "symbol table node size overflow");
+    var total = h5policy_checked_add_u64(8UL, body, 0xffffffffffffffffUL,
+                                         "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                         snod_addr#B, parent_path,
+                                         "symbol table node size overflow");
+    if (!h5policy_checked_addr_range(snod_addr, total, file_size,
+                                     "symbol table node entries outside file",
+                                     snod_addr#B, parent_path))
+        return ctx;
+
+    ctx = h5policy_account_metadata(ctx, profile, total, snod_addr#B, parent_path);
+
+    var i = 0UL;
+    while (i < num)
+        {
+            /* Each entry holds a name offset, object-header address, cache
+               metadata, and scratch fields.  h5policy follows only hard-link
+               entries; symbolic links do not point at object headers.  */
+            var eoff = snod_addr + 8UL + (i * ent_size);
+            var cache_type = h5policy_msg_u64_at(ios, profile,
+                                                 eoff#B + (2UL * o)#B, 4UL);
+            /* Valid cache types are 0 (none), 1 (cached group B-tree/heap) and
+               2 (symbolic link).  libhdf5 rejects anything else with "unknown
+               symbol table entry cache type".  */
+            if (cache_type > 2UL)
+                h5policy_emit_error("H5_CORRUPT_SYMBOL_TABLE_CACHE_TYPE",
+                                    "corrupt", eoff#B, parent_path,
+                                    "symbol table entry has an unknown cache type");
+            if (cache_type != 2UL)   /* 2 = symbolic (soft) link: no object header */
+                {
+                    var name_off = h5policy_msg_u64_at(ios, profile, eoff#B, o);
+                    var ohdr_raw = h5policy_msg_bytes(ios, profile, eoff#B + o#B, o);
+                    var ohdr_addr = bytes_to_u64_le(ohdr_raw);
+
+                    if (name_off >= h5policy_heap_data_seg_size)
+                        h5policy_emit_error("H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS",
+                                            "corrupt", eoff#B, parent_path,
+                                            "link name offset is beyond the local heap data segment");
+
+                    if (!h5policy_msg_addr_is_undef(ohdr_raw))
+                        {
+                            if (ohdr_addr < file_size)
+                                {
+                                    var name = h5policy_heap_name(ios, profile,
+                                                                  data_seg_addr,
+                                                                  name_off, file_size);
+                                    if (name == "")
+                                        h5policy_emit_error("H5_CORRUPT_LINK_NAME_EMPTY",
+                                                            "corrupt", eoff#B,
+                                                            parent_path,
+                                                            "symbol table entry link name is empty");
+                                    else
+                                        h5policy_enqueue_ohdr(profile, ohdr_addr,
+                                                              obj_depth + 1UL,
+                                                              h5policy_join_path(parent_path, name),
+                                                              eoff#B, parent_path);
+                                }
+                            else
+                                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                    "corrupt", eoff#B, parent_path,
+                                                    "symbol table entry object header address outside file");
+                        }
+                }
+            i = i + 1UL;
+        }
+
+    return ctx;
+}
+
+/* Recurse the group v1 B-tree (node type 0); leaves reference SNODs. */
+fun h5policy_walk_group_btree = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+                                 uint<64> btree_addr, uint<64> data_seg_addr,
+                                 string parent_path, uint<64> obj_depth,
+                                 uint<64> btree_depth) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var l = global_sizeof_lengths as uint<64>;
+    var file_size = h5policy_ceiling(ios);
+
+    if (btree_depth > profile.max_btree_depth)
+        {
+            h5policy_emit_error("H5_CORRUPT_BTREE_DEPTH_EXCEEDED", "corrupt",
+                                btree_addr#B, parent_path,
+                                "group B-tree depth exceeds the selected profile limit");
+            return ctx;
+        }
+
+    if (!h5policy_mark_visited_btree(btree_addr))
+        return ctx;
+
+    /* Type-0 v1 B-tree capacity comes from the superblock internal K value.
+       Keys are heap offsets and children are either lower B-tree nodes or SNOD
+       leaves depending on node_level.  */
+    var hdr = 8UL + (2UL * o);
+    if (!h5policy_checked_addr_range(btree_addr, hdr, file_size,
+                                     "group B-tree node outside file",
+                                     btree_addr#B, parent_path))
+        return ctx;
+
+    if (h5policy_msg_bytes(ios, profile, btree_addr#B, 4UL) != H5POLICY_TREE_SIG)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                btree_addr#B, parent_path,
+                                "group B-tree signature mismatch");
+            return ctx;
+        }
+
+    var node_type = h5policy_msg_u64_at(ios, profile, btree_addr#B + 4#B, 1UL);
+    if (node_type != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                btree_addr#B, parent_path,
+                                "expected a group (type 0) v1 B-tree node");
+            return ctx;
+        }
+
+    var node_level = h5policy_msg_u64_at(ios, profile, btree_addr#B + 5#B, 1UL);
+    var entries_used = h5policy_msg_u64_at(ios, profile, btree_addr#B + 6#B, 2UL);
+    var pair = l + o;
+    var capacity = h5policy_checked_mul_u64(2UL, h5policy_super_stab_internal_k,
+                                            0xffffffffffffffffUL,
+                                            "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                            btree_addr#B, parent_path,
+                                            "group B-tree node capacity overflow");
+    if (entries_used > capacity)
+        h5policy_emit_error("H5_CORRUPT_BTREE_NODE_ENTRY_COUNT",
+                            "corrupt", btree_addr#B, parent_path,
+                            "group B-tree node uses more entries than its superblock K permits");
+    var body = h5policy_checked_mul_u64(capacity, pair, 0xffffffffffffffffUL,
+                                        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                        btree_addr#B, parent_path,
+                                        "group B-tree node size overflow");
+    body = h5policy_checked_add_u64(body, l, 0xffffffffffffffffUL,
+                                    "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                    btree_addr#B, parent_path,
+                                    "group B-tree node size overflow");
+    var total = h5policy_checked_add_u64(hdr, body, 0xffffffffffffffffUL,
+                                         "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                         btree_addr#B, parent_path,
+                                         "group B-tree node size overflow");
+    if (!h5policy_checked_addr_range(btree_addr, total, file_size,
+                                     "group B-tree node body outside file",
+                                     btree_addr#B, parent_path))
+        return ctx;
+
+    ctx = h5policy_account_metadata(ctx, profile, total, btree_addr#B, parent_path);
+
+    /* A type-0 node has entries_used+1 keys, each a byte offset into the group's
+       local heap (the split names).  libhdf5 rejects a key past the heap data
+       segment ("unable to offset into local heap data block"); validate them all
+       against the same heap-size the SNOD name-offset check uses.  */
+    var kk = 0UL;
+    while (kk <= entries_used)
+        {
+            var key = h5policy_msg_u64_at(ios, profile,
+                                          (btree_addr + hdr + (kk * pair))#B, l);
+            if (key >= h5policy_heap_data_seg_size)
+                h5policy_emit_error("H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS",
+                                    "corrupt",
+                                    (btree_addr + hdr + (kk * pair))#B, parent_path,
+                                    "group B-tree key offset is beyond the local heap data segment");
+            kk = kk + 1UL;
+        }
+
+    var i = 0UL;
+    while (i < entries_used)
+        {
+            /* pair i = key(l) then child(o); child follows the key. */
+            var child_off = btree_addr + hdr + (i * pair) + l;
+            var child_raw = h5policy_msg_bytes(ios, profile, child_off#B, o);
+            var child_addr = bytes_to_u64_le(child_raw);
+
+            if (!h5policy_msg_addr_is_undef(child_raw))
+                {
+                    /* Internal nodes recurse through the same key/child shape;
+                       leaf children are SNOD addresses.  Both paths share the
+                       visited-B-tree set so cycles are stopped consistently.  */
+                    if (child_addr >= file_size)
+                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                            "corrupt", child_off#B, parent_path,
+                                            "group B-tree child address outside file");
+                    else if (node_level > 0UL)
+                        ctx = h5policy_walk_group_btree(ios, profile, ctx,
+                                                        child_addr, data_seg_addr,
+                                                        parent_path, obj_depth,
+                                                        btree_depth + 1UL);
+                    else
+                        ctx = h5policy_walk_snod(ios, profile, ctx,
+                                                 child_addr, data_seg_addr,
+                                                 parent_path, obj_depth);
+                }
+            i = i + 1UL;
+        }
+
+    return ctx;
+}
+
+/* Symbol-table messages are the object-header entry point for old-style
+   groups.  They contain exactly the v1 B-tree and local-heap addresses needed
+   to start the legacy group traversal.  */
+fun h5policy_validate_stab_payload = (int ios,
+                                      H5PolicyLimits profile,
+                                      H5WalkContext ctx,
+                                      offset<uint<64>,B> payload_off,
+                                      uint<64> msg_size,
+                                      string object) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL * o,
+                                   "H5_CORRUPT_SYMBOL_TABLE_MESSAGE_TOO_SMALL",
+                                   payload_off, object,
+                                   "symbol-table message is too small"))
+        return ctx;
+
+    /* The message stores B-tree first, heap second.  The heap must be opened
+       first because B-tree keys and SNOD entry names are offsets into it.  */
+    var btree_raw = h5policy_msg_bytes(ios, profile, payload_off, o);
+    var heap_raw = h5policy_msg_bytes(ios, profile, payload_off + o#B, o);
+    var btree_addr = bytes_to_u64_le(btree_raw);
+    var heap_addr = bytes_to_u64_le(heap_raw);
+
+    /* Both addresses are required for an old-style group.  Undefined means the
+       group has no traversable symbol table here, so the validator leaves the
+       current context unchanged.  */
+    if (h5policy_msg_addr_is_undef(btree_raw) || h5policy_msg_addr_is_undef(heap_raw))
+        return ctx;
+
+    var file_size = h5policy_ceiling(ios);
+    var data_seg_addr = h5policy_local_heap_data_addr(ios, profile, heap_addr,
+                                                      file_size, payload_off, object);
+    if (btree_addr >= file_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                payload_off, object,
+                                "symbol-table B-tree address outside file");
+            return ctx;
+        }
+
+    /* The heap supplies link names while the B-tree/SNOD path supplies object
+       addresses; passing the same parent path keeps discovered children labeled
+       consistently with modern hard-link traversal.  */
+    return h5policy_walk_group_btree(ios, profile, ctx, btree_addr, data_seg_addr,
+                                     object, h5policy_current_object_depth, 0UL);
+}

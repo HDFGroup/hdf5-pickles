@@ -1,0 +1,178 @@
+/* unit_datatype.pk - Synthetic checks for the bounded, depth-guarded datatype
+   validator (h5_walk.pk h5policy_dtype_check).  These craft datatype blobs in
+   memory, so they exercise the recursion cap and bounds handling precisely,
+   without needing a full HDF5 file.  Run via h5policy/tests/run.sh.
+
+   Prints one "PASS <name>" / "FAIL <name> ..." line per case and exits 0 only
+   if every case passed.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+load h5_policy;
+
+var P = H5_UNTRUSTED_STRICT;
+var unit_failures = 0;
+
+fun expect = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else
+        {
+            printf("FAIL %s\n", name);
+            unit_failures = unit_failures + 1;
+        }
+}
+
+/* Little-endian datatype header: flags (class|version<<4|nfields<<8) + elm.  */
+fun dt_hdr = (uint<64> ver, uint<64> cls, uint<64> nfield, uint<64> elm) byte[]:
+{
+    var flags = (cls & 0xfUL) | ((ver & 0xfUL) <<. 4) | ((nfield & 0xffffUL) <<. 8);
+    return [ (flags & 0xffUL) as byte, ((flags .>> 8) & 0xffUL) as byte,
+             ((flags .>> 16) & 0xffUL) as byte, ((flags .>> 24) & 0xffUL) as byte,
+             (elm & 0xffUL) as byte, ((elm .>> 8) & 0xffUL) as byte,
+             ((elm .>> 16) & 0xffUL) as byte, ((elm .>> 24) & 0xffUL) as byte ];
+}
+
+fun run_blob = (byte[] blob) uint<64>:
+{
+    var ios = open("*unit*");
+    byte[blob'length] @ ios : 0#B = blob;
+    h5policy_reset_findings;
+    var consumed = h5policy_dtype_check(ios, P, 0#B, blob'length, "/u", 0UL);
+    close(ios);
+    return consumed;
+}
+
+fun run_dataspace_blob = (byte[] blob) void:
+{
+    var ios = open("*unit*");
+    byte[blob'length] @ ios : 0#B = blob;
+    h5policy_reset_findings;
+    var ctx = h5policy_new_walk_context;
+    ctx = h5policy_validate_dataspace_payload(ios, P, ctx, 0#B,
+                                              blob'length, "/u");
+    close(ios);
+}
+
+fun run_layout_blob = (byte[] blob) void:
+{
+    var ios = open("*unit*");
+    byte[blob'length] @ ios : 0#B = blob;
+    h5policy_reset_findings;
+    var ctx = h5policy_new_walk_context;
+    ctx = h5policy_validate_layout_payload(ios, P, ctx, 0#B,
+                                           blob'length, "/u");
+    close(ios);
+}
+
+fun has_code = (string code) int:
+{
+    var i = 0UL;
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[i] == code)
+                return 1;
+            i = i + 1UL;
+        }
+    return 0;
+}
+
+/* 1. simple fixed-point: 8B header + 4B props = 12 consumed, no findings.  */
+var simple = dt_hdr(1UL, 0UL, 0UL, 4UL) + [0UB, 0UB, 32UB, 0UB];
+var c1 = run_blob(simple);
+expect("simple_fixed_point", c1 == 12UL && h5policy_finding_codes'length == 0UL);
+
+/* 2. VLEN of fixed-point: recurses one level, consumes 8 + 12 = 20.  */
+var vlen = dt_hdr(1UL, 9UL, 0UL, 16UL) + simple;
+var c2 = run_blob(vlen);
+expect("vlen_of_fixed", c2 == 20UL && h5policy_finding_codes'length == 0UL);
+
+/* 3. Pathological deep nesting exceeds max_datatype_recursion_depth (64):
+   the depth cap must fire and reject rather than exhaust the stack.  */
+var deep = byte[]();
+var d = 0UL;
+while (d < 200UL) { deep = dt_hdr(1UL, 9UL, 0UL, 8UL) + deep; d = d + 1UL; }
+deep = deep + simple;
+var c3 = run_blob(deep);
+expect("deep_nesting_rejected",
+       c3 == 0UL && h5policy_decision == "reject_corrupt"
+       && h5policy_finding_codes[0UL] == "H5_CORRUPT_DATATYPE_RECURSION_LIMIT");
+
+/* 4. Truncated nested type: base type header does not fit -> bounded corrupt,
+   no read past the blob.  */
+var trunc = dt_hdr(1UL, 9UL, 0UL, 16UL) + [0UB, 0UB];
+var c4 = run_blob(trunc);
+expect("truncated_nested_bounded",
+       c4 == 0UL
+       && h5policy_finding_codes[0UL] == "H5_CORRUPT_DATATYPE_MESSAGE_TOO_SMALL");
+
+/* 5. Array datatype with rank 0 is rejected by libhdf5. */
+var bad_array_rank = dt_hdr(2UL, 10UL, 0UL, 4UL)
+                     + [0UB, 0UB, 0UB, 0UB] + simple;
+var c5 = run_blob(bad_array_rank);
+expect("array_rank_zero_rejected",
+       c5 != 0UL && has_code("H5_CORRUPT_DATATYPE_ARRAY_RANK"));
+
+/* 6. Compound member offset + member type size may not exceed parent size. */
+var member_name = [97UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+var bad_compound_bounds = dt_hdr(1UL, 6UL, 1UL, 4UL)
+                          + member_name
+                          + [2UB, 0UB, 0UB, 0UB]
+                          + [0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+                             0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+                             0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+                             0UB, 0UB, 0UB, 0UB]
+                          + simple;
+var c6 = run_blob(bad_compound_bounds);
+expect("compound_member_bounds_rejected",
+       c6 != 0UL && has_code("H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_BOUNDS"));
+
+/* 7. Enum member names must be non-empty. */
+var bad_enum_name = dt_hdr(1UL, 8UL, 1UL, 4UL)
+                    + simple
+                    + [0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB]
+                    + [0UB, 0UB, 0UB, 0UB];
+var c7 = run_blob(bad_enum_name);
+expect("enum_empty_name_rejected",
+       c7 != 0UL && has_code("H5_CORRUPT_DATATYPE_ENUM_NAME_EMPTY"));
+
+/* 8. Floating-point mantissa range must fit inside the element bit width. */
+var bad_float_mantissa = dt_hdr(1UL, 1UL, 0UL, 4UL)
+                         + [0UB, 0UB, 32UB, 0UB,
+                            23UB, 8UB, 31UB, 4UB,
+                            127UB, 0UB, 0UB, 0UB];
+var c8 = run_blob(bad_float_mantissa);
+expect("float_mantissa_rejected",
+       c8 != 0UL && has_code("H5_CORRUPT_DATATYPE_FLOAT_MANTISSA"));
+
+/* 9. Scalar/NULL dataspace messages must have rank 0. */
+run_dataspace_blob([2UB, 1UB, 0UB, 0UB]);
+expect("dataspace_scalar_rank_rejected",
+       has_code("H5_CORRUPT_DATASPACE_INVALID_RANK"));
+
+/* 10. Legacy layout dimensionality must be in 1..H5O_LAYOUT_NDIMS. */
+run_layout_blob([1UB, 0UB, 1UB, 0UB, 0UB, 0UB, 0UB, 0UB]);
+expect("layout_zero_dimensionality_rejected",
+       has_code("H5_CORRUPT_LAYOUT_DIMENSIONALITY"));
+
+if (unit_failures != 0)
+    {
+        printf("UNIT DATATYPE: %i32d failure(s)\n", unit_failures);
+        exit(1);
+    }
+printf("UNIT DATATYPE: all passed\n");

@@ -11,7 +11,7 @@
   (file-name-directory (or load-file-name buffer-file-name)))
 
 (defconst hdf5-poke-process-test--source-root
-  (expand-file-name ".." hdf5-poke-process-test--test-directory))
+  (expand-file-name "../.." hdf5-poke-process-test--test-directory))
 
 (load-file (expand-file-name "emacs/hdf5-poke.el"
                              hdf5-poke-process-test--source-root))

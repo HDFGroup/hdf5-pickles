@@ -1,0 +1,609 @@
+/* h5_walk.pk - Bounded object-header walking and message checks.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* This file owns the mutable traversal state that threads through the split
+   validators.  h5policy is metadata-only: it follows object headers, messages,
+   group indexes, and chunk indexes far enough to classify risk, but it never
+   opens external files, runs filters, or reads raw dataset payloads.  */
+
+/* Accumulated facts about the reachable graph and the dataset currently being
+   interpreted.  Message validators update these fields opportunistically; the
+   cross-message checks at the bottom of the file compare dataspace, datatype,
+   layout, and fill-value facts once enough of them are known.  */
+type H5WalkContext = struct
+{
+    uint<64> metadata_seen;
+    uint<64> object_count;
+    uint<64> attribute_count;
+    uint<64> object_header_chunk_count;
+    uint<64> btree_depth;
+    uint<64> link_depth;
+    uint<64> dtype_depth;
+    uint<64> max_rank_seen;
+    uint<64> dataspace_rank;
+    uint<64> dataset_element_count;
+    uint<64> datatype_size;
+    uint<64> datatype_logical_size;
+    uint<64> fill_value_size;
+    uint<64> compact_layout_size;
+    uint<64> contiguous_layout_size;
+    uint<64> legacy_chunked_layout_ndims;
+    uint<64> chunk_dataset_element_count;
+    uint<64> chunk_logical_bytes;
+    uint<64> logical_dataset_bytes;
+    uint<64> max_logical_dataset_bytes_seen;
+    uint<64> chunk_index_count;
+    uint<8> has_dataspace;
+    uint<8> has_datatype;
+    uint<8> has_dataset_layout;
+    uint<8> has_fill_value;
+    uint<8> has_compact_layout;
+    uint<8> has_contiguous_layout;
+    uint<8> has_legacy_chunked_layout;
+    uint<8> has_chunked_layout;
+    uint<8> dataset_element_count_overflowed;
+    uint<8> dataset_dim_exceeds_max;
+    uint<8> dataspace_has_max_dims;
+    uint<8> dataspace_has_unlimited_dim;
+};
+
+/* Visited sets are plain arrays because poke keeps this script portable and
+   simple.  The walk budget charges linear membership tests so hostile graphs
+   with many duplicate references still terminate under profile control.  */
+var h5policy_visited_ohdrs = uint<64>[]();
+var h5policy_visited_conts = uint<64>[]();
+var h5policy_visited_btrees = uint<64>[]();
+
+/* Object headers are walked breadth-first.  Link messages enqueue child object
+   headers here; h5policy_walk_reachable_metadata drains the queue while
+   enforcing max link depth and continue-after-corruption policy.  */
+var h5policy_pending_ohdrs = uint<64>[]();
+var h5policy_pending_depths = uint<64>[]();
+var h5policy_pending_paths = string[]();
+var h5policy_pending_index = 0UL;
+
+/* Current-object scratch state.  Message validators use these values for
+   contextual checks that are cheaper to do while a single object header is
+   being parsed, such as v1 message-count repair support and link-depth labels.
+   The superblock K values are defaults until h5policy_validate_superblock reads
+   the real values.  */
+var h5policy_current_object_depth = 0UL;
+var h5policy_current_object_msg_count = 0UL;
+var h5policy_current_object_root_msg_count = 0UL;
+var h5policy_dense_handled = 0;
+var h5policy_super_stab_leaf_k = 4UL;
+var h5policy_super_stab_internal_k = 16UL;
+var h5policy_super_indexed_internal_k = 32UL;
+var H5POLICY_H5S_MAX_RANK = 32UL;
+var H5POLICY_LAYOUT_MAX_DIMS = 33UL;  /* H5O_LAYOUT_NDIMS = H5S_MAX_RANK + 1 */
+
+/* Reset per-walk state, including the wall-clock budget counters.  This is
+   called by the top-level metadata walk and also by h5patch when it asks
+   h5policy to recount a single object header.  */
+fun h5policy_reset_traversal_state = void:
+{
+    h5policy_visited_ohdrs = uint<64>[]();
+    h5policy_visited_conts = uint<64>[]();
+    h5policy_visited_btrees = uint<64>[]();
+    h5policy_pending_ohdrs = uint<64>[]();
+    h5policy_pending_depths = uint<64>[]();
+    h5policy_pending_paths = string[]();
+    h5policy_pending_index = 0UL;
+    h5policy_current_object_depth = 0UL;
+    h5policy_current_object_msg_count = 0UL;
+    h5policy_current_object_root_msg_count = 0UL;
+    h5policy_walk_ops = 0UL;
+    h5policy_walk_next_check = 0UL;
+}
+
+/* Linear membership helper used by all visited sets.  The tick cost includes
+   the array length because this is O(n), and the walk budget should reflect
+   that cost on adversarial files with many metadata references.  */
+fun h5policy_seen_u64 = (uint<64>[] values, uint<64> value) int:
+{
+    h5policy_walk_tick(values'length + 1UL);   /* this membership test costs O(len) */
+    var i = 0UL;
+
+    while (i < values'length)
+        {
+            if (values[i] == value)
+                return 1;
+            i = i + 1UL;
+        }
+
+    return 0;
+}
+
+/* Object headers are only marked when dequeued, not when enqueued.  That keeps
+   duplicate pending references cheap to reject while preserving the BFS queue's
+   single source of truth.  */
+fun h5policy_mark_visited_ohdr = (uint<64> addr) int:
+{
+    h5policy_visited_ohdrs += [addr];
+    return 1;
+}
+
+fun h5policy_mark_visited_cont = (uint<64> addr) int:
+{
+    if (h5policy_seen_u64(h5policy_visited_conts, addr))
+        return 0;
+
+    h5policy_visited_conts += [addr];
+    return 1;
+}
+
+fun h5policy_mark_visited_btree = (uint<64> addr) int:
+{
+    if (h5policy_seen_u64(h5policy_visited_btrees, addr))
+        return 0;
+
+    h5policy_visited_btrees += [addr];
+    return 1;
+}
+
+fun h5policy_join_path = (string parent, string name) string:
+{
+    if (parent == "/")
+        return "/" + name;
+    return parent + "/" + name;
+}
+
+/* Enqueue one object header discovered through a hard link or old-style group
+   record.  Depth is checked before enqueueing so a single deep branch cannot
+   grow the pending list past the selected profile's link traversal limit.  */
+fun h5policy_enqueue_ohdr = (H5PolicyLimits profile,
+                             uint<64> addr,
+                             uint<64> depth,
+                             string path,
+                             off64 loc,
+                             string object) void:
+{
+    if (depth > profile.max_link_traversal_depth)
+        {
+            h5policy_emit_error("H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED",
+                                "corrupt", loc, object,
+                                "link traversal depth exceeds the selected profile limit");
+            return;
+        }
+
+    if (h5policy_seen_u64(h5policy_visited_ohdrs, addr)
+        || h5policy_seen_u64(h5policy_pending_ohdrs, addr))
+        return;
+
+    h5policy_pending_ohdrs += [addr];
+    h5policy_pending_depths += [depth];
+    h5policy_pending_paths += [path];
+}
+
+/* Build an empty context with all per-dataset flags cleared.  A fresh context
+   is also used for attribute payloads so attribute datatype/dataspace messages
+   do not pollute the parent dataset's cross-message checks.  */
+fun h5policy_new_walk_context = H5WalkContext:
+{
+    return H5WalkContext
+    {
+        metadata_seen = 0UL,
+        object_count = 0UL,
+        attribute_count = 0UL,
+        object_header_chunk_count = 0UL,
+        btree_depth = 0UL,
+        link_depth = 0UL,
+        dtype_depth = 0UL,
+        max_rank_seen = 0UL,
+        dataspace_rank = 0UL,
+        dataset_element_count = 0UL,
+        datatype_size = 0UL,
+        datatype_logical_size = 0UL,
+        fill_value_size = 0UL,
+        compact_layout_size = 0UL,
+        contiguous_layout_size = 0UL,
+        legacy_chunked_layout_ndims = 0UL,
+        chunk_dataset_element_count = 0UL,
+        chunk_logical_bytes = 0UL,
+        logical_dataset_bytes = 0UL,
+        max_logical_dataset_bytes_seen = 0UL,
+        chunk_index_count = 0UL,
+        has_dataspace = 0UB,
+        has_datatype = 0UB,
+        has_dataset_layout = 0UB,
+        has_fill_value = 0UB,
+        has_compact_layout = 0UB,
+        has_contiguous_layout = 0UB,
+        has_legacy_chunked_layout = 0UB,
+        has_chunked_layout = 0UB,
+        dataset_element_count_overflowed = 0UB,
+        dataset_dim_exceeds_max = 0UB,
+        dataspace_has_max_dims = 0UB,
+        dataspace_has_unlimited_dim = 0UB
+    };
+}
+
+/* Resource counters are updated through checked arithmetic so over-budget and
+   overflow cases become explicit findings instead of wrapping silently.  */
+fun h5policy_count_object = (H5WalkContext ctx,
+                             H5PolicyLimits profile,
+                             off64 loc,
+                             string object) H5WalkContext:
+{
+    var next = h5policy_checked_add_u64(ctx.object_count, 1UL,
+                                        profile.max_object_count,
+                                        "H5_RESOURCE_OBJECT_COUNT",
+                                        "resource",
+                                        loc, object,
+                                        "object count budget exceeded");
+    ctx.object_count = next;
+    return ctx;
+}
+
+fun h5policy_account_metadata = (H5WalkContext ctx,
+                                 H5PolicyLimits profile,
+                                 uint<64> bytes,
+                                 off64 loc,
+                                 string object) H5WalkContext:
+{
+    var next = h5policy_checked_add_u64(ctx.metadata_seen, bytes,
+                                        profile.max_metadata_bytes,
+                                        "H5_RESOURCE_METADATA_BYTES",
+                                        "resource",
+                                        loc, object,
+                                        "metadata byte budget exceeded");
+    ctx.metadata_seen = next;
+    return ctx;
+}
+
+/* These mapping wrappers centralize strict/non-strict behavior.  Strict mode
+   uses ordinary mappings; forensic mode uses @! so corrupt structures can be
+   inspected long enough to collect nearby findings.  */
+fun h5policy_map_msg_prefix = (int ios, H5PolicyLimits profile,
+                               offset<uint<64>,B> off) msg_prefix:
+{
+    if (h5policy_nonstrict != 0)
+        return msg_prefix @! ios : off;
+    return msg_prefix @ ios : off;
+}
+
+fun h5policy_map_cont = (int ios, H5PolicyLimits profile,
+                         offset<uint<64>,B> off) H5O_msg_cont:
+{
+    if (h5policy_nonstrict != 0)
+        return H5O_msg_cont @! ios : off;
+    return H5O_msg_cont @ ios : off;
+}
+
+fun h5policy_msg_bytes = (int ios, H5PolicyLimits profile,
+                          offset<uint<64>,B> off,
+                          uint<64> size) byte[]:
+{
+    h5policy_walk_tick(size + 1UL);   /* account the bytes touched, not just the call */
+    if (h5policy_nonstrict != 0)
+        return byte[size] @! ios : off;
+    return byte[size] @ ios : off;
+}
+
+fun h5policy_msg_u64_at = (int ios, H5PolicyLimits profile,
+                           offset<uint<64>,B> off,
+                           uint<64> size) uint<64>:
+{
+    return bytes_to_u64_le(h5policy_msg_bytes(ios, profile, off, size));
+}
+
+/* All message validators use payload-relative bounds checks before reading
+   variable-length fields.  That keeps malformed size fields from turning into
+   poke map exceptions that would otherwise abort the surrounding analysis.  */
+fun h5policy_payload_range_ok = (uint<64> msg_size,
+                                 uint<64> rel,
+                                 uint<64> size,
+                                 string code,
+                                 off64 loc,
+                                 string object,
+                                 string message) int:
+{
+    if (rel > msg_size || size > msg_size - rel)
+        {
+            h5policy_emit_error(code, "corrupt", loc, object, message);
+            return 0;
+        }
+
+    return 1;
+}
+
+/* HDF5 undefined addresses are all-ones at the file's configured offset width.
+   Many optional metadata references use this sentinel, so callers pass the raw
+   bytes rather than a widened integer to preserve width-specific semantics.  */
+fun h5policy_msg_addr_is_undef = (byte[] raw) int:
+{
+    var n = 0UL;
+
+    while (n < raw'length)
+        {
+            if (raw[n] != 0xffUB) return 0;
+            n = n + 1UL;
+        }
+
+    return 1;
+}
+
+/* Decode bounded, NUL-terminated names out of metadata payloads.  The caller
+   supplies a validated byte window; this routine never scans beyond it.  */
+fun h5policy_string_from_payload = (int ios, H5PolicyLimits profile,
+                                    offset<uint<64>,B> off,
+                                    uint<64> size) string:
+{
+    var name = "";
+    var i = 0UL;
+
+    while (i < size)
+        {
+            var b = h5policy_msg_u64_at(ios, profile, off + i#B, 1UL) as uint<8>;
+            if (b == 0UB)
+                return name;
+            name = name + ((b as char) as string);
+            i = i + 1UL;
+        }
+
+    return name;
+}
+
+/* Policy treats core filters differently from plugin filters.  Some built-in
+   filters are still advisory because consumers must decode attacker-controlled
+   bytes to read data, but they do not require loading external code.  */
+fun h5policy_core_filter = (uint<64> filter_id) int:
+{
+    return filter_id >= 1UL && filter_id <= 6UL;
+}
+
+/* Built-in filters that expand/decode data on read: deflate/gzip (1), szip (4),
+   n-bit (5), scale-offset (6).  Shuffle (2) only permutes bytes and fletcher32
+   (3) only verifies a checksum -- neither decompresses -- so neither is flagged.
+   These are the paths where reading the data runs decode code over
+   attacker-controlled bytes (the H5Z__filter_scaleoffset / deflate CVE class).  */
+fun h5policy_filter_decodes = (uint<64> filter_id) int:
+{
+    return filter_id == 1UL || filter_id == 4UL
+        || filter_id == 5UL || filter_id == 6UL;
+}
+
+fun h5policy_filter_name = (uint<64> filter_id) string:
+{
+    if (filter_id == 1UL) return "deflate/gzip";
+    if (filter_id == 4UL) return "szip";
+    if (filter_id == 5UL) return "n-bit";
+    if (filter_id == 6UL) return "scale-offset";
+    return "unknown";
+}
+
+/* Some index formats are counted but not decoded yet.  Record the address once
+   as visited, emit a coverage-gap finding, and keep the caller's resource
+   accounting in sync without recursively chasing an unsupported structure.  */
+fun h5policy_note_btree_addr = (H5PolicyLimits profile,
+                                uint<64> addr,
+                                off64 loc,
+                                string object,
+                                string message) void:
+{
+    if (addr == 0UL || addr == 0xffffffffffffffffUL)
+        return;
+
+    if (h5policy_mark_visited_btree(addr))
+        h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                            "unsupported", loc, object, message);
+}
+
+fun h5policy_note_chunk_index_addr = (H5WalkContext ctx,
+                                      H5PolicyLimits profile,
+                                      uint<64> addr,
+                                      off64 loc,
+                                      string object) H5WalkContext:
+{
+    if (addr == 0UL || addr == 0xffffffffffffffffUL)
+        return ctx;
+
+    ctx.chunk_index_count =
+        h5policy_checked_add_u64(ctx.chunk_index_count, 1UL,
+                                 profile.max_chunk_count,
+                                 "H5_RESOURCE_CHUNK_COUNT",
+                                 "resource",
+                                 loc, object,
+                                 "chunk index budget exceeded");
+
+    h5policy_note_btree_addr(profile, addr, loc, object,
+                             "chunk index traversal is bounded but not decoded yet");
+    return ctx;
+}
+
+fun h5policy_percent_exceeded = (uint<64> numer,
+                                 uint<64> denom,
+                                 uint<64> percent) int:
+{
+    if (denom == 0UL || percent == 0UL)
+        return 0;
+
+    var base = (denom / 100UL) * percent;
+    var rem = ((denom % 100UL) * percent) / 100UL;
+    return numer > base + rem;
+}
+
+fun h5policy_check_metadata_ratio = (H5WalkContext ctx,
+                                     H5PolicyLimits profile,
+                                     uint<64> file_size) void:
+{
+    if (profile.metadata_ratio_reject_percent != 0UL
+        && ctx.metadata_seen > profile.metadata_ratio_reject_min_bytes
+        && h5policy_percent_exceeded(ctx.metadata_seen, file_size,
+                                     profile.metadata_ratio_reject_percent))
+        h5policy_emit_error("H5_RESOURCE_METADATA_RATIO", "resource",
+                            0UL#B, "metadata",
+                            "reachable metadata exceeds the selected profile's file-size ratio");
+    else if (profile.metadata_ratio_warn_percent != 0UL
+             && ctx.metadata_seen > profile.metadata_ratio_warn_min_bytes
+             && h5policy_percent_exceeded(ctx.metadata_seen, file_size,
+                                          profile.metadata_ratio_warn_percent))
+        h5policy_emit_warning("H5_ADVISORY_METADATA_RATIO",
+                              0UL#B, "metadata",
+                              "reachable metadata is a large fraction of the file size");
+}
+
+fun h5policy_update_chunk_resource_pressure = (H5WalkContext ctx,
+                                               H5PolicyLimits profile,
+                                               off64 loc,
+                                               string object) H5WalkContext:
+{
+    if (ctx.has_chunked_layout == 0UB
+        || ctx.has_dataspace == 0UB
+        || ctx.has_datatype == 0UB
+        || ctx.dataset_element_count_overflowed != 0UB
+        || ctx.chunk_dataset_element_count == 0UL
+        || ctx.datatype_logical_size == 0UL)
+        return ctx;
+
+    if (ctx.chunk_dataset_element_count
+        > 0xffffffffffffffffUL / ctx.datatype_logical_size)
+        ctx.chunk_logical_bytes = 0xffffffffffffffffUL;
+    else
+        ctx.chunk_logical_bytes =
+            ctx.chunk_dataset_element_count * ctx.datatype_logical_size;
+
+    if (profile.min_logical_chunk_bytes != 0UL
+        && ctx.chunk_logical_bytes < profile.min_logical_chunk_bytes
+        && ctx.dataset_element_count != 0UL)
+        {
+            var adjusted = ctx.dataset_element_count;
+            if (ctx.dataset_element_count
+                <= 0xffffffffffffffffUL - (ctx.chunk_dataset_element_count - 1UL))
+                adjusted = ctx.dataset_element_count
+                           + ctx.chunk_dataset_element_count - 1UL;
+            else
+                adjusted = 0xffffffffffffffffUL;
+
+            var nchunks = adjusted / ctx.chunk_dataset_element_count;
+            if (nchunks > profile.min_logical_chunk_count)
+                h5policy_emit_error("H5_RESOURCE_CHUNK_TOO_SMALL", "resource",
+                                    loc, object,
+                                    "logical chunk size is too small for the estimated chunk count");
+        }
+
+    return ctx;
+}
+
+/* Cross-message dataset check.  Dataspace, datatype, layout, and fill-value
+   messages can arrive in any object-header order, so every validator calls back
+   here after updating its part of ctx.  The function is idempotent and only
+   emits checks whose prerequisites have been seen.  */
+fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
+                                            H5PolicyLimits profile,
+                                            off64 loc,
+                                            string object) H5WalkContext:
+{
+    if (ctx.has_dataspace != 0UB && ctx.has_datatype != 0UB)
+        {
+            if (ctx.has_dataset_layout != 0UB
+                && ctx.dataset_dim_exceeds_max != 0UB)
+                {
+                    h5policy_emit_error("H5_CORRUPT_DATASPACE_DIMENSION_EXCEEDS_MAX",
+                                        "corrupt", loc, object,
+                                        "dataspace current dimension exceeds maximum dimension");
+                    ctx.dataset_dim_exceeds_max = 0UB;
+                }
+
+            if (ctx.dataset_element_count_overflowed != 0UB)
+                {
+                    ctx.logical_dataset_bytes = 0xffffffffffffffffUL;
+                    if (ctx.logical_dataset_bytes > ctx.max_logical_dataset_bytes_seen)
+                        ctx.max_logical_dataset_bytes_seen = ctx.logical_dataset_bytes;
+                    return ctx;
+                }
+
+            var storage_dataset_bytes = 0UL;
+            if (ctx.has_dataset_layout != 0UB
+                && ctx.dataset_element_count != 0UL
+                && ctx.datatype_size > 0xffffffffffffffffUL / ctx.dataset_element_count)
+                {
+                    h5policy_emit_error("H5_CORRUPT_DATASET_STORAGE_OVERFLOW",
+                                        "corrupt", loc, object,
+                                        "size of dataset storage overflowed");
+                    ctx.logical_dataset_bytes = 0xffffffffffffffffUL;
+                    if (ctx.logical_dataset_bytes > ctx.max_logical_dataset_bytes_seen)
+                        ctx.max_logical_dataset_bytes_seen = ctx.logical_dataset_bytes;
+                    return ctx;
+                }
+            if (ctx.dataset_element_count != 0UL)
+                storage_dataset_bytes = ctx.dataset_element_count * ctx.datatype_size;
+
+            ctx.logical_dataset_bytes =
+                h5policy_checked_mul_u64(ctx.dataset_element_count,
+                                         ctx.datatype_logical_size,
+                                         profile.max_logical_dataset_bytes,
+                                         "H5_RESOURCE_LOGICAL_DATASET_BYTES",
+                                         "resource",
+                                         loc, object,
+                                         "logical dataset byte budget exceeded");
+            if (ctx.logical_dataset_bytes > ctx.max_logical_dataset_bytes_seen)
+                ctx.max_logical_dataset_bytes_seen = ctx.logical_dataset_bytes;
+
+            ctx = h5policy_update_chunk_resource_pressure(ctx, profile,
+                                                          loc, object);
+
+            if (ctx.has_dataset_layout != 0UB
+                && ctx.has_compact_layout != 0UB
+                && ctx.compact_layout_size != storage_dataset_bytes)
+                h5policy_emit_error("H5_CORRUPT_COMPACT_LAYOUT_SIZE_MISMATCH",
+                                    "corrupt", loc, object,
+                                    "compact layout data size does not match the dataspace and datatype");
+
+            if (ctx.has_dataset_layout != 0UB
+                && ctx.has_contiguous_layout != 0UB
+                && ((storage_dataset_bytes == 0UL && ctx.contiguous_layout_size != 0UL)
+                    || (storage_dataset_bytes != 0UL && ctx.contiguous_layout_size == 0UL)))
+                h5policy_emit_error("H5_CORRUPT_CONTIGUOUS_LAYOUT_SIZE_MISMATCH",
+                                    "corrupt", loc, object,
+                                    "contiguous layout data size does not match the dataspace and datatype");
+        }
+
+    return ctx;
+}
+
+/* Legacy chunked layouts encode one extra dimension for the chunk's element
+   size field.  The rank check has to wait until both dataspace and layout are
+   known, so it lives in this shared updater.  */
+fun h5policy_update_legacy_chunked_layout_rank = (H5WalkContext ctx,
+                                                 off64 loc,
+                                                 string object) H5WalkContext:
+{
+    if (ctx.has_dataspace != 0UB && ctx.has_legacy_chunked_layout != 0UB
+        && ctx.legacy_chunked_layout_ndims != ctx.dataspace_rank + 1UL)
+        h5policy_emit_error("H5_CORRUPT_LAYOUT_RANK_MISMATCH",
+                            "corrupt", loc, object,
+                            "legacy chunked layout dimensionality does not match dataspace rank");
+
+    return ctx;
+}
+
+/* Fill-value payloads should match the datatype storage size.  As with layout
+   checks, this can fire when either message is parsed second.  */
+fun h5policy_update_fill_value_size = (H5WalkContext ctx,
+                                       off64 loc,
+                                       string object) H5WalkContext:
+{
+    if (ctx.has_fill_value != 0UB && ctx.has_datatype != 0UB
+        && ctx.fill_value_size != ctx.datatype_size)
+        h5policy_emit_error("H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH",
+                            "corrupt", loc, object,
+                            "fill value size does not match the dataset datatype size");
+
+    return ctx;
+}

@@ -1,0 +1,174 @@
+/* h5_policy.pk - h5policy entry point.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+load "common.pk";
+load "superblock.pk";
+load "ohdr.pk";
+load "lookup3.pk";
+
+load "h5_findings.pk";
+load "h5_profiles.pk";
+load "h5_checked.pk";
+/* h5_walk.pk was split by concern; load order is significant (poke resolves
+   references at load time), so these must load in this sequence -- h5_walk.pk
+   first (it defines the H5WalkContext type and traversal state).  */
+load "h5_walk.pk";
+load "h5_dataspace.pk";
+load "h5_datatype.pk";
+load "h5_chunkindex.pk";
+load "h5_layout.pk";
+load "h5_dense_links.pk";
+load "h5_group.pk";
+load "h5_messages.pk";
+load "h5_dense_attrs.pk";
+load "h5_dispatch.pk";
+load "h5_validate.pk";
+
+var h5policy_profile_name = "untrusted_strict";
+var h5policy_file_name = "";
+
+/* CLI overrides, independent of the profile.  Empty string means "use the
+   profile default".  Mapping: "strict" | "non_strict".  Continue: "yes".  */
+var h5policy_mapping_arg = "";
+var h5policy_continue_arg = "";
+
+fun h5policy_profile = H5PolicyLimits:
+{
+    if (h5policy_profile_name == "forensic")
+        return H5_FORENSIC;
+    if (h5policy_profile_name == "trusted_fast")
+        return H5_TRUSTED_FAST;
+    if (h5policy_profile_name == "legacy")
+        return H5_LEGACY;
+    return H5_UNTRUSTED_STRICT;
+}
+
+/* Resolve the effective run mode from the profile default plus any override.  */
+fun h5policy_apply_run_mode = (H5PolicyLimits profile) void:
+{
+    if (h5policy_mapping_arg == "strict")
+        h5policy_nonstrict = 0;
+    else if (h5policy_mapping_arg == "non_strict")
+        h5policy_nonstrict = 1;
+    else
+        h5policy_nonstrict = (profile.forensic_mode != 0UB) ? 1 : 0;
+
+    if (h5policy_continue_arg == "yes")
+        h5policy_continue = 1;
+    else
+        h5policy_continue = (profile.forensic_mode != 0UB) ? 1 : 0;
+}
+
+fun h5policy_mapping_mode = string:
+{
+    if (h5policy_nonstrict != 0)
+        return "non_strict";
+    return "strict";
+}
+
+fun h5policy_run = void:
+{
+    h5policy_reset_findings;
+
+    var profile = h5policy_profile;
+    h5policy_apply_run_mode(profile);
+    var walk_start = gettime;
+    h5policy_walk_deadline = walk_start[0] + (profile.max_walk_seconds as int<64>);
+    var mode = h5policy_mapping_mode;
+    var ios = open(h5policy_file_name, IOS_M_RDONLY);
+    var ctx = h5policy_new_walk_context;
+
+    try
+        {
+            h5policy_locate_superblock(ios);
+            if (!h5policy_super_found)
+                {
+                    h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE",
+                                        "corrupt", 0UL#B, "superblock",
+                                        "HDF5 signature was not found at a valid superblock offset");
+                }
+            else
+                {
+                    var sb = h5policy_map_super(ios, profile, h5policy_super_off);
+                    ctx = h5policy_validate_superblock(ios, sb, profile,
+                                                       ctx, h5policy_super_off);
+
+                    var root_addr = h5policy_root_addr(sb);
+                    var ext_addr = h5policy_super_ext_addr(sb);
+                    if ((root_addr/#B) < (iosize(ios)/#B)
+                        && (h5policy_continue != 0
+                            || h5policy_exit_code == H5POLICY_EXIT_ACCEPT
+                            || h5policy_exit_code == H5POLICY_EXIT_WARN))
+                        {
+                            ctx = h5policy_walk_reachable_metadata(ios, profile,
+                                                                   ctx, root_addr,
+                                                                   ext_addr);
+                        }
+                }
+        }
+    catch (Exception e)
+        {
+            /* The walk-operation budget fired: the reachable graph is too large
+               or complex to fully vet within this profile's ceiling.  That is a
+               coverage limit, not a corruption verdict.  */
+            if (e.code == H5POLICY_EC_WALK_BUDGET as int<32>)
+                h5policy_emit_error("H5_UNSUPPORTED_WALK_BUDGET", "unsupported",
+                                    0UL#B, "metadata",
+                                    "file too large or complex to fully analyze within the walk operation budget");
+            /* Only exceptions that arise from mapping attacker-controlled
+               bytes/offsets mean "the file is corrupt/hostile".  Anything
+               else is a defect in this validator and must surface as
+               internal_error (exit 70), not be laundered as reject_corrupt.  */
+            else if (e.code == EC_constraint || e.code == EC_eof
+                || e.code == EC_io || e.code == EC_map)
+                h5policy_emit_error("H5_CORRUPT_MAPPING_FAILED",
+                                    "corrupt", 0UL#B, "metadata",
+                                    "metadata mapping failed under the selected profile ("
+                                    + e.name + ")");
+            else if (h5policy_exit_rank >= h5policy_class_rank("unsupported"))
+                /* An unanticipated exception (overflow, out-of-bounds, ...) but a
+                   rejection was ALREADY established: the file is known-bad, and
+                   continuing to compute on its attacker-controlled values is what
+                   threw.  This is a downstream symptom of the corruption, not an
+                   h5policy defect, so keep it a rejection rather than laundering
+                   it up to internal_error (which outranks corrupt).  */
+                h5policy_emit_error("H5_CORRUPT_MAPPING_FAILED",
+                                    "corrupt", 0UL#B, "metadata",
+                                    "metadata processing failed on already-rejected input ("
+                                    + e.name + ")");
+            else
+                h5policy_emit_error("H5_INTERNAL_ERROR",
+                                    "internal", 0UL#B, "metadata",
+                                    "internal validator error (" + e.name + ")");
+        }
+
+    h5policy_check_metadata_ratio(ctx, profile, h5policy_ceiling(ios));
+
+    h5policy_print_json_report(h5policy_profile_name, h5policy_file_name, mode,
+                               ctx.metadata_seen,
+                               ctx.object_count,
+                               ctx.attribute_count,
+                               ctx.object_header_chunk_count,
+                               ctx.chunk_index_count,
+                               ctx.max_rank_seen,
+                               ctx.max_logical_dataset_bytes_seen,
+                               h5policy_visited_ohdrs'length,
+                               h5policy_visited_conts'length,
+                               h5policy_visited_btrees'length);
+    printf("__H5POLICY_EXIT_CODE=%u32d\n", h5policy_exit_code as uint<32>);
+}

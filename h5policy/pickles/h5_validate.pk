@@ -1,0 +1,549 @@
+/* h5_validate.pk - Semantic validators and bounded reachable-metadata walk.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* h5_validate.pk connects raw HDF5 structures to the policy walk.  It locates
+   the legal superblock root, establishes the file address ceiling, validates
+   object-header containers, and hands message chunks to the dispatcher.  */
+
+/* Superblock discovery state is global because the JSON report and h5patch both
+   need to know whether a legal superblock offset was found.  */
+var H5POLICY_SIGNATURE = [0x89UB, 'H', 'D', 'F', '\r', '\n', 0x1aUB, '\n'];
+var h5policy_super_found = 0;
+var h5policy_super_off = 0UL#B;
+
+/* Generic all-ones sentinel test for optional superblock addresses.  Message
+   code has a width-aware twin in h5_walk.pk; this helper is used before the
+   reachable metadata walk has fully started.  */
+fun h5policy_addr_is_undef = (byte[] raw) int:
+{
+    var n = 0UL;
+
+    while (n < raw'length)
+        {
+            if (raw[n] != 0xffUB) return 0;
+            n = n + 1UL;
+        }
+
+    return 1;
+}
+
+/* Restrict offset and length sizes to widths the shared pickle definitions can
+   safely interpret throughout the policy code.  */
+fun h5policy_width_supported = (uint<8> width) int:
+{
+    return width == 2UB || width == 4UB || width == 8UB;
+}
+
+/* Signature probes are strict byte reads.  If the eight-byte magic is not fully
+   inside the file image, that candidate offset is not a superblock.  */
+fun h5policy_signature_at = (int ios, offset<uint<64>,B> off) int:
+{
+    if ((off/#B + 8UL) > iosize(ios)/#B)
+        return 0;
+    return (byte[8] @ ios : off) == H5POLICY_SIGNATURE;
+}
+
+/* Legal superblock offsets are byte 0 or userblock offsets at powers of two
+   starting at 512.  h5policy does not scan arbitrary offsets because false
+   positives would change the trusted root of the metadata graph.  */
+fun h5policy_locate_superblock = (int ios) void:
+{
+    h5policy_super_found = 0;
+    h5policy_super_off = 0UL#B;
+
+    if (h5policy_signature_at(ios, 0UL#B))
+        {
+            h5policy_super_found = 1;
+            h5policy_super_off = 0UL#B;
+            return;
+        }
+
+    var pos = 512UL;
+    var file_size = iosize(ios)/#B;
+    while (pos + 8UL <= file_size)
+        {
+            if (h5policy_signature_at(ios, pos#B))
+                {
+                    h5policy_super_found = 1;
+                    h5policy_super_off = pos#B;
+                    return;
+                }
+            pos = pos * 2UL;
+        }
+}
+
+/* Superblock and byte mapping wrappers mirror the message mapping wrappers:
+   strict profiles reject malformed mappings immediately, while forensic mode
+   maps non-strictly so nearby fields can still be classified.  */
+fun h5policy_map_super = (int ios, H5PolicyLimits profile,
+                          offset<uint<64>,B> off) superblock:
+{
+    if (h5policy_nonstrict != 0)
+        return superblock @! ios : off;
+    return superblock @ ios : off;
+}
+
+fun h5policy_map_bytes = (int ios, H5PolicyLimits profile,
+                          offset<uint<64>,B> off,
+                          uint<64> size) byte[]:
+{
+    if (h5policy_nonstrict != 0)
+        return byte[size] @! ios : off;
+    return byte[size] @ ios : off;
+}
+
+fun h5policy_read_u64_le_at = (int ios, H5PolicyLimits profile,
+                               offset<uint<64>,B> off,
+                               uint<64> size) uint<64>:
+{
+    return bytes_to_u64_le(h5policy_map_bytes(ios, profile, off, size));
+}
+
+/* Address checks use the current ceiling, not always the physical file size.
+   h5policy_validate_superblock sets h5policy_eof from the declared EOA, and
+   later walks reject metadata beyond that boundary.  */
+fun h5policy_addr_in_file = (uint<64> addr, uint<64> file_size,
+                             string code, off64 loc,
+                             string object, string message) int:
+{
+    if (addr >= file_size)
+        {
+            h5policy_emit_error(code, "corrupt", loc, object, message);
+            return 0;
+        }
+
+    return 1;
+}
+
+/* Optional addresses are valid when undefined or in range.  Defined but
+   out-of-file values are findings even when the referenced structure is not
+   otherwise decoded by this phase.  */
+fun h5policy_validate_optional_addr = (byte[] raw, uint<64> file_size,
+                                       off64 loc, string object,
+                                       string message) void:
+{
+    if (!h5policy_addr_is_undef(raw))
+        {
+            var addr = bytes_to_u64_le(raw);
+            var ok = h5policy_addr_in_file(addr, file_size,
+                                           "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                           loc, object, message);
+        }
+}
+
+/* v0/v1 superblocks have no superblock-extension object header.  Return the
+   undefined-address sentinel so the reachable walk can treat "none" uniformly. */
+fun h5policy_super_ext_addr = (superblock sb) uint<64>:
+{
+    if (sb.super_vers < 2UB)
+        return 0xffffffffffffffffUL;   /* v0/v1 use a driver-info block, not an ohdr */
+    return bytes_to_u64_le(sb.super.v2_v3.ext_addr_raw);
+}
+
+/* Root object headers live in different superblock fields across versions, but
+   downstream traversal wants one byte offset.  */
+fun h5policy_root_addr = (superblock sb) offset<uint<64>,B>:
+{
+    if (sb.super_vers < 2UB)
+        return bytes_to_off(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw);
+    return bytes_to_off(sb.super.v2_v3.root_obj_addr_raw);
+}
+
+/* Validate the fields that define the rest of the address space: offset/length
+   widths, K values for legacy indexes, declared EOA, root and optional metadata
+   addresses, and v2/v3 checksum integrity.  */
+fun h5policy_validate_superblock = (int ios, superblock sb,
+                                    H5PolicyLimits profile,
+                                    H5WalkContext ctx,
+                                    offset<uint<64>,B> super_off) H5WalkContext:
+{
+    var file_size = iosize(ios)/#B;
+
+    ctx = h5policy_account_metadata(ctx, profile,
+                                    sb'size/#B, super_off, "superblock");
+
+    if (sb.super_vers < 2UB)
+        {
+            if (!h5policy_width_supported(sb.super.v0_v1.sizeof_offsets))
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", super_off, "superblock",
+                                    "unsupported superblock offset width");
+
+            if (!h5policy_width_supported(sb.super.v0_v1.sizeof_lengths))
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", super_off, "superblock",
+                                    "unsupported superblock length width");
+
+            if (sb.super.v0_v1.fs_info_vers != 0UB
+                || sb.super.v0_v1.root_stab_vers != 0UB
+                || sb.super.v0_v1.shared_hdr_vers != 0UB)
+                h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_SUPERBLOCK_FIELD_VERSION",
+                                    "corrupt", super_off, "superblock",
+                                    "legacy superblock contains an unsupported format-version field");
+            if (sb.super.v0_v1.res1 != 0UB || sb.super.v0_v1.res2 != 0UB)
+                h5policy_emit_error("H5_CORRUPT_SUPERBLOCK_RESERVED",
+                                    "corrupt", super_off, "superblock",
+                                    "legacy superblock reserved field is nonzero");
+            if (sb.super.v0_v1.stab_leaf_k == 0UH
+                || sb.super.v0_v1.stab_internal_k == 0UH)
+                h5policy_emit_error("H5_CORRUPT_SUPERBLOCK_K_VALUE",
+                                    "corrupt", super_off, "superblock",
+                                    "legacy superblock B-tree K value is zero");
+            if (sb.super_vers == 1UB)
+                {
+                    if (sb.super.v0_v1.res3 != 0UH)
+                        h5policy_emit_error("H5_CORRUPT_SUPERBLOCK_RESERVED",
+                                            "corrupt", super_off, "superblock",
+                                            "legacy superblock reserved field is nonzero");
+                    if (sb.super.v0_v1.indexed_internal_k == 0UH)
+                        h5policy_emit_error("H5_CORRUPT_SUPERBLOCK_K_VALUE",
+                                            "corrupt", super_off, "superblock",
+                                            "legacy superblock B-tree K value is zero");
+                }
+
+            var base = bytes_to_u64_le(sb.super.v0_v1.base_addr_raw);
+            var eof = bytes_to_u64_le(sb.super.v0_v1.eof_addr_raw);
+            var root = bytes_to_u64_le(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw);
+            h5policy_super_stab_leaf_k =
+                sb.super.v0_v1.stab_leaf_k as uint<64>;
+            h5policy_super_stab_internal_k =
+                sb.super.v0_v1.stab_internal_k as uint<64>;
+            h5policy_super_indexed_internal_k =
+                (sb.super_vers == 1UB)
+                ? (sb.super.v0_v1.indexed_internal_k as uint<64>)
+                : 32UL;
+
+            /* Adopt the declared EOF as the address ceiling for the walk.  */
+            h5policy_eof = eof;
+
+            /* The HDF5 spec constrains the base address to equal the address of
+               the superblock itself (0 with no userblock).  libhdf5 measures the
+               EOA relative to base, so a wrong base shifts every address and it
+               rejects with "actual len exceeds EOA".  */
+            if (base != super_off/#B)
+                h5policy_emit_error("H5_CORRUPT_BASE_ADDRESS_MISMATCH",
+                                    "corrupt", super_off, "superblock",
+                                    "superblock base address does not match the superblock location");
+            if (eof > file_size)
+                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                    "corrupt", super_off, "superblock",
+                                    "end-of-file address is beyond the available file image");
+            var ok_root = h5policy_addr_in_file(root, file_size,
+                                                "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                super_off, "/",
+                                                "root object header address is outside the file");
+            h5policy_validate_optional_addr(sb.super.v0_v1.fs_info_addr_raw,
+                                            file_size, super_off,
+                                            "superblock",
+                                            "free-space info address is outside the file");
+            h5policy_validate_optional_addr(sb.super.v0_v1.drv_info_addr_raw,
+                                            file_size, super_off,
+                                            "superblock",
+                                            "driver-info address is outside the file");
+        }
+    else
+        {
+            if (!h5policy_width_supported(sb.super.v2_v3.sizeof_offsets))
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", super_off, "superblock",
+                                    "unsupported superblock offset width");
+
+            if (!h5policy_width_supported(sb.super.v2_v3.sizeof_lengths))
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", super_off, "superblock",
+                                    "unsupported superblock length width");
+
+            if (sb.super_vers == 3UB
+                && ((sb.super.v2_v3.status_flags.v3_flags & 0xf8UB) != 0UB))
+                h5policy_emit_error("H5_CORRUPT_SUPERBLOCK_STATUS_FLAGS",
+                                    "corrupt", super_off, "superblock",
+                                    "superblock version 3 status flags use reserved bits");
+
+            var base2 = bytes_to_u64_le(sb.super.v2_v3.base_addr_raw);
+            var eof2 = bytes_to_u64_le(sb.super.v2_v3.eof_addr_raw);
+            var root2 = bytes_to_u64_le(sb.super.v2_v3.root_obj_addr_raw);
+
+            /* Adopt the declared EOF as the address ceiling for the walk.  */
+            h5policy_eof = eof2;
+
+            /* Base address must equal the superblock location (see v0/v1 note).  */
+            if (base2 != super_off/#B)
+                h5policy_emit_error("H5_CORRUPT_BASE_ADDRESS_MISMATCH",
+                                    "corrupt", super_off, "superblock",
+                                    "superblock base address does not match the superblock location");
+            if (eof2 > file_size)
+                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                    "corrupt", super_off, "superblock",
+                                    "end-of-file address is beyond the available file image");
+            var ok_root2 = h5policy_addr_in_file(root2, file_size,
+                                                 "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                 super_off, "/",
+                                                 "root object header address is outside the file");
+            h5policy_validate_optional_addr(sb.super.v2_v3.ext_addr_raw,
+                                            file_size, super_off,
+                                            "superblock",
+                                            "superblock extension address is outside the file");
+
+            var checksum_bytes = byte[(sb'size/#B) - 4UL] @ ios : super_off;
+            var checksum = lookup3_hashlittle(checksum_bytes, 0);
+            if (checksum != sb.super.v2_v3.chksum)
+                h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM",
+                                    "corrupt", super_off, "superblock",
+                                    "superblock checksum mismatch");
+        }
+
+    return ctx;
+}
+
+/* Validate one object header at a known byte offset.  The per-object dataset
+   scratch fields are cleared before parsing so messages from a previous object
+   do not affect cross-message checks for this one.  */
+fun h5policy_validate_ohdr_raw = (int ios,
+                                  H5PolicyLimits profile,
+                                  H5WalkContext ctx,
+                                  offset<uint<64>,B> root_off,
+                                  string object,
+                                  uint<64> depth) H5WalkContext:
+{
+    var file_size = h5policy_ceiling(ios);
+    var sig = h5policy_map_bytes(ios, profile, root_off, 4UL);
+
+    h5policy_current_object_depth = depth;
+    h5policy_current_object_msg_count = 0UL;
+    h5policy_current_object_root_msg_count = 0UL;
+    ctx.has_dataspace = 0UB;
+    ctx.has_datatype = 0UB;
+    ctx.has_dataset_layout = 0UB;
+    ctx.has_fill_value = 0UB;
+    ctx.has_compact_layout = 0UB;
+    ctx.has_contiguous_layout = 0UB;
+    ctx.has_legacy_chunked_layout = 0UB;
+    ctx.dataset_element_count_overflowed = 0UB;
+    ctx.dataset_dim_exceeds_max = 0UB;
+    ctx.dataspace_has_max_dims = 0UB;
+    ctx.dataspace_has_unlimited_dim = 0UB;
+    ctx.dataspace_rank = 0UL;
+    ctx.dataset_element_count = 0UL;
+    ctx.datatype_size = 0UL;
+    ctx.datatype_logical_size = 0UL;
+    ctx.fill_value_size = 0UL;
+    ctx.compact_layout_size = 0UL;
+    ctx.contiguous_layout_size = 0UL;
+    ctx.legacy_chunked_layout_ndims = 0UL;
+    ctx.chunk_dataset_element_count = 0UL;
+    ctx.chunk_logical_bytes = 0UL;
+    ctx.logical_dataset_bytes = 0UL;
+    ctx.has_chunked_layout = 0UB;
+
+    ctx = h5policy_count_object(ctx, profile, root_off, object);
+
+    /* Version-2 object headers are self-describing: optional creation/access
+       metadata, chunk-0 size width, message data, and a trailing checksum.  */
+    if (sig == V2_SIG)
+        {
+            var version = h5policy_read_u64_le_at(ios, profile,
+                                                  root_off + 4#B, 1UL) as uint<8>;
+            var flags = h5policy_read_u64_le_at(ios, profile,
+                                                root_off + 5#B, 1UL) as uint<8>;
+
+            if (version != 2UB)
+                {
+                    h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
+                                        "corrupt", root_off, object,
+                                        "v2 object-header signature has an unsupported version byte");
+                    return ctx;
+                }
+
+            var cursor = root_off + 6#B;
+            if ((flags & (1U <<. 5)) != 0U)
+                cursor = cursor + 16#B;
+            if ((flags & (1U <<. 4)) != 0U)
+                cursor = cursor + 4#B;
+
+            var size_width = 1UL <<. (flags & 3U);
+            var chunk_size = h5policy_read_u64_le_at(ios, profile,
+                                                     cursor, size_width);
+            var chunk_off = cursor + size_width#B;
+            var header_bytes = ((chunk_off - root_off)/#B) as uint<64>;
+            var total_without_checksum =
+                h5policy_checked_add_u64(header_bytes, chunk_size,
+                                         0xffffffffffffffffUL,
+                                         "H5_CORRUPT_LENGTH_OVERFLOW",
+                                         "corrupt", root_off, object,
+                                         "object-header size overflow");
+            var total_size =
+                h5policy_checked_add_u64(total_without_checksum, 4UL,
+                                         0xffffffffffffffffUL,
+                                         "H5_CORRUPT_LENGTH_OVERFLOW",
+                                         "corrupt", root_off, object,
+                                         "object-header checksum size overflow");
+
+            var ok = h5policy_checked_addr_range(root_off/#B, total_size,
+                                                 file_size,
+                                                 "object header outside file",
+                                                 root_off, object);
+            if (!ok)
+                return ctx;
+
+            ctx = h5policy_account_metadata(ctx, profile,
+                                            total_size, root_off, object);
+
+            var checksum_bytes = h5policy_map_bytes(ios, profile,
+                                                    root_off,
+                                                    total_size - 4UL);
+            var stored_checksum = lookup3_u32_le(h5policy_map_bytes(ios, profile,
+                                                                    root_off + (total_size - 4UL)#B,
+                                                                    4UL));
+            var checksum = lookup3_hashlittle(checksum_bytes, 0);
+            if (checksum != stored_checksum)
+                h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM",
+                                    "corrupt", root_off, object,
+                                    "object-header checksum mismatch");
+
+            var crt_order_tracked = ((flags & 4U) != 0U);
+            var prefix_bytes = crt_order_tracked ? (V2_PREFIX_BYTES + 2) : V2_PREFIX_BYTES;
+
+            global_crt_tracked = crt_order_tracked;
+            ctx = h5policy_validate_msg_chunk(ios, profile, ctx,
+                                              version, prefix_bytes,
+                                              0,
+                                              chunk_off, chunk_size, object);
+
+            return ctx;
+        }
+
+    /* Version-1 headers have a fixed 16-byte prefix and no checksum.  libhdf5
+       validates the declared message count only after loading chunk 0; unless
+       built with H5_STRICT_FORMAT_CHECKS, later continuation messages may make
+       the total differ from the prefix.  */
+    var version1 = h5policy_read_u64_le_at(ios, profile, root_off, 1UL) as uint<8>;
+    if (version1 != 1UB)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
+                                "corrupt", root_off, object,
+                                "root object header is neither v1 nor v2");
+            return ctx;
+        }
+
+    var nmessages1 = h5policy_read_u64_le_at(ios, profile,
+                                             root_off + 2#B, 2UL);
+    var chunk_size1 = h5policy_read_u64_le_at(ios, profile,
+                                             root_off + 8#B, 4UL);
+    var total_size1 =
+        h5policy_checked_add_u64(16UL, chunk_size1,
+                                 0xffffffffffffffffUL,
+                                 "H5_CORRUPT_LENGTH_OVERFLOW",
+                                 "corrupt", root_off, object,
+                                 "object-header size overflow");
+    var ok1 = h5policy_checked_addr_range(root_off/#B, total_size1,
+                                          file_size,
+                                          "object header outside file",
+                                          root_off, object);
+    if (!ok1)
+        return ctx;
+
+    if ((nmessages1 > 0UL && chunk_size1 < (V1_PREFIX_BYTES as uint<64>))
+        || (nmessages1 == 0UL && chunk_size1 > 0UL))
+        h5policy_emit_error("H5_CORRUPT_OBJECT_HEADER_MESSAGE_COUNT",
+                            "corrupt", root_off, object,
+                            "v1 object-header message count is inconsistent with first chunk size");
+
+    ctx = h5policy_account_metadata(ctx, profile,
+                                    total_size1, root_off, object);
+
+    global_crt_tracked = 0;
+    ctx = h5policy_validate_msg_chunk(ios, profile, ctx,
+                                      version1, V1_PREFIX_BYTES,
+                                      1,
+                                      root_off + 16#B, chunk_size1, object);
+
+    if (h5policy_current_object_root_msg_count > nmessages1)
+        h5policy_emit_error("H5_CORRUPT_OBJECT_HEADER_MESSAGE_COUNT",
+                            "corrupt", root_off, object,
+                            "v1 object header first chunk contains more messages than declared");
+
+    return ctx;
+}
+
+/* Walk every reachable object header from the root graph.  A bounded BFS keeps
+   link traversal deterministic, allows duplicate hard links to be deduplicated,
+   and gives continue-after-corruption mode a single place to decide whether to
+   keep draining queued objects.  */
+fun h5policy_walk_reachable_metadata = (int ios,
+                                        H5PolicyLimits profile,
+                                        H5WalkContext ctx,
+                                        offset<uint<64>,B> root_off,
+                                        uint<64> ext_addr) H5WalkContext:
+{
+    h5policy_reset_traversal_state;
+    h5policy_enqueue_ohdr(profile, root_off/#B, 0UL, "/",
+                          root_off, "/");
+
+    /* The superblock extension is an object header carrying file-level messages
+       (driver info, file-space info, metadata cache image, ...).  libhdf5 reads
+       it at open, so validate it too -- otherwise out-of-file addresses hidden
+       there (e.g. a bogus cache-image address) are missed.  Only HADDR_UNDEF
+       (all-ones) means "no extension"; a defined address of 0 points at the
+       superblock itself, which libhdf5 rejects -- so validate it rather than
+       treating 0 as absent (the walk finds the superblock magic and rejects).  */
+    if (ext_addr != 0xffffffffffffffffUL
+        && ext_addr < h5policy_ceiling(ios))
+        h5policy_enqueue_ohdr(profile, ext_addr, 0UL, "/<superblock-extension>",
+                              ext_addr#B, "/<superblock-extension>");
+
+    /* pending_index advances monotonically through the queue.  New hard links
+       discovered while validating an object are appended and picked up later,
+       which gives breadth-first traversal without mutating already visited
+       entries.  */
+    while (h5policy_pending_index < h5policy_pending_ohdrs'length)
+        {
+            var addr = h5policy_pending_ohdrs[h5policy_pending_index];
+            var depth = h5policy_pending_depths[h5policy_pending_index];
+            var path = h5policy_pending_paths[h5policy_pending_index];
+            h5policy_pending_index = h5policy_pending_index + 1UL;
+
+            if (h5policy_continue == 0
+                && h5policy_exit_code != H5POLICY_EXIT_ACCEPT
+                && h5policy_exit_code != H5POLICY_EXIT_WARN)
+                return ctx;
+
+            if (!h5policy_mark_visited_ohdr(addr))
+                continue;
+
+            if (depth > profile.max_link_traversal_depth)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED",
+                                        "corrupt", addr#B, path,
+                                        "link traversal depth exceeds the selected profile limit");
+                    continue;
+                }
+
+            if (addr >= h5policy_ceiling(ios))
+                {
+                    h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                        "corrupt", addr#B, path,
+                                        "object header address is at or beyond the declared end-of-file");
+                    continue;
+                }
+
+            ctx = h5policy_validate_ohdr_raw(ios, profile, ctx,
+                                             addr#B, path, depth);
+        }
+
+    return ctx;
+}

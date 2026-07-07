@@ -1,5 +1,24 @@
 # Tools
 
+## Command Entry Points
+
+The top-level `tools/` directory collects repository commands.  Most entries are
+relative symlinks to the tool-owned implementations:
+
+```text
+tools/h5explain          -> ../h5explain/tools/h5explain
+tools/h5patch            -> ../h5patch/tools/h5patch
+tools/h5policy           -> ../h5policy/tools/h5policy
+tools/h5policy-diff      -> ../h5policy/tools/h5policy-diff
+tools/h5policy-fuzz      -> ../h5policy/tools/h5policy-fuzz
+tools/h5policy-fuzzlib   -> ../h5policy/tools/h5policy-fuzzlib
+tools/h5policy-crashfuzz -> ../h5policy/tools/h5policy-crashfuzz
+tools/h5policy-gencorpus -> ../h5policy/tools/h5policy-gencorpus
+```
+
+`tools/pkdoc.py` is a repository-level helper script used by the documentation
+targets.
+
 ## Marker Scanner
 
 `h5markers` is a multithreaded file scanner for the concrete on-disk markers defined in the [HDF5 file format specification](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) and the [Onion file format](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/Onion_VFD_RFC_211122.pdf). See also the [MARKERS.md](MARKERS.md) file for a complete list of known markers.
@@ -40,7 +59,7 @@ hexadecimal and decimal. Progress is reported on stderr when scanning in a termi
 For example, scanning the sample file `file.h5` in this repository produces the following output:
 
 ```text
-HDF5_SIGNATURE  0x0000000000000000 (0)                      
+HDF5_SIGNATURE  0x0000000000000000 (0)
 OHDR            0x0000000000000030 (48)
 OHDR            0x00000000000000C3 (195)
 TREE            0x00000000000001DF (479)
@@ -59,9 +78,9 @@ TREE            0x00000000000001DF (479)
 
 **Navigation commands:** `root`, `h5super`, `cd ("NAME")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
 
-**Inspection commands:** `info`, `msgs`, `cur`, `ls` / `links`, `traverse`, `dump`, `h5dump`
+**Inspection commands:** `explain`, `explain (N)`, `explain_msg (N)`, `info`, `msgs`, `cur`, `ls` / `links`, `traverse`, `dump`, `h5dump`
 
-Type `help` at the prompt for a full description of each command.
+Use `msgs` to list object-header messages, then `explain (N)` or `explain_msg (N)` to explain message `N` in the current object header. Type `help` at the prompt for a full description of each command.
 
 `traverse` is the only command that recursively walks chunk indexes. Ordinary navigation and `info` map the current primitive only, so large chunk indexes are not traversed accidentally.
 

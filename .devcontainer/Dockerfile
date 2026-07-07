@@ -2,7 +2,18 @@ FROM archlinux:latest
 
 RUN pacman -Sy --noconfirm archlinux-keyring && \
     pacman -Syu --noconfirm && \
-    pacman -S --noconfirm base-devel git sudo poke
+    pacman -S --noconfirm \
+        base-devel \
+        cmake \
+        emacs \
+        git \
+        hdf5 \
+        poke \
+        python \
+        python-h5py \
+        python-numpy \
+        python-yaml \
+        sudo
 
 ARG USERNAME=vscode
 ARG USER_UID=1000

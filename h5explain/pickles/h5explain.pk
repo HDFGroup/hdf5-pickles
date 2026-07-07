@@ -81,6 +81,18 @@ var h5explain_ctx_pfx = 0;
 var h5explain_ctx_chunk_off = 0UL#B;
 var h5explain_ctx_chunk_size = 0UL;
 
+var h5explain_msg_target = 0UL;
+var h5explain_msg_seen = 0UL;
+var h5explain_msg_found = 0;
+var h5explain_msg_index = 0UL;
+var h5explain_msg_type = 0UL;
+var h5explain_msg_size = 0UL;
+var h5explain_msg_flags = 0UB;
+var h5explain_msg_crt_order = 0UL;
+var h5explain_msg_has_crt_order = 0;
+var h5explain_msg_prefix_off = 0UL#B;
+var h5explain_msg_payload_off = 0UL#B;
+
 fun pk_prompt = string:
 {
     return "(h5explain) ";
@@ -519,7 +531,10 @@ fun h5explain_banner = void:
     printf("  back                       return to the previous location\n");
     printf("  pwd                        show current label, offset, and kind\n\n");
     printf("Inspection:\n");
-    printf("  info                       explain the current primitive\n");
+    printf("  explain                    describe what the current primitive means\n");
+    printf("  explain (N)                describe object-header message N\n");
+    printf("  explain_msg (N)            alias for explain (N)\n");
+    printf("  info                       show structural details for the current primitive\n");
     printf("  msgs                       decode object header messages (OHDR only)\n");
     printf("  cur                        return the current mapped value (raw poke struct)\n");
     printf("  ls or links                list hard links when current primitive is a group header\n");
@@ -561,6 +576,905 @@ fun cur = any:
         return h5explain_map_ea_dblock(h5explain_cur_off);
 
     return h5explain_map_raw(h5explain_cur_off);
+}
+
+fun h5explain_bt2_record_type_name = (uint<8> record_type) string:
+{
+    if (record_type == 5UB) return "dense link name index";
+    if (record_type == 6UB) return "dense link creation-order index";
+    if (record_type == 10UB) return "non-filtered chunk index";
+    if (record_type == 11UB) return "filtered chunk index";
+    return "record type handled by the generic v2 B-tree decoder";
+}
+
+fun h5explain_array_client_name = (uint<8> client_id) string:
+{
+    if (client_id == 0UB) return "non-filtered dataset chunks";
+    if (client_id == 1UB) return "filtered dataset chunks";
+    return "client class not yet described by h5explain";
+}
+
+fun h5explain_msg_type_name = (uint<64> msg_type) string:
+{
+    if (msg_type == 0x00UL) return "NIL";
+    if (msg_type == 0x01UL) return "Dataspace";
+    if (msg_type == 0x02UL) return "Link info";
+    if (msg_type == 0x03UL) return "Datatype";
+    if (msg_type == 0x04UL) return "Fill value (old)";
+    if (msg_type == 0x05UL) return "Fill value";
+    if (msg_type == 0x06UL) return "Link";
+    if (msg_type == 0x07UL) return "External file list";
+    if (msg_type == 0x08UL) return "Data layout";
+    if (msg_type == 0x09UL) return "Bogus valid";
+    if (msg_type == 0x0aUL) return "Group info";
+    if (msg_type == 0x0bUL) return "Filter pipeline";
+    if (msg_type == 0x0cUL) return "Attribute";
+    if (msg_type == 0x0dUL) return "Object name";
+    if (msg_type == 0x0eUL) return "Modification time (old)";
+    if (msg_type == 0x0fUL) return "Shared message table";
+    if (msg_type == 0x10UL) return "Object header continuation";
+    if (msg_type == 0x11UL) return "Symbol table";
+    if (msg_type == 0x12UL) return "Modification time";
+    if (msg_type == 0x13UL) return "v1 B-tree K values";
+    if (msg_type == 0x14UL) return "Driver info";
+    if (msg_type == 0x15UL) return "Attribute info";
+    if (msg_type == 0x16UL) return "Object reference count";
+    if (msg_type == 0x17UL) return "File space info";
+    if (msg_type == 0x18UL) return "Metadata cache image";
+    return "Unknown object-header message";
+}
+
+fun h5explain_dtype_class_name = (int dtype_class) string:
+{
+    if (dtype_class == 0) return "fixed-point integer";
+    if (dtype_class == 1) return "floating-point";
+    if (dtype_class == 2) return "time";
+    if (dtype_class == 3) return "string";
+    if (dtype_class == 4) return "bitfield";
+    if (dtype_class == 5) return "opaque";
+    if (dtype_class == 6) return "compound";
+    if (dtype_class == 7) return "reference";
+    if (dtype_class == 8) return "enumeration";
+    if (dtype_class == 9) return "variable-length";
+    if (dtype_class == 10) return "array";
+    if (dtype_class == 11) return "complex";
+    return "unknown datatype class";
+}
+
+fun h5explain_layout_class_name = (uint<8> layout_class) string:
+{
+    if (layout_class == 0UB) return "compact";
+    if (layout_class == 1UB) return "contiguous";
+    if (layout_class == 2UB) return "chunked";
+    if (layout_class == 3UB) return "virtual";
+    return "unknown layout class";
+}
+
+fun h5explain_layout_index_name = (uint<8> idx_type) string:
+{
+    if (idx_type == 1UB) return "single chunk";
+    if (idx_type == 2UB) return "implicit";
+    if (idx_type == 3UB) return "fixed array";
+    if (idx_type == 4UB) return "extensible array";
+    if (idx_type == 5UB) return "version 2 B-tree";
+    return "unknown chunk index";
+}
+
+fun h5explain_space_type_name = (uint<8> space_type) string:
+{
+    if (space_type == 0UB) return "scalar";
+    if (space_type == 1UB) return "simple";
+    if (space_type == 2UB) return "null";
+    return "unknown";
+}
+
+fun h5explain_reset_msg_search = (uint<64> target) void:
+{
+    h5explain_msg_target = target;
+    h5explain_msg_seen = 0UL;
+    h5explain_msg_found = 0;
+    h5explain_msg_index = 0UL;
+    h5explain_msg_type = 0UL;
+    h5explain_msg_size = 0UL;
+    h5explain_msg_flags = 0UB;
+    h5explain_msg_crt_order = 0UL;
+    h5explain_msg_has_crt_order = 0;
+    h5explain_msg_prefix_off = 0UL#B;
+    h5explain_msg_payload_off = 0UL#B;
+}
+
+fun h5explain_capture_msg_if_target = (uint<64> msg_type,
+                                       uint<64> msg_size,
+                                       byte msg_flags,
+                                       int has_crt_order,
+                                       uint<64> crt_order,
+                                       offset<uint<64>,B> prefix_off,
+                                       offset<uint<64>,B> payload_off) void:
+{
+    if (h5explain_msg_seen == h5explain_msg_target) {
+        h5explain_msg_found = 1;
+        h5explain_msg_index = h5explain_msg_seen;
+        h5explain_msg_type = msg_type;
+        h5explain_msg_size = msg_size;
+        h5explain_msg_flags = msg_flags;
+        h5explain_msg_has_crt_order = has_crt_order;
+        h5explain_msg_crt_order = crt_order;
+        h5explain_msg_prefix_off = prefix_off;
+        h5explain_msg_payload_off = payload_off;
+    }
+    h5explain_msg_seen = h5explain_msg_seen + 1UL;
+}
+
+fun h5explain_find_msg_in_chunk = (uint<8> version, int prefix_bytes,
+                                   offset<uint<64>,B> chunk_off,
+                                   uint<64> chunk_size) void:
+{
+    var i = 0UL;
+
+    global_version = version;
+
+    while ((i + prefix_bytes) < chunk_size && !h5explain_msg_found) {
+        var msg_type = 0UL;
+        var msg_size = 0UL;
+        var msg_flags = 0UB;
+        var has_crt_order = 0;
+        var crt_order = 0UL;
+        var prefix_off = chunk_off + i#B;
+        var prefix = h5explain_map_msg_prefix(prefix_off);
+
+        if (version == 1UB) {
+            msg_type = prefix.v1_msg_prefix.msg_type as uint<64>;
+            msg_size = prefix.v1_msg_prefix.msg_size as uint<64>;
+            msg_flags = prefix.v1_msg_prefix.msg_flags;
+        } else {
+            msg_type = prefix.v2_msg_prefix.msg_type as uint<64>;
+            msg_size = prefix.v2_msg_prefix.msg_size as uint<64>;
+            msg_flags = prefix.v2_msg_prefix.msg_flags;
+            if (global_crt_tracked) {
+                has_crt_order = 1;
+                crt_order = prefix.v2_msg_prefix.crt_order as uint<64>;
+            }
+        }
+
+        var payload_off = chunk_off + i#B + prefix_bytes#B;
+        h5explain_capture_msg_if_target(msg_type, msg_size, msg_flags,
+                                        has_crt_order, crt_order,
+                                        prefix_off, payload_off);
+
+        if (!h5explain_msg_found && msg_type == 0x10UL) {
+            var cont = h5explain_map_cont(payload_off);
+            var cont_off = bytes_to_off(cont.addr_raw);
+            var cont_size = bytes_to_u64_le(cont.size_raw);
+            if (version == 2UB)
+                h5explain_find_msg_in_chunk(version, prefix_bytes,
+                                            cont_off + 4#B, cont_size - 4UL);
+            else
+                h5explain_find_msg_in_chunk(version, prefix_bytes,
+                                            cont_off, cont_size);
+        }
+
+        i = i + prefix_bytes + msg_size;
+    }
+}
+
+fun h5explain_cb_count_msg = (uint<64> m_type,
+                              offset<uint<64>,B> payload_off,
+                              uint<64> m_size) uint<64>:
+{
+    return 1UL;
+}
+
+fun h5explain_print_current_heading = void:
+{
+    var value = cur;
+
+    printf("Current: %s at %v", h5explain_kind_name(h5explain_cur_kind),
+           h5explain_cur_off);
+    if (h5explain_cur_label != "") printf(" [%s]", h5explain_cur_label);
+    printf("\n");
+    printf("Extent: %v, mapping: %s\n\n",
+           value'size, value'strict ? "strict" : "non-strict");
+}
+
+fun h5explain_explain_super = void:
+{
+    var sb = h5explain_map_super(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  The superblock is the file's entry point. It establishes address\n");
+    printf("  widths, file bounds, consistency flags, and the root object header.\n\n");
+
+    printf("Key fields:\n");
+    printf("  version=%v\n", sb.super_vers);
+    if (sb.super_vers < 2UB) {
+        printf("  sizeof_offsets=%v, sizeof_lengths=%v\n",
+               sb.super.v0_v1.sizeof_offsets, sb.super.v0_v1.sizeof_lengths);
+        printf("  base_addr=%v\n", bytes_to_off(sb.super.v0_v1.base_addr_raw));
+        printf("  eof_addr=%v\n", bytes_to_off(sb.super.v0_v1.eof_addr_raw));
+        printf("  root_object_header=%v\n",
+               bytes_to_off(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw));
+        printf("  status_flags=%v\n", sb.super.v0_v1.status_flags);
+        printf("  old_style_group_k=(leaf=%v, internal=%v)\n",
+               sb.super.v0_v1.stab_leaf_k, sb.super.v0_v1.stab_internal_k);
+    } else {
+        printf("  sizeof_offsets=%v, sizeof_lengths=%v\n",
+               sb.super.v2_v3.sizeof_offsets, sb.super.v2_v3.sizeof_lengths);
+        printf("  base_addr=%v\n", bytes_to_off(sb.super.v2_v3.base_addr_raw));
+        printf("  eof_addr=%v\n", bytes_to_off(sb.super.v2_v3.eof_addr_raw));
+        printf("  extension_addr=%v\n", bytes_to_off(sb.super.v2_v3.ext_addr_raw));
+        printf("  root_object_header=%v\n", bytes_to_off(sb.super.v2_v3.root_obj_addr_raw));
+        if (sb.super_vers == 2UB)
+            printf("  status_flags=%v\n", sb.super.v2_v3.status_flags.v2_flags);
+        else
+            printf("  status_flags=%v\n", sb.super.v2_v3.status_flags.v3_flags);
+        printf("  checksum=%v\n", sb.super.v2_v3.chksum);
+    }
+
+    printf("\nWhy it matters:\n");
+    printf("  Everything reachable in the file is interpreted using these sizes and\n");
+    printf("  addresses. Bad EOF/base/root values usually mean the rest of the file\n");
+    printf("  will be misread or unreachable.\n\n");
+
+    printf("Next:\n");
+    printf("  root                       jump to the root object header\n");
+    printf("  cur                        inspect the mapped superblock struct\n");
+    printf("  h5dump                     hex-dump exactly this superblock\n");
+}
+
+fun h5explain_explain_ohdr = void:
+{
+    var hdr = h5explain_map_ohdr(h5explain_cur_off);
+    h5explain_load_ohdr_ctx(h5explain_cur_off);
+    var msg_count = h5explain_walk_msg_chunk(h5explain_ctx_version,
+                                             h5explain_ctx_pfx,
+                                             h5explain_ctx_chunk_off,
+                                             h5explain_ctx_chunk_size,
+                                             h5explain_cb_count_msg);
+
+    printf("What it is:\n");
+    printf("  An object header is the metadata record for one HDF5 object: group,\n");
+    printf("  dataset, committed datatype, or another object-like node.\n\n");
+
+    printf("Key fields:\n");
+    if (hdr.sig_peek == V2_SIG) {
+        printf("  version=%v\n", hdr._ohdr.v2.version);
+        printf("  flags=%v\n", hdr._ohdr.v2.flags);
+        printf("  chunk0_size=%u64d\n", bytes_to_u64_le(hdr._ohdr.v2.chunk0_size));
+        printf("  message_prefix_bytes=%v\n", h5explain_ctx_pfx);
+        printf("  reachable_messages=%u64d\n", msg_count);
+        printf("  checksum=%v\n", hdr._ohdr.v2.chksum);
+    } else {
+        printf("  version=%v\n", hdr._ohdr.v1.version);
+        printf("  declared_message_count=%v\n", hdr._ohdr.v1.msg_cnt);
+        printf("  reachable_messages=%u64d\n", msg_count);
+        printf("  object_reference_count=%v\n", hdr._ohdr.v1.obj_ref_cnt);
+        printf("  message_chunk_size=%v\n", hdr._ohdr.v1.obj_hdr_size);
+    }
+
+    printf("\nWhy it matters:\n");
+    printf("  Object-header messages describe the object's datatype, dataspace,\n");
+    printf("  storage layout, filters, links, attributes, and continuation chunks.\n");
+    printf("  If this header is wrong, the object may point at the wrong metadata or\n");
+    printf("  raw data.\n\n");
+
+    printf("Next:\n");
+    printf("  msgs                       decode the object-header messages\n");
+    printf("  links                      list hard links if this object is a group\n");
+    printf("  cur                        inspect the raw object-header struct\n");
+}
+
+fun h5explain_explain_v1_btree = void:
+{
+    var tree = h5explain_map_v1_btree(h5explain_cur_off);
+
+    printf("What it is:\n");
+    if (tree.node_type == 0UB)
+        printf("  A version 1 B-tree for an old-style group symbol table.\n");
+    else
+        printf("  A version 1 B-tree for raw dataset chunks.\n");
+    printf("  It maps sorted keys to child pointers or chunk addresses.\n\n");
+
+    printf("Key fields:\n");
+    printf("  node_type=%v (%s)\n", tree.node_type,
+           tree.node_type == 0UB ? "group symbol table" : "raw chunk index");
+    printf("  node_level=%v (%s)\n", tree.node_level,
+           tree.node_level == 0UB ? "leaf" : "internal");
+    printf("  entries_used=%v\n", tree.entries_used);
+    printf("  left_sibling=%v\n", bytes_to_off(tree.left_sib_raw));
+    printf("  right_sibling=%v\n", bytes_to_off(tree.right_sib_raw));
+
+    printf("\nWhy it matters:\n");
+    printf("  This is an older HDF5 index. For groups it leads to SNOD symbol-table\n");
+    printf("  nodes and local-heap names. For chunked datasets it leads to raw chunk\n");
+    printf("  storage records.\n\n");
+
+    printf("Next:\n");
+    printf("  traverse                   recursively print this B-tree\n");
+    printf("  cur                        inspect this node only\n");
+}
+
+fun h5explain_explain_v2_btree_hdr = void:
+{
+    var hdr = h5explain_map_v2_btree_hdr(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A version 2 B-tree header. It describes the tree shape and record\n");
+    printf("  layout; the actual records live in the root node and its children.\n\n");
+
+    printf("Key fields:\n");
+    printf("  record_type=%v (%s)\n", hdr.record_type,
+           h5explain_bt2_record_type_name(hdr.record_type));
+    printf("  node_size=%v, record_size=%v\n", hdr.node_size, hdr.record_size);
+    printf("  depth=%v (%s)\n", hdr.depth,
+           hdr.depth == 0UH ? "root is a leaf" : "root is internal");
+    printf("  root_addr=%v\n", bytes_to_off(hdr.root_addr_raw));
+    printf("  root_records=%v\n", hdr.num_root_records);
+    printf("  total_records=%u64d\n", bytes_to_u64_le(hdr.total_nrec_raw));
+    printf("  checksum=%v\n", hdr.chksum);
+
+    printf("\nWhy it matters:\n");
+    printf("  V2 B-trees index dense links/attributes and several chunk-index\n");
+    printf("  layouts. The record type tells you what each record means.\n\n");
+
+    printf("Next:\n");
+    printf("  traverse                   recursively print the tree\n");
+    printf("  go (%v, \"v2 btree root\") inspect the root node directly\n",
+           bytes_to_off(hdr.root_addr_raw));
+    printf("  cur                        inspect the header struct\n");
+}
+
+fun h5explain_explain_v2_btree_node = void:
+{
+    printf("What it is:\n");
+    if (h5explain_cur_kind == H5EX_KIND_V2_BTREE_LEAF)
+        printf("  A version 2 B-tree leaf node. It stores records directly.\n\n");
+    else
+        printf("  A version 2 B-tree internal node. It stores separator records and child pointers.\n\n");
+
+    printf("Why it matters:\n");
+    printf("  The header determines the record type and width. Enter through BTHD\n");
+    printf("  when possible so h5explain can set those decoding parameters first.\n\n");
+
+    printf("Next:\n");
+    printf("  info                       print this node's decoded records\n");
+    printf("  cur                        inspect the raw node struct\n");
+}
+
+fun h5explain_explain_snod = void:
+{
+    var snod = h5explain_map_snod(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A symbol-table node for an old-style group. It stores link entries\n");
+    printf("  whose names live in a local heap.\n\n");
+
+    printf("Key fields:\n");
+    printf("  num_symbols=%v\n", snod.num_symbols);
+
+    printf("\nWhy it matters:\n");
+    printf("  In old-style groups, a type-0 v1 B-tree points at SNOD leaves, and\n");
+    printf("  each SNOD entry points onward to an object header.\n\n");
+
+    printf("Next:\n");
+    printf("  info                       print the symbol entries\n");
+    printf("  cur                        inspect the raw SNOD struct\n");
+}
+
+fun h5explain_explain_lheap = void:
+{
+    var heap = h5explain_map_lheap(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A local heap. Old-style groups use it to store variable-length link\n");
+    printf("  names referenced by symbol-table nodes.\n\n");
+
+    printf("Key fields:\n");
+    printf("  data_segment_addr=%v\n", bytes_to_off(heap.data_seg_addr_raw));
+    printf("  data_segment_size=%u64d\n", bytes_to_u64_le(heap.data_seg_size_raw));
+    printf("  free_list_head=%u64d\n", bytes_to_u64_le(heap.free_list_head_raw));
+
+    printf("\nNext:\n");
+    printf("  dump                       hex-dump around the heap header\n");
+    printf("  cur                        inspect the local-heap struct\n");
+}
+
+fun h5explain_explain_fa = void:
+{
+    var fa = h5explain_map_fa_hdr(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A fixed-array chunk index. It is used when the chunk population has a\n");
+    printf("  fixed bounded element count.\n\n");
+
+    printf("Key fields:\n");
+    printf("  client_id=%v (%s)\n", fa.client_id, h5explain_array_client_name(fa.client_id));
+    printf("  raw_element_size=%v\n", fa.raw_elmt_size);
+    printf("  elements=%u64d\n", bytes_to_u64_le(fa.nelmts_raw));
+    printf("  data_block_addr=%v\n", bytes_to_off(fa.dblk_addr_raw));
+    printf("  pages=%u64d\n", global_fa_npages);
+    printf("  checksum=%v\n", fa.chksum);
+
+    printf("\nWhy it matters:\n");
+    printf("  Each fixed-array element points at a chunk or filtered chunk record.\n");
+    printf("  Paged arrays add page checksums after the data-block prefix.\n\n");
+
+    printf("Next:\n");
+    printf("  traverse                   print the data block and pages\n");
+    printf("  go (%v, \"fixed array data block\") inspect the data block directly\n",
+           bytes_to_off(fa.dblk_addr_raw));
+    printf("  cur                        inspect the fixed-array header\n");
+}
+
+fun h5explain_explain_ea = void:
+{
+    var ea = h5explain_map_ea_hdr(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  An extensible-array chunk index. It is used for chunked datasets with\n");
+    printf("  an unlimited dimension and grows through index, secondary, and data blocks.\n\n");
+
+    printf("Key fields:\n");
+    printf("  client_id=%v (%s)\n", ea.client_id, h5explain_array_client_name(ea.client_id));
+    printf("  raw_element_size=%v\n", ea.raw_elmt_size);
+    printf("  elements=%u64d\n", bytes_to_u64_le(ea.nelmts_raw));
+    printf("  index_block_addr=%v\n", bytes_to_off(ea.idx_blk_addr_raw));
+    printf("  max_elements_bits=%v\n", ea.max_nelmts_bits);
+    printf("  secondary_blocks=%u64d\n", global_ea_nsblks);
+    printf("  checksum=%v\n", ea.chksum);
+
+    printf("\nWhy it matters:\n");
+    printf("  The header defines the growth geometry. The index block then fans out\n");
+    printf("  to direct data blocks and secondary blocks that hold chunk records.\n\n");
+
+    printf("Next:\n");
+    printf("  traverse                   print the reachable EA blocks\n");
+    printf("  go (%v, \"extensible array index block\") inspect the index block directly\n",
+           bytes_to_off(ea.idx_blk_addr_raw));
+    printf("  cur                        inspect the extensible-array header\n");
+}
+
+fun h5explain_explain_raw = void:
+{
+    printf("What it is:\n");
+    printf("  h5explain did not recognize a supported HDF5 metadata signature at\n");
+    printf("  this offset. It is treating the location as raw bytes.\n\n");
+
+    printf("Next:\n");
+    printf("  dump                       hex-dump bytes at this offset\n");
+    printf("  go (OFF#B, \"label\")       try a nearby known metadata address\n");
+    printf("  h5super                    return to the superblock\n");
+}
+
+fun h5explain_print_msg_heading = void:
+{
+    printf("Object-header message %u64d: %s (type=0x%u64x)\n",
+           h5explain_msg_index, h5explain_msg_type_name(h5explain_msg_type),
+           h5explain_msg_type);
+    printf("  prefix_offset=%v\n", h5explain_msg_prefix_off);
+    printf("  payload_offset=%v\n", h5explain_msg_payload_off);
+    printf("  payload_size=%u64d\n", h5explain_msg_size);
+    printf("  flags=%v\n", h5explain_msg_flags);
+    if (h5explain_msg_has_crt_order)
+        printf("  creation_order=%u64d\n", h5explain_msg_crt_order);
+    printf("\n");
+}
+
+fun h5explain_msg_explain_dspace = void:
+{
+    var ds = H5O_msg_sdspace @ h5explain_msg_payload_off;
+
+    printf("What it is:\n");
+    printf("  The dataspace message describes the rank and dimensions of a dataset\n");
+    printf("  or attribute payload.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", ds.version);
+    if (ds.version == 1UB) {
+        printf("  ndims=%v\n", ds.space.v1.ndims);
+        printf("  flags=%v\n", ds.space.v1.flags);
+        if ((ds.space.v1.flags & 1U) != 0U)
+            printf("  max_dims_present=yes\n");
+    } else if (ds.version == 2UB) {
+        printf("  ndims=%v\n", ds.space.v2.ndims);
+        printf("  flags=%v\n", ds.space.v2.flags);
+        printf("  space_type=%v (%s)\n", ds.space.v2.space_type,
+               h5explain_space_type_name(ds.space.v2.space_type));
+        if ((ds.space.v2.flags & 1U) != 0U)
+            printf("  max_dims_present=yes\n");
+    }
+    printf("\nWhy it matters:\n");
+    printf("  Dataspace rank and dimensions combine with datatype size to determine\n");
+    printf("  logical element counts and byte counts.\n");
+}
+
+fun h5explain_msg_explain_linfo = void:
+{
+    var linfo = h5explain_map_linfo(h5explain_msg_payload_off);
+
+    printf("What it is:\n");
+    printf("  The link-info message points to dense link storage for a group.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", linfo.version);
+    printf("  flags=%v\n", linfo.flags);
+    if ((linfo.flags & 1U) != 0U)
+        printf("  max_creation_order=%v\n", linfo.max_corder);
+    printf("  fractal_heap_addr=%v\n", bytes_to_off(linfo.fheap_addr_raw));
+    printf("  name_btree_addr=%v\n", bytes_to_off(linfo.name_bt2_addr_raw));
+    if ((linfo.flags & 2U) != 0U)
+        printf("  corder_btree_addr=%v\n", bytes_to_off(linfo.corder_bt2_addr_raw));
+    printf("\nWhy it matters:\n");
+    printf("  Compact links live directly in object-header link messages; dense links\n");
+    printf("  move into a fractal heap and v2 B-trees when a group grows.\n");
+    printf("\nNext:\n");
+    printf("  links                      list hard links through this storage\n");
+}
+
+fun h5explain_msg_explain_dtype = void:
+{
+    var dt = H5O_msg_dtype @ h5explain_msg_payload_off;
+
+    printf("What it is:\n");
+    printf("  The datatype message describes the on-disk type of dataset or\n");
+    printf("  attribute elements.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", dt.hdr.get_version());
+    printf("  class=%v (%s)\n", dt.hdr.get_ctype(),
+           h5explain_dtype_class_name(dt.hdr.get_ctype()));
+    printf("  element_size=%v\n", dt.hdr.elm_size);
+    printf("  flags=%v\n", dt.hdr.flags);
+    printf("\nWhy it matters:\n");
+    printf("  Datatype size and semantics determine logical byte counts. Nested,\n");
+    printf("  variable-length, reference, and compound types can pull in additional\n");
+    printf("  metadata and storage rules.\n");
+    printf("\nNext:\n");
+    printf("  msgs                       print the fully decoded datatype payload\n");
+}
+
+fun h5explain_msg_explain_fill = void:
+{
+    printf("What it is:\n");
+    printf("  The fill-value message describes the value used for unallocated or\n");
+    printf("  unwritten dataset elements.\n\n");
+    printf("Why it matters:\n");
+    printf("  Fill timing and fill size affect what a reader returns for sparse or\n");
+    printf("  partially written datasets.\n");
+}
+
+fun h5explain_msg_explain_link = void:
+{
+    var link = h5explain_map_link(h5explain_msg_payload_off);
+    var name = char_array_to_string(link.lnk_name);
+    var link_kind = 0U;
+    if ((link.flags & 8U) != 0U)
+        link_kind = link.lnk_type as uint<32>;
+
+    printf("What it is:\n");
+    printf("  The link message stores a compact group link directly in the object\n");
+    printf("  header.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", link.version);
+    printf("  flags=%v\n", link.flags);
+    printf("  name=\"%s\"\n", name);
+    if (link_kind == 0U) {
+        printf("  link_type=hard\n");
+        printf("  target_object_header=%v\n", bytes_to_off(link.ohdr_addr_raw));
+    } else if (link_kind == LNK_TYPE_SOFT) {
+        printf("  link_type=soft\n");
+    } else if (link_kind >= LNK_TYPE_EXT) {
+        printf("  link_type=external-or-user-defined\n");
+    }
+    printf("\nWhy it matters:\n");
+    printf("  Hard links build the object graph. Soft and external links may need\n");
+    printf("  policy decisions before an application follows them.\n");
+    if (link_kind == 0U) {
+        printf("\nNext:\n");
+        printf("  go (%v, \"%s\") inspect the target object header\n",
+               bytes_to_off(link.ohdr_addr_raw), name);
+    }
+}
+
+fun h5explain_msg_explain_layout = void:
+{
+    var layout = h5explain_map_layout(h5explain_msg_payload_off);
+    var layout_class = 255UB;
+
+    printf("What it is:\n");
+    printf("  The data-layout message says where an object's raw data is stored and\n");
+    printf("  which storage scheme is used.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", layout.version);
+
+    if (layout.version < 3UB) {
+        layout_class = layout.layout.v1_v2.layout_class;
+        printf("  layout_class=%v (%s)\n", layout_class,
+               h5explain_layout_class_name(layout_class));
+        printf("  ndims=%v\n", layout.layout.v1_v2.ndims);
+        if (layout_class == CONTIG)
+            printf("  data_addr=%v\n",
+                   bytes_to_off(layout.layout.v1_v2.properties.contig.data_addr_raw));
+        else if (layout_class == CHUNKED)
+            printf("  chunk_index_addr=%v\n",
+                   bytes_to_off(layout.layout.v1_v2.properties.chunked.idx_addr_raw));
+        else if (layout_class == COMPACT)
+            printf("  compact_size=%v\n",
+                   layout.layout.v1_v2.properties.compact.size);
+    } else if (layout.version == 3UB) {
+        layout_class = layout.layout.v3.layout_class;
+        printf("  layout_class=%v (%s)\n", layout_class,
+               h5explain_layout_class_name(layout_class));
+        if (layout_class == CONTIG) {
+            printf("  data_addr=%v\n",
+                   bytes_to_off(layout.layout.v3.properties.contig.data_addr_raw));
+            printf("  data_size=%u64d\n",
+                   bytes_to_u64_le(layout.layout.v3.properties.contig.data_size_raw));
+        } else if (layout_class == CHUNKED) {
+            printf("  ndims=%v\n", layout.layout.v3.properties.chunked.ndims);
+            printf("  chunk_index_addr=%v\n",
+                   bytes_to_off(layout.layout.v3.properties.chunked.idx_addr_raw));
+        } else if (layout_class == COMPACT) {
+            printf("  compact_size=%v\n", layout.layout.v3.properties.compact.size);
+        }
+    } else if (layout.version == 4UB) {
+        layout_class = layout.layout.v4.layout_class;
+        printf("  layout_class=%v (%s)\n", layout_class,
+               h5explain_layout_class_name(layout_class));
+        if (layout_class == CONTIG) {
+            printf("  data_addr=%v\n",
+                   bytes_to_off(layout.layout.v4.properties.contig.data_addr_raw));
+            printf("  data_size=%u64d\n",
+                   bytes_to_u64_le(layout.layout.v4.properties.contig.data_size_raw));
+        } else if (layout_class == CHUNKED) {
+            printf("  ndims=%v\n", layout.layout.v4.properties.chunked.ndims);
+            printf("  chunk_index_type=%v (%s)\n",
+                   layout.layout.v4.properties.chunked.idx_type,
+                   h5explain_layout_index_name(layout.layout.v4.properties.chunked.idx_type));
+            printf("  chunk_index_addr=%v\n",
+                   bytes_to_off(layout.layout.v4.properties.chunked.idx_addr_raw));
+        } else if (layout_class == COMPACT) {
+            printf("  compact_size=%v\n", layout.layout.v4.properties.compact.size);
+        } else if (layout_class == VIRTUAL) {
+            printf("  global_heap_addr=%v\n",
+                   bytes_to_off(layout.layout.v4.properties.virtual.gheap_addr_raw));
+            printf("  global_heap_index=%v\n", layout.layout.v4.properties.virtual.idx);
+        }
+    }
+
+    printf("\nWhy it matters:\n");
+    printf("  The layout determines whether data bytes are inline, contiguous,\n");
+    printf("  chunk-indexed, or virtual. Chunked layouts point at the metadata\n");
+    printf("  structures that h5explain can traverse.\n");
+}
+
+fun h5explain_msg_explain_ginfo = void:
+{
+    var ginfo = H5O_msg_ginfo @ h5explain_msg_payload_off;
+
+    printf("What it is:\n");
+    printf("  The group-info message stores group storage tuning and estimates.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", ginfo.version);
+    printf("  flags=%v\n", ginfo.flags);
+    if ((ginfo.flags & 1U) != 0U) {
+        printf("  max_compact=%v\n", ginfo.max_compact);
+        printf("  min_dense=%v\n", ginfo.min_dense);
+    }
+    if ((ginfo.flags & 2U) != 0U) {
+        printf("  estimated_entries=%v\n", ginfo.est_num_entries);
+        printf("  estimated_name_length=%v\n", ginfo.est_name_len);
+    }
+}
+
+fun h5explain_msg_explain_pline = void:
+{
+    var pline = H5O_msg_pline @ h5explain_msg_payload_off;
+
+    printf("What it is:\n");
+    printf("  The filter-pipeline message lists filters that must be applied to raw\n");
+    printf("  chunk bytes before application data is available.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", pline.version);
+    printf("  filter_count=%v\n", pline.nfilters);
+    printf("\nWhy it matters:\n");
+    printf("  Filters can require decompression or plugin code. h5policy treats\n");
+    printf("  dynamic filters as policy-relevant for untrusted files.\n");
+}
+
+fun h5explain_msg_explain_attr = void:
+{
+    var attr = H5O_msg_attr @ h5explain_msg_payload_off;
+
+    printf("What it is:\n");
+    printf("  The attribute message stores a small named value attached to this\n");
+    printf("  object, including its own datatype and dataspace.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", attr.version);
+    printf("  flags=%v\n", attr.flags);
+    printf("  name_size=%v\n", attr.name_size);
+    printf("  dtype_size=%v\n", attr.dtype_size);
+    printf("  dspace_size=%v\n", attr.dspace_size);
+    if (attr.version == 3UB)
+        printf("  character_set=%s\n", attr.cset == 0UB ? "ASCII" : "UTF-8");
+    printf("\nWhy it matters:\n");
+    printf("  Attributes are miniature typed datasets. Large, shared, or malformed\n");
+    printf("  attribute payloads can exercise datatype and dataspace decoders too.\n");
+}
+
+fun h5explain_msg_explain_cont = void:
+{
+    var cont = h5explain_map_cont(h5explain_msg_payload_off);
+
+    printf("What it is:\n");
+    printf("  The continuation message points to another object-header message\n");
+    printf("  chunk elsewhere in the file.\n\n");
+    printf("Key fields:\n");
+    printf("  continuation_addr=%v\n", bytes_to_off(cont.addr_raw));
+    printf("  continuation_size=%u64d\n", bytes_to_u64_le(cont.size_raw));
+    printf("\nWhy it matters:\n");
+    printf("  Large object headers spill messages into continuation chunks. Bounds,\n");
+    printf("  signatures, and checksums around those chunks are corruption-sensitive.\n");
+    printf("\nNext:\n");
+    printf("  go (%v, \"continuation chunk\") inspect the continuation bytes\n",
+           bytes_to_off(cont.addr_raw));
+}
+
+fun h5explain_msg_explain_stab = void:
+{
+    var stab = h5explain_map_stab(h5explain_msg_payload_off);
+
+    printf("What it is:\n");
+    printf("  The symbol-table message points an old-style group at its v1 B-tree\n");
+    printf("  and local heap.\n\n");
+    printf("Key fields:\n");
+    printf("  btree_addr=%v\n", bytes_to_off(stab.btree_addr_raw));
+    printf("  heap_addr=%v\n", bytes_to_off(stab.heap_addr_raw));
+    printf("\nNext:\n");
+    printf("  go (%v, \"symbol table btree\") inspect the v1 B-tree\n",
+           bytes_to_off(stab.btree_addr_raw));
+    printf("  go (%v, \"local heap\") inspect the link-name heap\n",
+           bytes_to_off(stab.heap_addr_raw));
+}
+
+fun h5explain_msg_explain_btreek = void:
+{
+    var btk = H5O_msg_btreek @ h5explain_msg_payload_off;
+
+    printf("What it is:\n");
+    printf("  The v1 B-tree K-values message supplies non-default fanout settings\n");
+    printf("  for old v1 B-tree metadata.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", btk.version);
+    printf("  indexed_storage_internal_k=%v\n", btk.btree_k_chunk);
+    printf("  group_internal_k=%v\n", btk.btree_k_snode);
+    printf("  group_leaf_k=%v\n", btk.sym_leaf_k);
+}
+
+fun h5explain_msg_explain_ainfo = void:
+{
+    var ainfo = H5O_msg_ainfo @ h5explain_msg_payload_off;
+
+    printf("What it is:\n");
+    printf("  The attribute-info message points to dense attribute storage.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", ainfo.version);
+    printf("  flags=%v\n", ainfo.flags);
+    if ((ainfo.flags & 1U) != 0U)
+        printf("  max_creation_index=%v\n", ainfo.max_crt_idx);
+    printf("  fractal_heap_addr=%v\n", bytes_to_off(ainfo.fheap_addr_raw));
+    printf("  name_btree_addr=%v\n", bytes_to_off(ainfo.name_bt2_addr_raw));
+    if ((ainfo.flags & 2U) != 0U)
+        printf("  corder_btree_addr=%v\n", bytes_to_off(ainfo.corder_bt2_addr_raw));
+}
+
+fun h5explain_msg_explain_refcount = void:
+{
+    var ref = H5O_msg_refcount @ h5explain_msg_payload_off;
+
+    printf("What it is:\n");
+    printf("  The reference-count message stores the object's link/reference count.\n\n");
+    printf("Key fields:\n");
+    printf("  version=%v\n", ref.version);
+    printf("  ref_count=%v\n", ref.ref_cnt);
+}
+
+fun h5explain_msg_explain_generic = void:
+{
+    printf("What it is:\n");
+    printf("  h5explain recognizes the message type but does not yet have a\n");
+    printf("  detailed explainer for this payload.\n\n");
+    printf("Next:\n");
+    printf("  msgs                       print the decoded payload, if supported\n");
+    printf("  dump                       inspect bytes around the object header\n");
+}
+
+fun h5explain_explain_current_msg = void:
+{
+    h5explain_print_msg_heading;
+
+    if (h5explain_msg_type == 0x00UL) {
+        printf("What it is:\n");
+        printf("  A NIL message is padding or unused object-header space.\n");
+    } else if (h5explain_msg_type == 0x01UL)
+        h5explain_msg_explain_dspace;
+    else if (h5explain_msg_type == 0x02UL)
+        h5explain_msg_explain_linfo;
+    else if (h5explain_msg_type == 0x03UL)
+        h5explain_msg_explain_dtype;
+    else if (h5explain_msg_type == 0x04UL || h5explain_msg_type == 0x05UL)
+        h5explain_msg_explain_fill;
+    else if (h5explain_msg_type == 0x06UL)
+        h5explain_msg_explain_link;
+    else if (h5explain_msg_type == 0x08UL)
+        h5explain_msg_explain_layout;
+    else if (h5explain_msg_type == 0x0aUL)
+        h5explain_msg_explain_ginfo;
+    else if (h5explain_msg_type == 0x0bUL)
+        h5explain_msg_explain_pline;
+    else if (h5explain_msg_type == 0x0cUL)
+        h5explain_msg_explain_attr;
+    else if (h5explain_msg_type == 0x10UL)
+        h5explain_msg_explain_cont;
+    else if (h5explain_msg_type == 0x11UL)
+        h5explain_msg_explain_stab;
+    else if (h5explain_msg_type == 0x13UL)
+        h5explain_msg_explain_btreek;
+    else if (h5explain_msg_type == 0x15UL)
+        h5explain_msg_explain_ainfo;
+    else if (h5explain_msg_type == 0x16UL)
+        h5explain_msg_explain_refcount;
+    else
+        h5explain_msg_explain_generic;
+}
+
+fun explain_msg = (uint<64> msg_index) void:
+{
+    if (h5explain_cur_kind != H5EX_KIND_OHDR) {
+        printf("explain_msg is only available when the current primitive is an object header.\n");
+        return;
+    }
+
+    h5explain_load_ohdr_ctx(h5explain_cur_off);
+    h5explain_reset_msg_search(msg_index);
+    h5explain_find_msg_in_chunk(h5explain_ctx_version, h5explain_ctx_pfx,
+                                h5explain_ctx_chunk_off, h5explain_ctx_chunk_size);
+
+    if (!h5explain_msg_found) {
+        printf("no object-header message %u64d found; use msgs to list messages\n",
+               msg_index);
+        return;
+    }
+
+    h5explain_explain_current_msg;
+}
+
+fun explain = (int msg_index = -1) void:
+{
+    if (msg_index >= 0) {
+        explain_msg(msg_index as uint<64>);
+        return;
+    }
+
+    h5explain_print_current_heading;
+
+    if (h5explain_cur_kind == H5EX_KIND_SUPER)
+        h5explain_explain_super;
+    else if (h5explain_cur_kind == H5EX_KIND_OHDR)
+        h5explain_explain_ohdr;
+    else if (h5explain_cur_kind == H5EX_KIND_V1_BTREE)
+        h5explain_explain_v1_btree;
+    else if (h5explain_cur_kind == H5EX_KIND_V2_BTREE_HDR)
+        h5explain_explain_v2_btree_hdr;
+    else if (h5explain_cur_kind == H5EX_KIND_V2_BTREE_INTERNAL
+             || h5explain_cur_kind == H5EX_KIND_V2_BTREE_LEAF)
+        h5explain_explain_v2_btree_node;
+    else if (h5explain_cur_kind == H5EX_KIND_SNOD)
+        h5explain_explain_snod;
+    else if (h5explain_cur_kind == H5EX_KIND_LHEAP)
+        h5explain_explain_lheap;
+    else if (h5explain_cur_kind == H5EX_KIND_FA_HDR)
+        h5explain_explain_fa;
+    else if (h5explain_cur_kind == H5EX_KIND_EA_HDR)
+        h5explain_explain_ea;
+    else
+        h5explain_explain_raw;
 }
 
 /* Dispatch to type-specific printing; for OHDR and B-tree headers this adds

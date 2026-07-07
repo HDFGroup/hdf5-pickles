@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 The HDF Group.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  h5patch plan [--aggressive] [-o PLAN.json] FILE
+  h5patch explain [-o PLAN.md] PLAN.json
+  h5patch apply [--output FILE | --in-place] [--force] [--log LOG.jsonl] FILE PLAN.json
+  h5patch verify [--profile PROFILE] [--continue-after-corruption] FILE
+  h5patch -h|--help
+
+The top-level script is a driver. Repair discovery and byte writes are
+implemented in GNU poke pickles.
+EOF
+}
+
+source_path=${BASH_SOURCE[0]}
+while [[ -L "$source_path" ]]; do
+    source_dir="$(cd -- "$(dirname -- "$source_path")" && pwd)"
+    source_path="$(readlink -- "$source_path")"
+    [[ "$source_path" == /* ]] || source_path="$source_dir/$source_path"
+done
+script_dir="$(cd -- "$(dirname -- "$source_path")" && pwd)"
+overlay_dir="$(cd -- "$script_dir/.." && pwd)"
+repo_dir="$(cd -- "$overlay_dir/.." && pwd)"
+
+if [[ $# -lt 1 ]]; then
+    usage >&2
+    exit 2
+fi
+
+escape_poke_string() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '%s' "$value"
+}
+
+abs_path() {
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -f -- "$1"
+    else
+        case "$1" in
+            /*) printf '%s\n' "$1" ;;
+            *) printf '%s/%s\n' "$PWD" "$1" ;;
+        esac
+    fi
+}
+
+set_poke_load_path() {
+    if [[ -n "${POKE_LOAD_PATH:-}" ]]; then
+        export POKE_LOAD_PATH="$overlay_dir/pickles:$repo_dir/h5policy/pickles:$repo_dir/pickles:$POKE_LOAD_PATH"
+    else
+        export POKE_LOAD_PATH="$overlay_dir/pickles:$repo_dir/h5policy/pickles:$repo_dir/pickles"
+    fi
+}
+
+run_poke_h5patch() {
+    local fn=$1
+    local file=$2
+    local aggressive=${3:-0}
+    local cmd_file
+    local poke_output
+    local poke_status=0
+    local exit_code=
+    local report=""
+
+    set_poke_load_path
+    cmd_file=$(mktemp "${TMPDIR:-/tmp}/h5patch.XXXXXX")
+    {
+        printf 'load h5_patch\n'
+        printf 'h5patch_file_name = "%s"\n' "$(escape_poke_string "$file")"
+        printf 'h5patch_aggressive = %s\n' "$aggressive"
+        printf '%s\n' "$fn"
+        printf '.exit 0\n'
+    } >"$cmd_file"
+
+    poke_output=$(poke --quiet -s "$cmd_file" 2>&1) || poke_status=$?
+    rm -f "$cmd_file"
+
+    while IFS= read -r line; do
+        case "$line" in
+            __H5PATCH_EXIT_CODE=*)
+                exit_code=${line#__H5PATCH_EXIT_CODE=}
+                ;;
+            *)
+                report+="$line"$'\n'
+                ;;
+        esac
+    done <<<"$poke_output"
+
+    if [[ -z "$exit_code" ]]; then
+        printf '%s' "$poke_output" >&2
+        if [[ $poke_status -ne 0 ]]; then
+            return "$poke_status"
+        fi
+        return 70
+    fi
+
+    printf '%s' "$report"
+    return "$exit_code"
+}
+
+write_or_print() {
+    local output=$1
+    if [[ -n "$output" ]]; then
+        cat >"$output"
+    else
+        cat
+    fi
+}
+
+json_decision() {
+    sed -n 's/^[[:space:]]*"decision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | sed -n '1p'
+}
+
+json_action_count() {
+    sed -n 's/.*"action_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" | sed -n '1p'
+}
+
+cmd=${1:-}
+shift || true
+
+case "$cmd" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    plan)
+        output=""
+        aggressive=0
+        positional=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -o|--output)
+                    if [[ $# -lt 2 ]]; then
+                        printf 'h5patch plan: %s requires an argument\n' "$1" >&2
+                        exit 2
+                    fi
+                    output=$2
+                    shift 2
+                    ;;
+                --aggressive)
+                    aggressive=1
+                    shift
+                    ;;
+                --)
+                    shift
+                    break
+                    ;;
+                -*)
+                    printf 'h5patch plan: unknown option: %s\n' "$1" >&2
+                    exit 2
+                    ;;
+                *)
+                    positional+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+        if [[ ${#positional[@]} -ne 1 ]]; then
+            usage >&2
+            exit 2
+        fi
+        file=$(abs_path "${positional[0]}")
+        if [[ ! -e "$file" ]]; then
+            printf 'h5patch: file not found: %s\n' "${positional[0]}" >&2
+            exit 1
+        fi
+        run_poke_h5patch h5patch_run_plan "$file" "$aggressive" | write_or_print "$output"
+        ;;
+    explain)
+        output=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -o|--output)
+                    if [[ $# -lt 2 ]]; then
+                        printf 'h5patch explain: %s requires an argument\n' "$1" >&2
+                        exit 2
+                    fi
+                    output=$2
+                    shift 2
+                    ;;
+                --)
+                    shift
+                    break
+                    ;;
+                -*)
+                    printf 'h5patch explain: unknown option: %s\n' "$1" >&2
+                    exit 2
+                    ;;
+                *)
+                    break
+                    ;;
+            esac
+        done
+        if [[ $# -ne 1 ]]; then
+            usage >&2
+            exit 2
+        fi
+        {
+            printf '# h5patch-plan-v1\n\n'
+            printf 'Plan: `%s`\n\n' "$1"
+            printf 'Actions: %s\n\n' "$(json_action_count "$1")"
+            sed -n 's/^[[:space:]]*"kind"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/- kind: `\1`/p; s/^[[:space:]]*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/  reason: \1/p' "$1"
+        } | write_or_print "$output"
+        ;;
+    apply)
+        output=""
+        in_place=0
+        force=0
+        log=""
+        positional=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --output)
+                    if [[ $# -lt 2 ]]; then
+                        printf 'h5patch apply: --output requires an argument\n' >&2
+                        exit 2
+                    fi
+                    output=$2
+                    shift 2
+                    ;;
+                --in-place)
+                    in_place=1
+                    shift
+                    ;;
+                --force)
+                    force=1
+                    shift
+                    ;;
+                --log)
+                    if [[ $# -lt 2 ]]; then
+                        printf 'h5patch apply: --log requires an argument\n' >&2
+                        exit 2
+                    fi
+                    log=$2
+                    shift 2
+                    ;;
+                --)
+                    shift
+                    break
+                    ;;
+                -*)
+                    printf 'h5patch apply: unknown option: %s\n' "$1" >&2
+                    exit 2
+                    ;;
+                *)
+                    positional+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+        if [[ ${#positional[@]} -ne 2 ]]; then
+            usage >&2
+            exit 2
+        fi
+        if [[ $in_place -eq 1 && -n "$output" ]]; then
+            printf 'h5patch apply: choose --output or --in-place, not both\n' >&2
+            exit 2
+        fi
+        if [[ $in_place -eq 0 && -z "$output" ]]; then
+            printf 'h5patch apply: pass --output or --in-place\n' >&2
+            exit 2
+        fi
+
+        input=$(abs_path "${positional[0]}")
+        plan=${positional[1]}
+        if [[ ! -e "$input" ]]; then
+            printf 'h5patch: file not found: %s\n' "${positional[0]}" >&2
+            exit 1
+        fi
+        if [[ ! -e "$plan" ]]; then
+            printf 'h5patch: plan not found: %s\n' "$plan" >&2
+            exit 1
+        fi
+
+        generated=$(mktemp "${TMPDIR:-/tmp}/h5patch-plan.XXXXXX")
+        run_poke_h5patch h5patch_run_plan "$input" 0 >"$generated"
+        if ! cmp -s "$generated" "$plan"; then
+            rm -f "$generated"
+            printf 'h5patch apply: plan does not match the current input; regenerate and review it\n' >&2
+            exit 2
+        fi
+
+        if [[ $in_place -eq 1 ]]; then
+            target=$input
+        else
+            target=$(abs_path "$output")
+            if [[ -e "$target" && $force -eq 0 ]]; then
+                rm -f "$generated"
+                printf 'h5patch apply: output exists: %s (use --force)\n' "$output" >&2
+                exit 1
+            fi
+            cp -- "$input" "$target"
+        fi
+
+        if [[ -n "$log" ]]; then
+            count=$(json_action_count "$generated")
+            printf '{"event":"apply_start","input":' >"$log"
+            printf '%s' "$(printf '%s' "$input" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/')" >>"$log"
+            printf ',"output":' >>"$log"
+            printf '%s' "$(printf '%s' "$target" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/')" >>"$log"
+            printf ',"action_count":%s}\n' "${count:-0}" >>"$log"
+        fi
+
+        run_poke_h5patch h5patch_run_apply "$target" 0 >/dev/null
+
+        verify_tmp=$(mktemp "${TMPDIR:-/tmp}/h5patch-verify.XXXXXX")
+        verify_rc=0
+        "$repo_dir/h5policy/tools/h5policy" --profile untrusted-strict --json "$target" >"$verify_tmp" || verify_rc=$?
+        decision=$(json_decision "$verify_tmp")
+        verified=false
+        if [[ "$decision" == accept || "$decision" == accept_with_warnings ]]; then
+            verified=true
+        fi
+
+        if [[ -n "$log" ]]; then
+            printf '{"event":"h5policy_verification","exit":%s,"decision":"%s","verified":%s}\n' "$verify_rc" "$decision" "$verified" >>"$log"
+        fi
+
+        printf '{\n'
+        printf '  "decision": "%s",\n' "$decision"
+        printf '  "h5policy_exit": %s,\n' "$verify_rc"
+        printf '  "output": "%s",\n' "$(printf '%s' "$target" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        printf '  "verified": %s\n' "$verified"
+        printf '}\n'
+
+        rm -f "$generated" "$verify_tmp"
+        if [[ "$verified" == true ]]; then
+            exit 0
+        fi
+        exit 4
+        ;;
+    verify)
+        profile="untrusted-strict"
+        cont=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --profile)
+                    if [[ $# -lt 2 ]]; then
+                        printf 'h5patch verify: --profile requires an argument\n' >&2
+                        exit 2
+                    fi
+                    profile=$2
+                    shift 2
+                    ;;
+                --continue-after-corruption)
+                    cont=(--continue-after-corruption)
+                    shift
+                    ;;
+                --)
+                    shift
+                    break
+                    ;;
+                -*)
+                    printf 'h5patch verify: unknown option: %s\n' "$1" >&2
+                    exit 2
+                    ;;
+                *)
+                    break
+                    ;;
+            esac
+        done
+        if [[ $# -ne 1 ]]; then
+            usage >&2
+            exit 2
+        fi
+        "$repo_dir/h5policy/tools/h5policy" --profile "$profile" --json "${cont[@]}" "$1"
+        ;;
+    *)
+        printf 'h5patch: unknown command: %s\n\n' "$cmd" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

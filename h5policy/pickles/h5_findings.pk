@@ -1,0 +1,481 @@
+/* h5_findings.pk - Finding collection and JSON reporting for h5policy.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* h5policy reports two things at once: a stable top-level decision/exit code
+   and a bounded list of findings explaining how that decision was reached.
+   This file owns that state plus JSON escaping/printing for the CLI wrapper. */
+
+/* Exit codes are ordered by h5policy_class_rank, not numeric value.  The
+   numeric values are the process contract; ranks decide which class wins when
+   a file triggers multiple finding classes.  */
+var H5POLICY_EXIT_ACCEPT = 0;
+var H5POLICY_EXIT_WARN = 1;
+var H5POLICY_EXIT_CORRUPT = 2;
+var H5POLICY_EXIT_POLICY = 3;
+var H5POLICY_EXIT_RESOURCE = 4;
+var H5POLICY_EXIT_UNSUPPORTED = 5;
+var H5POLICY_EXIT_INTERNAL = 70;
+
+/* Parallel vectors keep reporting compatible with GNU poke's simple append and
+   print patterns.  Every index across these arrays is one finding.  */
+var h5policy_finding_severities = string[]();
+var h5policy_finding_codes = string[]();
+var h5policy_finding_classes = string[]();
+var h5policy_finding_offsets = uint<64>[]();
+var h5policy_finding_objects = string[]();
+var h5policy_finding_messages = string[]();
+
+var h5policy_exit_code = H5POLICY_EXIT_ACCEPT;
+var h5policy_exit_rank = 0;
+
+/* Walk time budget.  Some traversal de-dup sets are linear-scan arrays, so a
+   walk over N reachable structures can be O(N^2); on a pathological file
+   (especially in forensic, which keeps walking past corruption) that can run
+   for a long time without ever looping forever.  A metadata preflight must
+   terminate in bounded *wall-clock* time, so h5policy_walk_tick samples the
+   clock periodically and
+   raises a distinguished exception once the profile's second-budget is passed;
+   the top-level catch turns it into unsupported_coverage_gap.  The op counter is
+   kept for observability and to cheaply pace the clock samples.  */
+var h5policy_walk_ops = 0UL;
+var h5policy_walk_next_check = 0UL;
+var h5policy_walk_deadline = 0L;          /* gettime seconds; 0 = no deadline */
+var H5POLICY_EC_WALK_BUDGET = 0x7701UL;   /* private exception code (not a poke EC_*) */
+
+fun h5policy_walk_tick = (uint<64> cost) void:
+{
+    h5policy_walk_ops = h5policy_walk_ops + cost;
+    if (h5policy_walk_deadline != 0L
+        && h5policy_walk_ops >= h5policy_walk_next_check)
+        {
+            h5policy_walk_next_check = h5policy_walk_ops + 200000UL;
+            var now = gettime;
+            if (now[0] > h5policy_walk_deadline)
+                raise Exception { code = H5POLICY_EC_WALK_BUDGET as int<32>,
+                                  name = "walk time budget exceeded" };
+        }
+}
+
+/* Self-defense: the oracle must not be exhausted by the file it judges.
+   Cap the number of stored findings, and collapse repeated resource-budget
+   findings (which otherwise re-fire on every increment past the limit).  */
+var H5POLICY_MAX_FINDINGS = 4096UL;
+var h5policy_findings_truncated = 0;
+var h5policy_emitted_resource_codes = string[]();
+
+/* Effective run mode, decoupled from the profile (h5policy_run computes these
+   from the profile default and any CLI override).  Mapping strictness (@ vs @!)
+   and continue-after-corruption are independent axes: e.g. untrusted-strict
+   policy with continue-after-corruption collects every finding for triage.  */
+var h5policy_nonstrict = 0;
+var h5policy_continue = 0;
+
+var h5policy_feature_external_links = 0UL;
+var h5policy_feature_external_storage = 0UL;
+var h5policy_feature_vds = 0UL;
+var h5policy_feature_unknown_messages = 0UL;
+var h5policy_feature_dynamic_filters = uint<64>[]();
+
+/* Built-in filters that decode/expand data on read (deflate, szip, n-bit,
+   scale-offset).  The file is structurally fine, but a consumer must run decode
+   code over attacker-controlled bytes to read the data -- a surface this
+   metadata-only oracle does not enter.  Tracked so the advisory fires once per
+   distinct filter.  */
+var h5policy_feature_decode_filters = uint<64>[]();
+
+fun h5policy_class_exit_code = (string klass) int:
+{
+    if (klass == "warning") return H5POLICY_EXIT_WARN;
+    if (klass == "corrupt") return H5POLICY_EXIT_CORRUPT;
+    if (klass == "policy") return H5POLICY_EXIT_POLICY;
+    if (klass == "resource") return H5POLICY_EXIT_RESOURCE;
+    if (klass == "unsupported") return H5POLICY_EXIT_UNSUPPORTED;
+    if (klass == "internal") return H5POLICY_EXIT_INTERNAL;
+    return H5POLICY_EXIT_ACCEPT;
+}
+
+/* Class rank is the semantic precedence for mixed findings.  Corruption and
+   internal errors outrank policy/resource decisions, while warnings never
+   override a rejection.  */
+fun h5policy_class_rank = (string klass) int:
+{
+    /* Ranks must be distinct so the top-level decision is order-independent:
+       a file that is both policy-denied and over a resource budget always
+       reports reject_policy, regardless of which finding the walk hit first.
+       A denied feature is a categorical "no"; a resource budget is a tunable
+       threshold, so policy outranks resource.  */
+    if (klass == "internal") return 60;
+    if (klass == "corrupt") return 50;
+    if (klass == "policy") return 46;
+    if (klass == "resource") return 44;
+    if (klass == "unsupported") return 40;
+    if (klass == "warning") return 10;
+    return 0;
+}
+
+/* Map the final exit code to the stable JSON decision string.  Consumers should
+   key off this string or the process exit code rather than finding order.  */
+fun h5policy_decision = string:
+{
+    if (h5policy_exit_code == H5POLICY_EXIT_WARN) return "accept_with_warnings";
+    if (h5policy_exit_code == H5POLICY_EXIT_CORRUPT) return "reject_corrupt";
+    if (h5policy_exit_code == H5POLICY_EXIT_POLICY) return "reject_policy";
+    if (h5policy_exit_code == H5POLICY_EXIT_RESOURCE) return "reject_resource";
+    if (h5policy_exit_code == H5POLICY_EXIT_UNSUPPORTED) return "unsupported_coverage_gap";
+    if (h5policy_exit_code == H5POLICY_EXIT_INTERNAL) return "internal_error";
+    return "accept";
+}
+
+/* Update the process result while still allowing every finding to be stored in
+   continue-after-corruption mode.  */
+fun h5policy_consider_exit = (string klass) void:
+{
+    var rank = h5policy_class_rank(klass);
+    if (rank > h5policy_exit_rank)
+        {
+            h5policy_exit_rank = rank;
+            h5policy_exit_code = h5policy_class_exit_code(klass);
+        }
+}
+
+/* Small dedup helpers for feature and resource reporting.  Arrays are tiny in
+   normal reports; high-volume traversal is bounded elsewhere by the walk
+   budget and finding cap.  */
+fun h5policy_feature_seen_u64 = (uint<64>[] values, uint<64> value) int:
+{
+    var i = 0UL;
+
+    while (i < values'length)
+        {
+            if (values[i] == value)
+                return 1;
+            i = i + 1UL;
+        }
+
+    return 0;
+}
+
+fun h5policy_string_seen = (string[] values, string value) int:
+{
+    var i = 0UL;
+
+    while (i < values'length)
+        {
+            if (values[i] == value)
+                return 1;
+            i = i + 1UL;
+        }
+
+    return 0;
+}
+
+/* Feature counters populate the JSON `features` object and also suppress
+   repeated decode-filter advisories for the same filter ID.  */
+fun h5policy_note_external_link = void:
+{
+    h5policy_feature_external_links = h5policy_feature_external_links + 1UL;
+}
+
+fun h5policy_note_external_storage = void:
+{
+    h5policy_feature_external_storage = h5policy_feature_external_storage + 1UL;
+}
+
+fun h5policy_note_vds = void:
+{
+    h5policy_feature_vds = h5policy_feature_vds + 1UL;
+}
+
+fun h5policy_note_unknown_message = void:
+{
+    h5policy_feature_unknown_messages = h5policy_feature_unknown_messages + 1UL;
+}
+
+fun h5policy_note_dynamic_filter = (uint<64> filter_id) void:
+{
+    if (!h5policy_feature_seen_u64(h5policy_feature_dynamic_filters, filter_id))
+        h5policy_feature_dynamic_filters += [filter_id];
+}
+
+fun h5policy_reset_features = void:
+{
+    h5policy_feature_external_links = 0UL;
+    h5policy_feature_external_storage = 0UL;
+    h5policy_feature_vds = 0UL;
+    h5policy_feature_unknown_messages = 0UL;
+    h5policy_feature_dynamic_filters = uint<64>[]();
+    h5policy_feature_decode_filters = uint<64>[]();
+}
+
+/* Reset all per-run report state.  The CLI can reuse a poke process in tests,
+   so stale findings or feature counters must not survive between h5policy_run
+   invocations.  */
+fun h5policy_reset_findings = void:
+{
+    h5policy_finding_severities = string[]();
+    h5policy_finding_codes = string[]();
+    h5policy_finding_classes = string[]();
+    h5policy_finding_offsets = uint<64>[]();
+    h5policy_finding_objects = string[]();
+    h5policy_finding_messages = string[]();
+    h5policy_exit_code = H5POLICY_EXIT_ACCEPT;
+    h5policy_exit_rank = 0;
+    h5policy_findings_truncated = 0;
+    h5policy_emitted_resource_codes = string[]();
+    h5policy_reset_features;
+}
+
+/* Store a finding unless the report cap or dedup rules suppress it.  The final
+   decision is updated before suppression so the exit code remains correct even
+   if many repeated resource findings are collapsed.  */
+fun h5policy_emit = (string severity, string code, string klass,
+                     off64 loc, string object, string message) void:
+{
+    /* The decision always reflects this finding's severity, even if the
+       finding itself is deduplicated or dropped past the storage cap.  */
+    h5policy_consider_exit(klass);
+
+    if (h5policy_findings_truncated)
+        return;
+
+    /* Resource-budget findings re-fire on every increment past the limit
+       (and forensic mode never stops the walk).  Record the decision once,
+       but store only the first finding for each resource code.  */
+    if (klass == "resource"
+        && h5policy_string_seen(h5policy_emitted_resource_codes, code))
+        return;
+
+    var out_severity = severity;
+    var out_code = code;
+    var out_klass = klass;
+    var out_object = object;
+    var out_message = message;
+    /* Some corrupt files carry high-bit addresses that GNU poke can represent
+       as offsets but not convert back to a JSON-safe byte count without raising
+       overflow.  A diagnostic location must not turn a corrupt verdict into an
+       internal error, so fall back to offset 0 when the location itself is not
+       printable.  */
+    var out_offset = 0UL;
+    try
+        {
+            out_offset = (loc/#B) as uint<64>;
+        }
+    catch (Exception e)
+        {
+            out_offset = 0UL;
+        }
+
+    if (h5policy_finding_codes'length >= H5POLICY_MAX_FINDINGS)
+        {
+            /* Replace this finding with a single terminal marker and stop
+               storing.  The decision has already been updated above.  */
+            h5policy_findings_truncated = 1;
+            out_severity = "warning";
+            out_code = "H5_POLICY_FINDINGS_TRUNCATED";
+            out_klass = "warning";
+            out_object = "";
+            out_message = "finding limit reached; additional findings suppressed";
+            out_offset = 0UL;
+        }
+    else if (klass == "resource")
+        h5policy_emitted_resource_codes += [code];
+
+    h5policy_finding_severities += [out_severity];
+    h5policy_finding_codes += [out_code];
+    h5policy_finding_classes += [out_klass];
+    h5policy_finding_offsets += [out_offset];
+    h5policy_finding_objects += [out_object];
+    h5policy_finding_messages += [out_message];
+}
+
+fun h5policy_emit_error = (string code, string klass,
+                           off64 loc, string object, string message) void:
+{
+    h5policy_emit("error", code, klass, loc, object, message);
+}
+
+fun h5policy_emit_warning = (string code,
+                             off64 loc, string object, string message) void:
+{
+    h5policy_emit("warning", code, "warning", loc, object, message);
+}
+
+var H5POLICY_HEX_DIGITS = "0123456789abcdef";
+
+/* JSON escaping is local so reports stay valid even when attacker-controlled
+   object names contain control bytes or quotes.  */
+fun h5policy_hex_nibble = (uint<8> n) string:
+{
+    return (H5POLICY_HEX_DIGITS[(n & 0xfUB) as uint<64>]) as string;
+}
+
+fun h5policy_json_escape = (string value) string:
+{
+    var escaped = "";
+    var i = 0UL;
+
+    while (i < value'length)
+        {
+            var c = value[i];
+
+            if (c == '"')
+                escaped = escaped + "\\\"";
+            else if (c == '\\')
+                escaped = escaped + "\\\\";
+            else if (c == '\n')
+                escaped = escaped + "\\n";
+            else if (c == '\r')
+                escaped = escaped + "\\r";
+            else if (c == '\t')
+                escaped = escaped + "\\t";
+            else if (c < ' ')
+                /* Any other control byte (attacker-controlled names can carry
+                   them) must be \u-escaped or the report is invalid JSON.  */
+                escaped = escaped + "\\u00"
+                          + h5policy_hex_nibble(((c as uint<8>) .>> 4) & 0xfUB)
+                          + h5policy_hex_nibble((c as uint<8>) & 0xfUB);
+            else
+                escaped = escaped + (c as string);
+
+            i = i + 1UL;
+        }
+
+    return escaped;
+}
+
+fun h5policy_print_json_string = (string value) void:
+{
+    printf("\"%s\"", h5policy_json_escape(value));
+}
+
+fun h5policy_print_json_u64_array = (uint<64>[] values) void:
+{
+    printf("[");
+
+    var i = 0UL;
+    while (i < values'length)
+        {
+            if (i != 0UL)
+                printf(", ");
+            printf("%u64d", values[i]);
+            i = i + 1UL;
+        }
+
+    printf("]");
+}
+
+/* Emit the canonical machine-readable report.  The `boundary` section is part
+   of the API: it states the operations h5policy did not perform while reaching
+   the decision, which matters for safe use with hostile files.  */
+fun h5policy_print_json_report = (string profile_name, string file_name,
+                                  string mapping_mode,
+                                  uint<64> metadata_seen,
+                                  uint<64> object_count,
+                                  uint<64> attribute_count,
+                                  uint<64> object_header_chunk_count,
+                                  uint<64> chunk_index_count,
+                                  uint<64> max_rank_seen,
+                                  uint<64> max_logical_dataset_bytes_seen,
+                                  uint<64> visited_object_headers,
+                                  uint<64> visited_continuations,
+                                  uint<64> visited_btree_refs) void:
+{
+    printf("{\n");
+    printf("  \"decision\": ");
+    h5policy_print_json_string(h5policy_decision);
+    printf(",\n");
+    printf("  \"profile\": ");
+    h5policy_print_json_string(profile_name);
+    printf(",\n");
+    printf("  \"file\": ");
+    h5policy_print_json_string(file_name);
+    printf(",\n");
+    printf("  \"mapping_mode\": ");
+    h5policy_print_json_string(mapping_mode);
+    printf(",\n");
+    printf("  \"phase\": \"0-4\",\n");
+    printf("  \"boundary\": {\n");
+    printf("    \"libhdf5\": false,\n");
+    printf("    \"plugins\": false,\n");
+    printf("    \"decompression\": false,\n");
+    printf("    \"external_file_opens\": false,\n");
+    printf("    \"repair\": false,\n");
+    printf("    \"writes\": false,\n");
+    printf("    \"application_deserialization\": false\n");
+    printf("  },\n");
+    printf("  \"features\": {\n");
+    printf("    \"external_links\": %u64d,\n", h5policy_feature_external_links);
+    printf("    \"external_storage\": %u64d,\n", h5policy_feature_external_storage);
+    printf("    \"vds\": %u64d,\n", h5policy_feature_vds);
+    printf("    \"dynamic_filters\": ");
+    h5policy_print_json_u64_array(h5policy_feature_dynamic_filters);
+    printf(",\n");
+    printf("    \"decode_filters\": ");
+    h5policy_print_json_u64_array(h5policy_feature_decode_filters);
+    printf(",\n");
+    printf("    \"unknown_messages\": %u64d,\n", h5policy_feature_unknown_messages);
+    printf("    \"max_rank_seen\": %u64d,\n", max_rank_seen);
+    printf("    \"max_logical_dataset_bytes_seen\": %u64d\n",
+           max_logical_dataset_bytes_seen);
+    printf("  },\n");
+    printf("  \"metrics\": {\n");
+    printf("    \"metadata_bytes_seen\": %u64d,\n", metadata_seen);
+    printf("    \"object_count\": %u64d,\n", object_count);
+    printf("    \"attribute_count\": %u64d,\n", attribute_count);
+    printf("    \"object_header_chunk_count\": %u64d,\n",
+           object_header_chunk_count);
+    printf("    \"chunk_index_refs\": %u64d,\n", chunk_index_count);
+    printf("    \"visited_object_headers\": %u64d,\n",
+           visited_object_headers);
+    printf("    \"visited_continuations\": %u64d,\n",
+           visited_continuations);
+    printf("    \"visited_btree_refs\": %u64d,\n", visited_btree_refs);
+    printf("    \"walk_operations\": %u64d\n", h5policy_walk_ops);
+    printf("  },\n");
+    printf("  \"findings\": [\n");
+
+    var i = 0UL;
+    while (i < h5policy_finding_codes'length)
+        {
+            printf("    {\n");
+            printf("      \"severity\": ");
+            h5policy_print_json_string(h5policy_finding_severities[i]);
+            printf(",\n");
+            printf("      \"code\": ");
+            h5policy_print_json_string(h5policy_finding_codes[i]);
+            printf(",\n");
+            printf("      \"class\": ");
+            h5policy_print_json_string(h5policy_finding_classes[i]);
+            printf(",\n");
+            printf("      \"offset\": %u64d,\n", h5policy_finding_offsets[i]);
+            printf("      \"object\": ");
+            h5policy_print_json_string(h5policy_finding_objects[i]);
+            printf(",\n");
+            printf("      \"message\": ");
+            h5policy_print_json_string(h5policy_finding_messages[i]);
+            printf("\n");
+            printf("    }");
+            if (i + 1UL < h5policy_finding_codes'length)
+                printf(",");
+            printf("\n");
+            i = i + 1UL;
+        }
+
+    printf("  ]\n");
+    printf("}\n");
+}

@@ -1,101 +1,102 @@
-# SHAPE5: Specification for HDF5 Analysis, Parsing, and Encoding
+# H5Lens: HDF5 Pickles and Policy Workbench
 
-`SHAPE5` is a machine-readable specification of the HDF5 file format using [GNU poke](https://www.jemarch.net/poke/) pickles.
+`H5Lens` is a machine-readable description of HDF5 on-disk metadata using
+[GNU poke](https://www.jemarch.net/poke/) pickles. It is both a format
+exploration kit and the home of `h5policy`, an independent metadata preflight
+oracle for hostile or untrusted HDF5 files.  It also includes the early
+`h5patch` repair planner for proposing and applying conservative metadata
+repairs.
 
-The goal is to describe HDF5 on-disk structures as executable binary format definitions that can be loaded in GNU poke to inspect, validate, and reason about HDF5 files.
+## What's Here
 
-This repository is a work in progress. The current pickles focus on core HDF5 metadata structures, including the superblock, B-trees, object headers, and related messages.
+- [`pickles/`](pickles/) contains the reusable HDF5 format definitions loaded by
+  GNU poke.
+- [`h5policy/`](h5policy/) contains the policy oracle, focused validators,
+  security profiles, regression corpus, differential harness, and fuzzing tools.
+- [`h5patch/`](h5patch/) contains the experimental metadata repair planner,
+  JSON patch-plan format, apply workflow, and repair tests.
+- [`h5explain/`](h5explain/) contains the interactive GNU poke explorer for
+  byte-level HDF5 metadata navigation.
+- [`src/`](src/) contains the marker scanner implementation.
+- [`tools/`](tools/) collects top-level command symlinks and repository helper
+  scripts such as the documentation generator.
+- [`docs/`](docs/) contains YAML format notes and generated Markdown reference
+  pages.
+- [`emacs/`](emacs/) contains an Emacs front end for inspecting HDF5 files
+  through GNU poke.
+- [`examples/`](examples/) contains poke scripts for generating and inspecting
+  HDF5 structures.
+- [`MARKERS.md`](MARKERS.md), [`TOOLS.md`](TOOLS.md), and
+  [`TUTORIAL.md`](TUTORIAL.md) explain the format markers, helper tools, and a
+  hands-on exploration path.
 
 ## Quick Start
 
-The pickles are meant to be loaded by GNU poke from the repository root:
+Run `h5policy` against an HDF5 file:
 
 ```sh
-POKE_LOAD_PATH=$PWD/pickles poke file.h5
+./tools/h5policy --profile untrusted-strict --json file.h5
 ```
 
-For a guided walk through the sample file, see [`TUTORIAL.md`](TUTORIAL.md). To use the interactive explorer instead of the raw poke REPL:
+Try the regression suite:
 
 ```sh
-./tools/h5explain file.h5
+cd h5policy/tests
+./run.sh
 ```
 
-The C++ marker scanner and generated documentation targets are built with CMake:
+Create a what-if metadata repair plan:
+
+```sh
+./tools/h5patch plan damaged.h5 -o repair.plan.json
+./tools/h5patch explain repair.plan.json
+```
+
+Build the marker scanner and generated format docs:
 
 ```sh
 cmake -S . -B build
 cmake --build build
 cmake --build build --target docs
-cmake --build build --target docs-check
 ```
 
-The Emacs front end can be byte-compiled and tested with:
+Explore the sample file interactively:
 
 ```sh
-cmake --build build --target emacs-check
+./tools/h5explain file.h5
 ```
 
-That target requires Emacs 30+, GNU poke on `PATH`, `h5py`, and `numpy`.
+See [`h5explain/README.md`](h5explain/README.md) for interactive navigation
+commands and [`TUTORIAL.md`](TUTORIAL.md) for a guided GNU poke walkthrough.
 
-## Repository Layout
+## h5policy In Under A Minute
 
-### Core Pickles
+`h5policy` maps HDF5 metadata with GNU poke, validates the metadata it can reach,
+applies a selected security profile, and emits a JSON decision with stable exit
+codes. It is intentionally metadata-only: it does not call `libhdf5`, load
+plugins, decompress data, open external files, repair inputs, write files, or
+deserialize application payloads.
 
-- [`pickles/common.pk`](pickles/common.pk): shared helpers and common definitions
-- [`pickles/superblock.pk`](pickles/superblock.pk): HDF5 superblock definitions
-- [`pickles/messages.pk`](pickles/messages.pk): object header message definitions
-- [`pickles/ohdr.pk`](pickles/ohdr.pk): object header definitions
-- [`pickles/btree.pk`](pickles/btree.pk): umbrella loader for version 1 and version 2 B-tree definitions
-- [`pickles/v1_btree.pk`](pickles/v1_btree.pk): version 1 B-tree and symbol table node definitions
-- [`pickles/v2_btree.pk`](pickles/v2_btree.pk): version 2 B-tree definitions
-- [`pickles/farray.pk`](pickles/farray.pk): fixed array chunk index definitions
-- [`pickles/earray.pk`](pickles/earray.pk): extensible array chunk index definitions
-- [`pickles/fheap.pk`](pickles/fheap.pk): fractal heap header, indirect block, direct block, and heap ID definitions
-- [`pickles/lheap.pk`](pickles/lheap.pk): local heap definitions
-- [`pickles/gheap.pk`](pickles/gheap.pk): global heap definitions
-- [`pickles/fsm.pk`](pickles/fsm.pk): free-space manager header and section information definitions
-- [`pickles/sohm.pk`](pickles/sohm.pk): shared object header message table and list definitions
-- [`pickles/drv_info.pk`](pickles/drv_info.pk): driver information block definitions
-- [`pickles/dspace_enc.pk`](pickles/dspace_enc.pk): dataspace encoding definitions
-- [`pickles/ref_enc.pk`](pickles/ref_enc.pk): object and dataset region reference encoding definitions
-- [`pickles/vds.pk`](pickles/vds.pk): virtual dataset global heap block definitions
-- [`pickles/lookup3.pk`](pickles/lookup3.pk): implementation of the lookup3 hash function used for checksums
-- [`pickles/construct.pk`](pickles/construct.pk): helpers for constructing HDF5 metadata in memory
-- [`pickles/h5explain.pk`](pickles/h5explain.pk): command layer loaded by the interactive explorer
-- [`pickles/hdf5_poke_emacs.pk`](pickles/hdf5_poke_emacs.pk): machine-readable protocol helpers for the Emacs front end
+Use [`h5policy/README.md`](h5policy/README.md) for profile behavior, exit codes,
+coverage, checksum notes, and CLI examples. Use
+[`h5policy/tests/README.md`](h5policy/tests/README.md) for the corpus,
+differential harness, and fuzzing workflow.
 
-### Documentation
+## h5patch In Under A Minute
 
-- [`MARKERS.md`](MARKERS.md): list of known on-disk markers in HDF5 and Onion files
-- [`TOOLS.md`](TOOLS.md): documentation for tools included in this repository, including the marker scanner and interactive explorer
-- [`TUTORIAL.md`](TUTORIAL.md): step-by-step tutorial for using the pickles and tools in this repository
-- [`docs/README.md`](docs/README.md): generated documentation workflow
-- [`docs/spec/`](docs/spec/): prose sidecars for generated pickle documentation
-- [`docs/generated/`](docs/generated/): generated Markdown documentation for selected pickles
+`h5patch` plans byte-level repairs for damaged HDF5 metadata, applies only an
+approved JSON plan, writes an audit log, and verifies the result with
+`h5policy`. Planning is a what-if operation: it does not modify the input file.
 
-### Emacs Front End
-
-- [`emacs/hdf5-poke.el`](emacs/hdf5-poke.el): public entry point for the Emacs 30+ inspector
-- [`emacs/hdf5-poke-core.el`](emacs/hdf5-poke-core.el): process, protocol, request tracking, and path helper layer
-- [`emacs/hdf5-poke-ui.el`](emacs/hdf5-poke-ui.el): inspector modes, keymaps, renderers, tree browsing, and interactive commands
-- [`emacs/README.md`](emacs/README.md): setup, commands, and test instructions for the Emacs module
-
-### Tools
-
-- [`tools/h5explain`](tools/h5explain): interactive HDF5 byte-level explorer built on GNU poke
-- [`src/h5markers.cpp`](src/h5markers.cpp): C++ marker scanner for HDF5 and Onion on-disk signatures
-- [`tools/pkdoc.py`](tools/pkdoc.py): generator for Markdown documentation from pickle files and YAML sidecars
-
-### Examples
-
-- [`examples/`](examples/): example HDF5 files and GNU poke sessions demonstrating the use of the pickles and tools in this repository
-
-### Tests
-
-- [`tests/hdf5-poke-test.el`](tests/hdf5-poke-test.el): protocol parser and renderer unit tests
-- [`tests/hdf5-poke-process-test.el`](tests/hdf5-poke-process-test.el): process-level Emacs/GNU poke smoke tests
-- [`tests/fixtures/`](tests/fixtures/): fixture generator and notes for build-tree HDF5 test files covering dense groups, old-style symbol tables, chunk-index families, and nested datatypes
+The first repair catalog is intentionally narrow and high-confidence: HDF5
+signature restoration, stale v2/v3 superblock flags, v2/v3 superblock
+checksums, and reachable v2 object-header checksums. See
+[`h5patch/README.md`](h5patch/README.md) for the plan format and workflow.
 
 ## Acknowledgments
 
-> This material is based upon work supported by the U.S. National Science Foundation under Federal Award No. 2534078. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s) and do not necessarily reflect the views of the National Science Foundation.
+> This material is based upon work supported by the U.S. National Science
+> Foundation under Federal Award No. 2534078. Any opinions, findings, and
+> conclusions or recommendations expressed in this material are those of the
+> author(s) and do not necessarily reflect the views of the National Science
+> Foundation.

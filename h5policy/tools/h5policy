@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 The HDF Group.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  h5policy [--profile PROFILE] [--json] [MODE FLAGS] FILE
+  h5policy -h|--help
+
+Profiles (see main.pdf Table 5):
+  legacy           compatibility bias; unlimited budgets, all features allowed
+  trusted-fast     normal validation, generous budgets, features allowed
+  untrusted-strict strict validation, tight budgets, features denied (default)
+  forensic         non-strict mapping, report anomalies, never follow refs
+
+Mode flags (independent of the profile; default to the profile's behavior):
+  --strict / --non-strict        force strict (@) or non-strict (@!) mapping
+  --continue-after-corruption    keep walking to collect every finding
+                                 (e.g. untrusted-strict --continue-after-corruption
+                                  applies strict policy but reports all issues)
+
+Policy boundary:
+  metadata-only, read-only, no libhdf5, no plugins, no decompression,
+  no external file opens, no repair, no writes, no application deserialization.
+
+Exit codes:
+  0  accept
+  1  accept_with_warnings
+  2  reject_corrupt
+  3  reject_policy
+  4  reject_resource
+  5  unsupported_coverage_gap
+  70 internal_error
+EOF
+}
+
+source_path=${BASH_SOURCE[0]}
+while [[ -L "$source_path" ]]; do
+    source_dir="$(cd -- "$(dirname -- "$source_path")" && pwd)"
+    source_path="$(readlink -- "$source_path")"
+    [[ "$source_path" == /* ]] || source_path="$source_dir/$source_path"
+done
+script_dir="$(cd -- "$(dirname -- "$source_path")" && pwd)"
+overlay_dir="$(cd -- "$script_dir/.." && pwd)"
+repo_dir="$(cd -- "$overlay_dir/.." && pwd)"
+
+profile="untrusted_strict"
+mapping_arg=""
+continue_arg=""
+json=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --json)
+            json=1
+            shift
+            ;;
+        --profile)
+            if [[ $# -lt 2 ]]; then
+                printf 'h5policy: --profile requires an argument\n\n' >&2
+                usage >&2
+                exit 2
+            fi
+            case "$2" in
+                legacy)
+                    profile="legacy"
+                    ;;
+                trusted-fast|trusted_fast)
+                    profile="trusted_fast"
+                    ;;
+                untrusted-strict|untrusted_strict)
+                    profile="untrusted_strict"
+                    ;;
+                forensic)
+                    profile="forensic"
+                    ;;
+                *)
+                    printf 'h5policy: unsupported profile: %s\n\n' "$2" >&2
+                    usage >&2
+                    exit 2
+                    ;;
+            esac
+            shift 2
+            ;;
+        --strict)
+            mapping_arg="strict"
+            shift
+            ;;
+        --non-strict)
+            mapping_arg="non_strict"
+            shift
+            ;;
+        --continue-after-corruption)
+            continue_arg="yes"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            printf 'h5policy: unknown option: %s\n\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ $# -ne 1 ]]; then
+    usage >&2
+    exit 2
+fi
+
+file=$1
+
+if [[ ! -e "$file" ]]; then
+    printf 'h5policy: file not found: %s\n' "$file" >&2
+    exit 1
+fi
+
+if [[ "$file" == *$'\n'* ]]; then
+    printf 'h5policy: file names containing newlines are not supported\n' >&2
+    exit 1
+fi
+
+if [[ $json -eq 0 ]]; then
+    printf 'h5policy: Phase 1 currently supports JSON output only; pass --json\n' >&2
+    exit 2
+fi
+
+escape_poke_string() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '%s' "$value"
+}
+
+if [[ -n "${POKE_LOAD_PATH:-}" ]]; then
+    export POKE_LOAD_PATH="$overlay_dir/pickles:$repo_dir/pickles:$POKE_LOAD_PATH"
+else
+    export POKE_LOAD_PATH="$overlay_dir/pickles:$repo_dir/pickles"
+fi
+
+cmd_file=$(mktemp "${TMPDIR:-/tmp}/h5policy.XXXXXX")
+trap 'rm -f "$cmd_file"' EXIT
+
+{
+    printf 'load h5_policy\n'
+    printf 'h5policy_profile_name = "%s"\n' "$(escape_poke_string "$profile")"
+    printf 'h5policy_file_name = "%s"\n' "$(escape_poke_string "$file")"
+    printf 'h5policy_mapping_arg = "%s"\n' "$(escape_poke_string "$mapping_arg")"
+    printf 'h5policy_continue_arg = "%s"\n' "$(escape_poke_string "$continue_arg")"
+    printf 'h5policy_run\n'
+    printf '.exit 0\n'
+} >"$cmd_file"
+
+# Hard wall-clock backstop.  Parts of the reachable-metadata walk still use
+# linear-scan de-dup sets; the pickle enforces a soft per-profile deadline, but
+# a single long-running poke operation can run between those checks.  A process
+# timeout guarantees the preflight always terminates.  Kept above the pickle's
+# own max_walk_seconds so the clean in-pickle coverage-gap fires first when it can.
+case "$profile" in
+    forensic)             wall=50 ;;
+    legacy)               wall=90 ;;
+    trusted_fast|trusted-fast) wall=35 ;;
+    *)                    wall=20 ;;
+esac
+
+poke_status=0
+if command -v timeout >/dev/null 2>&1; then
+    poke_output=$(timeout "${wall}s" poke --quiet -s "$cmd_file" 2>&1) || poke_status=$?
+else
+    poke_output=$(poke --quiet -s "$cmd_file" 2>&1) || poke_status=$?
+fi
+
+# timeout(1) exits 124 when it kills the child: emit a coverage-gap and stop.
+if [[ $poke_status -eq 124 ]]; then
+    printf '{\n  "decision": "unsupported_coverage_gap",\n'
+    printf '  "profile": "%s",\n  "file": "%s",\n' "$profile" "$file"
+    printf '  "features": {},\n  "metrics": {},\n'
+    printf '  "findings": [ { "code": "H5_UNSUPPORTED_WALK_TIMEOUT", "class": "unsupported", "severity": "warning", "object": "metadata", "offset": 0, "message": "analysis exceeded the %ss wall-clock limit; file too large or complex to fully vet" } ]\n' "$wall"
+    printf '}\n'
+    exit 5
+fi
+
+exit_code=
+report=""
+while IFS= read -r line; do
+    case "$line" in
+        __H5POLICY_EXIT_CODE=*)
+            exit_code=${line#__H5POLICY_EXIT_CODE=}
+            ;;
+        *)
+            report+="$line"$'\n'
+            ;;
+    esac
+done <<<"$poke_output"
+
+if [[ -z "$exit_code" ]]; then
+    printf '%s' "$poke_output" >&2
+    if [[ $poke_status -ne 0 ]]; then
+        exit "$poke_status"
+    fi
+    exit 70
+fi
+
+printf '%s' "$report"
+exit "$exit_code"

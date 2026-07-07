@@ -14,7 +14,7 @@ metadata layouts:
 Regenerate them under the CMake build tree with:
 
 ```sh
-python3 tests/fixtures/make_hdf5_fixtures.py build/tests/fixtures
+python3 emacs/tests/fixtures/make_hdf5_fixtures.py build/emacs/tests/fixtures
 ```
 
 The `emacs-check` CMake target does this automatically. The generator requires

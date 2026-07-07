@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 The HDF Group.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Crash-fuzz the installed HDF5 command-line tools -- the oracle is libhdf5
+itself, whatever version the tools on PATH link.
+
+h5policy-diff / h5policy-fuzz use h5py's *bundled* libhdf5, which is often older
+than the installed release, so a crash they find may already be fixed upstream.
+This tool instead drives the on-PATH tools (h5dump, h5ls, h5stat, h5repack, ...),
+so a crash it finds is against the *installed* library -- the kind that is
+actually reportable.  It reuses h5policy-fuzz's mutation engine and triages every
+crasher with h5policy:
+
+  * a crash on a file h5policy calls structurally valid (accept / warn) is the
+    strongest signal -- the metadata is well-formed, the library still crashes;
+  * a crash on a file h5policy rejects is still a tool-robustness bug (the HDF
+    Group's own CVE bar: a malformed file must not crash a tool).
+
+A "crash" is a tool run killed by a signal (SIGSEGV/SIGABRT/SIGBUS/SIGFPE), a
+run that times out (hang), or one that prints a memory-error marker.  Crashers
+are grouped by a signature (tool + fault kind + faulting message) so a hundred
+mutants that trip the same bug are reported once.
+
+Usage:
+  h5policy-crashfuzz [--seeds DIR|FILE ...] [--iters N] [--seed S]
+                     [--tools h5dump,h5ls,...] [--strategy S ...] [--guided]
+                     [--timeout SEC] [--out DIR] [--max-save N] [--quiet]
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+TESTS = os.path.normpath(os.path.join(HERE, "..", "tests"))
+H5POLICY = os.path.join(HERE, "h5policy")
+
+
+def _load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# Reuse the shared engine: mutation strategies (bitflip / interesting /
+# truncate / super / dict / struct), seed loading, and the guided corpus.
+_lib = _load("h5policy_fuzzlib", os.path.join(HERE, "h5policy-fuzzlib"))
+MUTATORS = _lib.MUTATORS
+load_corpus = _lib.load_corpus
+mutant_path = _lib.mutant_path
+
+# (name, fixed args, needs an output-file argument).  Read-oriented tools that
+# fully parse the file; h5repack/h5copy also rewrite, exercising encode paths.
+# Full `h5dump` (no -H) also reads data, reaching filter/decompression code.
+TOOL_DEFS = [
+    ("h5dump", ["-pBH"], False),   # properties + boot block + header (metadata)
+    ("h5dump", [], False),         # + data (filter / conversion paths)
+    ("h5ls", ["-r", "-v"], False),
+    ("h5stat", [], False),
+    ("h5repack", [], True),        # read + rewrite
+]
+# h5debug is a developer tool, and h5copy requires a concrete source/dest pair;
+# include optional tools only if asked by name.
+OPTIONAL_TOOLS = {
+    "h5debug": ([], False),
+    "h5copy": (["-s", "/", "-d", "/copy"], True),
+}
+
+CRASH_MARKERS = ("Segmentation fault", "munmap_chunk", "double free",
+                 "corrupted", "stack smashing", "AddressSanitizer",
+                 "malloc(): ", "free(): ", "core dumped", "buffer overflow",
+                 "Assertion", "sanitizer")
+SIGNAMES = {6: "SIGABRT", 8: "SIGFPE", 11: "SIGSEGV", 7: "SIGBUS", 4: "SIGILL"}
+
+
+def selected_tools(spec):
+    out = []
+    for name, args, needs_out in TOOL_DEFS:
+        if (spec is None or name in spec) and shutil.which(name):
+            out.append((name, args, needs_out))
+    for name in (spec or []):
+        if name in OPTIONAL_TOOLS and shutil.which(name):
+            a, n = OPTIONAL_TOOLS[name]
+            out.append((name, a, n))
+    return out
+
+
+def tool_version(name):
+    try:
+        out = subprocess.run([name, "--version"], capture_output=True,
+                             text=True, timeout=10).stdout
+        m = re.search(r"\d+\.\d+\.\d+", out)
+        return m.group(0) if m else "?"
+    except Exception:
+        return "?"
+
+
+def tool_command(name, args, needs_out, path, out_path):
+    """Build the command for a tool run.
+
+    Most tools take the input path as their final positional argument, followed
+    by an output path only for rewrite tools.  h5copy is shaped differently:
+    it names input/output files with options, then names a source and
+    destination object.
+    """
+    if name == "h5copy":
+        return [name, "-i", path, "-o", out_path] + args
+    cmd = [name] + args + [path]
+    if needs_out:
+        cmd += [out_path]
+    return cmd
+
+
+def tool_label(name, args):
+    return f"{name}[{' '.join(args)}]"
+
+
+def run_tool(name, args, needs_out, path, repack_out, timeout):
+    """Return (fault_kind|None, signature, detail).  fault_kind in
+    SIGNAL/HANG/MARKER."""
+    cmd = tool_command(name, args, needs_out, path, repack_out)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "HANG", f"{name}:hang", ""
+    finally:
+        if needs_out:
+            try:
+                os.unlink(repack_out)
+            except OSError:
+                pass
+    err = (p.stderr or "") + (p.stdout or "")
+    if p.returncode < 0:                       # killed by a signal
+        sig = -p.returncode
+        func = _gdb_faulting_func(cmd) or _fault_line(err) or SIGNAMES.get(sig, sig)
+        return "SIGNAL", f"{name}:{SIGNAMES.get(sig, sig)}:{func}", \
+            (func + "\n" + err[-400:])
+    for mk in CRASH_MARKERS:
+        if mk in err:
+            func = _gdb_faulting_func(cmd) or _fault_line(err) or mk
+            return "MARKER", f"{name}:marker:{func}", (func + "\n" + err[-400:])
+    return None, "", ""
+
+
+def _gdb_faulting_func(cmd):
+    """Faulting HDF5 function from a gdb backtrace (for a precise crash
+    signature).  Prefers the first H5* frame -- the library culprit -- over
+    libc unwinding frames (abort/raise/malloc_printerr).  Empty if no gdb."""
+    if not shutil.which("gdb"):
+        return ""
+    try:
+        p = subprocess.run(
+            ["gdb", "-q", "-batch", "-ex", "run", "-ex", "bt", "-ex", "quit",
+             "--args"] + cmd, capture_output=True, text=True,
+            errors="replace", timeout=40)
+    except Exception:
+        return ""
+    funcs = []
+    for ln in p.stdout.splitlines():
+        m = re.match(r"#\d+\s+(?:0x[0-9a-fA-F]+ in )?(\w+)", ln.strip())
+        if m:
+            funcs.append(m.group(1))
+    for f in funcs:
+        if f.startswith("H5"):
+            return f
+    libc = {"abort", "raise", "__GI_abort", "__GI_raise", "__libc_message",
+            "malloc_printerr", "__pthread_kill", "_int_free", "cfree",
+            "__assert_fail", "__assert_fail_base"}
+    for f in funcs:
+        if f not in libc:
+            return f
+    return funcs[0] if funcs else ""
+
+
+def _fault_line(err):
+    """A stable-ish identifying line from a fault (glibc / assert / sanitizer)."""
+    for ln in err.splitlines():
+        s = ln.strip()
+        for mk in ("munmap_chunk", "malloc(): ", "free(): ", "double free",
+                   "corrupted", "Assertion", "runtime error", "SUMMARY",
+                   "stack smashing"):
+            if mk in s:
+                return s[:120]
+    return ""
+
+
+def h5policy_decision(path, timeout):
+    try:
+        p = subprocess.run([H5POLICY, "--profile", "forensic", "--json", path],
+                           capture_output=True, text=True, errors="replace",
+                           timeout=timeout)
+        return json.loads(p.stdout).get("decision", "?")
+    except Exception:
+        return "?"
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--seeds", nargs="+",
+                    default=[os.path.join(TESTS, "valid")])
+    ap.add_argument("--iters", type=int, default=300)
+    ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--tools", help="comma-separated subset (default: the "
+                    "user-facing read/repack tools; add h5debug/h5copy by name)")
+    ap.add_argument("--strategy", action="append", choices=list(MUTATORS))
+    ap.add_argument("--guided", action="store_true",
+                    help="breed mutants that elicit new tool behaviour")
+    ap.add_argument("--timeout", type=float, default=10.0)
+    ap.add_argument("--out", default=os.path.join(TESTS, "crash-findings"))
+    ap.add_argument("--max-save", type=int, default=4,
+                    help="mutants to keep per distinct crash signature")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    tools = selected_tools(args.tools.split(",") if args.tools else None)
+    if not tools:
+        ap.error("no HDF5 tools found on PATH")
+    seeds, corpus = load_corpus(args.seeds)
+    if not seeds:
+        ap.error("no seed *.h5 files found")
+    strategies = args.strategy or list(MUTATORS)
+    rng = random.Random(args.seed)
+    os.makedirs(args.out, exist_ok=True)
+
+    tv = {t[0]: tool_version(t[0]) for t in tools}
+    if not args.quiet:
+        print("tools (libhdf5 " + ", ".join(sorted({v for v in tv.values()}))
+              + "): " + " ".join(tool_label(n, a) for n, a, _ in tools))
+
+    mutant = mutant_path(args.out)
+    repack_out = os.path.join(args.out, f".repack.{os.getpid()}.h5")
+    behaviours = set()                 # (tool, rc) seen -> guided novelty
+    sig_count = {}                     # crash signature -> saved count
+    crashes = []                       # (signature, kind, decision, detail)
+    tool_runs = 0
+
+    for it in range(args.iters):
+        label, base = corpus.pick(rng)
+        strat = rng.choice(strategies)
+        m = MUTATORS[strat](base, rng)
+        if m is None:
+            continue
+        with open(mutant, "wb") as f:
+            f.write(m)
+
+        hit = []
+        novel = False
+        for name, targs, needs_out in tools:
+            kind, sig, detail = run_tool(name, targs, needs_out, mutant,
+                                         repack_out, args.timeout)
+            tool_runs += 1
+            btok = (name, kind or "ok")
+            if btok not in behaviours:
+                behaviours.add(btok)
+                novel = True
+            if kind:
+                hit.append((kind, sig, detail))
+
+        if hit:
+            decision = h5policy_decision(mutant, args.timeout)
+            for kind, sig, detail in hit:
+                crashes.append((sig, kind, decision))
+                n = sig_count.get(sig, 0)
+                if n < args.max_save:
+                    stem = "crash_%s_%s" % (
+                        re.sub(r"[^A-Za-z0-9]+", "_", sig)[:48], it)
+                    dst = os.path.join(args.out, stem + ".h5")
+                    with open(dst, "wb") as f:
+                        f.write(m)
+                    with open(dst[:-3] + ".txt", "w") as f:
+                        f.write(f"signature  {sig}\nkind       {kind}\n"
+                                f"h5policy   {decision}\nseed       {label}\n"
+                                f"strategy   {strat}\niter       {it}\n"
+                                f"rng_seed   {args.seed}\n\n{detail}\n")
+                    sig_count[sig] = n + 1
+            if not args.quiet:
+                tag = "!!" if decision in ("accept", "accept_with_warnings") else "  "
+                print(f"{tag} CRASH {hit[0][1]}  (h5policy={decision}) "
+                      f"src={label} strat={strat}")
+
+        if args.guided and novel:
+            corpus.breed(f"g{it:05d}", m, rng, 500)
+
+    for tmp in (mutant, repack_out):
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+    # --- report: distinct crash signatures, split by h5policy verdict ---
+    print(f"\n=== crash-fuzz summary ({args.iters} iters, {tool_runs} tool "
+          f"runs, rng_seed={args.seed}) ===")
+    distinct = {}
+    for sig, kind, decision in crashes:
+        d = distinct.setdefault(sig, {"kind": kind, "n": 0, "decisions": set()})
+        d["n"] += 1
+        d["decisions"].add(decision)
+    valid_crashers = [s for s, d in distinct.items()
+                      if d["decisions"] & {"accept", "accept_with_warnings"}]
+    print(f"  total crash events:        {len(crashes)}")
+    print(f"  distinct crash signatures: {len(distinct)}")
+    print(f"  ...on h5policy-valid input:{len(valid_crashers)}  <== strongest\n")
+    for sig in sorted(distinct, key=lambda s: -distinct[s]["n"]):
+        d = distinct[sig]
+        mark = " <== h5policy VALID" if sig in valid_crashers else ""
+        print(f"  [{d['kind']:6}] x{d['n']:<4} "
+              f"{'/'.join(sorted(d['decisions'])):22} {sig}{mark}")
+    print(f"\nfindings dir: {os.path.relpath(args.out)}")
+    return 1 if distinct else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
