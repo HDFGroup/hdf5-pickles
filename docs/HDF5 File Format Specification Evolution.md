@@ -116,9 +116,8 @@ carry-forward · **✝** retained for compatibility but superseded · — not pr
    (`H5Pset_libver_bounds`) pinned low — relevant when reasoning about reproducibility claims.
 3. **Signature inventory.** Four-character signatures by introduction: 1.0 — `TREE`, `SNOD`,
    `HEAP`, `GCOL`; 2.0 — `OHDR`, `OCHK`, `FRHP`, `FHDB`, `FHIB`, `BTHD`, `BTIN`, `BTLF`, `SMTB`,
-   `SMLI`; 3.0 — `FSHD`, `FSSE`, `FAHD`, `FADB`, `EAHD`, `EAIB`, `EASB`, `EADB`, `VHDB`, plus the
-   revised-reference `RV` token. A signature scan of a file therefore yields a quick lower bound on
-   format generation.
+   `SMLI`; 3.0 — `FSHD`, `FSSE`, `FAHD`, `FADB`, `EAHD`, `EAIB`, `EASB`, `EADB`, `VHDB`.
+   A signature scan of a file therefore yields a quick lower bound on format generation.
 
 ## Caveats
 
