@@ -123,9 +123,8 @@ carry-forward · **✝** retained for compatibility but superseded · — not pr
 ## Caveats
 
 - Entries marked **⚠** are best-effort attributions to design documents whose exact titles,
-  numbers, or dates should be verified against the HDF Group RFC archive
-  (https://support.hdfgroup.org/releases/hdf5/documentation/rfc/) before citation in formal audit
-  artifacts. The VDS, File Space Management, New Datatypes, and Complex/float16 RFCs were verified
+  numbers, or dates should be verified against the [HDF Group RFC archive](https://support.hdfgroup.org/documentation/hdf5/latest/_r_f_c.html)
+  before citation in formal audit artifacts. The VDS, File Space Management, New Datatypes, and Complex/float16 RFCs were verified
   against public sources; the 1.8-era design documents (group revisions, fractal heap, SOHM, SWMR)
   circulated in various forms and are less uniformly archived.
 - Spec 3.0 and 4.0 as currently published on support.hdfgroup.org both incorporate the HDF5 2.0
