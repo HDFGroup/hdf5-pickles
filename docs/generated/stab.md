@@ -39,7 +39,7 @@ Present when `cache_type == 2`. Stores the byte offset of the symbolic-link targ
 
 ### `pad`
 
-Present when `cache_type == 0` (or any reserved value). The 16 bytes are undefined and should be ignored.
+Present when `cache_type == 0`. The 16 bytes are undefined and should be ignored. Reserved cache type values cannot select this arm because `stab_ent` constrains `cache_type` to values 0–2.
 
 
 ## `stab_node`

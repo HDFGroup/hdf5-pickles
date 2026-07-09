@@ -38,11 +38,11 @@ Layout for superblock versions 0 and 1. Version 1 extends version 0 by adding th
 | `res2` | Reserved. Must be zero. |
 | `stab_leaf_k` | Half the rank of leaf nodes in the version 1 group B-tree. Must be greater than zero.  The maximum number of entries in a leaf node is `2 * stab_leaf_k`. |
 | `stab_internal_k` | Half the rank of internal nodes in the version 1 group B-tree. Must be greater than zero. |
-| `status_flags` | File consistency flags. Bit 0: file is open for write access and may be inconsistent. Bit 1: file has been verified as consistently closed. |
+| `status_flags` | File consistency flags. This field is unused in superblock versions 0 and 1 and should be ignored. |
 | `indexed_internal_k` | Half the rank of internal nodes in the version 1 B-tree used for indexed (chunked) storage. Present only in superblock version 1; must be greater than zero. |
 | `res3` | Reserved. Must be zero. Present only in superblock version 1, immediately following `indexed_internal_k`. |
-| `base_addr_raw` | Absolute byte offset of the start of the HDF5 address space within the physical file. Usually 0. All stored addresses are relative to this base. |
-| `fs_info_addr_raw` | File address of the free-space manager information block, or HADDR_UNDEF (`0xFF…FF`) if free space is not tracked. |
+| `base_addr_raw` | Absolute byte offset of the start of the HDF5 address space within the physical file. For newly created files this is constrained to the physical offset of the superblock signature, which may be 0, 512, 1024, 2048, and so on. Unless otherwise noted, stored file addresses are relative to this base. |
+| `fs_info_addr_raw` | Address of the global free-space index. Persistent free-space management is not supported by superblock versions 0 and 1, so this field always contains HADDR_UNDEF (`0xFF…FF`). |
 | `eof_addr_raw` | File address of the first byte beyond all HDF5 data (the logical end-of-file). |
 | `drv_info_addr_raw` | File address of the driver information block, or HADDR_UNDEF if no driver information is present. |
 | `root_stab_ent` | Symbol table entry for the root group (type `stab_ent`). |
@@ -55,7 +55,7 @@ Compact layout introduced in superblock version 2. Replaces the symbol-table roo
 |-------|-------------|
 | `sizeof_offsets` | Size in bytes of file addresses. Typical value: 8. Sets the global `sizeof_offsets`. |
 | `sizeof_lengths` | Size in bytes of file lengths. Typical value: 8. Sets the global `sizeof_lengths`. |
-| `status_flags` | File consistency flags. In version 2, any bit may be set. In version 3, only bits 0–2 are defined; bits 3–7 must be zero. |
+| `status_flags` | File consistency flags. In version 2 this field is unused and should be ignored. In version 3, bit 0 indicates that the file is open for write access, bit 1 is reserved, and bit 2 indicates that the file is open for single-writer/multiple-reader (SWMR) write access. Bits 3–7 are reserved and must be zero. |
 | `base_addr_raw` | Absolute byte offset of the start of the HDF5 address space. |
 | `ext_addr_raw` | File address of the superblock extension object header, or HADDR_UNDEF if no extension is present. The extension carries optional metadata such as the driver information message. |
 | `eof_addr_raw` | File address of the first byte beyond all HDF5 data. |

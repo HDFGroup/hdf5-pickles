@@ -835,7 +835,7 @@ Version 1 message prefix (5 bytes of declared fields; the message-decoding logic
 
 | Field | Description |
 |-------|-------------|
-| `msg_type` | 16-bit message type identifier. Values 0x0000–0x001F are defined by the HDF5 specification; all others are reserved. |
+| `msg_type` | 16-bit message type identifier. Values 0x0000–0x0018 are defined by the HDF5 specification; all others are reserved. |
 | `msg_size` | Size of the message payload in bytes, not including this prefix or the 3 reserved bytes that follow it. |
 | `msg_flags` | Bit flags applying to this message. Bit 0: message data is constant after object creation and may be cached or shared. Bit 1: message is shared (payload is a Shared Message record rather than the message data itself). Bit 2: this message must not be shared. Bit 3: the HDF5 library may skip this message on open if it does not understand it. Bit 4: this message was marked as shareable but has not yet been moved to the shared message table. Bit 5: the object header was created before version 1.6 and this message was not originally encoded as a shared message. |
 

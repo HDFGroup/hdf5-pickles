@@ -129,6 +129,7 @@ Record type 7, sub-type 1 — shared message stored inline in an object header. 
 |-------|-------------|
 | `message_location` | Storage location indicator. Must be 1 for this sub-type (message is in an object header). |
 | `hash` | Jenkins lookup3 hash of the shared message payload (B-tree key). |
+| `reserved` | Reserved byte between `hash` and `message_type`. Must be zero. |
 | `message_type` | Object header message type of the shared message. |
 | `obj_hdr_index` | Index of the message within its containing object header. |
 | `obj_hdr_addr_raw` | File address of the object header containing the shared message (`sizeof_offsets` bytes). |
