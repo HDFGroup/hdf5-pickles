@@ -1,6 +1,6 @@
 # Mapping HDF5 Binary Primitives onto an Object Store
 
-**Decision:** The linear address space is no longer required. Byte identity with any
+**Assumption/Decision:** The linear address space is no longer required. Byte identity with any
 ingested `.h5` file is explicitly sacrificed; **format compatibility** *is* retained via a canonical linearization (described below). Attestation moves to a canonical per-object level.
 
 ## Invariants
@@ -50,31 +50,25 @@ The keyspace splits along the mutation grain of the format itself:
 
 {c}/root                              commit pointer: tiny object naming the current
                                       superblock OID + OID-map generation + Merkle root
-{c}/sb/{gen}                          superblock + superblock-extension OH, versioned
 
-{c}/o/{class}/{oid}                   metadata-plane structure, one per OID
+{c}/sb/{gen}                          superblock + superblock-extension OH, synthesized superblock
+                                      parameters per generation (profile, K values), versioned
 
-      class ∈ { oh                    object header (v1 w/ continuations coalesced,
-                                      v2 w/ OCHK chunks as sub-objects {oid}.{n}),
-                bt1, bt2l, bt2i       B-tree nodes,
-                fhdb, fhib, frhp      fractal heap blocks/headers,
-                snod, lheap, gcol,    old-style group machinery + global heap,
-                smtb, smli,           SOHM tables,
-                ea*, fa*              extensible/fixed array index blocks }
+{c}/map/{shard}/{gen}                 OID map shards: oid → (key, size, class, hash) record 
+                                      manifests, COW-sharded: object-header stubs, link records,
+                                      attribute records, chunk records, dtype bodies (small bodies
+                                      inline, large by digest reference)
 
 {c}/h/{algo}/{digest}                 payload plane: immutable, content-addressed, deduplicating :
                                       chunk bytes (post-filter), contiguous data bodies, large
                                       message bodies
 
-{c}/map/{shard}/{gen}                 OID map shards: oid → (key, size, class, hash)
-
 {c}/ext/{name}                        external-reference table: EFL filenames, external
                                       link targets, VDS source files → container IDs/URIs
-{c}/att/{gen}                         attestation manifest
 
+{c}/att/{gen}                         attestation manifest, attestation objects: signed Merkle
+                                      roots; ingest records
 ```
-
-The `{class}` component is redundant with the structure's own signature — it exists purely for audit ergonomics: a prefix listing of `{c}/o/bt2l/` is our signature-scan-in-the-store, giving generation bounds and structure inventories without reading a byte of payload. It's the object-store equivalent of the four-character-code scan from the matrix.
 
 The payload plane is conflict-free by construction: content-addressed `PUTs` are idempotent, so any number of uncoordinated producers may write it. All coordination concentrates in `{c}/map` and `{c}/root`.
 
@@ -114,6 +108,16 @@ Format compatibility is then a *canonical linearization*: deterministic traversa
 | Symbol-table-entry scratch pads (cached addresses) | Not stored; regenerated or cache-type-zeroed at pack time |
 | External file lists / external links / VDS sources | Quarantined in `{c}/ext/`; inherently foreign byte ranges / URIs |
 | User block, driver-info block | Ingest-side provenance only; re-emitted on request at pack time |
+
+## Commit-epoch granularity under concurrent writers
+
+We don't want to invent a distributed database. The current format has no concurrent-mutation semantics: SWMR is single-writer with ordered visibility; parallel HDF5 is many processes forming one logical writer via collective MPI-IO. So the compatibility bar is single-writer commits — anything beyond that is new semantics we choose to define, and should be quarantined as such.
+
+Within that bar, the derived-index decision does most of the work. The payload plane is content-addressed and immutable, so concurrent chunk *production* is conflict-free by construction: any number of producers can `PUT {c}/h/{algo}/{digest}` objects with no coordination whatsoever, because a content-addressed `PUT` is idempotent. All contention concentrates at exactly two points: manifest-shard updates and the root swap. That gives us the natural deployment shape for your actual workloads (detector/instrument ingest): **N uncoordinated payload writers, one committer**. Producers stream chunks and hand `(coords, digest, size, filter mask)` tuples to a sequencer; the sequencer batches manifest-shard COW updates and swaps the root. No locks, no CAS storms, and HDF5 semantics preserved exactly.
+
+Epoch granularity then becomes a batching parameter, not a correctness question, and it's bounded on both sides by concrete numbers. Lower bound: the root is a single hot key, and object stores throttle per-prefix request rates (S3 on the order of a few thousand `PUT`/s per prefix, but a *single key* with read-after-write consistency wants far less churn than that), plus every epoch generates map-shard garbage for GC and, if you sign roots, an attestation cost. Practical floor: don't swap faster than ~1–10 Hz. Upper bound: epoch length is the reader-staleness window (SWMR VFD...) and the crash-replay window: uncommitted objects after a crash are invisible garbage (a genuinely better failure mode than the linear format's torn-file corruption; there is no "partial epoch" state a reader can observe). For SWMR-replacement use cases, epochs of 100 ms–1 s replicate the flush cadence applications already expect; for bulk ingest, seconds to minutes with size-triggered commits. We can make it adaptive: commit on max(interval, dirty-shard count), and it's a tuning knob per container.
+
+If we later want true multi-writer, the COW shard structure gives us optimistic concurrency almost for free: writers prepare disjoint shard deltas and CAS the root; disjoint-shard commits merge trivially (different datasets → different shards), same-shard conflicts retry with rebase. This is `git` semantics grafted onto HDF5, with merge rules HDF5 never defined (two writers appending to the same unlimited dimension have no format-sanctioned outcome). We need to specify this as an explicit extension profile, off by default, so the base design's compatibility claim stays intact and crisp. Finally: signed roots and GC are in tension. The retention policy must treat attested roots as pinned, or the Merkle history develops holes exactly where an auditor would look.
 
 ## Summary
 
