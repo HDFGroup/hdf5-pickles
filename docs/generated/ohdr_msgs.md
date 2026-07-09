@@ -388,6 +388,17 @@ External Data Files message (type 0x0007). Lists the external files that hold a 
 | `slots` | Array of `used_slots` `ext_slot` records, one per external file segment. |
 
 
+## `ext_slot`
+
+One entry in the External Data Files slot array (`oh_msg_external`). Each record describes a contiguous segment of a dataset's raw data stored in one external file.
+
+| Field | Description |
+|-------|-------------|
+| `name_off_raw` | Offset of the external file's name within the local heap referenced by the message's `heap_addr_raw` (`sizeof_lengths` bytes). |
+| `file_off_raw` | Byte offset into the external file at which this segment's data begins (`sizeof_lengths` bytes). |
+| `data_size_raw` | Number of bytes reserved for this segment in the external file (`sizeof_lengths` bytes). |
+
+
 ## `oh_msg_layout`
 
 Data layout message (type 0x0008). Specifies how a dataset's raw data are stored on disk: compact (inside the object header), contiguous, chunked, or virtual. Four format versions are defined; versions 1 and 2 share the same struct.

@@ -14,11 +14,13 @@ A heap stores objects in three broad forms:
 - **Tiny objects** are embedded directly in the heap ID, so no heap
   block lookup is needed.
 
-This pickle currently types the Fractal Heap header (signature 'FRHP')
-and the embedded doubling-table parameters. Direct blocks (signature
-'FHDB'), indirect blocks (signature 'FHIB'), and heap ID payloads are
-decoded by callers with explicit offset arithmetic using the geometry
-exposed by `frhp_dtable`.
+This pickle types the Fractal Heap header (signature 'FRHP') with its
+embedded doubling-table parameters, the direct blocks (signature 'FHDB')
+and indirect blocks (signature 'FHIB') that hold managed objects, the
+indirect-block child entries, and the heap ID payload. Locating a
+managed object requires the doubling-table geometry exposed by
+`frhp_dtable`, which drives the offset arithmetic in
+`frhp_managed_id_to_addr`.
 
 ## `frhp_dtable`
 
@@ -64,5 +66,76 @@ Fractal Heap header (signature 'FRHP'). Stores heap-wide counters, addresses for
 | `io_filter_mask` | Filter pipeline skip mask for the filtered root direct block. Present only when `filter_len != 0`. _optional_ |
 | `io_filter_info` | Encoded I/O filter information bytes for root direct blocks. The array length is `filter_len`, and the field is present only when `filter_len != 0`. _optional_ |
 | `chksum` | Jenkins lookup3 checksum of all preceding header bytes. |
+
+
+## `frhp_dir_entry`
+
+Direct-block child entry in an indirect block, unfiltered heap. Rows below `max_direct_rows` hold direct-block entries; this variant is used when the heap has no I/O filter pipeline.
+
+| Field | Description |
+|-------|-------------|
+| `addr_raw` | File address of the child direct block (`sizeof_offsets` bytes). An all-ones (undefined) address marks an unallocated entry. |
+
+
+## `frhp_dir_entry_filt`
+
+Direct-block child entry in an indirect block, filtered heap. Used in place of `frhp_dir_entry` when `filter_len != 0`, adding the stored (filtered) block size and the filter skip mask.
+
+| Field | Description |
+|-------|-------------|
+| `addr_raw` | File address of the child direct block (`sizeof_offsets` bytes). An all-ones (undefined) address marks an unallocated entry. |
+| `filtered_size_raw` | On-disk size of the filtered direct block, stored in `sizeof_lengths` bytes. |
+| `filter_mask` | Bit mask of filters skipped for this direct block, matching the filter pipeline convention (1 = filter not applied). |
+
+
+## `frhp_iblock_dir_entry`
+
+Direct-block child entry, selecting the filtered layout when the heap carries an I/O filter pipeline (`filter_len > 0`) and the plain address-only layout otherwise.
+
+### `filtered`
+
+`frhp_dir_entry_filt` — chosen when `filter_len > 0`.
+
+### `unfiltered`
+
+`frhp_dir_entry` — chosen when the heap is unfiltered.
+
+
+## `fheap_iblock`
+
+Fractal Heap indirect block (signature 'FHIB'). Holds the child entries for one node of the doubling table: direct-block entries for rows below `max_direct_rows`, followed by indirect-block addresses for the remaining rows. Call `set_frhp_iblock(nrows)` before mapping.
+
+| Field | Description |
+|-------|-------------|
+| `signature` | 4-byte signature: 'F' 'H' 'I' 'B'. Must match exactly. |
+| `version` | Indirect block format version. Must be 0. |
+| `hdr_addr_raw` | File address of the fractal heap header that owns this block (`sizeof_offsets` bytes). |
+| `block_off_raw` | Logical heap offset of the first object mapped by this block, stored in `heap_off_size` bytes. |
+| `dir_entries` | Array of direct-block child entries (`frhp_iblock_dir_entry`), one per direct-block slot in this block's rows. |
+| `indir_addrs` | Array of child indirect-block file addresses (`sizeof_offsets` bytes each) for rows at or above `max_direct_rows`. |
+| `chksum` | Jenkins lookup3 checksum over the indirect block. |
+
+
+## `fheap_dblock`
+
+Fractal Heap direct block (signature 'FHDB'). Stores the managed objects themselves in its `data` region. Call `set_frhp_dblock(block_size)` before mapping so the data length can be derived from the block size.
+
+| Field | Description |
+|-------|-------------|
+| `signature` | 4-byte signature: 'F' 'H' 'D' 'B'. Must match exactly. |
+| `version` | Direct block format version. Must be 0. |
+| `hdr_addr_raw` | File address of the fractal heap header that owns this block (`sizeof_offsets` bytes). |
+| `block_off_raw` | Logical heap offset of the first object in this block, stored in `heap_off_size` bytes. |
+| `chksum` | Jenkins lookup3 checksum over the entire block (computed with this field zeroed). Present only when the header's checksum-direct-blocks flag is set. _optional_ |
+| `data` | Managed object data region, `block_size` minus the block overhead bytes long. Objects are packed at heap-offset positions decoded from their heap IDs. |
+
+
+## `frhp_heap_id`
+
+Fractal Heap ID (`heap_id_length` bytes). The first byte's type bits select one of three payload forms: managed (offset/length into the heap's direct blocks), huge (direct address or v2 B-tree key), or tiny (object bytes embedded in the ID). `fheap_hdr` must be mapped first so the derived geometry globals are set.
+
+| Field | Description |
+|-------|-------------|
+| `raw` | The raw ID bytes (`heap_id_length` long). The `_print` method decodes the flags byte and the form-specific fields. |
 
 
