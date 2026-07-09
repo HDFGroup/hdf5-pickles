@@ -18,7 +18,7 @@ the data block is split into fixed-size pages stored consecutively after
 the data block prefix in the file.  The prefix then records only the
 page-initialisation bitmask; elements live in `fa_dblk_page` records.
 When `max_dblk_page_nelmts_bits == 0` or the element count is small
-enough, all elements are stored directly in the data block (`fa_dblock_nopaged`).
+enough, all elements are stored directly in the data block (`fadb_nopaged`).
 
 **Client IDs:**
 
@@ -30,7 +30,7 @@ enough, all elements are stored directly in the data block (`fa_dblock_nopaged`)
 Use `print_fa(addr#B)` to map the header, print it, and recursively
 print the data block and all pages.
 
-## `fa_chunk_elem`
+## `fadb_chunk_elem`
 
 One element for a non-filtered chunk (client ID 0). Contains only the chunk's file address.
 
@@ -39,7 +39,7 @@ One element for a non-filtered chunk (client ID 0). Contains only the chunk's fi
 | `addr_raw` | File address of the chunk data (`sizeof_offsets` bytes). HADDR_UNDEF if the chunk has not been written. |
 
 
-## `fa_filt_chunk_elem`
+## `fadb_filt_chunk_elem`
 
 One element for a filtered chunk (client ID 1). Stores the chunk address, its on-disk (post-filter) size, and the filter pipeline skip mask.
 
@@ -50,17 +50,17 @@ One element for a filtered chunk (client ID 1). Stores the chunk address, its on
 | `filter_mask` | Filter pipeline skip mask. Bit i set means filter i was not applied to this chunk. |
 
 
-## `fa_element`
+## `fadb_element`
 
 Dispatch union that resolves to the correct element layout based on `global_fa_client_id` at mapping time. Both arms have the same on-disk footprint (`raw_elmt_size` bytes) for a given header.
 
 ### `non_filtered`
 
-Active when `global_fa_client_id == 0`. Wraps `fa_chunk_elem`.
+Active when `global_fa_client_id == 0`. Wraps `fadb_chunk_elem`.
 
 ### `filtered`
 
-Active when `global_fa_client_id == 1`. Wraps `fa_filt_chunk_elem`.
+Active when `global_fa_client_id == 1`. Wraps `fadb_filt_chunk_elem`.
 
 
 ## `fa_hdr`
@@ -85,11 +85,11 @@ Fixed Array data block page. Only present when paging is active (`global_fa_npag
 
 | Field | Description |
 |-------|-------------|
-| `elements` | Array of `global_fa_page_nelmts` elements (type `fa_element`). |
+| `elements` | Array of `global_fa_page_nelmts` elements (type `fadb_element`). |
 | `chksum` | Jenkins lookup3 checksum of all preceding page bytes. |
 
 
-## `fa_dblock_nopaged`
+## `fadb_nopaged`
 
 Fixed Array data block, non-paged layout (signature 'FADB'). Used when `global_fa_npages == 0`. All `global_fa_nelmts` elements are stored inline in the `elements` array.
 
@@ -99,11 +99,11 @@ Fixed Array data block, non-paged layout (signature 'FADB'). Used when `global_f
 | `version` | Data block format version. Must be 0. |
 | `client_id` | Element class (mirrors `fa_hdr.client_id`). |
 | `hdr_addr_raw` | Back-pointer: file address of the Fixed Array header (`sizeof_offsets` bytes). |
-| `elements` | Array of `global_fa_nelmts` inline elements (type `fa_element`). |
+| `elements` | Array of `global_fa_nelmts` inline elements (type `fadb_element`). |
 | `chksum` | Jenkins lookup3 checksum of all preceding data block bytes. |
 
 
-## `fa_dblock_paged`
+## `fadb_paged`
 
 Fixed Array data block, paged layout (signature 'FADB'). Used when `global_fa_npages > 0`. This struct captures only the prefix; the actual elements are stored in `fa_dblk_page` records that follow immediately in the file. The page-initialisation bitmask tracks which pages have been written.
 
@@ -119,7 +119,7 @@ Fixed Array data block, paged layout (signature 'FADB'). Used when `global_fa_np
 
 ## `fa_dblock`
 
-Top-level Fixed Array data block dispatch union (signature 'FADB'). Selects `fa_dblock_paged` when `global_fa_npages > 0`, otherwise `fa_dblock_nopaged`. Map with `var db = fa_dblock @ bytes_to_off(hdr.dblk_addr_raw)`.
+Top-level Fixed Array data block dispatch union (signature 'FADB'). Selects `fadb_paged` when `global_fa_npages > 0`, otherwise `fadb_nopaged`. Map with `var db = fa_dblock @ bytes_to_off(hdr.dblk_addr_raw)`.
 
 ### `paged`
 

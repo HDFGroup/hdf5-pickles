@@ -14,36 +14,6 @@ replaces the symbol-table root group entry with a plain object header
 address and adds a checksum. Version 3 additionally restricts which
 bits of the consistency flags field may be set.
 
-## `stab_ent`
-
-Symbol table entry for the root group object, embedded directly in superblock versions 0 and 1. Each entry records the object header address, a cache type, and a scratch-pad area whose meaning depends on the cache type.
-
-| Field | Description |
-|-------|-------------|
-| `lnk_nm_off_raw` | Byte offset of the link name within the root local heap's data segment. For the root entry this field is not meaningful and is typically zero. |
-| `ohdr_addr_raw` | File address of the object header for the root group. |
-| `cache_type` | Indicates what is cached in the scratch-pad space. 0 = no cache; 1 = group (B-tree address and heap address are cached); 2 = symbolic link (soft-link target offset is cached). Values 3 and above are reserved. |
-| `res` | Reserved. Must be zero. |
-| `scratch_pad` | 16-byte scratch-pad area. Interpretation is determined by `cache_type`. See variants below. |
-
-### `obj_info`
-
-Present when `cache_type == 1`. Caches the group's B-tree and local heap addresses so that the symbol table can be traversed without first mapping the object header.
-
-| Field | Description |
-|-------|-------------|
-| `btree_addr_raw` | File address of the root B-tree node for the group's symbol table. |
-| `heap_addr_raw` | File address of the local heap containing link names for the group. |
-
-### `slink`
-
-Present when `cache_type == 2`. Stores the byte offset of the symbolic-link target string within the local heap.
-
-### `pad`
-
-Present when `cache_type == 0`. The 16 bytes are undefined and should be ignored.
-
-
 ## `superblock`
 
 The root on-disk metadata structure of every HDF5 file.

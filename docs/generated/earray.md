@@ -44,7 +44,7 @@ file.  All pages within one data block hold the same number of elements.
 Use `print_ea(addr#B)` to map the header, print it and the index block,
 and recursively walk all reachable data blocks and secondary blocks.
 
-## `ea_chunk_elem`
+## `eadb_chunk_elem`
 
 One element for a non-filtered chunk (client ID 0). Contains only the chunk's file address.
 
@@ -53,7 +53,7 @@ One element for a non-filtered chunk (client ID 0). Contains only the chunk's fi
 | `addr_raw` | File address of the chunk data (`sizeof_offsets` bytes). HADDR_UNDEF if the chunk has not been written. |
 
 
-## `ea_filt_chunk_elem`
+## `eadb_filt_chunk_elem`
 
 One element for a filtered chunk (client ID 1). Records the chunk address, its on-disk (post-filter) size, and the filter pipeline skip mask.
 
@@ -64,21 +64,21 @@ One element for a filtered chunk (client ID 1). Records the chunk address, its o
 | `filter_mask` | Filter pipeline skip mask. Bit i set means filter i was not applied to this chunk. |
 
 
-## `ea_element`
+## `eadb_element`
 
 Dispatch union that resolves to the correct element layout based on `global_ea_client_id` at mapping time.
 
 ### `non_filtered`
 
-Active when `global_ea_client_id == 0`. Wraps `ea_chunk_elem`.
+Active when `global_ea_client_id == 0`. Wraps `eadb_chunk_elem`.
 
 ### `filtered`
 
-Active when `global_ea_client_id == 1`. Wraps `ea_filt_chunk_elem`.
+Active when `global_ea_client_id == 1`. Wraps `eadb_filt_chunk_elem`.
 
 ### `testing`
 
-Active when `global_ea_client_id == 2`. Wraps `ea_chunk_elem`. Added for compatibility with internal EA test files only; not part of the public format specification.
+Active when `global_ea_client_id == 2`. Wraps `eadb_chunk_elem`. Added for compatibility with internal EA test files only; not part of the public format specification.
 
 
 ## `ea_hdr`
@@ -116,7 +116,7 @@ Extensible Array index block (signature 'EAIB'). Central dispatch structure. Hol
 | `version` | Index block format version. Must be 0. |
 | `client_id` | Element class (mirrors `ea_hdr.client_id`). |
 | `hdr_addr_raw` | Back-pointer: file address of the Extensible Array header (`sizeof_offsets` bytes). |
-| `elements` | Array of `global_ea_idx_blk_elmts` elements stored inline (type `ea_element`). These are the lowest-index chunks and are accessed without following any data block pointer. |
+| `elements` | Array of `global_ea_idx_blk_elmts` elements stored inline (type `eadb_element`). These are the lowest-index chunks and are accessed without following any data block pointer. |
 | `dblk_addrs` | `global_ea_ndblk_addrs × sizeof_offsets` byte array of data block file addresses. Entries are grouped by secondary block group u; within group u there are `2^(u/2)` addresses. HADDR_UNDEF entries indicate unallocated data blocks. |
 | `sblk_addrs` | `global_ea_nsblk_addrs × sizeof_offsets` byte array of secondary block file addresses for groups u = iblk_nsblks … nsblks−1. HADDR_UNDEF entries indicate unallocated secondary blocks. |
 | `chksum` | Jenkins lookup3 checksum of all preceding index block bytes. |
@@ -138,7 +138,7 @@ Extensible Array secondary block (signature 'EASB'). Manages the data blocks for
 | `chksum` | Jenkins lookup3 checksum of all preceding secondary block bytes. |
 
 
-## `ea_dblock_nopaged`
+## `eadb_nopaged`
 
 Extensible Array data block, non-paged layout (signature 'EADB'). Used when `global_ea_dblk_npages == 0`. All `global_ea_dblk_nelmts` elements are stored inline after the block header. Before mapping, call `set_ea_dblock(nelmts)` with the element count for this particular data block.
 
@@ -149,11 +149,11 @@ Extensible Array data block, non-paged layout (signature 'EADB'). Used when `glo
 | `client_id` | Element class (mirrors `ea_hdr.client_id`). |
 | `hdr_addr_raw` | Back-pointer: file address of the Extensible Array header (`sizeof_offsets` bytes). |
 | `block_off_raw` | Array-element offset of the first element in this data block (`global_ea_arr_off_size` bytes). |
-| `elements` | Array of `global_ea_dblk_nelmts` inline elements (type `ea_element`). |
+| `elements` | Array of `global_ea_dblk_nelmts` inline elements (type `eadb_element`). |
 | `chksum` | Jenkins lookup3 checksum of all preceding data block bytes. |
 
 
-## `ea_dblock_paged`
+## `eadb_paged`
 
 Extensible Array data block, paged layout (signature 'EADB'). Used when `global_ea_dblk_npages > 0`. Captures only the block prefix; elements are in `ea_dblk_page` records that follow the prefix consecutively in the file. Before mapping, call `set_ea_dblock(nelmts)`.
 
@@ -169,7 +169,7 @@ Extensible Array data block, paged layout (signature 'EADB'). Used when `global_
 
 ## `ea_dblock`
 
-Top-level Extensible Array data block dispatch union (signature 'EADB'). Selects `ea_dblock_paged` when `global_ea_dblk_npages > 0`, otherwise `ea_dblock_nopaged`. Map with `set_ea_dblock(nelmts)` then `var db = ea_dblock @ addr#B`.
+Top-level Extensible Array data block dispatch union (signature 'EADB'). Selects `eadb_paged` when `global_ea_dblk_npages > 0`, otherwise `eadb_nopaged`. Map with `set_ea_dblock(nelmts)` then `var db = ea_dblock @ addr#B`.
 
 ### `paged`
 
@@ -186,7 +186,7 @@ Extensible Array data block page. No on-disk signature; pages are appended conse
 
 | Field | Description |
 |-------|-------------|
-| `elements` | Array of `global_ea_dblk_page_nelmts` elements (type `ea_element`). |
+| `elements` | Array of `global_ea_dblk_page_nelmts` elements (type `eadb_element`). |
 | `chksum` | Jenkins lookup3 checksum of all preceding page bytes. |
 
 

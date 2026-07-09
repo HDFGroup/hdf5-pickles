@@ -35,7 +35,7 @@ Doubling-table geometry embedded in every fractal heap header. It describes how 
 | `curr_root_rows` | Current number of rows in the root indirect block. A value of 0 means the root address points directly at a root direct block. |
 
 
-## `frhp_hdr`
+## `fheap_hdr`
 
 Fractal Heap header (signature 'FRHP'). Stores heap-wide counters, addresses for huge-object and free-space tracking, and the doubling-table parameters used to locate managed objects.
 

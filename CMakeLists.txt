@@ -41,8 +41,8 @@ set(PKDOC_SPECS
     earray
     farray
     fheap
-    messages
-    ohdr
+    ohdr_msgs
+    stab
     superblock
     v1_btree
     v2_btree
