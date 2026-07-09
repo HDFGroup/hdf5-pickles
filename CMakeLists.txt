@@ -38,14 +38,22 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(PKDOC_SPECS
     drv_info
+    dspace_enc
+    dtype_enc
     earray
     farray
     fheap
+    fsm
+    gheap
+    lheap
     ohdr_msgs
+    ref_enc
+    sohm
     stab
     superblock
     v1_btree
     v2_btree
+    vds
 )
 
 set(PKDOC_GENERATED_FILES)
