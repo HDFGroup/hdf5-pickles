@@ -1,0 +1,153 @@
+/* dtype_enc.pk - HDF5 Datatype Encoding (Appendix D, Section VIII.B). */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+load "ohdr_msgs.pk";
+
+/*
+ * Covers:
+ *   Appendix D, Section VIII.B of the HDF5 format spec v4.0.
+ *   This is the format produced by the public H5Tencode() / H5Tdecode()
+ *   API calls.  The HDF5 library itself never writes H5Tencode buffers into
+ *   a file as part of normal file operations; they appear on disk only when
+ *   application code explicitly stores the raw bytes as dataset or attribute
+ *   data.  The test file dtype_enc_test.h5 does exactly that -- each dataset
+ *   holds one encoded buffer as its raw data -- so that poke can verify
+ *   print_dtype_enc() against bytes at a known absolute file offset.
+ *
+ * On-disk layout (H5T.c H5Tencode / H5Tdecode via H5T__encode / H5T__decode):
+ *
+ *   [dtype_id      : 1]   0x03 -- Datatype Message type ID
+ *   [encode_version: 1]   0x00 -- H5T_ENCODE_VERSION
+ *   [datatype_msg  : var] Datatype message payload (Section IV.A.2.d)
+ *
+ * The Datatype Message payload begins with an 8-byte header packed as two
+ * uint32 LE words:
+ *
+ *   word 0 (flags):
+ *     bits  3-0  class      (0=fixed-point, 1=float, 2=time, 3=string,
+ *                             4=bitfield, 5=opaque, 6=compound, 7=reference,
+ *                             8=enum, 9=vlen, 10=array, 11=complex)
+ *     bits  7-4  version    (1-5; see spec for when each version is used)
+ *     bits 31-8  class bit fields (class-specific; see Section IV.A.2.d)
+ *   word 1 (elm_size): element size in bytes
+ *
+ * Followed by class-specific properties (see Section IV.A.2.d for details).
+ *
+ * Total buffer size = 2 + 8 + dtype_properties_size
+ *
+ * Datatype class IDs:
+ *   0  Fixed-Point     4  Bit Field     8  Enumeration
+ *   1  Floating-Point  5  Opaque        9  Variable-Length
+ *   2  Time            6  Compound     10  Array
+ *   3  String          7  Reference    11  Complex
+ *
+ * Datatype message versions:
+ *   1  Early compound types with explicit array fields
+ *   2  Array datatypes
+ *   3  VAX byte-ordered types; more efficient packing
+ *   4  Revised reference datatype
+ *   5  Complex number datatype
+ *
+ * Load order:
+ *   (poke) .file <hdf5-file>
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk
+ *   (poke) var _sb = superblock @ 0#B   <- MUST map superblock to set
+ *                                               global_sizeof_offsets /
+ *                                               global_sizeof_lengths
+ *   (poke) .load pickles/ohdr_msgs.pk   <- oh_msg_dtype, print_dtype
+ *   (poke) .load pickles/dtype_enc.pk
+ *
+ * Quick start:
+ *   print_dtype_enc(<addr>#B)
+ *     Parses and prints the H5Tencode buffer at the given absolute file
+ *     offset.  The superblock of the containing HDF5 file must be mapped
+ *     first (see above) so that global_sizeof_offsets is set.
+ *
+ * Example -- testfiles/dtype_enc_test.h5
+ *   (sizeof_offsets=8, sizeof_lengths=8, superblock at offset 0):
+ *
+ *   class 0 Fixed-Point:
+ *     /fixed_int32_le  data at 2048:  (poke) print_dtype_enc(2048#B)
+ *     /fixed_int16_be  data at 2062:  (poke) print_dtype_enc(2062#B)
+ *     /fixed_uint8     data at 2076:  (poke) print_dtype_enc(2076#B)
+ *   class 1 Floating-Point:
+ *     /float_f32le     data at 2090:  (poke) print_dtype_enc(2090#B)
+ *     /float_f64be     data at 2112:  (poke) print_dtype_enc(2112#B)
+ *   class 3 String:
+ *     /string_fixed    data at 2134:  (poke) print_dtype_enc(2134#B)
+ *     /string_vlen     data at 2144:  (poke) print_dtype_enc(2144#B)
+ *   class 4 Bit Field:
+ *     /bitfield_b32le  data at 2166:  (poke) print_dtype_enc(2166#B)
+ *   class 5 Opaque:
+ *     /opaque_5        data at 2180:  (poke) print_dtype_enc(2180#B)
+ *   class 6 Compound:
+ *     /compound        data at 2198:  (poke) print_dtype_enc(2198#B)
+ *   class 8 Enumeration:
+ *     /enum_color      data at 2320:  (poke) print_dtype_enc(2320#B)
+ *   class 9 Variable-Length:
+ *     /vlen_float      data at 2378:  (poke) print_dtype_enc(2378#B)
+ *   class 10 Array:
+ *     /array_3x4       data at 2408:  (poke) print_dtype_enc(2408#B)
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Constants
+ * ----------------------------------------------------------------------- */
+
+var H5T_ENCODE_ID      = 3UB;   /* Datatype Message type ID (always 3)     */
+var H5T_ENCODE_VERSION = 0UB;   /* H5T_ENCODE_VERSION (always 0)           */
+
+/* ----------------------------------------------------------------------- *
+ * dtype_enc_hdr -- H5Tencode buffer.
+ *
+ * Maps the two-byte prefix followed by the full datatype message.
+ * oh_msg_dtype handles all class-specific properties, including recursive
+ * compound, enumeration, variable-length, and array types.
+ *
+ * Fields:
+ *   dtype_id        Must be 3 (Datatype Message type ID).
+ *   encode_version  Must be 0 (H5T_ENCODE_VERSION).
+ *   msg             Datatype message (version + class + properties).
+ * ----------------------------------------------------------------------- */
+
+type dtype_enc_hdr = struct {
+    byte dtype_id      == H5T_ENCODE_ID;
+    byte encode_version == H5T_ENCODE_VERSION;
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_dtype_enc -- print a datatype encoding buffer at OFF
+ *
+ * Usage:
+ *   print_dtype_enc(<off>#B);
+ *
+ * Example:
+ *   (poke) print_dtype_enc(512#B);
+ * ----------------------------------------------------------------------- */
+
+fun print_dtype_enc = (offset<uint<64>,B> off) void:
+{
+    var hdr = dtype_enc_hdr @ off;
+    printf("dtype_enc_hdr {\n");
+    printf("  dtype_id=0x%u8x (Datatype Message)\n", hdr.dtype_id);
+    printf("  encode_version=%u8d\n", hdr.encode_version);
+    var msg = oh_msg_dtype @ (off + 2#B);
+    print_dtype(msg, 1);
+    printf("}\n");
+};
