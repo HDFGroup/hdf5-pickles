@@ -99,6 +99,10 @@ std::vector<Marker> build_markers() {
     return {
         {"HDF5_SIGNATURE", "HDF5 file signature", "HDF5",
          {0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a}},
+        {"NCSAmult", "Multi VFD driver identifier", "HDF5",
+         {'N', 'C', 'S', 'A', 'm', 'u', 'l', 't'}},
+        {"NCSAfami", "Family VFD driver identifier", "HDF5",
+         {'N', 'C', 'S', 'A', 'f', 'a', 'm', 'i'}},
         {"TREE", "Version 1 B-tree node", "HDF5", {'T', 'R', 'E', 'E'}},
         {"BTHD", "Version 2 B-tree header", "HDF5", {'B', 'T', 'H', 'D'}},
         {"BTIN", "Version 2 B-tree internal node", "HDF5", {'B', 'T', 'I', 'N'}},
@@ -116,6 +120,7 @@ std::vector<Marker> build_markers() {
         {"OHDR", "Version 2 object header", "HDF5", {'O', 'H', 'D', 'R'}},
         {"OCHK", "Version 2 object header continuation block", "HDF5",
          {'O', 'C', 'H', 'K'}},
+        {"MDCI", "Metadata cache image block", "HDF5", {'M', 'D', 'C', 'I'}},
         {"FAHD", "Fixed Array header", "HDF5", {'F', 'A', 'H', 'D'}},
         {"FADB", "Fixed Array data block", "HDF5", {'F', 'A', 'D', 'B'}},
         {"EAHD", "Extensible Array header", "HDF5", {'E', 'A', 'H', 'D'}},
@@ -123,7 +128,10 @@ std::vector<Marker> build_markers() {
         {"EASB", "Extensible Array secondary block", "HDF5", {'E', 'A', 'S', 'B'}},
         {"EADB", "Extensible Array data block", "HDF5", {'E', 'A', 'D', 'B'}},
         {"OHDH", "Onion History Data Header", "Onion", {'O', 'H', 'D', 'H'}},
-        {"OWHR", "Onion Whole-History Record", "Onion", {'O', 'W', 'H', 'R'}},
+        {"OWHR", "Onion Whole-History Record (RFC spelling)", "Onion",
+         {'O', 'W', 'H', 'R'}},
+        {"OWHS", "Onion Whole-History Summary (current HDF5 implementation)", "Onion",
+         {'O', 'W', 'H', 'S'}},
         {"ORRS", "Onion Revision Record Signature", "Onion", {'O', 'R', 'R', 'S'}},
     };
 }
@@ -280,7 +288,7 @@ std::string bytes_to_hex(const std::vector<std::uint8_t> &bytes) {
 }
 
 void list_markers(std::ostream &out, const std::optional<std::string> &group_filter) {
-    out << "Markers defined in the HDF5 and Onion formats:\n\n";
+    out << "Markers used by HDF5 and Onion files:\n\n";
 
     std::string current_group;
     const std::size_t col_width = max_marker_name_width();
