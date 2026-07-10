@@ -308,6 +308,8 @@ def generate(root):
         f"{root}/malformed/bad_datatype_precision_bounds.h5")
     _make_bad_dataspace_maxdim(
         f"{root}/malformed/bad_dataspace_maxdim.h5")
+    _make_dataspace_nelem_overflow(
+        f"{root}/malformed/dataspace_nelem_overflow.h5")
     _make_bad_external_link_info(
         f"{root}/malformed/bad_external_link_info.h5")
     _make_external_link_unterminated(
@@ -1442,6 +1444,45 @@ def _make_bad_dataspace_maxdim(path):
     if off < 0:
         raise RuntimeError("could not locate the max-dimension dataspace")
     struct.pack_into("<Q", raw, off + 24, 5)
+    _patch(path, bytes(raw))
+
+
+def _make_dataspace_nelem_overflow(path):
+    """Compact 2-D dataset whose dimensions multiply to more than 2**64.
+
+    libhdf5 stores the element count in hsize_t, so the product wraps to a
+    small value and it under-sizes the inline compact buffer -- an
+    out-of-bounds read in H5D__compact_readvv.  h5policy rejects the
+    unrepresentable dataspace as corrupt, distinct from a
+    representable-but-oversized dataset (a resource shape)."""
+    base = path + ".base"
+    with h5py.File(base, "w", libver="latest") as h:
+        space = h5py.h5s.create_simple((2, 8))
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_layout(h5py.h5d.COMPACT)
+        dt = h5py.h5t.py_create(np.dtype("u1"))
+        dsid = h5py.h5d.create(h.id, b"dset", dt, space, dcpl)
+        dsid.write(h5py.h5s.ALL, h5py.h5s.ALL,
+                   np.arange(16, dtype="u1").reshape(2, 8))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+
+    # v2 dataspace: version(1) rank(1) flags(1=maxdims) type(1), then dims,
+    # then maxdims.  Overwrite dim0 and maxdim0 together so the only defect is
+    # the overflowing product (dim never exceeds its own maximum).
+    hdr = struct.pack("<BBBB", 2, 2, 1, 1) + struct.pack("<QQ", 2, 8)
+    ds = raw.find(hdr)
+    if ds < 0:
+        raise RuntimeError("could not locate the 2-D dataspace message")
+    dims = ds + 4
+    big = (1 << 62) + 1                          # (2**62+1) * 8 = 2**65 + 8
+    struct.pack_into("<Q", raw, dims, big)       # dim0
+    struct.pack_into("<Q", raw, dims + 16, big)  # maxdim0
+
+    ohdr = raw.rfind(b"OHDR", 0, ds)
+    if ohdr < 0:
+        raise RuntimeError("could not locate the dataset object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 
 
