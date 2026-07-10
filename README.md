@@ -35,7 +35,7 @@ repairs.
 Run `h5policy` against an HDF5 file:
 
 ```sh
-./tools/h5policy --profile untrusted-strict --json file.h5
+./tools/h5policy --profile untrusted-strict file.h5
 ```
 
 Try the regression suite:

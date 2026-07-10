@@ -23,18 +23,20 @@ or payload decoders get a chance to run.
 Run from the repository root:
 
 ```sh
-./h5policy/tools/h5policy --profile untrusted-strict --json file.h5
-./h5policy/tools/h5policy --profile trusted-fast --json file.h5
-./h5policy/tools/h5policy --profile legacy --json file.h5
-./h5policy/tools/h5policy --profile forensic --json --continue-after-corruption file.h5
+./h5policy/tools/h5policy --profile untrusted-strict file.h5
+./h5policy/tools/h5policy --profile trusted-fast file.h5
+./h5policy/tools/h5policy --profile legacy file.h5
+./h5policy/tools/h5policy --profile forensic --continue-after-corruption file.h5
 ```
+
+Output is JSON (the machine-readable result); it is the only format, so no flag
+is required.  `--json` is still accepted as a no-op for backward compatibility.
 
 Useful mode flags:
 
 - `--strict` / `--non-strict` force GNU poke strict or non-strict mapping.
 - `--continue-after-corruption` keeps walking after the first corruption finding
   so diagnostics include every reachable issue.
-- `--json` prints the machine-readable result.
 
 ## Decisions
 
