@@ -111,6 +111,29 @@ Checksum coverage includes the HDF5 Jenkins checksums used by:
 - dense metadata fractal heaps: `FRHP`, `FHDB`, `FHIB`
 - dense metadata v2 B-trees: `BTHD`, `BTLF`, `BTIN`
 
+### Known blind spots
+
+Some defects live strictly beyond a metadata-only boundary and are reported as
+`unsupported_coverage_gap` rather than `reject_corrupt`, even when `libhdf5`
+crashes on them:
+
+- **Filtered dense link/attribute fractal heaps.** When a dense group's or
+  object's fractal heap declares an I/O filter pipeline, the link/attribute
+  records live inside a filter-compressed direct block. Resolving them means
+  reversing the pipeline (decompressing untrusted bytes), which h5policy does
+  not do. h5policy validates everything it can see in metadata — the pipeline
+  descriptor, the header checksum, the direct-block checksum flag (see
+  `H5_CORRUPT_FILTERED_HEAP_NO_DBLOCK_CHECKSUM`) — but a fault that only appears
+  *after* decoding, such as a decoded direct block whose size does not match the
+  heap's declared block size, is invisible to it. Such a file can crash some
+  `libhdf5` versions during dense iteration (e.g. an invalid free in
+  `H5G__link_release_table`) while h5policy can only answer "unsupported." The
+  coverage gap is still a refusal, not an accept: a consumer honoring it will
+  not process the file. Regression note: because the differential harness treats
+  a `libhdf5` crash as "must be `reject_corrupt`," these files cannot be pinned
+  as `coverage_gap` corpus fixtures — a filtered heap that `h5py` cannot
+  traverse reads as a rejection under invariant A'.
+
 ## Companion Tools
 
 - [`tools/h5policy`](tools/h5policy): the policy oracle.
