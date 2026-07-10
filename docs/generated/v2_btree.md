@@ -23,7 +23,7 @@ The global variables `global_bt2_*` must be set correctly before
 mapping any node. `print_v2_btree(addr#B)` handles this automatically
 by reading the header first.
 
-## `v2_btree_hdr`
+## `bt2_hdr`
 
 Version 2 B-tree header (signature 'BTHD'). Describes the geometry of the entire B-tree. Mapping this struct sets the global parameters `global_bt2_type`, `global_bt2_record_size`, `global_bt2_node_size`, and `global_bt2_depth` via constraint side-effects, so subsequent node mappings require no additional setter calls.
 
@@ -129,6 +129,7 @@ Record type 7, sub-type 1 — shared message stored inline in an object header. 
 |-------|-------------|
 | `message_location` | Storage location indicator. Must be 1 for this sub-type (message is in an object header). |
 | `hash` | Jenkins lookup3 hash of the shared message payload (B-tree key). |
+| `reserved` | Reserved byte between `hash` and `message_type`. Must be zero. |
 | `message_type` | Object header message type of the shared message. |
 | `obj_hdr_index` | Index of the message within its containing object header. |
 | `obj_hdr_addr_raw` | File address of the object header containing the shared message (`sizeof_offsets` bytes). |
@@ -188,7 +189,7 @@ Generic fallback record used when the record type is unknown or unhandled. Store
 | `data` | Raw record bytes (`global_bt2_record_size` bytes). |
 
 
-## `bt2_child_ptr_d1`
+## `child_ptr_d1`
 
 Child pointer in a depth-1 internal node (one whose children are leaf nodes). Contains the child's file address and the number of records directly stored in that child. No subtree record count is needed because the child is a leaf.
 
@@ -198,7 +199,7 @@ Child pointer in a depth-1 internal node (one whose children are leaf nodes). Co
 | `nrec_in_child_raw` | Number of records stored in the child node (`global_bt2_nrec_in_node_bytes` bytes). Use `set_bt2_nrec_size_from_hdr` to compute the correct byte width from the header. |
 
 
-## `bt2_child_ptr_dn`
+## `child_ptr_dn`
 
 Child pointer in a depth > 1 internal node (one whose children are themselves internal nodes). Adds a subtree record count field that records the total number of records in the child's entire subtree.
 
@@ -209,7 +210,7 @@ Child pointer in a depth > 1 internal node (one whose children are themselves in
 | `nrec_in_subtree_raw` | Total records in the child's subtree including all descendant nodes (`global_bt2_nrec_in_subtree_bytes` bytes). Use `set_bt2_nrec_subtree_size_from_hdr` to compute the correct byte width. |
 
 
-## `v2_btree_leaf`
+## `bt2_leaf`
 
 Version 2 B-tree leaf node (signature 'BTLF'). Contains up to the configured maximum number of records and no child pointers. Before mapping, set `global_bt2_nrec` to the record count for this node (from `hdr.num_root_records` for the root, or from the parent's `nrec_in_child_raw` for non-root nodes).
 
@@ -217,29 +218,30 @@ Version 2 B-tree leaf node (signature 'BTLF'). Contains up to the configured max
 |-------|-------------|
 | `signature` | 4-byte signature: 'B' 'T' 'L' 'F'. Must match exactly. |
 | `version` | Leaf node format version. Must be 0. |
-| `record_type` | Record type identifier (mirrors `v2_btree_hdr.record_type`). |
+| `record_type` | Record type identifier (mirrors `bt2_hdr.record_type`). |
 | `records` | Array of `global_bt2_nrec` raw records, each `global_bt2_record_size` bytes. Use `print_v2_btree_record_at` to decode individual records according to `record_type`. |
 | `chksum` | Jenkins lookup3 checksum of all preceding node bytes. |
 
 
-## `v2_btree_internal`
+## `bt2_internal`
 
-Version 2 B-tree internal node (signature 'BTIN'). Stores records interleaved with `global_bt2_nrec + 1` child pointers. The child- pointer layout depends on the node's depth: depth-1 nodes use `bt2_child_ptr_d1`; deeper nodes use `bt2_child_ptr_dn`. Before mapping, set `global_bt2_depth` and `global_bt2_nrec` to the values for this node.
+Version 2 B-tree internal node (signature 'BTIN'). Stores records interleaved with `global_bt2_nrec + 1` child pointers. The child- pointer layout depends on the node's depth: depth-1 nodes use `child_ptr_d1`; deeper nodes use `child_ptr_dn`. Before mapping, set `global_bt2_depth` and `global_bt2_nrec` to the values for this node.
 
 | Field | Description |
 |-------|-------------|
 | `signature` | 4-byte signature: 'B' 'T' 'I' 'N'. Must match exactly. |
 | `version` | Internal node format version. Must be 0. |
-| `record_type` | Record type identifier (mirrors `v2_btree_hdr.record_type`). |
+| `record_type` | Record type identifier (mirrors `bt2_hdr.record_type`). |
 | `records` | Array of `global_bt2_nrec` raw records in ascending key order. |
 | `children` | Union of `global_bt2_nrec + 1` child pointers; layout selected by tree depth. |
 | `chksum` | Jenkins lookup3 checksum of all preceding node bytes. |
 
 ### `d1`
 
-Child-pointer array for a depth-1 internal node (children are leaves). Each pointer is a `bt2_child_ptr_d1` carrying the child address and record count only.
+Child-pointer array for a depth-1 internal node (children are leaves). Each pointer is a `child_ptr_d1` carrying the child address and record count only.
 
 ### `dn`
 
-Child-pointer array for a depth > 1 internal node (children are internal nodes). Each pointer is a `bt2_child_ptr_dn` carrying the child address, node record count, and subtree record count.
+Child-pointer array for a depth > 1 internal node (children are internal nodes). Each pointer is a `child_ptr_dn` carrying the child address, node record count, and subtree record count.
+
 

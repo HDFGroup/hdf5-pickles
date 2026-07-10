@@ -20,7 +20,7 @@ Address range descriptor for one member file in the multi-file virtual file driv
 | `eoa_addr` | End-of-allocation address for this member file. |
 
 
-## `drv_info_blk`
+## `file_drv_info`
 
 Driver Information Block referenced by version 0 and 1 superblocks when driver-specific file-access metadata is stored in the file.
 

@@ -1,18 +1,29 @@
-# IV.A.2. Disk Format: Level 1A – Object Header Messages
+# IV.A.2. Disk Format: Level 1A – Object Headers and Object Header Messages
 
-Object header messages carry all the metadata associated with an HDF5
-object. Each message occupies one slot in an object header chunk and
-is preceded by a `msg_prefix` (defined in `ohdr.pk`). The message
-payload begins immediately after the prefix.
+Object headers store all metadata associated with an HDF5 data object
+(a group or a dataset). Every object header is composed of a prefix
+(`oh_hdr`) followed by a sequence of variable-length messages; the
+messages describe the object's dataspace, datatype, storage layout,
+attributes, and other properties.
 
-Message type identifiers range from 0x0000 to 0x0018. The
+Two object header versions are defined. Version 1 is the original
+format. Version 2 is more compact: it narrows several fields, makes
+timestamps and attribute phase-change thresholds optional, and adds a
+checksum over the entire header. An object header may span more than
+one contiguous block on disk; additional blocks are continuation chunks
+referenced by Object Header Continuation messages (type 0x0010).
+
+Each message occupies one slot in an object header chunk and is
+preceded by a `msg_prefix`, whose layout differs between version 1 and
+version 2 headers. The message payload begins immediately after the
+prefix. Message type identifiers range from 0x0000 to 0x0018. The
 `message_factory` function dispatches a raw type ID and file offset to
 the appropriate typed struct. Unknown types are returned as raw byte
 arrays and are silently skipped.
 
 Several messages exist in an "old" and a "new" versioned form:
-`H5O_msg_old_fill` / `H5O_msg_fill` and `H5O_msg_old_mtime` /
-`H5O_msg_mtime`. Applications should write only the new form; the old
+`oh_msg_old_fill` / `oh_msg_fill` and `oh_msg_old_mtime` /
+`oh_msg_mtime`. Applications should write only the new form; the old
 form is retained for reading legacy files.
 
 All fields are stored in little-endian byte order.
@@ -117,12 +128,12 @@ Descriptor for one filter in the filter pipeline message. Version 1 appends a `p
 | `padding` | 4-byte alignment padding. Present in version 1 only, and only when `cd_nelmts` is odd. _version 1 only, when cd_nelmts is odd_ |
 
 
-## `H5O_msg_nil`
+## `oh_msg_nil`
 
 Null message (type 0x0000). An empty, zero-length payload used to fill gaps left when a previous message was deleted or when an object header chunk is created with reserved space.
 
 
-## `H5O_msg_sdspace`
+## `oh_msg_sdspace`
 
 Dataspace message (type 0x0001). Describes the shape and dimensionality of a dataset, including current dimension sizes and, optionally, maximum dimension sizes.
 
@@ -156,7 +167,7 @@ Version 2 dataspace. Replaces the reserved block with an explicit space-type byt
 | `max` | Array of `ndims` maximum dimension sizes. Present when `flags` bit 0 is set. _optional_ |
 
 
-## `H5O_msg_linfo`
+## `oh_msg_linfo`
 
 Link info message (type 0x0002). Carries addresses of the fractal heap and B-trees used for dense link storage, and optionally the maximum creation order index assigned to a link in this group.
 
@@ -170,7 +181,7 @@ Link info message (type 0x0002). Carries addresses of the fractal heap and B-tre
 | `corder_bt2_addr_raw` | File address of the v2 B-tree indexing link creation order. Present when `flags` bit 1 is set. _optional_ |
 
 
-## `H5O_msg_dtype`
+## `oh_msg_dtype`
 
 Datatype message (type 0x0003). Fully describes the type of a dataset's elements or an attribute's values. The datatype class is encoded in `hdr.flags` bits 0–3; the format version in bits 4–7. Compound, enumerated, variable-length, and array types embed one or more recursive `dtype_hdr` + properties blocks.
 
@@ -302,9 +313,9 @@ Version 2 array dimensions: `array_props2` (with permutation array).
 Version 3 array dimensions: `array_props3` (without permutation array).
 
 
-## `H5O_msg_old_fill`
+## `oh_msg_old_fill`
 
-Fill value message, old form (type 0x0004). Stores a single raw fill value without versioning or allocation-time metadata. Present only in legacy files; new files use `H5O_msg_fill`.
+Fill value message, old form (type 0x0004). Stores a single raw fill value without versioning or allocation-time metadata. Present only in legacy files; new files use `oh_msg_fill`.
 
 | Field | Description |
 |-------|-------------|
@@ -312,7 +323,7 @@ Fill value message, old form (type 0x0004). Stores a single raw fill value witho
 | `fill_value` | Raw fill value bytes. Present only when `fill_size > 0`. _optional_ |
 
 
-## `H5O_msg_fill`
+## `oh_msg_fill`
 
 Fill value message, new form (type 0x0005). Extends the old form with explicit allocation- and fill-time controls and a defined/ undefined flag.
 
@@ -343,7 +354,7 @@ Version 3: allocation-time and fill-time are packed into a single flags byte; th
 | `fill_value` | Raw fill value bytes. Present when `flags` bit 5 is set and `fill_size > 0`. _optional_ |
 
 
-## `H5O_msg_link`
+## `oh_msg_link`
 
 Link message (type 0x0006). Describes one link within a group. The link type (hard, soft, external, or user-defined) is encoded in the `flags` field.
 
@@ -363,7 +374,32 @@ Link message (type 0x0006). Describes one link within a group. The link type (ha
 | `ud_data` | User-defined link data. For external links this is a NUL-terminated file path followed by a NUL-terminated object path. Present when `ud_len > 0`. _external/user-defined links only_ |
 
 
-## `H5O_msg_layout`
+## `oh_msg_external`
+
+External Data Files message (type 0x0007). Lists the external files that hold a dataset's raw data when contiguous storage is placed outside the HDF5 file. Each slot names one file segment via the local heap referenced by `heap_addr_raw`.
+
+| Field | Description |
+|-------|-------------|
+| `version` | Message version. Must be 1. |
+| `reserved` | Reserved. Must be zero (3 bytes). |
+| `allocated_slots` | Number of slot entries allocated in this message (may exceed `used_slots`). |
+| `used_slots` | Number of slot entries currently in use; only these are mapped in `slots`. |
+| `heap_addr_raw` | File address of the local heap holding the external file name strings (`sizeof_offsets` bytes). |
+| `slots` | Array of `used_slots` `ext_slot` records, one per external file segment. |
+
+
+## `ext_slot`
+
+One entry in the External Data Files slot array (`oh_msg_external`). Each record describes a contiguous segment of a dataset's raw data stored in one external file.
+
+| Field | Description |
+|-------|-------------|
+| `name_off_raw` | Offset of the external file's name within the local heap referenced by the message's `heap_addr_raw` (`sizeof_lengths` bytes). |
+| `file_off_raw` | Byte offset into the external file at which this segment's data begins (`sizeof_lengths` bytes). |
+| `data_size_raw` | Number of bytes reserved for this segment in the external file (`sizeof_lengths` bytes). |
+
+
+## `oh_msg_layout`
 
 Data layout message (type 0x0008). Specifies how a dataset's raw data are stored on disk: compact (inside the object header), contiguous, chunked, or virtual. Four format versions are defined; versions 1 and 2 share the same struct.
 
@@ -537,7 +573,7 @@ Virtual storage (layout_class == 3).
 | `idx` | Index of the VDS entry within the global heap collection. |
 
 
-## `H5O_msg_ginfo`
+## `oh_msg_ginfo`
 
 Group info message (type 0x000a). Stores optional parameters controlling when a group switches between compact and dense link storage, and estimated size hints for newly created groups.
 
@@ -551,7 +587,7 @@ Group info message (type 0x000a). Stores optional parameters controlling when a 
 | `est_name_len` | Estimated average length of link names. Present when `flags` bit 1 is set. _optional_ |
 
 
-## `H5O_msg_pline`
+## `oh_msg_pline`
 
 Filter pipeline message (type 0x000b). Lists the filters that are applied to a dataset's raw data in order. Versions 1 and 2 differ only in the filter descriptor layout.
 
@@ -578,7 +614,7 @@ Version 2 pipeline. The reserved block is removed; the filter list begins immedi
 | `filt_list` | Array of `nfilters` version 2 `filt_descr` entries. |
 
 
-## `H5O_msg_attr`
+## `oh_msg_attr`
 
 Attribute message (type 0x000c). Stores an attribute inline in the object header. Each attribute consists of a name, a datatype, a dataspace, and a data payload; versions 1 and 3 align the name, datatype, and dataspace to 8 bytes, while version 2 does not.
 
@@ -591,12 +627,12 @@ Attribute message (type 0x000c). Stores an attribute inline in the object header
 | `dspace_size` | Byte length of the `dspace` field. |
 | `cset` | Character set of the attribute name: 0 = ASCII, 1 = UTF-8. Version 3 only. _version 3 only_ |
 | `name` | Attribute name bytes. In version 1 the length is rounded up to an 8-byte boundary; in versions 2 and 3 it is stored exactly. |
-| `dtype` | Raw datatype message bytes (parsed as `H5O_msg_dtype`). |
-| `dspace` | Raw dataspace message bytes (parsed as `H5O_msg_sdspace`). |
+| `dtype` | Raw datatype message bytes (parsed as `oh_msg_dtype`). |
+| `dspace` | Raw dataspace message bytes (parsed as `oh_msg_sdspace`). |
 | `data` | Raw attribute data bytes (size = `dtype.elm_size × product(dim_sizes)`). |
 
 
-## `H5O_msg_name`
+## `oh_msg_name`
 
 Object comment message (type 0x000d). Stores a short human-readable comment string for the object. There is no version or length field; the string is NUL-terminated and the message payload size determines its extent.
 
@@ -605,9 +641,9 @@ Object comment message (type 0x000d). Stores a short human-readable comment stri
 | `name` | NUL-terminated comment string. |
 
 
-## `H5O_msg_old_mtime`
+## `oh_msg_old_mtime`
 
-Modification time message, old form (type 0x000e). Stores an object modification time as broken-out calendar fields rather than a UNIX timestamp. Present only in legacy files; new files use `H5O_msg_mtime`.
+Modification time message, old form (type 0x000e). Stores an object modification time as broken-out calendar fields rather than a UNIX timestamp. Present only in legacy files; new files use `oh_msg_mtime`.
 
 | Field | Description |
 |-------|-------------|
@@ -620,7 +656,7 @@ Modification time message, old form (type 0x000e). Stores an object modification
 | `res` | Reserved. Must be zero (2 bytes). |
 
 
-## `H5O_msg_shmesg_table`
+## `oh_msg_shmesg_table`
 
 Shared object header message table message (type 0x000f). Points to the file-level shared message (SOHM) master table and records the number of indexes it contains.
 
@@ -631,7 +667,7 @@ Shared object header message table message (type 0x000f). Points to the file-lev
 | `nindexes` | Number of shared message indexes in the master table. |
 
 
-## `H5O_msg_cont`
+## `oh_msg_cont`
 
 Object header continuation message (type 0x0010). Points to an additional object header chunk on disk, allowing an object header to span multiple non-contiguous blocks.
 
@@ -641,7 +677,7 @@ Object header continuation message (type 0x0010). Points to an additional object
 | `size_raw` | Byte size of the continuation block. |
 
 
-## `H5O_msg_stab`
+## `oh_msg_stab`
 
 Symbol table message (type 0x0011). Present on groups encoded with the version 1 (legacy) symbol table structure. Points to the group's v1 B-tree and local heap.
 
@@ -651,7 +687,7 @@ Symbol table message (type 0x0011). Present on groups encoded with the version 1
 | `heap_addr_raw` | File address of the local heap containing link name strings. |
 
 
-## `H5O_msg_mtime`
+## `oh_msg_mtime`
 
 Modification time message, new form (type 0x0012). Stores the object modification time as a UNIX timestamp.
 
@@ -662,7 +698,7 @@ Modification time message, new form (type 0x0012). Stores the object modificatio
 | `seconds` | UNIX timestamp (seconds since 1970-01-01 00:00:00 UTC) of the last metadata modification. |
 
 
-## `H5O_msg_btreek`
+## `oh_msg_btreek`
 
 Version 1 B-tree K values message (type 0x0013). Overrides the file-global B-tree K values from the superblock for this particular object. Stored in the superblock extension object header.
 
@@ -674,7 +710,7 @@ Version 1 B-tree K values message (type 0x0013). Overrides the file-global B-tre
 | `sym_leaf_k` | Leaf node K value for the group (symbol table) v1 B-tree. |
 
 
-## `H5O_msg_drvinfo`
+## `oh_msg_drvinfo`
 
 Driver information message (type 0x0014). Stores virtual file driver metadata in an object header, most commonly in the superblock extension. The payload layout is selected by the 8-byte driver identifier.
 
@@ -715,9 +751,9 @@ Fallback payload for unrecognized driver identifiers. The bytes are retained wit
 | `data` | Raw driver-specific payload bytes. |
 
 
-## `H5O_msg_ainfo`
+## `oh_msg_ainfo`
 
-Attribute info message (type 0x0015). Stores addresses of the fractal heap and B-trees used for dense attribute storage, mirrors `H5O_msg_linfo` but for attributes rather than links.
+Attribute info message (type 0x0015). Stores addresses of the fractal heap and B-trees used for dense attribute storage, mirrors `oh_msg_linfo` but for attributes rather than links.
 
 | Field | Description |
 |-------|-------------|
@@ -729,7 +765,7 @@ Attribute info message (type 0x0015). Stores addresses of the fractal heap and B
 | `corder_bt2_addr_raw` | File address of the v2 B-tree indexing attribute creation order. Present when `flags` bit 1 is set. _optional_ |
 
 
-## `H5O_msg_refcount`
+## `oh_msg_refcount`
 
 Object reference count message (type 0x0016). Stores the count of hard links pointing to the object when that count exceeds what fits in the version 1 object header's 32-bit field.
 
@@ -739,7 +775,7 @@ Object reference count message (type 0x0016). Stores the count of hard links poi
 | `ref_cnt` | Current hard-link reference count. |
 
 
-## `H5O_msg_fsinfo`
+## `oh_msg_fsinfo`
 
 File space info message (type 0x0017). Describes the file space management strategy and stores addresses of the free-space managers for small and large allocations. Stored in the superblock extension.
 
@@ -756,7 +792,7 @@ File space info message (type 0x0017). Describes the file space management strat
 | `large_fs_addr` | Array of 6 file addresses for the large-allocation free-space managers, one per allocation type. |
 
 
-## `H5O_msg_mdci`
+## `oh_msg_mdci`
 
 Metadata cache image message (type 0x0018). Points to a serialized snapshot of the metadata cache written at file close to accelerate the next file open. Not described in the public format specification.
 
@@ -765,5 +801,90 @@ Metadata cache image message (type 0x0018). Points to a serialized snapshot of t
 | `version` | Format version. Must be 0. |
 | `image_addr_raw` | File address of the serialized metadata cache image block. |
 | `image_size` | Byte size of the metadata cache image block (`sizeof_lengths` bytes). |
+
+
+## `hdr_timestamps`
+
+Four UNIX timestamps optionally embedded in a version 2 object header. Present when bit 5 of the object header `flags` field is set. Each value is a 32-bit unsigned seconds count relative to the UNIX epoch (1970-01-01 00:00:00 UTC).
+
+| Field | Description |
+|-------|-------------|
+| `access` | Time of the last read access to the object. |
+| `modification` | Time of the last write to the object's raw data. |
+| `change` | Time of the last change to the object's metadata. |
+| `birth` | Time at which the object was created. |
+
+
+## `hdr_attr_phase`
+
+Attribute storage phase-change thresholds optionally embedded in a version 2 object header. Present when bit 4 of `flags` is set. These thresholds control when the HDF5 library switches between compact attribute storage (inside the object header) and indexed attribute storage (in a fractal heap and B-tree).
+
+| Field | Description |
+|-------|-------------|
+| `max_compact` | Maximum number of attributes stored in compact form before the library converts to indexed storage. Once the count exceeds this value the library migrates to a fractal heap and B-tree. |
+| `min_dense` | Minimum number of attributes that must remain in indexed storage before the library converts back to compact form. Must be less than or equal to `max_compact`. |
+
+
+## `msg_prefix`
+
+Fixed-size header that precedes every message payload in an object header chunk. The layout differs between version 1 and version 2 headers; the active arm is selected by the global version state set when the enclosing `oh_hdr` is mapped.
+
+### `v1_msg_prefix`
+
+Version 1 message prefix (5 bytes of declared fields; the message-decoding logic accounts for 3 additional reserved bytes beyond this struct, giving an effective prefix size of 8 bytes).
+
+| Field | Description |
+|-------|-------------|
+| `msg_type` | 16-bit message type identifier. Values 0x0000–0x0018 are defined by the HDF5 specification; all others are reserved. |
+| `msg_size` | Size of the message payload in bytes, not including this prefix or the 3 reserved bytes that follow it. |
+| `msg_flags` | Bit flags applying to this message. Bit 0: message data is constant after object creation and may be cached or shared. Bit 1: message is shared (payload is a Shared Message record rather than the message data itself). Bit 2: this message must not be shared. Bit 3: the HDF5 library may skip this message on open if it does not understand it. Bit 4: this message was marked as shareable but has not yet been moved to the shared message table. Bit 5: the object header was created before version 1.6 and this message was not originally encoded as a shared message. |
+
+### `v2_msg_prefix`
+
+Version 2 message prefix (4 bytes without creation-order tracking, 6 bytes with it). The type field narrows from 16 to 8 bits compared with the version 1 prefix.
+
+| Field | Description |
+|-------|-------------|
+| `msg_type` | 8-bit message type identifier. |
+| `msg_size` | Size of the message payload in bytes, not including this prefix. |
+| `msg_flags` | Bit flags (same bit definitions as in `v1_msg_prefix`). |
+| `crt_order` | Creation order index of this message within the object header. Present only when bit 2 of the enclosing object header's `flags` field is set. _optional_ |
+
+
+## `oh_hdr`
+
+An HDF5 object header in either version 1 or version 2 format. The first four bytes are mapped twice: once as `sig_peek` (pinned at offset 0 without consuming bytes) to select the correct union arm, and again as part of the chosen version struct.
+
+| Field | Description |
+|-------|-------------|
+| `sig_peek` | Four bytes read at file offset 0 of the header without advancing the read position. If equal to the signature 'O' 'H' 'D' 'R' the version 2 arm is selected; otherwise the version 1 arm is selected. |
+
+### `v2`
+
+Version 2 object header layout (identified by the 4-byte signature 'O' 'H' 'D' 'R'). More compact than version 1; adds a checksum and optional timestamps.
+
+| Field | Description |
+|-------|-------------|
+| `signature` | 4-byte signature: 'O' 'H' 'D' 'R'. Must match the constant V2_SIG. |
+| `version` | Object header version number. Must be 2. |
+| `flags` | Bit flags controlling optional fields and the encoding of `chunk0_size`. Bits 0–1: byte width of `chunk0_size`: 00 = 1 byte, 01 = 2 bytes, 10 = 4 bytes, 11 = 8 bytes. Bit 2: creation-order tracking is active — message prefixes include the optional `crt_order` field. Bit 3: a creation-order index (B-tree) is maintained for the attributes of this object. Bit 4: the `attr_phase` field is present. Bit 5: the `timestamps` field is present. |
+| `timestamps` | Optional creation and access timestamps (type `hdr_timestamps`). Present when `flags` bit 5 is set. _optional_ |
+| `attr_phase` | Optional attribute phase-change thresholds (type `hdr_attr_phase`). Present when `flags` bit 4 is set. _optional_ |
+| `chunk0_size` | Size in bytes of the message data in the first object header chunk. Encoded as 1, 2, 4, or 8 bytes according to `flags` bits 0–1. The message data immediately follows this field and is not itself part of the on-disk `oh_hdr` struct; it is accessed via the internal `_msg_chunk` wrapper. |
+| `gap` | Zero or more padding bytes between the last message and the checksum in the first chunk. Present only when the messages do not fill the chunk exactly (i.e. when `chunk0_size` is not divisible by the message prefix size). _optional_ |
+| `chksum` | 4-byte Jenkins lookup3 checksum computed over all bytes of the object header from `signature` through the last byte of `gap` (or of the final message if there is no gap). |
+
+### `v1`
+
+Version 1 object header layout. Identified by a version byte of 1 at the start of the header (no signature bytes precede it).
+
+| Field | Description |
+|-------|-------------|
+| `version` | Object header version number. Must be 1. |
+| `res1` | Reserved. Must be zero. |
+| `msg_cnt` | Total number of header messages across all chunks of this object header, including any continuation chunks. |
+| `obj_ref_cnt` | Reference count: the number of hard links pointing to this object. An object is eligible for deletion when this count reaches zero. |
+| `obj_hdr_size` | Size in bytes of the message data in the first object header chunk. The message bytes immediately follow the 16-byte fixed prefix and are accessed via the internal `_msg_chunk` wrapper. |
+| `res2` | Reserved. Must be zero (4 bytes). |
 
 
