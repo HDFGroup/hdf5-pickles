@@ -369,8 +369,11 @@ fun h5policy_validate_mdci_payload = (int ios,
                                          + (1UL + (global_sizeof_offsets as uint<64>))#B,
                                          global_sizeof_lengths as uint<64>);
 
-    /* Undefined means no cache image.  A defined image is only range-checked;
-       decoding its entries would be a separate metadata-cache parser.  */
+    /* Undefined means no cache image.  For a defined image, validate the MDCI
+       container and entry envelopes without interpreting the cached metadata
+       bodies.  This mirrors H5Cimage.c's cursor arithmetic closely enough to
+       reject entry-length and dependency-list overruns before libhdf5 copies
+       attacker-controlled entry images. */
     if (!h5policy_msg_addr_is_undef(addr_raw))
         {
             var ok = h5policy_checked_addr_range(image_addr, image_size,
@@ -378,6 +381,158 @@ fun h5policy_validate_mdci_payload = (int ios,
                                                  "metadata cache image outside file",
                                                  payload_off,
                                                  object);
+            if (!ok)
+                return;
+
+            var el = global_sizeof_lengths as uint<64>;
+            var o = global_sizeof_offsets as uint<64>;
+            var image_header = 10UL + el; /* sig+version+flags+data_len+nentries */
+            if (image_size < image_header)
+                {
+                    h5policy_emit_error("H5_CORRUPT_MDCI_HEADER_TOO_SMALL",
+                                        "corrupt", image_addr#B, object,
+                                        "metadata cache image is smaller than its header");
+                    return;
+                }
+            if (h5policy_msg_bytes(ios, profile, image_addr#B, 4UL)
+                != ['M','D','C','I'])
+                {
+                    h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                        image_addr#B, object,
+                                        "metadata cache image signature mismatch");
+                    return;
+                }
+            var block_version = h5policy_msg_u64_at(ios, profile,
+                                                     image_addr#B + 4#B, 1UL);
+            var block_flags = h5policy_msg_u64_at(ios, profile,
+                                                   image_addr#B + 5#B, 1UL);
+            if (block_version != 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_MDCI_BLOCK_VERSION", "corrupt",
+                                        image_addr#B + 4#B, object,
+                                        "metadata cache image block has an unsupported version");
+                    return;
+                }
+            /* Resize-status images are rejected by current libhdf5, and all
+               other header flag bits are reserved. */
+            if (block_flags != 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_MDCI_BLOCK_FLAGS", "corrupt",
+                                        image_addr#B + 5#B, object,
+                                        "metadata cache image block has unsupported header flags");
+                    return;
+                }
+            var data_len = h5policy_msg_u64_at(ios, profile,
+                                               image_addr#B + 6#B, el);
+            if (data_len != image_size)
+                {
+                    h5policy_emit_error("H5_CORRUPT_MDCI_LENGTH_MISMATCH",
+                                        "corrupt", image_addr#B + 6#B, object,
+                                        "metadata cache image header length differs from the extension message");
+                    return;
+                }
+            var nentries = h5policy_msg_u64_at(ios, profile,
+                                               image_addr#B + (6UL + el)#B, 4UL);
+            if (nentries == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_COUNT", "corrupt",
+                                        image_addr#B + (6UL + el)#B, object,
+                                        "metadata cache image contains no entries");
+                    return;
+                }
+
+            var entry_header = 14UL + o + el;
+            var remaining = image_size - image_header;
+            if (entry_header == 0UL || nentries > remaining / entry_header)
+                {
+                    h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_COUNT", "corrupt",
+                                        image_addr#B + (6UL + el)#B, object,
+                                        "metadata cache image entry count cannot fit in the image");
+                    return;
+                }
+            var cur = image_header;
+            var i = 0UL;
+            while (i < nentries)
+                {
+                    h5policy_walk_tick(1UL);
+                    if (cur > image_size || entry_header > image_size - cur)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE",
+                                                "corrupt", image_addr#B + cur#B,
+                                                object,
+                                                "metadata cache image entry header overruns the image");
+                            return;
+                        }
+                    var eoff = image_addr#B + cur#B;
+                    var eflags = h5policy_msg_u64_at(ios, profile, eoff + 1#B, 1UL);
+                    var child_count = h5policy_msg_u64_at(ios, profile,
+                                                          eoff + 4#B, 2UL);
+                    var dirty_child_count = h5policy_msg_u64_at(ios, profile,
+                                                                eoff + 6#B, 2UL);
+                    var parent_count = h5policy_msg_u64_at(ios, profile,
+                                                           eoff + 8#B, 2UL);
+                    if ((eflags & 0xf0UL) != 0UL
+                        || dirty_child_count > child_count
+                        || (((eflags & 4UL) != 0UL) != (child_count > 0UL))
+                        || (((eflags & 8UL) != 0UL) != (parent_count > 0UL)))
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_FLAGS",
+                                                "corrupt", eoff + 1#B, object,
+                                                "metadata cache image entry flags and dependency counts are inconsistent");
+                            return;
+                        }
+                    var entry_addr_raw = h5policy_msg_bytes(ios, profile,
+                                                            eoff + 14#B, o);
+                    if (h5policy_msg_addr_is_undef(entry_addr_raw))
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_ADDRESS",
+                                                "corrupt", eoff + 14#B, object,
+                                                "metadata cache image entry has an undefined address");
+                            return;
+                        }
+                    var body_len = h5policy_msg_u64_at(ios, profile,
+                                                       eoff + (14UL + o)#B, el);
+                    if (body_len == 0UL)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_LENGTH",
+                                                "corrupt", eoff + (14UL + o)#B,
+                                                object,
+                                                "metadata cache image entry has zero length");
+                            return;
+                        }
+                    var parents_size = h5policy_checked_mul_u64(parent_count, o,
+                                                                0xffffffffffffffffUL,
+                                                                "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                                "corrupt", eoff, object,
+                                                                "metadata cache image parent list size overflow");
+                    var entry_span = h5policy_checked_add_u64(entry_header,
+                                                              parents_size,
+                                                              0xffffffffffffffffUL,
+                                                              "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                              "corrupt", eoff, object,
+                                                              "metadata cache image entry size overflow");
+                    entry_span = h5policy_checked_add_u64(entry_span, body_len,
+                                                          0xffffffffffffffffUL,
+                                                          "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                          "corrupt", eoff, object,
+                                                          "metadata cache image entry size overflow");
+                    if (entry_span > image_size - cur)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE",
+                                                "corrupt", eoff, object,
+                                                "metadata cache image entry extends beyond the declared cache image");
+                            return;
+                        }
+                    cur = cur + entry_span;
+                    i = i + 1UL;
+                }
+            if (cur != image_size)
+                {
+                    h5policy_emit_error("H5_CORRUPT_MDCI_TRAILING_BYTES", "corrupt",
+                                        image_addr#B + cur#B, object,
+                                        "metadata cache image has unclaimed trailing bytes");
+                    return;
+                }
         }
 
     h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
