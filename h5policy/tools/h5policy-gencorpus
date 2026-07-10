@@ -324,6 +324,8 @@ def generate(root):
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
     _make_compound_member_array_nelem_overflow(
         f"{root}/malformed/compound_member_array_nelem_overflow.h5")
+    _make_compound_member_array_bounds(
+        f"{root}/malformed/compound_member_array_bounds.h5")
     _make_bad_reference_datatype_version(
         f"{root}/malformed/bad_reference_datatype_version.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
@@ -535,45 +537,41 @@ def _make_bad_compound(path):
     _patch(path, bytes(raw))
 
 
-def _make_compound_member_array_nelem_overflow(path):
-    """A version-1 compound whose member uses the legacy embedded-array encoding
-    with dimensions whose product overflows 64 bits.
-
-    libhdf5 later scales that element count by the base type size
-    (H5T__array_create), so an overflowing product wraps and underflows the
-    array type's size -- consumers that build the type overflow (h5py: "dtype
-    size in bytes must fit into a C int").  Modern libhdf5 only ever writes the
-    newer *nested* array-datatype form, so this legacy member encoding is
-    synthesized by splicing a hand-built v1 compound datatype message into a
-    compact dataset's object header (growing chunk 0 and repairing the object
-    header and superblock checksums)."""
-    # v1 compound: 1 member "a" of a [65537,65536,65536,65536] u32 array; the
-    # product is 2**64 + 2**48, so it overflows a 64-bit element count.
-    dt = bytearray()
-    dt += bytes([0x16]) + b"\x01\x00\x00" + struct.pack("<I", 4)  # compound v1, 1 memb, size 4
+def _v1_compound_array_member(elem_size, dims, base_size, base_precision):
+    """Bytes of a version-1 compound datatype with a single member "a" that uses
+    the legacy embedded-array encoding.  `dims` is the 4-slot dimension vector
+    (unused slots are zero and never read past the declared rank)."""
+    ndim = sum(1 for d in dims if d)  # number of leading non-zero dims
+    dt = bytes([0x16]) + b"\x01\x00\x00" + struct.pack("<I", elem_size)  # compound v1, 1 member
     name = b"a\x00"
-    name += b"\x00" * ((8 - len(name) % 8) % 8)                    # name padded to 8
-    dt += name + struct.pack("<I", 0)                             # member name + byte offset
-    dt += bytes([4]) + b"\x00" * 3                                # dimensionality + reserved
-    dt += struct.pack("<I", 0) + struct.pack("<I", 0)            # permutation + reserved
-    for d in (65537, 65536, 65536, 65536):
-        dt += struct.pack("<I", d)                               # dimension sizes
-    dt += bytes([0x10]) + b"\x00" * 3 + struct.pack("<I", 4) \
-        + struct.pack("<H", 0) + struct.pack("<H", 32)           # base type H5T_STD_U32LE
-    dt = bytes(dt)
+    name += b"\x00" * ((8 - len(name) % 8) % 8)                          # name padded to 8
+    dt += name + struct.pack("<I", 0)                                    # member name + byte offset
+    dt += bytes([ndim]) + b"\x00" * 3                                    # dimensionality + reserved
+    dt += struct.pack("<I", 0) + struct.pack("<I", 0)                   # permutation + reserved
+    for d in dims:
+        dt += struct.pack("<I", d)                                      # 4 dimension-size slots
+    dt += bytes([0x10]) + b"\x00" * 3 + struct.pack("<I", base_size) \
+        + struct.pack("<H", 0) + struct.pack("<H", base_precision)      # integer base type
+    return dt
 
+
+def _splice_compact_datatype(path, dt_bytes, elem_size):
+    """Splice a hand-built datatype message into a compact dataset's object
+    header, so the on-disk element size matches `elem_size` (keeping the compact
+    data consistent) and no data address shifts on the resize.  Grows chunk 0
+    and repairs the object-header and superblock checksums.  Used for legacy
+    encodings modern libhdf5 no longer writes."""
     base = path + ".base"
     with h5py.File(base, "w", libver="latest") as h:
         space = h5py.h5s.create_simple((1,))
         dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
         dcpl.set_layout(h5py.h5d.COMPACT)      # data inline: no address shifts on resize
-        u32 = h5py.h5t.py_create(np.dtype("u4"))
-        dsid = h5py.h5d.create(h.id, b"dset", u32, space, dcpl)
-        dsid.write(h5py.h5s.ALL, h5py.h5s.ALL, np.zeros((1,), dtype="u4"))
+        opaque = h5py.h5t.create(h5py.h5t.OPAQUE, elem_size)
+        dsid = h5py.h5d.create(h.id, b"dset", opaque, space, dcpl)
+        dsid.write(h5py.h5s.ALL, h5py.h5s.ALL, np.zeros((1,), dtype=f"V{elem_size}"))
     raw = bytearray(open(base, "rb").read())
     os.unlink(base)
 
-    # Locate the dataset object header and its datatype (type 3) message.
     ohdr = msg_start = old_size = body = size_off = size_w = None
     for o in range(len(raw) - 4):
         if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
@@ -597,15 +595,46 @@ def _make_compound_member_array_nelem_overflow(path):
     if ohdr is None:
         raise RuntimeError("could not locate the dataset datatype message")
 
-    delta = len(dt) - old_size
-    new = bytearray(raw[:body] + dt + raw[body + old_size:])
-    struct.pack_into("<H", new, msg_start + 1, len(dt))          # datatype message size
+    delta = len(dt_bytes) - old_size
+    new = bytearray(raw[:body] + dt_bytes + raw[body + old_size:])
+    struct.pack_into("<H", new, msg_start + 1, len(dt_bytes))    # datatype message size
     chunk0 = int.from_bytes(new[size_off:size_off + size_w], "little")
     new[size_off:size_off + size_w] = (chunk0 + delta).to_bytes(size_w, "little")
     _fix_v2_ohdr_checksum(new, ohdr)
     struct.pack_into("<Q", new, 12 + 2 * new[9], len(new))       # declared EOF := new size
     _fix_sb_checksum(new)
     _patch(path, bytes(new))
+
+
+def _make_compound_member_array_nelem_overflow(path):
+    """A version-1 compound whose member uses the legacy embedded-array encoding
+    with dimensions whose product overflows 64 bits.
+
+    libhdf5 later scales that element count by the base type size
+    (H5T__array_create), so an overflowing product wraps and underflows the
+    array type's size -- consumers that build the type overflow (h5py: "dtype
+    size in bytes must fit into a C int").  Modern libhdf5 only ever writes the
+    newer *nested* array-datatype form, so this legacy member encoding is
+    synthesized by splicing a hand-built datatype into a compact object header."""
+    # dims [65537,65536,65536,65536] -> product 2**64 + 2**48; base H5T_STD_U32LE.
+    dt = _v1_compound_array_member(4, (65537, 65536, 65536, 65536), 4, 32)
+    _splice_compact_datatype(path, dt, 4)
+
+
+def _make_compound_member_array_bounds(path):
+    """A version-1 compound whose legacy embedded-array member overruns the
+    compound element.
+
+    The member is a [262144] array of H5T_STD_U8LE -- 262144 bytes -- inside a
+    compound element declared as only 16 bytes.  libhdf5 reads base_size *
+    element_count bytes per element, so the member extends far past the element
+    storage: an out-of-bounds read (h5py refuses the type; h5dump prints past
+    the 16 real bytes).  h5policy must reject the member as extending outside its
+    parent type.  Built by splicing a hand-built v1 compound datatype whose
+    element size matches the compact dataset's."""
+    # A single 262144-element u8 array in a 16-byte compound element.
+    dt = _v1_compound_array_member(16, (262144, 0, 0, 0), 1, 8)
+    _splice_compact_datatype(path, dt, 16)
 
 
 def _make_bad_reference_datatype_version(path):
@@ -696,6 +725,9 @@ def _make_vds_nentries_overflow(path, base_path):
     the count/extent invariant is what rejects the file.
     """
     raw = bytearray(open(base_path, "rb").read())
+    # create_virtual_dataset can't set track_times=False, so pin the object
+    # header timestamps to keep this tracked cve/ seed byte-reproducible.
+    _pin_ohdr_times(raw)
     gcol = raw.find(b"GCOL")
     if gcol < 0:
         raise RuntimeError("generated VDS fixture has no global heap")
@@ -736,6 +768,37 @@ def _fix_v2_ohdr_checksum(raw, ohdr_off):
     chksum_off = cursor + size_width + chunk_size
     struct.pack_into("<I", raw, chksum_off,
                      _jenkins_lookup3()(bytes(raw[ohdr_off:chksum_off])))
+
+
+def _pin_ohdr_times(raw):
+    """Zero the timestamp block of every v2 object header (and repair its
+    checksum), making an h5py-written fixture byte-reproducible.
+
+    h5py's create_virtual_dataset cannot disable time tracking the way
+    create_dataset's ``track_times=False`` does, so a VDS fixture otherwise
+    embeds the wall-clock time and drifts on every regeneration.  Each candidate
+    header's stored checksum is verified before editing so incidental ``OHDR``
+    bytes in data are never touched."""
+    jenkins = _jenkins_lookup3()
+    pos = 0
+    while True:
+        o = raw.find(b"OHDR", pos)
+        if o < 0:
+            break
+        pos = o + 4
+        if raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cursor = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_width = 1 << (flags & 3)
+        chksum_off = cursor + size_width + int.from_bytes(raw[cursor:cursor + size_width], "little")
+        if chksum_off + 4 > len(raw):
+            continue
+        if struct.unpack_from("<I", raw, chksum_off)[0] != jenkins(bytes(raw[o:chksum_off])):
+            continue                              # not a genuine v2 object header
+        if flags & (1 << 5):                      # times-present flag: zero the block
+            raw[o + 6:o + 6 + 16] = b"\x00" * 16
+            _fix_v2_ohdr_checksum(raw, o)
 
 
 def _bytes_for_bits(nbits):
