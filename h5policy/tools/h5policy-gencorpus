@@ -336,6 +336,9 @@ def generate(root):
     _make_zero_v2_btree_record_size(
         f"{root}/malformed/zero_v2_btree_record_size.h5",
         f"{root}/valid/dense_links.h5")
+    _make_filtered_dense_link_no_dblock_checksum(
+        f"{root}/malformed/filtered_dense_link_no_dblock_checksum.h5",
+        f"{root}/valid/dense_links.h5")
     _make_bad_dense_checksum(f"{root}/malformed/bad_dense_frhp_checksum.h5",
                              "FRHP")
     _make_bad_dense_checksum(f"{root}/malformed/bad_dense_fhdb_checksum.h5",
@@ -734,6 +737,64 @@ def _make_zero_v2_btree_record_size(path, base_path):
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]])))
     _patch(path, bytes(raw))
+
+
+def _make_filtered_dense_link_no_dblock_checksum(path, base_path):
+    """Dense-link fractal heap that declares an I/O filter pipeline but clears
+    the "direct blocks are checksummed" header flag.
+
+    libhdf5 always writes dense link/attribute heaps with that flag set, so the
+    combination is malformed -- and a memory-safety hazard.  With the flag
+    clear, H5HF__cache_dblock_verify_chksum short-circuits and never allocates
+    the direct-block buffer, so H5HF__cache_dblock_deserialize then memcpy()s
+    the reverse-filtered bytes into a NULL block and libhdf5 segfaults
+    (H5HFcache.c).  h5policy validates the FRHP header and its filter pipeline,
+    then must reject this rather than report a bare fractal-heap coverage gap.
+
+    The mutation rewrites the FRHP header in place: it sets a non-zero I/O
+    filter length, inserts the filtered-header fields (size of the filtered
+    root direct block, the filter mask, and a minimal scale-offset pipeline),
+    clears the checksum flag, and repairs the FRHP and superblock checksums.
+    h5policy returns at the filtered-heap branch before reading the doubling
+    table, root block, or B-tree, so the now-stale trailing metadata (which
+    still makes libhdf5 unable to open the file) needs no address fixups.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    info = _dense_frhp_info(raw)
+    assert info["filter_len"] == 0, "base heap is already filtered"
+    frhp = info["frhp"]
+    len_size = info["len_size"]
+    # Fields up to and including "current rows in root indirect block".
+    body_end = frhp + 14 + (2 * info["off_size"]) + (10 * len_size) \
+        + (8 + 2 * len_size + info["off_size"])
+    assert body_end == info["frhp_checksum"], "unexpected unfiltered header size"
+
+    # Minimal, structurally valid v2 filter pipeline: one scale-offset filter
+    # (id 6) with no client data.  h5policy only needs the descriptor to parse.
+    pipeline = struct.pack("<BB", 2, 1) + struct.pack("<HHH", 6, 0, 0)
+    filter_len = len(pipeline)
+
+    filtered_fields = bytearray()
+    filtered_fields += int(info["start"]).to_bytes(len_size, "little")  # filt. dblock size
+    filtered_fields += struct.pack("<I", 0)                             # I/O filter mask
+    filtered_fields += pipeline
+
+    new = bytearray(raw[:body_end])
+    new += filtered_fields
+    chksum_off = len(new)
+    new += struct.pack("<I", 0)          # placeholder for the FRHP checksum
+    new += raw[info["frhp_checksum"] + 4:]
+
+    struct.pack_into("<H", new, frhp + 7, filter_len)   # I/O filters' encoded length
+    new[frhp + 9] &= ~0x02                               # clear checksum-dblocks flag
+    struct.pack_into("<I", new, chksum_off,
+                     _jenkins_lookup3()(bytes(new[frhp:chksum_off])))
+
+    # Declared EOF must cover the enlarged header for h5policy's ceiling.
+    soff = new[9]
+    struct.pack_into("<Q", new, 12 + 2 * soff, len(new))
+    _fix_sb_checksum(new)
+    _patch(path, bytes(new))
 
 
 def _make_bad_base_address(path):
