@@ -75,6 +75,107 @@ fun h5policy_dtype_room = (uint<64> need, uint<64> avail, uint<64> used,
 
     return 1;
 }
+
+/* Cheap iterative guard for long single-child datatype chains.  Recursive
+   Poke calls are deliberately retained for full semantic validation, but a
+   file can otherwise spend the whole wall-clock budget merely descending a
+   thousands-deep VLen/array/enum-base chain before reaching that guard. */
+fun h5policy_dtype_preflight_linear_depth = (int ios,
+                                              H5PolicyLimits profile,
+                                              offset<uint<64>,B> blob_off,
+                                              uint<64> avail,
+                                              string object) int:
+{
+    /* Four KiB covers 512 minimal VLen/enum wrappers and more than the
+       configured depth limit for ordinary low-rank arrays, while avoiding a
+       large dynamic mapping merely to reject a hostile prefix. */
+    var probe = avail < 4096UL ? avail : 4096UL;
+    var data = h5policy_msg_bytes(ios, profile, blob_off, probe);
+    var pos = 0UL;
+    var depth = 0UL;
+    while (pos < probe)
+        {
+            h5policy_walk_tick(1UL);
+            if (depth > profile.max_datatype_recursion_depth)
+                {
+                    h5policy_emit_error("H5_CORRUPT_DATATYPE_RECURSION_LIMIT",
+                                        "corrupt", blob_off + pos#B, object,
+                                        "datatype nesting exceeds the selected profile limit");
+                    return 0;
+                }
+            if (probe - pos < 8UL)
+                return 1;       /* detailed validator reports truncation */
+
+            var flags = bytes_to_u64_le_at(data, pos, 4UL);
+            var version = (flags .>> 4) & 0xfUL;
+            var ctype = flags & 0xfUL;
+            var child_rel = 0UL;
+
+            if (ctype == 9UL || ctype == 8UL)
+                /* VLen and enum place their sole/base child immediately after
+                   the datatype header. */
+                child_rel = 8UL;
+            else if (ctype == 10UL)
+                {
+                    /* Array child follows rank, optional v2 reserved bytes,
+                       dimensions, and the v2 permutation vector. */
+                    if (probe - pos < 9UL)
+                        return 1;
+                    var rank = data[pos + 8UL] as uint<64>;
+                    if (rank == 0UL || rank > H5POLICY_H5S_MAX_RANK)
+                        return 1;
+                    var dims = rank * 4UL;
+                    child_rel = 9UL + dims;
+                    if (version == 2UL)
+                        child_rel = child_rel + 3UL + dims;
+                }
+            else
+                return 1;       /* leaf or branching compound */
+
+            if (child_rel > probe - pos)
+                return 1;
+            pos = pos + child_rel;
+            depth = depth + 1UL;
+        }
+    return 1;
+}
+
+/* Locate inline datatype messages in a bounded object-header chunk and run the
+   cheap depth preflight before hashing a potentially huge object header.  This
+   does not perform semantic validation and skips shared wrappers; the ordinary
+   dispatcher still validates everything after checksum verification. */
+fun h5policy_preflight_dtype_chunk = (int ios, H5PolicyLimits profile,
+                                      uint<8> oh_version, int prefix_bytes,
+                                      offset<uint<64>,B> chunk_off,
+                                      uint<64> chunk_size,
+                                      string object) int:
+{
+    var i = 0UL;
+    while (i < chunk_size)
+        {
+            if (chunk_size - i < (prefix_bytes as uint<64>))
+                return 1;
+            var p = chunk_off + i#B;
+            var mtype = oh_version == 1UB
+                        ? h5policy_msg_u64_at(ios, profile, p, 2UL)
+                        : h5policy_msg_u64_at(ios, profile, p, 1UL);
+            var msize = oh_version == 1UB
+                        ? h5policy_msg_u64_at(ios, profile, p + 2#B, 2UL)
+                        : h5policy_msg_u64_at(ios, profile, p + 1#B, 2UL);
+            var mflags = oh_version == 1UB
+                         ? h5policy_msg_u64_at(ios, profile, p + 4#B, 1UL)
+                         : h5policy_msg_u64_at(ios, profile, p + 3#B, 1UL);
+            var payload = p + (prefix_bytes as uint<64>)#B;
+            var remaining = chunk_size - i - (prefix_bytes as uint<64>);
+            if (msize > remaining)
+                return 1;               /* ordinary parser reports overrun */
+            if (mtype == 3UL && (mflags & 2UL) == 0UL)
+                return h5policy_dtype_preflight_linear_depth(
+                    ios, profile, payload, msize, object);
+            i = i + (prefix_bytes as uint<64>) + msize;
+        }
+    return 1;
+}
 /* Validate a non-recursive (leaf) datatype's fixed-size property block:
    fixed-point / float / time / string / bit field / opaque / reference.
    Returns the datatype's on-disk size (header + props) or 0 on failure.
@@ -493,6 +594,9 @@ fun h5policy_validate_dtype_payload = (int ios,
                                        uint<64> msg_size,
                                        string object) H5WalkContext:
 {
+    if (!h5policy_dtype_preflight_linear_depth(ios, profile, payload_off,
+                                                msg_size, object))
+        return ctx;
     var consumed = h5policy_dtype_check(ios, profile, payload_off,
                                         msg_size, object, 0UL);
     if (consumed == 0UL)
