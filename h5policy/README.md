@@ -86,7 +86,13 @@ Examples:
   many very small logical chunks, and high reachable-metadata-to-file-size
   ratios after an absolute metadata floor.
 - `forensic` favors complete reporting over early exit, but still never follows
-  external references or decodes payload data.
+  external references or decodes payload data.  It additionally sweeps the raw
+  bytes for structures that the reachability walk cannot see -- currently
+  orphaned global heap collections (`GCOL`) whose object list does not advance,
+  which would hang a consumer that loads them (`H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP`,
+  reported as a resource/denial-of-service hazard).  The default profiles follow
+  references only, so they correctly accept a file whose sole defect is an
+  unreachable heap.
 
 ## Validation Coverage
 

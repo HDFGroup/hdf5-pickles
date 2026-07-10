@@ -130,6 +130,11 @@ def generate(root):
     _write(f"{root}/resource/tiny_chunks.h5",
            lambda h: h.create_dataset("tiny", shape=(5000,), dtype="u1",
                                       chunks=(1,)))
+    # An orphaned global heap collection whose free-space object has a zero
+    # length -> libhdf5's H5HG deserialize loops forever.  The forensic GCOL
+    # signature sweep flags it as a resource (DoS) hazard.
+    _make_gheap_infinite_loop(f"{root}/resource/gheap_infinite_loop.h5",
+                              f"{root}/valid/empty.h5")
 
     # Old-style (pre-1.8) groups: root and nested groups stored via a symbol
     # table -> v1 B-tree -> SNOD -> local heap.  Exercises that traversal, with
@@ -829,6 +834,39 @@ def _make_filtered_dense_link_pipeline_overrun(path, base_path):
     assert len(pipeline) == 16
     _patch(path, _filtered_frhp_rewrite(base_path, pipeline,
                                         clear_checksum_flag=False))
+
+
+def _make_gheap_infinite_loop(path, base_path):
+    """Append an orphaned, malformed global heap collection to a valid file.
+
+    The collection's free-space object (heap index 0) is encoded with a zero
+    length.  libhdf5's H5HG__cache_heap_deserialize advances the parse cursor by
+    obj[0].size for index 0, so a zero there never moves it and any consumer
+    that loads the collection loops forever (h5debug hangs on it).  Nothing
+    references the collection, so the reachability walk never sees it and
+    libhdf5's normal open ignores it; only the forensic profile's GCOL
+    signature sweep catches it, reporting a resource (DoS) hazard.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    assert raw[8] in (2, 3), "expected a v2/v3 superblock"
+    len_size = raw[10]
+    align8 = lambda n: (n + 7) & ~7
+
+    csize = 4096                                  # aligned collection size
+    coll = bytearray(csize)                        # zero-filled body
+    coll[0:4] = b"GCOL"
+    coll[4] = 1                                    # version
+    struct.pack_into("<" + {2: "H", 4: "I", 8: "Q"}[len_size], coll, 8, csize)
+    # The first object sits at the aligned header and is left all-zero: heap
+    # index 0 with a zero length -- the non-advancing free-space object.
+    assert align8(4 + 1 + 3 + len_size) == 16 and coll[16:16 + 2 + len_size] == b"\x00" * (2 + len_size)
+
+    raw += coll
+    # Declared EOF must cover the appended collection for h5policy's ceiling.
+    soff = raw[9]
+    struct.pack_into("<Q", raw, 12 + 2 * soff, len(raw))
+    _fix_sb_checksum(raw)
+    _patch(path, bytes(raw))
 
 
 def _make_bad_base_address(path):
