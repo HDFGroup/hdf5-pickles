@@ -1,0 +1,119 @@
+/* h5_external.pk - External File List (EFL) message validation. */
+
+/* Validate one external-file-list message without opening any referenced file.
+   The local heap is metadata in the HDF5 file, so its header, data segment, and
+   filename offsets remain inside h5policy's metadata-only boundary. */
+fun h5policy_validate_external_payload = (int ios,
+                                          H5PolicyLimits profile,
+                                          offset<uint<64>,B> payload_off,
+                                          uint<64> msg_size,
+                                          string object) void:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var l = global_sizeof_lengths as uint<64>;
+    var fixed_size = 8UL + o;
+
+    if (!h5policy_payload_range_ok(msg_size, 0UL, fixed_size,
+                                   "H5_CORRUPT_EXTERNAL_FILE_LIST_TRUNCATED_HEADER",
+                                   payload_off, object,
+                                   "external file list header is truncated"))
+        return;
+
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
+    if (version != 1UL)
+        h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_EXTERNAL_FILE_LIST_VERSION",
+                            "corrupt", payload_off, object,
+                            "external file list has an unsupported version");
+
+    if (h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL) != 0UL
+        || h5policy_msg_u64_at(ios, profile, payload_off + 2#B, 1UL) != 0UL
+        || h5policy_msg_u64_at(ios, profile, payload_off + 3#B, 1UL) != 0UL)
+        h5policy_emit_error("H5_CORRUPT_EXTERNAL_FILE_LIST_RESERVED",
+                            "corrupt", payload_off + 1#B, object,
+                            "external file list reserved bytes are nonzero");
+
+    var allocated = h5policy_msg_u64_at(ios, profile, payload_off + 4#B, 2UL);
+    var used = h5policy_msg_u64_at(ios, profile, payload_off + 6#B, 2UL);
+    if (used == 0UL || used > allocated)
+        h5policy_emit_error("H5_CORRUPT_EXTERNAL_FILE_LIST_SLOT_COUNT",
+                            "corrupt", payload_off + 4#B, object,
+                            "external file list slot counts are inconsistent");
+
+    var slot_size = h5policy_checked_mul_u64(3UL, l,
+                                             0xffffffffffffffffUL,
+                                             "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                             payload_off, object,
+                                             "external file list slot size overflows");
+    var slots_size = h5policy_checked_mul_u64(used, slot_size,
+                                              0xffffffffffffffffUL,
+                                              "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                              payload_off, object,
+                                              "external file list slot array size overflows");
+    var expected = h5policy_checked_add_u64(fixed_size, slots_size,
+                                            0xffffffffffffffffUL,
+                                            "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                            payload_off, object,
+                                            "external file list payload size overflows");
+    if (msg_size < expected)
+        {
+            h5policy_emit_error("H5_CORRUPT_EXTERNAL_FILE_LIST_TRUNCATED_SLOTS",
+                                "corrupt", payload_off, object,
+                                "external file list slot array is truncated");
+            return;
+        }
+    if (msg_size > expected)
+        h5policy_emit_error("H5_CORRUPT_EXTERNAL_FILE_LIST_TRAILING_BYTES",
+                            "corrupt", payload_off + expected#B, object,
+                            "external file list has trailing payload bytes");
+
+    var heap_addr = h5policy_msg_u64_at(ios, profile,
+                                        payload_off + 8#B, o);
+    var file_size = h5policy_ceiling(ios);
+    var data_addr = h5policy_local_heap_data_addr(ios, profile, heap_addr,
+                                                  file_size, payload_off,
+                                                  object);
+    if (data_addr == 0xffffffffffffffffUL)
+        return;
+
+    var i = 0UL;
+    while (i < used)
+        {
+            var slot_off = payload_off + fixed_size#B + (i * slot_size)#B;
+            var name_off = h5policy_msg_u64_at(ios, profile, slot_off, l);
+            var file_off = h5policy_msg_u64_at(ios, profile,
+                                               slot_off + l#B, l);
+            var data_size = h5policy_msg_u64_at(ios, profile,
+                                                slot_off + (2UL * l)#B, l);
+
+            if (name_off >= h5policy_heap_data_seg_size)
+                h5policy_emit_error("H5_CORRUPT_EXTERNAL_FILE_LIST_NAME_OFFSET",
+                                    "corrupt", slot_off, object,
+                                    "external filename offset is outside the local heap");
+            else
+                {
+                    var remaining = h5policy_heap_data_seg_size - name_off;
+                    var cap = remaining < H5POLICY_MAX_HEAP_NAME
+                              ? remaining : H5POLICY_MAX_HEAP_NAME;
+                    var j = 0UL;
+                    var terminated = 0;
+                    while (j < cap && !terminated)
+                        {
+                            if (h5policy_msg_u64_at(ios, profile,
+                                                    (data_addr + name_off + j)#B,
+                                                    1UL) == 0UL)
+                                terminated = 1;
+                            j = j + 1UL;
+                        }
+                    if (!terminated)
+                        h5policy_emit_error("H5_CORRUPT_EXTERNAL_FILE_LIST_NAME_OFFSET",
+                                            "corrupt", slot_off, object,
+                                            "external filename is not terminated within the local heap");
+                }
+
+            if (data_size > 0xffffffffffffffffUL - file_off)
+                h5policy_emit_error("H5_CORRUPT_EXTERNAL_FILE_LIST_SEGMENT_OVERFLOW",
+                                    "corrupt", slot_off + l#B, object,
+                                    "external file segment range overflows");
+            i = i + 1UL;
+        }
+}
