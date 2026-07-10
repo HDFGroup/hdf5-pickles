@@ -109,6 +109,21 @@ Format compatibility is then a *canonical linearization*: deterministic traversa
 | External file lists / external links / VDS sources | Quarantined in `{c}/ext/`; inherently foreign byte ranges / URIs |
 | User block, driver-info block | Ingest-side provenance only; re-emitted on request at pack time |
 
+## Variable-length data and embedded addresses
+
+The problem. VL data is the format's one violation of raw-data position independence: VL elements are stored in chunks as (length, global heap ID) tuples, where a heap ID = collection `haddr_t` + index. Addresses therefore leak into payload bytes for: VL sequences, VL strings, nested VL (heap IDs inside heap elements), old-style object/region references (embedded OH addresses; region selections via global-heap blobs), and revised (1.12) reference blobs. Naïve content-addressing of such chunks would hash accidental heap layout, break dedup, and be invalidated by heap regeneration at pack time.
+
+**Resolution — normalize at ingest, regenerate at pack** (invariant 2, one level deeper: the global heap is an access path; VL element bytes are semantics):
+
+- **Fixed part:** the chunk's element array with each heap ID replaced by a canonical ordinal (element i = i-th VL element in chunk scan order), preserving original tuple field widths.
+- **Sidecar:** length-prefixed concatenation of VL element bytes in scan order. Fixed part + sidecar are packed into one payload object with a header split-offset (single `GET`); individually huge elements spill to their own content-addressed objects (mirrors the format's own oversized-collection rule; enables dedup of large repeated values).
+- Both parts are deterministic functions of semantic content → content-addressable; identical VL data under different heap-packing histories hashes identically. This is an attestation *improvement* over the linear format, whose `GCOL` collections accrete insertion-order noise.
+- **Nested VL** recurses, driven by the stored datatype message; the packer necessarily parses raw data through the type. Precedent: `h5repack` already rebuilds heaps by pushing VL data through type conversion. (The format ecosystem concedes this corner: SWMR excludes VL; parallel HDF5 refuses VL writes.)
+- **References** (class 7, both encodings): embedded addresses rewritten to OIDs at ingest — stable in-store, so reference-bearing chunks are content-stable — substituted OID → offset at pack.
+- **Pack-time synthesis:** real `GCOL` collections regenerated (4 KB minimum, size-doubling, free-space tail), (address, index) pairs assigned, tuples rewritten.
+
+**Filter carve-out.** Post-filter bytes cannot be stored as-written for VL/reference chunks (filtered bytes wrap position-dependent tuples). These chunks are stored normalized + unfiltered and re-filtered at pack. Canonical-linearization determinism therefore requires pinned filter codecs (implementation + version + parameters) in the container profile, an SBOM-shaped requirement worth recording regardless. Loss is minimal: filters over VL chunks only ever compressed the tuple array, never the heap data.
+
 ## Commit-epoch granularity under concurrent writers
 
 We don't want to invent a distributed database. The current format has no concurrent-mutation semantics: SWMR is single-writer with ordered visibility; parallel HDF5 is many processes forming one logical writer via collective MPI-IO. So the compatibility bar is single-writer commits — anything beyond that is new semantics we choose to define, and should be quarantined as such.
