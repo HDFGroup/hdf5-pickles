@@ -322,6 +322,8 @@ def generate(root):
     _patch(f"{root}/malformed/bad_superblock_version.h5",
            raw[:8] + b"\xff" + raw[9:])
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
+    _make_compound_member_array_nelem_overflow(
+        f"{root}/malformed/compound_member_array_nelem_overflow.h5")
     _make_bad_reference_datatype_version(
         f"{root}/malformed/bad_reference_datatype_version.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
@@ -531,6 +533,79 @@ def _make_bad_compound(path):
     else:
         raise RuntimeError("could not locate the compound datatype header")
     _patch(path, bytes(raw))
+
+
+def _make_compound_member_array_nelem_overflow(path):
+    """A version-1 compound whose member uses the legacy embedded-array encoding
+    with dimensions whose product overflows 64 bits.
+
+    libhdf5 later scales that element count by the base type size
+    (H5T__array_create), so an overflowing product wraps and underflows the
+    array type's size -- consumers that build the type overflow (h5py: "dtype
+    size in bytes must fit into a C int").  Modern libhdf5 only ever writes the
+    newer *nested* array-datatype form, so this legacy member encoding is
+    synthesized by splicing a hand-built v1 compound datatype message into a
+    compact dataset's object header (growing chunk 0 and repairing the object
+    header and superblock checksums)."""
+    # v1 compound: 1 member "a" of a [65537,65536,65536,65536] u32 array; the
+    # product is 2**64 + 2**48, so it overflows a 64-bit element count.
+    dt = bytearray()
+    dt += bytes([0x16]) + b"\x01\x00\x00" + struct.pack("<I", 4)  # compound v1, 1 memb, size 4
+    name = b"a\x00"
+    name += b"\x00" * ((8 - len(name) % 8) % 8)                    # name padded to 8
+    dt += name + struct.pack("<I", 0)                             # member name + byte offset
+    dt += bytes([4]) + b"\x00" * 3                                # dimensionality + reserved
+    dt += struct.pack("<I", 0) + struct.pack("<I", 0)            # permutation + reserved
+    for d in (65537, 65536, 65536, 65536):
+        dt += struct.pack("<I", d)                               # dimension sizes
+    dt += bytes([0x10]) + b"\x00" * 3 + struct.pack("<I", 4) \
+        + struct.pack("<H", 0) + struct.pack("<H", 32)           # base type H5T_STD_U32LE
+    dt = bytes(dt)
+
+    base = path + ".base"
+    with h5py.File(base, "w", libver="latest") as h:
+        space = h5py.h5s.create_simple((1,))
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_layout(h5py.h5d.COMPACT)      # data inline: no address shifts on resize
+        u32 = h5py.h5t.py_create(np.dtype("u4"))
+        dsid = h5py.h5d.create(h.id, b"dset", u32, space, dcpl)
+        dsid.write(h5py.h5s.ALL, h5py.h5s.ALL, np.zeros((1,), dtype="u4"))
+    raw = bytearray(open(base, "rb").read())
+    os.unlink(base)
+
+    # Locate the dataset object header and its datatype (type 3) message.
+    ohdr = msg_start = old_size = body = size_off = size_w = None
+    for o in range(len(raw) - 4):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        size_off = cur
+        p = cur + size_w
+        while p < cur + size_w + chunk0 - 3:
+            mtype = raw[p]
+            msize = struct.unpack_from("<H", raw, p + 1)[0]
+            mbody = p + 4 + (2 if flags & 0x04 else 0)
+            if mtype == 3:
+                ohdr, msg_start, old_size, body = o, p, msize, mbody
+                break
+            p = mbody + msize
+        if ohdr is not None:
+            break
+    if ohdr is None:
+        raise RuntimeError("could not locate the dataset datatype message")
+
+    delta = len(dt) - old_size
+    new = bytearray(raw[:body] + dt + raw[body + old_size:])
+    struct.pack_into("<H", new, msg_start + 1, len(dt))          # datatype message size
+    chunk0 = int.from_bytes(new[size_off:size_off + size_w], "little")
+    new[size_off:size_off + size_w] = (chunk0 + delta).to_bytes(size_w, "little")
+    _fix_v2_ohdr_checksum(new, ohdr)
+    struct.pack_into("<Q", new, 12 + 2 * new[9], len(new))       # declared EOF := new size
+    _fix_sb_checksum(new)
+    _patch(path, bytes(new))
 
 
 def _make_bad_reference_datatype_version(path):
