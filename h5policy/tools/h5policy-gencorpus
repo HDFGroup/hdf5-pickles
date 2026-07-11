@@ -142,6 +142,15 @@ def _gen_valid(root):
            lambda h: h.create_dataset(
                "d", data=np.arange(100, dtype="i4").reshape(10, 10),
                chunks=(5, 5), compression="gzip"))
+    # A well-formed scale-offset dataset: accepted (with the decode advisory).
+    # Its cd_values[2]/cd_values[4] match the real chunk element count and the
+    # datatype size, so the filter chunk-consistency checks must NOT fire -- the
+    # regression guard against a false positive in those checks (and against the
+    # v4 chunk element-count computation double-counting the element-size dim).
+    _write(f"{root}/valid/scaleoffset_filter.h5",
+           lambda h: h.create_dataset(
+               "d", data=np.arange(100, dtype="i4").reshape(10, 10),
+               chunks=(5, 5), scaleoffset=0))
     # Regression guard for v1 object headers that contain zero-size NIL
     # messages.  libhdf5 may emit these as placeholders while growing a header
     # into continuation chunks; they still count toward the declared message
@@ -358,6 +367,8 @@ def _gen_malformed(root):
         f"{root}/malformed/compound_member_offset_oob.h5")
     _make_scaleoffset_nelmts_mismatch(
         f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
+    _make_scaleoffset_size_mismatch(
+        f"{root}/malformed/scaleoffset_size_mismatch.h5")
     _make_bad_reference_datatype_version(
         f"{root}/malformed/bad_reference_datatype_version.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
@@ -710,26 +721,19 @@ def _make_compound_member_offset_oob(path):
     _splice_compact_datatype(path, dt, 16)
 
 
-def _make_scaleoffset_nelmts_mismatch(path):
-    """A chunked dataset whose scale-offset filter declares a chunk element count
-    (cd_values[2]) larger than the real chunk.
+def _scaleoffset_cd_patch(path, cd_index, value):
+    """Build a chunked scale-offset dataset (4-element chunk of i4) and overwrite
+    cd_values[cd_index] in its v2 filter pipeline message, repairing the object-
+    header checksum.  Shared by the element-count and element-size fixtures.
 
-    libhdf5 auto-derives cd_values[2] from the chunk dataspace in
-    H5Z__set_local_scaleoffset; its decompressor then sizes the per-chunk output
-    buffer as cd_values[2] * element_size.  Inflating that count (here 4 -> 65537
-    for a 4-element chunk) makes the decompressor write past the buffer sized from
-    the real chunk -- and on a 32-bit size_t the 65537 * element_size product
-    wraps and under-allocates, the classic filter integer-overflow OOB write.
-    n-bit (filter 5) shares the identical cd_values[2] convention and code path;
-    scale-offset is used here only because h5py can write it directly.  Built by
-    byte-patching cd_values[2] in the filter pipeline message of a real dataset
-    and repairing the object-header checksum."""
+    The pipeline payload is: version(1) nfilters(1); then the descriptor id(2)
+    flags(2) cd_nelmts(2), followed by the 32-bit client-data words, so
+    cd_values[i] lives at mbody + 8 + 4*i."""
     def _build(h):
         h.create_dataset("d", data=np.arange(8, dtype="i4"),
                          chunks=(4,), scaleoffset=0, track_times=False)
     raw = _base_bytes(_build)
 
-    off = None
     for o in range(len(raw) - 4):
         if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
             continue
@@ -743,22 +747,42 @@ def _make_scaleoffset_nelmts_mismatch(path):
             mtype = raw[p]
             msize = struct.unpack_from("<H", raw, p + 1)[0]
             mbody = p + 4 + (2 if flags & 0x04 else 0)
-            if mtype == 0x0b:
-                # v2 pipeline: version(1) nfilters(1); descriptor id(2) flags(2)
-                # cd_nelmts(2); client data follows.  cd_values[2] is the third
-                # 32-bit word (H5Z_SCALEOFFSET_PARM_NELMTS = 2).
-                if (raw[mbody] == 2 and raw[mbody + 1] == 1
-                        and struct.unpack_from("<H", raw, mbody + 2)[0] == 6):
-                    off = mbody + 8 + 2 * 4
-                break
+            if (mtype == 0x0b and raw[mbody] == 2 and raw[mbody + 1] == 1
+                    and struct.unpack_from("<H", raw, mbody + 2)[0] == 6):
+                struct.pack_into("<I", raw, mbody + 8 + 4 * cd_index, value)
+                _fix_v2_ohdr_checksum(raw, o)
+                _patch(path, bytes(raw))
+                return
             p = mbody + msize
-        if off is not None:
-            struct.pack_into("<I", raw, off, 65537)      # inflate chunk nelmts (real chunk = 4)
-            _fix_v2_ohdr_checksum(raw, o)
-            break
-    if off is None:
-        raise RuntimeError("could not locate the scale-offset filter descriptor")
-    _patch(path, bytes(raw))
+    raise RuntimeError("could not locate the scale-offset filter descriptor")
+
+
+def _make_scaleoffset_nelmts_mismatch(path):
+    """A chunked dataset whose scale-offset filter declares a chunk element count
+    (cd_values[2], H5Z_SCALEOFFSET_PARM_NELMTS) larger than the real chunk.
+
+    libhdf5 auto-derives cd_values[2] from the chunk dataspace in
+    H5Z__set_local_scaleoffset; its decompressor then sizes the per-chunk output
+    buffer as cd_values[2] * element_size.  Inflating that count (here 4 -> 65537
+    for a 4-element chunk) makes the decompressor write past the buffer sized from
+    the real chunk -- and on a 32-bit size_t the 65537 * element_size product
+    wraps and under-allocates, the classic filter integer-overflow OOB write.
+    n-bit (filter 5) shares the identical cd_values[2] convention and code path;
+    scale-offset is used here only because h5py can write it directly."""
+    _scaleoffset_cd_patch(path, 2, 65537)
+
+
+def _make_scaleoffset_size_mismatch(path):
+    """A chunked dataset whose scale-offset filter declares a per-element size
+    (cd_values[4], H5Z_SCALEOFFSET_PARM_SIZE) larger than the real datatype.
+
+    cd_values[4] is the second factor libhdf5 multiplies into the decompressed
+    buffer (nelmts * size).  Leaving the element count consistent and inflating
+    only the size (here 4 -> 131073 for an i4 datatype) still overflows that
+    product on a 32-bit size_t (131073 * 131073 wraps below the real chunk),
+    driving the same out-of-bounds write.  h5policy rejects it because the
+    declared element size disagrees with the dataset's datatype size."""
+    _scaleoffset_cd_patch(path, 4, 131073)
 
 
 def _make_bad_reference_datatype_version(path):
