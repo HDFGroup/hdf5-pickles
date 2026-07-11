@@ -619,11 +619,16 @@ fun h5policy_validate_layout_payload = (int ios,
 /* Validate the filter-pipeline message envelope.  Filter definitions are
    metadata; actual decode/decompression is intentionally outside h5policy's
    boundary and is reported as an advisory or policy finding.  */
+/* `record_decode_nelmts` is set only on the dataset dispatch path: when true the
+   walk records an n-bit/scale-offset filter's cd_values[2] (the chunk element
+   count) into h5policy_pipeline_decode_nelmts for the finalize-time consistency
+   check.  Fractal-heap pipeline checks pass false so dense storage can't seed it.  */
 fun h5policy_validate_filter_pipeline_payload = (int ios,
                                                  H5PolicyLimits profile,
                                                  offset<uint<64>,B> payload_off,
                                                  uint<64> msg_size,
-                                                 string object) int:
+                                                 string object,
+                                                 int record_decode_nelmts) int:
 {
     if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
                                    "H5_CORRUPT_FILTER_PIPELINE_MESSAGE_TOO_SMALL",
@@ -758,6 +763,35 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                                            payload_off + cur#B, object,
                                            "filter descriptor overruns the pipeline message"))
                 return 0;
+
+            /* n-bit (5) and scale-offset (6) both store the chunk element count
+               that libhdf5 auto-derives from the chunk dataspace in cd_values[2]
+               (H5Z_{NBIT,SCALEOFFSET}_PARM_NELMTS).  Their decompressors size the
+               output buffer as cd_values[2] * element_size, so a hand-inflated
+               value drives an out-of-bounds write -- and on a 32-bit size_t the
+               product wraps and under-allocates.  Record the on-disk value (the
+               whole descriptor, client data included, is confirmed in range
+               above) for the chunk-consistency check at object finalization,
+               where the chunk element count is known regardless of message order.  */
+            if (record_decode_nelmts != 0
+                && (filter_id == 5UL || filter_id == 6UL) && cd_nelmts >= 3UL)
+                {
+                    var d_nelmts =
+                        h5policy_msg_u64_at(ios, profile,
+                                            payload_off
+                                            + (cur + desc_header + name_len + 8UL)#B,
+                                            4UL);
+                    if (h5policy_pipeline_has_decode_nelmts != 0UB
+                        && h5policy_pipeline_decode_nelmts != d_nelmts)
+                        /* Two decode filters on one dataset must agree on the
+                           chunk element count; a divergence is already tampering
+                           and cannot be reconciled with a single chunk shape.  */
+                        h5policy_emit_error("H5_CORRUPT_FILTER_NELMTS_MISMATCH",
+                                            "corrupt", payload_off + cur#B, object,
+                                            "decode filters disagree on the chunk element count");
+                    h5policy_pipeline_decode_nelmts = d_nelmts;
+                    h5policy_pipeline_has_decode_nelmts = 1UB;
+                }
 
             /* Advance by the computed descriptor size rather than by fields read
                so malformed names or client-data lengths cannot desynchronize

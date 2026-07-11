@@ -356,6 +356,8 @@ def _gen_malformed(root):
         f"{root}/malformed/compound_member_array_bounds.h5")
     _make_compound_member_offset_oob(
         f"{root}/malformed/compound_member_offset_oob.h5")
+    _make_scaleoffset_nelmts_mismatch(
+        f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
     _make_bad_reference_datatype_version(
         f"{root}/malformed/bad_reference_datatype_version.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
@@ -706,6 +708,57 @@ def _make_compound_member_offset_oob(path):
     size (modern libhdf5 no longer writes this legacy member encoding)."""
     dt = _v1_compound_plain_member(16, 0xFFFFFF00, 4, 32)
     _splice_compact_datatype(path, dt, 16)
+
+
+def _make_scaleoffset_nelmts_mismatch(path):
+    """A chunked dataset whose scale-offset filter declares a chunk element count
+    (cd_values[2]) larger than the real chunk.
+
+    libhdf5 auto-derives cd_values[2] from the chunk dataspace in
+    H5Z__set_local_scaleoffset; its decompressor then sizes the per-chunk output
+    buffer as cd_values[2] * element_size.  Inflating that count (here 4 -> 65537
+    for a 4-element chunk) makes the decompressor write past the buffer sized from
+    the real chunk -- and on a 32-bit size_t the 65537 * element_size product
+    wraps and under-allocates, the classic filter integer-overflow OOB write.
+    n-bit (filter 5) shares the identical cd_values[2] convention and code path;
+    scale-offset is used here only because h5py can write it directly.  Built by
+    byte-patching cd_values[2] in the filter pipeline message of a real dataset
+    and repairing the object-header checksum."""
+    def _build(h):
+        h.create_dataset("d", data=np.arange(8, dtype="i4"),
+                         chunks=(4,), scaleoffset=0, track_times=False)
+    raw = _base_bytes(_build)
+
+    off = None
+    for o in range(len(raw) - 4):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        p = cur + size_w
+        end = cur + size_w + chunk0
+        while p < end - 3:
+            mtype = raw[p]
+            msize = struct.unpack_from("<H", raw, p + 1)[0]
+            mbody = p + 4 + (2 if flags & 0x04 else 0)
+            if mtype == 0x0b:
+                # v2 pipeline: version(1) nfilters(1); descriptor id(2) flags(2)
+                # cd_nelmts(2); client data follows.  cd_values[2] is the third
+                # 32-bit word (H5Z_SCALEOFFSET_PARM_NELMTS = 2).
+                if (raw[mbody] == 2 and raw[mbody + 1] == 1
+                        and struct.unpack_from("<H", raw, mbody + 2)[0] == 6):
+                    off = mbody + 8 + 2 * 4
+                break
+            p = mbody + msize
+        if off is not None:
+            struct.pack_into("<I", raw, off, 65537)      # inflate chunk nelmts (real chunk = 4)
+            _fix_v2_ohdr_checksum(raw, o)
+            break
+    if off is None:
+        raise RuntimeError("could not locate the scale-offset filter descriptor")
+    _patch(path, bytes(raw))
 
 
 def _make_bad_reference_datatype_version(path):
