@@ -1,0 +1,373 @@
+/* h5_vds.pk - Bounded virtual-dataset global-heap mapping validation. */
+
+type H5PolicyVdsHeapRef = struct
+{
+    uint<8> found;
+    offset<uint<64>,B> data_off;
+    uint<64> data_size;
+};
+
+fun h5policy_vds_ref_none = H5PolicyVdsHeapRef:
+{
+    return H5PolicyVdsHeapRef { found = 0UB, data_off = 0UL#B,
+                                data_size = 0UL };
+}
+
+/* Find one indexed object in a GCOL while validating every cursor advance. */
+fun h5policy_vds_find_gheap_object = (int ios, H5PolicyLimits profile,
+                                      uint<64> heap_addr, uint<64> wanted,
+                                      off64 loc, string object) H5PolicyVdsHeapRef:
+{
+    var l = global_sizeof_lengths as uint<64>;
+    var file_size = h5policy_ceiling(ios);
+    var hdr_size = align8(8UL + l);
+    if (!h5policy_checked_addr_range(heap_addr, hdr_size, file_size,
+                                     "VDS global heap header outside file",
+                                     loc, object))
+        return h5policy_vds_ref_none;
+    if (h5policy_msg_bytes(ios, profile, heap_addr#B, 4UL) != ['G','C','O','L'])
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                heap_addr#B, object,
+                                "VDS global heap signature mismatch");
+            return h5policy_vds_ref_none;
+        }
+    if (h5policy_msg_u64_at(ios, profile, heap_addr#B + 4#B, 1UL) != 1UL
+        || h5policy_msg_u64_at(ios, profile, heap_addr#B + 5#B, 3UL) != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_HEADER", "corrupt",
+                                heap_addr#B, object,
+                                "VDS global heap version or reserved bytes are invalid");
+            return h5policy_vds_ref_none;
+        }
+    var coll_size = h5policy_msg_u64_at(ios, profile, heap_addr#B + 8#B, l);
+    if (coll_size < hdr_size
+        || !h5policy_checked_addr_range(heap_addr, coll_size, file_size,
+                                        "VDS global heap collection outside file",
+                                        loc, object))
+        return h5policy_vds_ref_none;
+    var pos = hdr_size;
+    while (pos < coll_size)
+        {
+            h5policy_walk_tick(1UL);
+            if (hdr_size > coll_size - pos)
+                break;                  /* permitted short trailing padding */
+            var oh = heap_addr#B + pos#B;
+            var idx = h5policy_msg_u64_at(ios, profile, oh, 2UL);
+            var reserved = h5policy_msg_u64_at(ios, profile, oh + 4#B, 4UL);
+            var data_size = h5policy_msg_u64_at(ios, profile, oh + 8#B, l);
+            if (reserved != 0UL || data_size == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT", "corrupt",
+                                        oh, object,
+                                        "VDS global heap object header is invalid");
+                    return h5policy_vds_ref_none;
+                }
+            if (idx == 0UL)
+                {
+                    if (data_size > coll_size - pos)
+                        h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT",
+                                            "corrupt", oh, object,
+                                            "VDS global heap free-space object overruns the collection");
+                    return h5policy_vds_ref_none;
+                }
+            var padded = align8(data_size);
+            var span = h5policy_checked_add_u64(hdr_size, padded,
+                                                0xffffffffffffffffUL,
+                                                "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                "corrupt", oh, object,
+                                                "VDS global heap object size overflow");
+            if (span > coll_size - pos)
+                {
+                    h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT", "corrupt",
+                                        oh, object,
+                                        "VDS global heap object overruns the collection");
+                    return h5policy_vds_ref_none;
+                }
+            if (idx == wanted)
+                return H5PolicyVdsHeapRef { found = 1UB,
+                                            data_off = oh + hdr_size#B,
+                                            data_size = data_size };
+            pos = pos + span;
+        }
+    h5policy_emit_error("H5_CORRUPT_VDS_HEAP_OBJECT_MISSING", "corrupt",
+                        loc, object,
+                        "VDS layout references a missing global heap object");
+    return h5policy_vds_ref_none;
+}
+
+/* Size one serialized H5S selection using only bounded scalar reads. */
+fun h5policy_vds_selection_size = (int ios, H5PolicyLimits profile,
+                                    off64 off, uint<64> available,
+                                    string object) uint<64>:
+{
+    if (available < 8UL)
+        return 0UL;
+    var st = h5policy_msg_u64_at(ios, profile, off, 4UL);
+    var ver = h5policy_msg_u64_at(ios, profile, off + 4#B, 4UL);
+    if (st == 0UL || st == 3UL)
+        return available >= 16UL ? 16UL : 0UL;
+    if ((st == 1UL || st == 2UL) && ver == 1UL)
+        {
+            if (available < 16UL) return 0UL;
+            var len1 = h5policy_msg_u64_at(ios, profile, off + 12#B, 4UL);
+            return len1 <= available - 16UL ? 16UL + len1 : 0UL;
+        }
+    if (st == 2UL && ver == 2UL)
+        {
+            if (available < 13UL) return 0UL;
+            var len2 = h5policy_msg_u64_at(ios, profile, off + 9#B, 4UL);
+            return len2 <= available - 13UL ? 13UL + len2 : 0UL;
+        }
+    if (st == 2UL && ver == 3UL)
+        {
+            if (available < 14UL) return 0UL;
+            var flags = h5policy_msg_u64_at(ios, profile, off + 8#B, 1UL);
+            var enc = h5policy_msg_u64_at(ios, profile, off + 9#B, 1UL);
+            var ndims = h5policy_msg_u64_at(ios, profile, off + 10#B, 4UL);
+            if (enc == 0UL || enc > 8UL || ndims > H5POLICY_H5S_MAX_RANK) return 0UL;
+            if ((flags & 1UL) != 0UL)
+                {
+                    var payload = h5policy_checked_mul_u64(4UL * ndims, enc,
+                                                           0xffffffffffffffffUL,
+                                                           "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                           "corrupt", off, object,
+                                                           "VDS hyperslab selection size overflow");
+                    return payload <= available - 14UL ? 14UL + payload : 0UL;
+                }
+            if (enc > available - 14UL) return 0UL;
+            var blocks = h5policy_msg_u64_at(ios, profile, off + 14#B, enc);
+            var block_unit = h5policy_checked_mul_u64(2UL * ndims, enc,
+                                                0xffffffffffffffffUL,
+                                                "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                "corrupt", off, object,
+                                                "VDS hyperslab selection size overflow");
+            var bytes = h5policy_checked_mul_u64(block_unit, blocks,
+                                                 0xffffffffffffffffUL,
+                                                 "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                 "corrupt", off, object,
+                                                 "VDS hyperslab selection size overflow");
+            return bytes <= available - 14UL - enc ? 14UL + enc + bytes : 0UL;
+        }
+    if (st == 1UL && ver == 2UL)
+        {
+            if (available < 14UL) return 0UL;
+            var encp = h5policy_msg_u64_at(ios, profile, off + 8#B, 1UL);
+            var ndimsp = h5policy_msg_u64_at(ios, profile, off + 9#B, 4UL);
+            if (encp == 0UL || encp > 8UL || ndimsp > H5POLICY_H5S_MAX_RANK
+                || encp > available - 13UL) return 0UL;
+            var points = h5policy_msg_u64_at(ios, profile, off + 13#B, encp);
+            var point_unit = h5policy_checked_mul_u64(ndimsp, encp,
+                                                 0xffffffffffffffffUL,
+                                                 "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                 "corrupt", off, object,
+                                                 "VDS point selection size overflow");
+            var pbytes = h5policy_checked_mul_u64(point_unit, points,
+                                                  0xffffffffffffffffUL,
+                                                  "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                  "corrupt", off, object,
+                                                  "VDS point selection size overflow");
+            return pbytes <= available - 13UL - encp ? 13UL + encp + pbytes : 0UL;
+        }
+    return 0UL;
+}
+
+/* Scan a NUL-terminated VDS name and optionally classify the source path.
+   Returns bytes consumed including NUL, or zero when unterminated. */
+fun h5policy_vds_name_size = (int ios, H5PolicyLimits profile, off64 off,
+                              uint<64> available, int classify,
+                              string object) uint<64>:
+{
+    var i = 0UL;
+    var first = 0UL; var second = 0UL; var third = 0UL;
+    var parent = 0; var component_start = 1;
+    while (i < available)
+        {
+            var ch = h5policy_msg_u64_at(ios, profile, off + i#B, 1UL);
+            if (i == 0UL) first = ch;
+            if (i == 1UL) second = ch;
+            if (i == 2UL) third = ch;
+            if (ch == 0UL)
+                {
+                    if (classify && profile.allow_vds != 0UB)
+                        {
+                            var absolute = first == ('/' as uint<64>)
+                                           || first == ('\\' as uint<64>)
+                                           || (second == (':' as uint<64>)
+                                               && (third == ('/' as uint<64>)
+                                                   || third == ('\\' as uint<64>)));
+                            if (parent)
+                                h5policy_emit_warning("H5_ADVISORY_VDS_PARENT_SOURCE",
+                                                      off, object,
+                                                      "VDS source path contains a parent-directory component and can direct dataset I/O outside the expected directory");
+                            else if (absolute)
+                                h5policy_emit_warning("H5_ADVISORY_VDS_ABSOLUTE_SOURCE",
+                                                      off, object,
+                                                      "VDS uses an absolute source path and can direct dataset I/O to that file");
+                            else
+                                h5policy_emit_warning("H5_ADVISORY_VDS_RELATIVE_SOURCE",
+                                                      off, object,
+                                                      "VDS uses a relative source path whose I/O target depends on consumer path resolution");
+                        }
+                    return i + 1UL;
+                }
+            if (component_start && ch == ('.' as uint<64>) && i + 1UL < available)
+                {
+                    var next = h5policy_msg_u64_at(ios, profile, off + (i + 1UL)#B, 1UL);
+                    if (next == ('.' as uint<64>))
+                        {
+                            var after = i + 2UL < available
+                                        ? h5policy_msg_u64_at(ios, profile,
+                                                              off + (i + 2UL)#B, 1UL)
+                                        : 0UL;
+                            if (after == 0UL || after == ('/' as uint<64>)
+                                || after == ('\\' as uint<64>)) parent = 1;
+                        }
+                }
+            component_start = ch == ('/' as uint<64>) || ch == ('\\' as uint<64>);
+            i = i + 1UL;
+        }
+    return 0UL;
+}
+
+fun h5policy_validate_vds_layout = (int ios, H5PolicyLimits profile,
+                                    offset<uint<64>,B> payload_off,
+                                    uint<64> msg_size, string object) void:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var l = global_sizeof_lengths as uint<64>;
+    if (!h5policy_payload_range_ok(msg_size, 2UL, o + 4UL,
+                                   "H5_CORRUPT_VDS_LAYOUT_TOO_SMALL",
+                                   payload_off, object,
+                                   "VDS layout global-heap ID is truncated")) return;
+    var heap_addr = h5policy_msg_u64_at(ios, profile, payload_off + 2#B, o);
+    var heap_idx = h5policy_msg_u64_at(ios, profile,
+                                       payload_off + (2UL + o)#B, 4UL);
+    var ref = h5policy_vds_find_gheap_object(ios, profile, heap_addr, heap_idx,
+                                             payload_off + 2#B, object);
+    if (ref.found == 0UB) return;
+    if (ref.data_size < l + 5UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_VDS_MAPPING_HEADER", "corrupt",
+                                ref.data_off, object,
+                                "VDS mapping block is too small");
+            return;
+        }
+    var version = h5policy_msg_u64_at(ios, profile, ref.data_off, 1UL);
+    var nmaps = h5policy_msg_u64_at(ios, profile, ref.data_off + 1#B, l);
+    if (version > 1UL || nmaps == 0UL || nmaps > ref.data_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_VDS_MAPPING_HEADER", "corrupt",
+                                ref.data_off, object,
+                                "VDS mapping block version or mapping count is invalid");
+            return;
+        }
+    var cur = 1UL + l;
+    var end = ref.data_size - 4UL;
+    var m = 0UL;
+    while (m < nmaps)
+        {
+            h5policy_walk_tick(1UL);
+            var flags = 0UL;
+            if (version == 1UL)
+                {
+                    if (cur >= end) return;
+                    flags = h5policy_msg_u64_at(ios, profile, ref.data_off + cur#B, 1UL);
+                    cur = cur + 1UL;
+                    if ((flags & 0xf8UL) != 0UL)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_VDS_MAPPING_FLAGS", "corrupt",
+                                                ref.data_off + (cur - 1UL)#B,
+                                                object, "VDS mapping flags use reserved bits");
+                            return;
+                        }
+                }
+            if ((flags & 4UL) == 0UL)
+                {
+                    if ((flags & 1UL) != 0UL)
+                        {
+                            if (l > end - cur) return;
+                            var origin = h5policy_msg_u64_at(ios, profile,
+                                                            ref.data_off + cur#B, l);
+                            if (origin >= m) return;
+                            cur = cur + l;
+                        }
+                    else
+                        {
+                            var fn = h5policy_vds_name_size(ios, profile,
+                                                            ref.data_off + cur#B,
+                                                            end - cur, 1, object);
+                            if (fn == 0UL)
+                                {
+                                    h5policy_emit_error("H5_CORRUPT_VDS_SOURCE_NAME",
+                                                        "corrupt",
+                                                        ref.data_off + cur#B,
+                                                        object,
+                                                        "VDS source filename is not terminated within the mapping block");
+                                    return;
+                                }
+                            cur = cur + fn;
+                        }
+                }
+            if ((flags & 2UL) != 0UL)
+                {
+                    if (l > end - cur) return;
+                    var dorigin = h5policy_msg_u64_at(ios, profile,
+                                                      ref.data_off + cur#B, l);
+                    if (dorigin >= m) return;
+                    cur = cur + l;
+                }
+            else
+                {
+                    var dn = h5policy_vds_name_size(ios, profile,
+                                                    ref.data_off + cur#B,
+                                                    end - cur, 0, object);
+                    if (dn == 0UL)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_VDS_SOURCE_NAME",
+                                                "corrupt", ref.data_off + cur#B,
+                                                object,
+                                                "VDS source dataset name is not terminated within the mapping block");
+                            return;
+                        }
+                    cur = cur + dn;
+                }
+            var ss = h5policy_vds_selection_size(ios, profile,
+                                                 ref.data_off + cur#B,
+                                                 end - cur, object);
+            if (ss == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_VDS_SELECTION", "corrupt",
+                                        ref.data_off + cur#B, object,
+                                        "VDS source selection is malformed or overruns the mapping block");
+                    return;
+                }
+            cur = cur + ss;
+            var vs = h5policy_vds_selection_size(ios, profile,
+                                                 ref.data_off + cur#B,
+                                                 end - cur, object);
+            if (vs == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_VDS_SELECTION", "corrupt",
+                                        ref.data_off + cur#B, object,
+                                        "VDS virtual selection is malformed or overruns the mapping block");
+                    return;
+                }
+            cur = cur + vs;
+            m = m + 1UL;
+        }
+    if (cur != end)
+        {
+            h5policy_emit_error("H5_CORRUPT_VDS_MAPPING_TRAILING_BYTES", "corrupt",
+                                ref.data_off + cur#B, object,
+                                "VDS mapping block has unclaimed bytes");
+            return;
+        }
+    var body = h5policy_msg_bytes(ios, profile, ref.data_off, end);
+    var stored = lookup3_u32_le(h5policy_msg_bytes(ios, profile,
+                                                   ref.data_off + end#B, 4UL));
+    if (lookup3_hashlittle(body, 0) != stored)
+        h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM", "corrupt",
+                            ref.data_off, object,
+                            "VDS mapping block checksum mismatch");
+}

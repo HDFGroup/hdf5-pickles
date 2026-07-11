@@ -146,6 +146,23 @@ fun h5policy_validate_link_name_charset = (int ios,
         }
 }
 
+/* Offset (relative to `off`) of the first NUL byte within `len` bytes, or the
+   all-ones sentinel when the range holds no terminator.  External link target
+   strings must terminate inside the link value: libhdf5 runs strlen() over
+   them, so a missing NUL is an out-of-bounds read.  */
+fun h5policy_scan_nul = (int ios, H5PolicyLimits profile,
+                         offset<uint<64>,B> off, uint<64> len) uint<64>:
+{
+    var i = 0UL;
+    while (i < len)
+        {
+            if (h5policy_msg_u64_at(ios, profile, off + i#B, 1UL) == 0UL)
+                return i;
+            i = i + 1UL;
+        }
+    return 0xffffffffffffffffUL;
+}
+
 fun h5policy_validate_link_payload = (int ios,
                                       H5PolicyLimits profile,
                                       offset<uint<64>,B> payload_off,
@@ -300,6 +317,33 @@ fun h5policy_validate_link_payload = (int ios,
                                                 payload_off + cur#B, object,
                                                 "external link value overruns the link message"))
                 return;
+            else
+                {
+                    /* The value is a version/flags byte, then a NUL-terminated
+                       target file name and a NUL-terminated target object path.
+                       libhdf5 runs strlen() over each, so a string that does not
+                       terminate inside the value is an out-of-bounds read.  This
+                       is structural corruption under every profile, independent
+                       of the external-reference policy applied below.  */
+                    var val_off = payload_off + (cur + 2UL)#B;
+                    var fname_nul = h5policy_scan_nul(ios, profile,
+                                                      val_off + 1#B, ext_len - 1UL);
+                    if (fname_nul == 0xffffffffffffffffUL)
+                        h5policy_emit_error("H5_CORRUPT_EXTERNAL_LINK_VALUE_NOT_TERMINATED",
+                                            "corrupt", val_off, object,
+                                            "external link target file name is not terminated within the link value");
+                    else
+                        {
+                            var obj_rel = fname_nul + 2UL;   /* past fname + its NUL */
+                            if (obj_rel >= ext_len
+                                || h5policy_scan_nul(ios, profile,
+                                                     val_off + obj_rel#B,
+                                                     ext_len - obj_rel) == 0xffffffffffffffffUL)
+                                h5policy_emit_error("H5_CORRUPT_EXTERNAL_LINK_VALUE_NOT_TERMINATED",
+                                                    "corrupt", val_off, object,
+                                                    "external link target object path is not terminated within the link value");
+                        }
+                }
             if (profile.allow_external_links == 0UB)
                 h5policy_emit_error("H5_POLICY_EXTERNAL_LINK", "policy",
                                     payload_off, object,
@@ -411,6 +455,19 @@ fun h5policy_frhp_header_size = (uint<64> filter_len, off64 loc,
                                     "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
                                     loc, object,
                                     "fractal heap header checksum size overflow");
+}
+
+/* A filtered fractal-heap header stores the compressed root-direct-block size
+   and filter mask immediately before an ordinary encoded filter pipeline.
+   Its data blocks remain outside h5policy's metadata-only coverage, but the
+   pipeline descriptor itself can be validated without executing any filter. */
+fun h5policy_frhp_filter_pipeline_off = (uint<64> fheap_addr) offset<uint<64>,B>:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var unfiltered_body = 14UL + (2UL * o) + (10UL * el)
+                          + (8UL + (2UL * el) + o);
+    return (fheap_addr + unfiltered_body + el + 4UL)#B;
 }
 
 /* Size a fractal heap indirect block from its doubling-table geometry.  Direct
@@ -1003,7 +1060,35 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyLimits profile,
                                                  "fractal heap header"))
         return 0;
     if (filter_len != 0UL)
-        return 0;                       /* filtered heap: not supported here */
+        {
+            var pipeline_ok = h5policy_validate_filter_pipeline_payload(
+                ios, profile, h5policy_frhp_filter_pipeline_off(fheap_addr),
+                filter_len, object);
+            if (!pipeline_ok)
+                return 1;               /* corrupt metadata was fully handled */
+            /* A filtered managed heap must checksum its direct blocks.  libhdf5
+               only allocates the decompressed direct-block buffer on the
+               checksum-verify path (H5HF__cache_dblock_verify_chksum); with the
+               flag clear that path is skipped, and H5HF__cache_dblock_deserialize
+               then memcpy()s the reverse-filtered bytes into a never-allocated
+               (NULL) block.  Dense link heaps are always written with this flag
+               set, so a clear flag is malformed, not merely unsupported.  */
+            if ((flags & 2UL) == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_FILTERED_HEAP_NO_DBLOCK_CHECKSUM",
+                                        "corrupt", fheap_addr#B, object,
+                                        "filtered fractal heap disables direct-block checksums; libhdf5 dereferences an unallocated direct block");
+                    return 1;
+                }
+            /* Known blind spot (see h5policy/README.md): the link records live
+               in a filter-compressed direct block, so a fault that only shows
+               up after decoding -- e.g. a decoded block whose size mismatches
+               the heap's declared block size -- is invisible here and can crash
+               some libhdf5 versions during dense iteration.  The coverage gap
+               is a refusal, not an accept; a metadata-only oracle cannot do
+               better without reversing the pipeline.  */
+            return 0;                   /* valid filtered traversal is unsupported */
+        }
     var checksum_dblocks = ((flags & 2UL) != 0UL) as uint<8>;
 
     /* The doubling table parameters below are trusted only after the heap
@@ -1065,6 +1150,10 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyLimits profile,
     var bt_root_raw = h5policy_msg_bytes(ios, profile, btree_addr#B + 16#B, o);
     var bt_root = bytes_to_u64_le(bt_root_raw);
     var num_root = h5policy_msg_u64_at(ios, profile, btree_addr#B + (16UL + o)#B, 2UL);
+
+    if (!h5policy_validate_v2_btree_geometry(node_size, record_size,
+                                              btree_addr#B, object))
+        return 1;
 
     if (record_type != 5UL || h5policy_msg_addr_is_undef(bt_root_raw))
         return 0;

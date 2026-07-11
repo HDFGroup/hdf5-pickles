@@ -288,6 +288,28 @@ fun h5policy_resolve_shared_message = (int ios,
             return h5policy_msg_ref_none;
         }
 
+    if (share_type == 1UL)
+        {
+            if (loc_rel > msg_size || 8UL > msg_size - loc_rel)
+                {
+                    h5policy_emit_error("H5_CORRUPT_SHARED_MESSAGE_TOO_SMALL",
+                                        "corrupt", payload_off, object,
+                                        "SOHM heap ID overruns the shared-message payload");
+                    return h5policy_msg_ref_none;
+                }
+            var sr = h5policy_resolve_sohm_heap(ios, profile, m_type,
+                                                payload_off + loc_rel#B, object);
+            if (sr.found == 0UB)
+                {
+                    h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                        "unsupported", payload_off, object,
+                                        "SOHM list-backed shared message could not be resolved");
+                    return h5policy_msg_ref_none;
+                }
+            return H5PolicyMsgRef { found = 1UB, payload_off = sr.payload_off,
+                                    msg_size = sr.msg_size, flags = 0UB };
+        }
+
     if (share_type != 2UL)
         {
             h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
@@ -339,6 +361,25 @@ fun h5policy_validate_message_payload = (int ios,
                                          uint<64> msg_size,
                                          string object) H5WalkContext:
 {
+    /* Sharing is a property of any shareable message class, not just
+       datatypes.  Resolve the wrapper once, clear the shared bit, and dispatch
+       the recovered payload through the ordinary validator.  Datatypes retain
+       their older duplicate-aware path below. */
+    if ((m_flags & 0x02UB) != 0UB && m_type != 0x03UL)
+        {
+            var shared_ref = h5policy_resolve_shared_message(ios, profile,
+                                                              m_type,
+                                                              payload_off,
+                                                              msg_size,
+                                                              object);
+            if (shared_ref.found == 0UB)
+                return ctx;
+            return h5policy_validate_message_payload(ios, profile, ctx, m_type,
+                                                      m_flags & 0xfdUB,
+                                                      shared_ref.payload_off,
+                                                      shared_ref.msg_size,
+                                                      object);
+        }
     if (m_type == 0x01UL)
         {
             /* Dataspace is one of the four messages that form the dataset
@@ -457,6 +498,12 @@ fun h5policy_validate_message_payload = (int ios,
            external, and user-defined links are bounded and classified.  */
         h5policy_validate_link_payload(ios, profile, payload_off,
                                        msg_size, object);
+    else if (m_type == 0x07UL)
+        /* External storage is policy-classified separately.  Even when the
+           profile permits it, validate all in-file EFL metadata without
+           opening or inspecting the referenced external files. */
+        h5policy_validate_external_payload(ios, profile, payload_off,
+                                           msg_size, object);
     else if (m_type == 0x0aUL)
         /* Group-info is small but structural: its version/flags determine the
            exact payload length libhdf5 expects. */
@@ -493,11 +540,8 @@ fun h5policy_validate_message_payload = (int ios,
                                                    payload_off, msg_size,
                                                    object);
     else if (m_type == 0x0fUL)
-        /* Shared-message tables are a distinct storage mechanism from the
-           committed-object-header shared messages resolved above.  */
-        h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
-                            "unsupported", payload_off, object,
-                            "shared object-header message table traversal is not covered yet");
+        h5policy_validate_sohm_payload(ios, profile, payload_off, msg_size,
+                                       object);
     else if (m_type == 0x15UL)
         /* Attribute-info is the dense-attribute equivalent of link-info.  */
         return h5policy_validate_ainfo_payload(ios, profile, ctx, payload_off,
@@ -718,7 +762,10 @@ fun h5policy_validate_msg_chunk = (int ios,
                 {
                     var cont = h5policy_map_cont(ios, profile, payload_off);
                     var cont_addr = bytes_to_u64_le(cont.addr_raw);
-                    var cont_size = bytes_to_u64_le(cont.size_raw);
+                    var cont_size = h5policy_decode_u64_raw(cont.size_raw,
+                                                            payload_off
+                                                            + (global_sizeof_offsets as uint<64>)#B,
+                                                            object);
 
                     ctx.object_header_chunk_count =
                         h5policy_checked_add_u64(ctx.object_header_chunk_count,

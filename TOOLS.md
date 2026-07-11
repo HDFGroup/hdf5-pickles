@@ -21,7 +21,10 @@ targets.
 
 ## Marker Scanner
 
-`h5markers` is a multithreaded file scanner for the concrete on-disk markers defined in the [HDF5 file format specification](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) and the [Onion file format](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/Onion_VFD_RFC_211122.pdf). See also the [MARKERS.md](MARKERS.md) file for a complete list of known markers.
+`h5markers` is a multithreaded file scanner for concrete on-disk markers used
+by HDF5 and Onion files. It covers the published format specifications and
+implementation-defined signatures used by the current HDF5 library. See
+[MARKERS.md](MARKERS.md) for the complete list and its sources.
 
 `h5markers` can be used to quickly identify the locations of these markers in large files, which can be useful for debugging, data recovery, or understanding file structure.
 

@@ -23,18 +23,20 @@ or payload decoders get a chance to run.
 Run from the repository root:
 
 ```sh
-./h5policy/tools/h5policy --profile untrusted-strict --json file.h5
-./h5policy/tools/h5policy --profile trusted-fast --json file.h5
-./h5policy/tools/h5policy --profile legacy --json file.h5
-./h5policy/tools/h5policy --profile forensic --json --continue-after-corruption file.h5
+./h5policy/tools/h5policy --profile untrusted-strict file.h5
+./h5policy/tools/h5policy --profile trusted-fast file.h5
+./h5policy/tools/h5policy --profile legacy file.h5
+./h5policy/tools/h5policy --profile forensic --continue-after-corruption file.h5
 ```
+
+Output is JSON (the machine-readable result); it is the only format, so no flag
+is required.  `--json` is still accepted as a no-op for backward compatibility.
 
 Useful mode flags:
 
 - `--strict` / `--non-strict` force GNU poke strict or non-strict mapping.
 - `--continue-after-corruption` keeps walking after the first corruption finding
   so diagnostics include every reachable issue.
-- `--json` prints the machine-readable result.
 
 ## Decisions
 
@@ -86,7 +88,13 @@ Examples:
   many very small logical chunks, and high reachable-metadata-to-file-size
   ratios after an absolute metadata floor.
 - `forensic` favors complete reporting over early exit, but still never follows
-  external references or decodes payload data.
+  external references or decodes payload data.  It additionally sweeps the raw
+  bytes for structures that the reachability walk cannot see -- currently
+  orphaned global heap collections (`GCOL`) whose object list does not advance,
+  which would hang a consumer that loads them (`H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP`,
+  reported as a resource/denial-of-service hazard).  The default profiles follow
+  references only, so they correctly accept a file whose sole defect is an
+  unreachable heap.
 
 ## Validation Coverage
 
@@ -110,6 +118,29 @@ Checksum coverage includes the HDF5 Jenkins checksums used by:
 - chunk-index metadata
 - dense metadata fractal heaps: `FRHP`, `FHDB`, `FHIB`
 - dense metadata v2 B-trees: `BTHD`, `BTLF`, `BTIN`
+
+### Known blind spots
+
+Some defects live strictly beyond a metadata-only boundary and are reported as
+`unsupported_coverage_gap` rather than `reject_corrupt`, even when `libhdf5`
+crashes on them:
+
+- **Filtered dense link/attribute fractal heaps.** When a dense group's or
+  object's fractal heap declares an I/O filter pipeline, the link/attribute
+  records live inside a filter-compressed direct block. Resolving them means
+  reversing the pipeline (decompressing untrusted bytes), which h5policy does
+  not do. h5policy validates everything it can see in metadata — the pipeline
+  descriptor, the header checksum, the direct-block checksum flag (see
+  `H5_CORRUPT_FILTERED_HEAP_NO_DBLOCK_CHECKSUM`) — but a fault that only appears
+  *after* decoding, such as a decoded direct block whose size does not match the
+  heap's declared block size, is invisible to it. Such a file can crash some
+  `libhdf5` versions during dense iteration (e.g. an invalid free in
+  `H5G__link_release_table`) while h5policy can only answer "unsupported." The
+  coverage gap is still a refusal, not an accept: a consumer honoring it will
+  not process the file. Regression note: because the differential harness treats
+  a `libhdf5` crash as "must be `reject_corrupt`," these files cannot be pinned
+  as `coverage_gap` corpus fixtures — a filtered heap that `h5py` cannot
+  traverse reads as a rejection under invariant A'.
 
 ## Companion Tools
 
