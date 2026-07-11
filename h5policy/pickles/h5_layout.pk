@@ -619,6 +619,102 @@ fun h5policy_validate_layout_payload = (int ios,
                                                 payload_off, object);
 }
 
+/* Walk the n-bit filter's cd_values type tree, bounding it to the client-data
+   array.  n-bit stores a self-describing type grammar after the 3-word header
+   (total, flag, d_nelmts); libhdf5's decompressor walks it by indexing cd_values,
+   so a tree that reaches past cd_nelmts is an out-of-bounds read of the parameter
+   array (garbage read as precision/offset/size, then OOB on the data buffers).
+   Node layouts (H5Znbit.c): ATOMIC(1)=class,size,order,precision,offset;
+   NOOPTYPE(4)=class,size; ARRAY(2)=class,size,<base>; COMPOUND(3)=class,size,
+   nmembers, then per member <byte-offset,<type>>.  This is metadata-only -- it
+   bounds-checks parameter indices without decompressing.  Returns the index just
+   past the node, or a poison value (> cd_nelmts, error already emitted) on
+   overrun / unknown class / recursion limit; the while loop is bounded by
+   cd_nelmts via the poison return even when nmembers is hostile.  */
+fun h5policy_nbit_walk_params = (int ios, H5PolicyLimits profile,
+                                 offset<uint<64>,B> cd_base, uint<64> cd_nelmts,
+                                 uint<64> idx, uint<64> depth,
+                                 offset<uint<64>,B> loc, string object) uint<64>:
+{
+    var poison = 0xffffffffffffffffUL;
+    if (depth > profile.max_datatype_recursion_depth)
+        {
+            h5policy_emit_error("H5_CORRUPT_NBIT_PARAMS_RECURSION", "corrupt", loc, object,
+                                "n-bit filter parameter tree nesting exceeds the profile limit");
+            return poison;
+        }
+    if (idx >= cd_nelmts)
+        {
+            h5policy_emit_error("H5_CORRUPT_NBIT_PARAMS_OVERRUN", "corrupt", loc, object,
+                                "n-bit filter parameter tree reads past the client-data array");
+            return poison;
+        }
+    var cls = h5policy_msg_u64_at(ios, profile, cd_base + (idx * 4UL)#B, 4UL);
+    if (cls == 1UL)          /* ATOMIC: class, size, order, precision, offset */
+        {
+            if (idx + 5UL > cd_nelmts)
+                {
+                    h5policy_emit_error("H5_CORRUPT_NBIT_PARAMS_OVERRUN", "corrupt", loc, object,
+                                        "n-bit filter parameter tree reads past the client-data array");
+                    return poison;
+                }
+            return idx + 5UL;
+        }
+    if (cls == 4UL)          /* NOOPTYPE: class, size */
+        {
+            if (idx + 2UL > cd_nelmts)
+                {
+                    h5policy_emit_error("H5_CORRUPT_NBIT_PARAMS_OVERRUN", "corrupt", loc, object,
+                                        "n-bit filter parameter tree reads past the client-data array");
+                    return poison;
+                }
+            return idx + 2UL;
+        }
+    if (cls == 2UL)          /* ARRAY: class, size, then base type */
+        {
+            if (idx + 2UL > cd_nelmts)
+                {
+                    h5policy_emit_error("H5_CORRUPT_NBIT_PARAMS_OVERRUN", "corrupt", loc, object,
+                                        "n-bit filter parameter tree reads past the client-data array");
+                    return poison;
+                }
+            return h5policy_nbit_walk_params(ios, profile, cd_base, cd_nelmts,
+                                             idx + 2UL, depth + 1UL, loc, object);
+        }
+    if (cls == 3UL)          /* COMPOUND: class, size, nmembers, then per member off+type */
+        {
+            if (idx + 3UL > cd_nelmts)
+                {
+                    h5policy_emit_error("H5_CORRUPT_NBIT_PARAMS_OVERRUN", "corrupt", loc, object,
+                                        "n-bit filter parameter tree reads past the client-data array");
+                    return poison;
+                }
+            var nmembers = h5policy_msg_u64_at(ios, profile,
+                                               cd_base + ((idx + 2UL) * 4UL)#B, 4UL);
+            var cur = idx + 3UL;
+            var j = 0UL;
+            while (j < nmembers)
+                {
+                    if (cur >= cd_nelmts)     /* room for the member byte-offset word */
+                        {
+                            h5policy_emit_error("H5_CORRUPT_NBIT_PARAMS_OVERRUN", "corrupt", loc, object,
+                                                "n-bit filter parameter tree reads past the client-data array");
+                            return poison;
+                        }
+                    cur = cur + 1UL;          /* member byte offset */
+                    cur = h5policy_nbit_walk_params(ios, profile, cd_base, cd_nelmts,
+                                                    cur, depth + 1UL, loc, object);
+                    if (cur > cd_nelmts)
+                        return poison;         /* poison already reported downstream */
+                    j = j + 1UL;
+                }
+            return cur;
+        }
+    h5policy_emit_error("H5_CORRUPT_NBIT_PARAMS_CLASS", "corrupt", loc, object,
+                        "n-bit filter parameter tree has an unknown type class");
+    return poison;
+}
+
 /* Validate the filter-pipeline message envelope.  Filter definitions are
    metadata; actual decode/decompression is intentionally outside h5policy's
    boundary and is reported as an advisory or policy finding.  */
@@ -812,6 +908,17 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                             h5policy_pipeline_has_decode_size = 1UB;
                         }
                 }
+
+            /* n-bit stores a self-describing type tree in cd_values[3..]; verify it
+               stays inside the client-data array so a consumer's decompressor
+               cannot index past it.  Independent of record_decode_nelmts: it is a
+               structural property of the descriptor, so it applies to any n-bit
+               pipeline (a heap pipeline would never legitimately carry n-bit).  */
+            if (filter_id == 5UL)
+                h5policy_nbit_walk_params(ios, profile,
+                                          payload_off + (cur + desc_header + name_len)#B,
+                                          cd_nelmts, 3UL, 0UL,
+                                          payload_off + cur#B, object);
 
             /* Advance by the computed descriptor size rather than by fields read
                so malformed names or client-data lengths cannot desynchronize
