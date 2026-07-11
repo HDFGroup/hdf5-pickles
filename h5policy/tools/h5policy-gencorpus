@@ -407,6 +407,8 @@ def _gen_malformed(root):
         f"{root}/valid/chunk_ext_array.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
+    _make_bad_dataset_missing_layout(
+        f"{root}/malformed/bad_dataset_missing_layout.h5")
     _make_bad_compact_layout_overrun(
         f"{root}/malformed/bad_compact_layout_overrun.h5")
     _make_bad_dataspace_trailing_bytes(
@@ -1637,6 +1639,54 @@ def _make_bad_contiguous_layout_size(path):
     if off < 0:
         raise RuntimeError("could not locate the rank-1 dataspace message")
     struct.pack_into("<Q", raw, off + 16, 0)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_dataset_missing_layout(path):
+    """A contiguous dataset whose Data Layout message type byte is overwritten
+    with Null (0x08 -> 0x00), so the header pairs a dataspace and datatype but
+    carries no layout message.  libhdf5's H5D__layout_oh_read then fails with
+    "unable to read data layout message" -- yet h5policy used to accept the file.
+    The structure-aware fuzzer found this on nested_datatypes.h5: flipping the
+    layout message type inside the checksummed v2 header and repairing the
+    checksum lets the mutant reach the deep validators, which never required a
+    dataset to have a layout.  Every dataset must carry exactly one."""
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")))
+    jenkins = _jenkins_lookup3()
+    pos = 0
+    patched = False
+    while True:
+        ohdr = raw.find(b"OHDR", pos)
+        if ohdr < 0:
+            break
+        pos = ohdr + 4
+        if raw[ohdr + 4] != 2:                    # not a v2 object header
+            continue
+        flags = raw[ohdr + 5]
+        cursor = ohdr + 6 + (16 if flags & (1 << 5) else 0) \
+            + (4 if flags & (1 << 4) else 0)
+        size_width = 1 << (flags & 3)
+        chunk_size = int.from_bytes(raw[cursor:cursor + size_width], "little")
+        msg = cursor + size_width
+        end = msg + chunk_size
+        if end + 4 > len(raw) or \
+                struct.unpack_from("<I", raw, end)[0] != jenkins(bytes(raw[ohdr:end])):
+            continue                              # incidental "OHDR" bytes, not a header
+        corder = 2 if (flags & (1 << 2)) else 0   # per-message creation order field
+        while msg + 4 <= end:
+            m_type = raw[msg]
+            m_size = struct.unpack_from("<H", raw, msg + 1)[0]
+            if m_type == 0x08:                    # Data Layout -> Null
+                raw[msg] = 0x00
+                _fix_v2_ohdr_checksum(raw, ohdr)
+                patched = True
+                break
+            msg += 4 + corder + m_size
+        if patched:
+            break
+    if not patched:
+        raise RuntimeError("could not locate the data layout message")
     _patch(path, bytes(raw))
 
 
