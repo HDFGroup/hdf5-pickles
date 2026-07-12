@@ -1,25 +1,37 @@
-# `H5PolicyLimits`: Current Semantics
+# `H5PolicyProfile`: Current Semantics
 
-This document describes the behavior of `H5PolicyLimits` as it is implemented
-today. It is a characterization reference, not a proposal for a future profile
-model. Where a field name suggests broader behavior than the validators
-currently implement, the narrower implemented behavior is documented.
+This document describes the behavior of `H5PolicyProfile` and its nested
+configuration groups as they are implemented today. It is a characterization
+reference, not a proposal for future policy behavior. Where a field name
+suggests broader behavior than the validators currently implement, the
+narrower implemented behavior is documented.
 
-The type and four built-in values are defined in
+The types and four built-in values are defined in
 [`h5_profiles.pk`](../pickles/h5_profiles.pk). The command-line wrapper maps the
 public profile names to those values, and [`h5_policy.pk`](../pickles/h5_policy.pk)
 selects one value for a run.
 
+## Model structure
+
+`H5PolicyProfile` separates the former flat configuration into four groups:
+
+- `limits` (`H5PolicyLimits`) contains hard numeric resource, shape, and depth
+  ceilings;
+- `heuristics` (`H5PolicyHeuristics`) contains the tiny-chunk and metadata-ratio
+  thresholds, plus the currently unused filter-expansion threshold;
+- `features` (`H5PolicyFeaturePolicy`) contains the six `allow_*` switches; and
+- `analysis` (`H5PolicyAnalysis`) contains the walk deadline and
+  `forensic_mode`.
+
+This grouping is organizational. It did not change any preset value,
+comparison, sentinel convention, finding, or validator control-flow decision.
+The field descriptions below generally use the leaf field name; validator code
+accesses it through the group shown above.
+
 ## General behavior
 
-Although named `H5PolicyLimits`, the struct contains three kinds of setting:
-
-- numeric resource, shape, depth, and time limits;
-- feature-policy flags; and
-- `forensic_mode`, which selects analysis behavior as well as a profile default.
-
 There is currently no profile-validation step. Callers constructing another
-`H5PolicyLimits` value are responsible for using meaningful percentages,
+`H5PolicyProfile` value are responsible for using meaningful percentages,
 boolean values, sentinel values, and relationships between fields.
 
 ### Comparisons and saturation
@@ -354,7 +366,7 @@ updates `max_rank_seen`, then applies two checks:
 
 1. rank greater than the fixed `H5POLICY_H5S_MAX_RANK` value of 32 emits
    `H5_CORRUPT_DATASPACE_RANK_TOO_LARGE`;
-2. rank greater than `profile.max_rank` emits
+2. rank greater than `profile.limits.max_rank` emits
    `H5_RESOURCE_DATASPACE_RANK`.
 
 The profile finding is a resource finding and does not stop dimension parsing.
@@ -490,7 +502,7 @@ H5_UNSUPPORTED_WALK_BUDGET (unsupported)
 and normal validation does not resume. `max_walk_seconds = 0` sets the deadline
 to the current integer second; it does not disable deadline checking. Internal
 callers such as h5patch disable the in-pickle deadline by directly assigning
-`h5policy_walk_deadline = 0`, outside `H5PolicyLimits`.
+`h5policy_walk_deadline = 0`, outside `H5PolicyProfile`.
 
 The shell wrapper has a second, independent hard timeout: 20 seconds for the
 default/untrusted profile, 35 for trusted-fast, 50 for forensic, and 90 for
@@ -629,14 +641,16 @@ still controlled directly by `forensic_mode`.
 
 ## Current test coverage
 
-[`unit_limits.pk`](../tests/unit_limits.pk) copies the strict profile, reduces
-one or two fields at a time, and drives synthetic in-memory metadata through the
-ordinary enforcement helpers. It characterizes current behavior without
-requiring production-scale files. The generated corpus remains the end-to-end
-and libhdf5-facing layer.
+[`unit_limits.pk`](../tests/unit_limits.pk) constructs an independent copy of
+the strict profile, reduces one or two fields at a time, and drives synthetic
+in-memory metadata through the ordinary enforcement helpers. It also snapshots
+all 27 fields of each of the four built-in profiles. It characterizes current
+behavior without requiring production-scale files. The generated corpus
+remains the end-to-end and libhdf5-facing layer.
 
 | Field or rule | Current direct coverage |
 | --- | --- |
+| Built-in profile values | Every field in all four presets is compared with its documented value. The copy helper reconstructs every nested group, preventing test mutations from aliasing a shipped preset. |
 | `max_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. |
 | `max_attribute_count` | A valid synthetic attribute is parsed at and above a reduced cumulative limit. |
 | `max_object_header_chunks` | A synthetic continuation message covers equality, over-limit saturation, and the fact that its later structural finding is independent. |

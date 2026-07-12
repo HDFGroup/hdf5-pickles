@@ -12,8 +12,9 @@ controlled outcome; a change that alters any decision is surfaced for review.
 - `unit_datatype.pk` — synthetic checks for the bounded, depth-guarded
   datatype validator (recursion cap and truncation handling), run under poke.
 - `unit_limits.pk` — reduced-limit, in-memory characterization checks for the
-  current `H5PolicyLimits` boundaries, saturation, finding classes, compound
-  rules, feature switches, and run-mode defaults.
+  current `H5PolicyProfile` boundaries, complete built-in preset values,
+  saturation, finding classes, compound rules, feature switches, and run-mode
+  defaults.
 - `valid/ malformed/ policy/ resource/ coverage/ cve/` — generated fixtures
   (git-ignored build output; see below).
 

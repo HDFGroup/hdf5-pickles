@@ -73,7 +73,7 @@ profile.
 
 For an implementation-level reference covering every current profile field,
 including its scope, sentinel behavior, finding class, and test coverage, see
-[`H5PolicyLimits`: Current Semantics](docs/H5PolicyLimits.md).
+[`H5PolicyProfile`: Current Semantics](docs/H5PolicyProfile.md).
 
 | Profile            | Mapping     | Resource budgets | Feature policy                         |
 | ------------------ | ----------- | ---------------- | -------------------------------------- |
