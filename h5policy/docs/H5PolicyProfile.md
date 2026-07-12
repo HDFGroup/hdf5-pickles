@@ -12,6 +12,12 @@ resolver are in [`h5_run_options.pk`](../pickles/h5_run_options.pk). The
 command-line wrapper maps public profile names to the built-in values, and
 [`h5_policy.pk`](../pickles/h5_policy.pk) selects and resolves them for a run.
 
+Shared, non-configurable format and libhdf5 invariants are defined separately
+in [`h5_fixed_invariants.pk`](../pickles/h5_fixed_invariants.pk), which is loaded
+before the profile model. They include the fixed rank/layout ceilings and
+format signatures used across multiple validators; structure-local constants
+remain beside their validators. These values are not policy settings.
+
 ## Model structure
 
 `H5PolicyProfile` contains four groups:
@@ -422,7 +428,8 @@ an unlimited value.
 This is checked independently for every decoded dataspace. h5policy first
 updates `max_rank_seen`, then applies two checks:
 
-1. rank greater than the fixed `H5POLICY_H5S_MAX_RANK` value of 32 emits
+1. rank greater than the fixed `H5POLICY_H5S_MAX_RANK` value of 32 from
+   `h5_fixed_invariants.pk` emits
    `H5_CORRUPT_DATASPACE_RANK_TOO_LARGE`;
 2. rank greater than `profile.resources.max_rank` emits
    `H5_RESOURCE_DATASPACE_RANK`.
