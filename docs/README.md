@@ -2,7 +2,8 @@
 
 Specification Markdown is generated from two sources of truth:
 
-- **`pickles/*.pk`** — the executable format definitions (structure, types, constraints)
+- **`pickles/*.pk`** — the executable format definitions (shared constants,
+  structure, types, and constraints)
 - **`docs/spec/*.yml`** — prose sidecars (field descriptions, introductory text,
   version notes, cross-references)
 

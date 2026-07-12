@@ -865,7 +865,7 @@ Version 2 object header layout (identified by the 4-byte signature 'O' 'H' 'D' '
 
 | Field | Description |
 |-------|-------------|
-| `signature` | 4-byte signature: 'O' 'H' 'D' 'R'. Must match the constant V2_SIG. |
+| `signature` | 4-byte signature: 'O' 'H' 'D' 'R'. Must match `H5_FORMAT_OHDR_SIGNATURE`. |
 | `version` | Object header version number. Must be 2. |
 | `flags` | Bit flags controlling optional fields and the encoding of `chunk0_size`. Bits 0–1: byte width of `chunk0_size`: 00 = 1 byte, 01 = 2 bytes, 10 = 4 bytes, 11 = 8 bytes. Bit 2: creation-order tracking is active — message prefixes include the optional `crt_order` field. Bit 3: a creation-order index (B-tree) is maintained for the attributes of this object. Bit 4: the `attr_phase` field is present. Bit 5: the `timestamps` field is present. |
 | `timestamps` | Optional creation and access timestamps (type `hdr_timestamps`). Present when `flags` bit 5 is set. _optional_ |
@@ -886,5 +886,4 @@ Version 1 object header layout. Identified by a version byte of 1 at the start o
 | `obj_ref_cnt` | Reference count: the number of hard links pointing to this object. An object is eligible for deletion when this count reaches zero. |
 | `obj_hdr_size` | Size in bytes of the message data in the first object header chunk. The message bytes immediately follow the 16-byte fixed prefix and are accessed via the internal `_msg_chunk` wrapper. |
 | `res2` | Reserved. Must be zero (4 bytes). |
-
 
