@@ -125,6 +125,13 @@ def _gen_valid(root):
                        + dtype_vlen_wrapper * 5000
                        + dtype_rec_suffix)
     _patch(f"{root}/cve/dtype_unbounded_recursion.h5", dtype_recursion)
+    # The same recursion CVE in its *compound* form: a single-member version-3
+    # compound nested deeply.  h5policy's cheap linear-depth preflight treats a
+    # single-member compound as a one-child chain (like the VLen wrappers above),
+    # so this is rejected as a resource violation without descending the whole
+    # depth.  Assembled rather than patched -- no libhdf5 writes a type this deep.
+    _make_dtype_compound_recursion(
+        f"{root}/cve/dtype_compound_unbounded_recursion.h5")
     # h5py does not expose the file-creation SOHM controls.  Repack a normal
     # file through libhdf5 to force a list-backed shared dataspace index; this
     # exercises SMTB/SMLI validation plus managed fractal-heap ID resolution.
@@ -920,6 +927,60 @@ def _jenkins_lookup3():
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod.jenkins_lookup3
+
+
+def _make_dtype_compound_recursion(path, levels=5000):
+    """A single-member compound datatype nested ``levels`` deep in the modern
+    (version-3) encoding: each level is a compound with one 1-char-named member
+    whose type is the next compound, bottoming out in a fixed-point leaf.  This
+    is the datatype-recursion CVE in its compound form -- libhdf5's
+    H5O__dtype_decode_helper recurses once per level and overflows the stack.
+    h5policy caps nesting at profile.resources.max_datatype_recursion_depth and
+    rejects it as reject_resource (H5_RESOURCE_DATATYPE_RECURSION_DEPTH).
+
+    Companion to the single-child VLen sibling (dtype_unbounded_recursion.h5):
+    h5policy's cheap linear-depth preflight recognises a single-member compound
+    as a one-child chain too, so both are rejected from the datatype prefix alone
+    without descending the whole depth or checksumming the giant object header --
+    the crisp resource rejection lands well inside the tightest wall-clock
+    regardless of how deep the file claims to nest.
+
+    Assembled from scratch (superblock + dataset object header + root-group
+    object header) rather than byte-patched, because no libhdf5 writes a type this
+    deep.  The fixed message encodings mirror the VLen sibling's envelope; both
+    Jenkins checksums are recomputed for the compound datatype's length.
+    """
+    jenkins = _jenkins_lookup3()
+
+    # Fixed envelope pieces, byte-identical to the known-good VLen recursion
+    # fixture (superblock header, the dataset's dataspace/fill/layout messages,
+    # and the root-group object header whose link points at the dataset OH @0x30).
+    sb_head = bytes.fromhex("894844460d0a1a0a02080800")           # sig + v2 + 8B off/len + flags
+    dataspace_msg = bytes.fromhex("0104000002000002")             # dataspace message (hdr + body)
+    ds_trailer = bytes.fromhex("0502000003060804000003000000")    # fill-value + data-layout messages
+    root_group_oh = bytes.fromhex(
+        "4f484452020030021200000000ffffffffffffffffffffffffffffffff"
+        "0a020000000006100000010005706f6331363000000000000000d7543402")
+
+    # One version-3 compound level: header (class 6, version 3, 1 member, element
+    # size 1 -> 1-byte member-offset field), the 1-char member name "a", and the
+    # member's byte offset.  The member type is the next compound (11 bytes/level).
+    wrapper = bytes.fromhex("3601000001000000") + b"a\x00" + b"\x00"
+    leaf = bytes.fromhex("100000000100000000000800")              # fixed-point leaf, size 1
+    dtype_data = wrapper * levels + leaf
+
+    dtype_msg = bytes([0x03]) + struct.pack("<H", len(dtype_data)) + b"\x00" + dtype_data
+    chunk0 = dataspace_msg + dtype_msg + ds_trailer
+    dataset_oh = b"OHDR" + bytes([2, 1]) + struct.pack("<H", len(chunk0)) + chunk0
+    dataset_oh += struct.pack("<I", jenkins(dataset_oh))
+
+    root_addr = 48 + len(dataset_oh)                              # the superblock is 48 bytes
+    eof = root_addr + len(root_group_oh)
+    sb = (sb_head + struct.pack("<Q", 0) + b"\xff" * 8
+          + struct.pack("<Q", eof) + struct.pack("<Q", root_addr))
+    sb += struct.pack("<I", jenkins(sb))
+
+    _patch(path, sb + dataset_oh + root_group_oh)
 
 
 def _make_vds_nentries_overflow(path, base_path):
