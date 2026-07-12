@@ -75,6 +75,13 @@ fixed-array index and a two-filter shuffle+gzip pipeline: its baseline case is
 valid with the normal gzip advisory, while separate overrides reduce only the
 chunk or filter count ceiling.
 
+Legacy chunk-index cases cover the subtler finite-ceiling boundary directly.
+A four-chunk v1 B-tree distinguishes equality from overflow within one leaf;
+a generated 130-chunk, multi-level v1 tree proves that an internal-node walk
+continues at equality into a later child and stops only after that child proves
+an additional chunk exists. Both rejecting cases remain resource decisions and
+saturate `chunk_index_refs` at the selected ceiling.
+
 ## Differential harness
 
 `../tools/h5policy-diff` cross-checks h5policy's independent parse against

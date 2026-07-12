@@ -311,8 +311,8 @@ Zero is an active zero-continuation limit. Unlimited uses `UINT64_MAX`.
 
 ### `max_chunk_count`
 
-This limits the file-wide `H5WalkContext.chunk_index_count`. Depending on the
-layout/index type, the counter is increased by:
+This limits the file-wide `H5WalkContext.accounted_chunk_count`. Depending on
+the layout/index type, the counter is increased by:
 
 - an estimated chunk count for an implicit v4 index;
 - one for a defined single-chunk v4 layout;
@@ -331,16 +331,21 @@ An addition beyond the limit emits:
 H5_RESOURCE_CHUNK_COUNT (resource)
 ```
 
-and saturates the counter. Header-counted index validators may continue
-validating their root or inline records after the finding. The v1 chunk B-tree
-walker has an additional early return: when a finite limit is configured and
-the accumulated count is already equal to it, it stops before processing the
-next entry. Because that return occurs before discovering another leaf, a v1
-tree can stop at the exact limit without emitting an over-limit finding for
-undiscovered remaining entries.
+and saturates the counter. An internal overflow flag preserves the distinction
+between exact equality and proven overflow after saturation, and suppresses
+duplicate chunk-count findings. Header-counted index validators may continue
+validating their root or inline records after the finding.
 
-Zero is an active zero-chunk limit. `UINT64_MAX` also disables the v1 walker's
-explicit equality early return and is used by the unlimited presets.
+For a validated v1 chunk-B-tree leaf, the declared leaf entry count is claimed
+atomically. If it crosses the remaining allowance, only entries within that
+allowance have their raw chunk addresses inspected. Internal nodes continue
+descending when the accumulated count merely equals the ceiling: the walk
+stops only when a later nonempty leaf proves overflow. That limited look-ahead
+remains bounded by `max_btree_depth`, the visited-node set,
+`max_walk_operations`, and `max_walk_seconds`.
+
+Zero is an active zero-chunk limit. `UINT64_MAX` is effectively unlimited and
+is used by the unlimited presets.
 
 ## Depth and shape limits
 
@@ -753,7 +758,7 @@ CLI.
 | `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. A reduced full-file case also saturates `metadata_bytes_seen` at its exact ceiling. |
 | `max_attribute_count` | A valid synthetic attribute is parsed at and above a reduced cumulative limit. |
 | `max_object_header_chunks` | A synthetic continuation message covers equality, over-limit saturation, and the fact that its later structural finding is independent. A valid continuation-heavy object header crosses a reduced full-walk ceiling and saturates the reported counter without becoming corrupt. |
-| `max_chunk_count` | Defined chunk-index references cover equality and over-limit saturation. A valid four-chunk fixed-array dataset is accepted at the shipped ceiling and rejects as resource policy under a reduced ceiling, with `chunk_index_refs` saturated exactly at that limit. |
+| `max_chunk_count` | Defined chunk-index references cover equality, over-limit saturation, and the internal exact-versus-exceeded state. A valid four-chunk fixed-array dataset rejects as resource policy under a reduced ceiling. Separate legacy v1 cases cover exact equality and overflow within one leaf, plus a 130-chunk multi-level tree whose parent must continue at equality into a later child to prove overflow. In every rejecting case, `chunk_index_refs` saturates exactly at the selected limit. |
 | `max_single_value_bytes` | Fill values cover equality, over-limit resource classification, and zero-as-disabled; separate valid datatype and attribute blobs cross the other two enforcement sites. A compact valid file isolates the attribute-value enforcement site during a full walk. |
 | `max_logical_dataset_bytes` | Synthetic dataset facts cover equality and saturation. `resource/huge_logical_dataset.h5` requires the resource finding, and the same file is accepted under legacy. |
 | Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, zero-byte disabling, and validation of the disabled pair. `resource/tiny_chunks.h5` supplies end-to-end coverage. |

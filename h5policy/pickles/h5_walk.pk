@@ -47,7 +47,11 @@ type H5WalkContext = struct
     uint<64> chunk_logical_bytes;
     uint<64> logical_dataset_bytes;
     uint<64> max_logical_dataset_bytes_seen;
-    uint<64> chunk_index_count;
+    uint<64> accounted_chunk_count;
+    /* The public count saturates at the selected ceiling, so equality alone
+       cannot say whether the walk observed exactly the limit or proved an
+       additional chunk.  Keep that proof as internal traversal state. */
+    uint<8> chunk_count_exceeded;
     uint<8> has_dataspace;
     uint<8> has_datatype;
     uint<8> has_dataset_layout;
@@ -226,7 +230,8 @@ fun h5policy_new_walk_context = H5WalkContext:
         chunk_logical_bytes = 0UL,
         logical_dataset_bytes = 0UL,
         max_logical_dataset_bytes_seen = 0UL,
-        chunk_index_count = 0UL,
+        accounted_chunk_count = 0UL,
+        chunk_count_exceeded = 0UB,
         has_dataspace = 0UB,
         has_datatype = 0UB,
         has_dataset_layout = 0UB,
@@ -272,6 +277,39 @@ fun h5policy_account_metadata = (H5WalkContext ctx,
                                         loc, object,
                                         "accounted metadata byte budget exceeded");
     ctx.metadata_seen = next;
+    return ctx;
+}
+
+/* Claim one or more chunks against the file-wide resource ceiling.  The
+   reported counter saturates at the ceiling, while chunk_count_exceeded keeps
+   the otherwise-lost distinction between exact equality and proven overflow.
+   Emit the resource finding only for the first proof of overflow. */
+fun h5policy_count_chunks = (H5WalkContext ctx,
+                             H5PolicyProfile profile,
+                             uint<64> chunks,
+                             off64 loc,
+                             string object,
+                             string message) H5WalkContext:
+{
+    var limit = profile.resources.max_chunk_count;
+    var exceeds = chunks > limit;
+
+    h5policy_walk_tick(1UL);
+    if (!exceeds
+        && ctx.accounted_chunk_count > limit - chunks)
+        exceeds = 1;
+
+    if (exceeds)
+        {
+            if (ctx.chunk_count_exceeded == 0UB)
+                h5policy_emit_error("H5_RESOURCE_CHUNK_COUNT", "resource",
+                                    loc, object, message);
+            ctx.accounted_chunk_count = limit;
+            ctx.chunk_count_exceeded = 1UB;
+        }
+    else
+        ctx.accounted_chunk_count = ctx.accounted_chunk_count + chunks;
+
     return ctx;
 }
 
@@ -459,13 +497,8 @@ fun h5policy_note_chunk_index_addr = (H5WalkContext ctx,
     if (addr == 0UL || addr == 0xffffffffffffffffUL)
         return ctx;
 
-    ctx.chunk_index_count =
-        h5policy_checked_add_u64(ctx.chunk_index_count, 1UL,
-                                 profile.resources.max_chunk_count,
-                                 "H5_RESOURCE_CHUNK_COUNT",
-                                 "resource",
-                                 loc, object,
-                                 "chunk index budget exceeded");
+    ctx = h5policy_count_chunks(ctx, profile, 1UL, loc, object,
+                                "chunk index budget exceeded");
 
     h5policy_note_btree_addr(profile, addr, loc, object,
                              "chunk index traversal is bounded but not decoded yet");
