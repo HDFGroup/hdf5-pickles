@@ -75,12 +75,12 @@ For an implementation-level reference covering every current profile field,
 including its scope, sentinel behavior, finding class, and test coverage, see
 [`H5PolicyProfile`: Current Semantics](docs/H5PolicyProfile.md).
 
-| Profile            | Mapping     | Resource budgets | Feature policy                         |
-| ------------------ | ----------- | ---------------- | -------------------------------------- |
-| `legacy`           | strict      | unlimited        | all features allowed                   |
-| `trusted-fast`     | strict      | generous         | external refs / VDS / filters allowed  |
-| `untrusted-strict` | strict      | tight            | denied by default                      |
-| `forensic`         | non-strict  | unlimited        | never follows refs; reports anomalies  |
+| Profile            | Mapping     | Resource / analysis budgets          | Feature policy                         |
+| ------------------ | ----------- | ------------------------------------ | -------------------------------------- |
+| `legacy`           | strict      | unlimited data; bounded analysis     | all features allowed                   |
+| `trusted-fast`     | strict      | generous; bounded analysis           | external refs / VDS / filters allowed  |
+| `untrusted-strict` | strict      | tight                                | denied by default                      |
+| `forensic`         | non-strict  | deep but bounded                     | never follows refs; reports anomalies  |
 
 Examples:
 
@@ -141,10 +141,9 @@ crashes on them:
   `libhdf5` versions during dense iteration (e.g. an invalid free in
   `H5G__link_release_table`) while h5policy can only answer "unsupported." The
   coverage gap is still a refusal, not an accept: a consumer honoring it will
-  not process the file. Regression note: because the differential harness treats
-  a `libhdf5` crash as "must be `reject_corrupt`," these files cannot be pinned
-  as `coverage_gap` corpus fixtures — a filtered heap that `h5py` cannot
-  traverse reads as a rejection under invariant A'.
+  not process the file. The differential harness accepts that explicit refusal
+  under invariant A' while retaining a classification warning when libhdf5
+  rejects the same file as corrupt.
 
 ## Companion Tools
 

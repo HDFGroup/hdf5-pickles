@@ -69,12 +69,14 @@ fun h5policy_apply_run_mode = (H5PolicyProfile profile) void:
     else if (h5policy_mapping_arg == "non_strict")
         h5policy_nonstrict = 1;
     else
-        h5policy_nonstrict = (profile.analysis.forensic_mode != 0UB) ? 1 : 0;
+        h5policy_nonstrict =
+            (profile.analysis.default_nonstrict_mapping != 0UB) ? 1 : 0;
 
     if (h5policy_continue_arg == "yes")
         h5policy_continue = 1;
     else
-        h5policy_continue = (profile.analysis.forensic_mode != 0UB) ? 1 : 0;
+        h5policy_continue =
+            (profile.analysis.default_continue_after_corruption != 0UB) ? 1 : 0;
 }
 
 fun h5policy_mapping_mode = string:
@@ -87,9 +89,25 @@ fun h5policy_mapping_mode = string:
 fun h5policy_run = void:
 {
     h5policy_reset_findings;
+    h5policy_reset_traversal_state;
 
     var profile = h5policy_profile;
+    var profile_error = h5policy_profile_validation_error(profile);
+    if (profile_error != "")
+        {
+            h5policy_emit_error("H5_INTERNAL_INVALID_PROFILE", "internal",
+                                0UL#B, "profile", profile_error);
+            h5policy_print_json_report(h5policy_profile_name,
+                                       h5policy_file_name, "strict",
+                                       0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL,
+                                       0UL, 0UL, 0UL);
+            printf("__H5POLICY_EXIT_CODE=%u32d\n",
+                   h5policy_exit_code as uint<32>);
+            return;
+        }
+
     h5policy_apply_run_mode(profile);
+    h5policy_walk_operation_limit = profile.analysis.max_walk_operations;
     var walk_start = gettime;
     h5policy_walk_deadline = walk_start[0] + (profile.analysis.max_walk_seconds as int<64>);
     var mode = h5policy_mapping_mode;
@@ -123,23 +141,28 @@ fun h5policy_run = void:
                                                                    ext_addr);
                         }
 
-                    /* Forensic mode also sweeps for structures outside the
-                       reachable graph, such as orphaned global heap
-                       collections that would hang a reader (see
-                       h5policy_forensic_gcol_sweep).  */
-                    if (profile.analysis.forensic_mode != 0UB)
-                        h5policy_forensic_gcol_sweep(ios, profile);
+                    /* When selected independently by the profile, also sweep
+                       for structures outside the reachable graph, such as
+                       orphaned global heap collections that would hang a
+                       reader (see h5policy_unreachable_gcol_sweep).  */
+                    if (profile.analysis.sweep_unreachable_metadata != 0UB)
+                        h5policy_unreachable_gcol_sweep(ios, profile);
                 }
         }
     catch (Exception e)
         {
-            /* The walk-operation budget fired: the reachable graph is too large
-               or complex to fully vet within this profile's ceiling.  That is a
-               coverage limit, not a corruption verdict.  */
-            if (e.code == H5POLICY_EC_WALK_BUDGET as int<32>)
-                h5policy_emit_error("H5_UNSUPPORTED_WALK_BUDGET", "unsupported",
+            /* A walk budget fired: the reachable graph is too large or complex
+               to fully vet within this profile's ceiling.  That is a coverage
+               limit, not a corruption verdict.  */
+            if (e.code == H5POLICY_EC_WALK_OPERATION_BUDGET as int<32>)
+                h5policy_emit_error("H5_UNSUPPORTED_WALK_OPERATION_BUDGET",
+                                    "unsupported", 0UL#B, "metadata",
+                                    "file exceeds the selected profile's deterministic walk operation budget");
+            else if (e.code == H5POLICY_EC_WALK_TIME_BUDGET as int<32>)
+                h5policy_emit_error("H5_UNSUPPORTED_WALK_TIME_BUDGET",
+                                    "unsupported",
                                     0UL#B, "metadata",
-                                    "file too large or complex to fully analyze within the walk operation budget");
+                                    "file exceeds the selected profile's wall-clock walk budget");
             /* Only exceptions that arise from mapping attacker-controlled
                bytes/offsets mean "the file is corrupt/hostile".  Anything
                else is a defect in this validator and must surface as

@@ -18,21 +18,54 @@ selects one value for a run.
 - `limits` (`H5PolicyLimits`) contains hard numeric resource, shape, and depth
   ceilings;
 - `heuristics` (`H5PolicyHeuristics`) contains the tiny-chunk and metadata-ratio
-  thresholds, plus the currently unused filter-expansion threshold;
+  thresholds;
 - `features` (`H5PolicyFeaturePolicy`) contains the six `allow_*` switches; and
-- `analysis` (`H5PolicyAnalysis`) contains the walk deadline and
-  `forensic_mode`.
+- `analysis` (`H5PolicyAnalysis`) contains deterministic and wall-clock walk
+  budgets plus three
+  independent run-analysis controls.
 
 This grouping is organizational. It did not change any preset value,
 comparison, sentinel convention, finding, or validator control-flow decision.
 The field descriptions below generally use the leaf field name; validator code
 accesses it through the group shown above.
 
+### Semantic normalization from the characterized model
+
+The subsequent field-by-field cleanup made these intentional API and behavior
+changes:
+
+- removed the unenforced `max_filter_expansion_ratio` field;
+- renamed `max_metadata_bytes` to `max_accounted_metadata_bytes` and
+  `max_single_allocation_bytes` to `max_single_value_bytes`;
+- renamed `min_logical_chunk_count` to
+  `max_chunks_below_min_logical_bytes`;
+- split `forensic_mode` into the three independent analysis controls documented
+  below;
+- added deterministic `max_walk_operations` and independent
+  `max_filter_parameter_recursion_depth` limits;
+- added profile validation for booleans, percentages, paired rules, walk
+  budgets, and rank; and
+- classified configurable depth ceilings as resource limits rather than proof
+  of corrupt HDF5.
+
+Finding identifiers were normalized with the fields:
+
+| Former finding | Current finding |
+| --- | --- |
+| `H5_RESOURCE_METADATA_BYTES` | `H5_RESOURCE_ACCOUNTED_METADATA_BYTES` |
+| `H5_RESOURCE_SINGLE_ALLOCATION_BYTES` | `H5_RESOURCE_SINGLE_VALUE_BYTES` |
+| `H5_CORRUPT_BTREE_DEPTH_EXCEEDED` | `H5_RESOURCE_BTREE_DEPTH` |
+| `H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED` | `H5_RESOURCE_LINK_TRAVERSAL_DEPTH` |
+| `H5_CORRUPT_DATATYPE_RECURSION_LIMIT` | `H5_RESOURCE_DATATYPE_RECURSION_DEPTH` |
+| `H5_CORRUPT_NBIT_PARAMS_RECURSION` | `H5_RESOURCE_FILTER_PARAMETER_RECURSION_DEPTH` |
+| `H5_UNSUPPORTED_WALK_BUDGET` | `H5_UNSUPPORTED_WALK_TIME_BUDGET` |
+
 ## General behavior
 
-There is currently no profile-validation step. Callers constructing another
-`H5PolicyProfile` value are responsible for using meaningful percentages,
-boolean values, sentinel values, and relationships between fields.
+`h5policy_profile_validation_error` validates a profile before file I/O. An
+invalid selected profile emits `H5_INTERNAL_INVALID_PROFILE`, prints a normal
+report, and returns without opening or validating the input file. Callers that
+construct profiles directly can use `h5policy_profile_is_valid` first.
 
 ### Comparisons and saturation
 
@@ -49,13 +82,13 @@ The sentinel conventions are not uniform:
 
 - `0xffffffffffffffffUL` is used as the practical unlimited value for most
   counters and byte maxima.
-- `0` disables `max_single_allocation_bytes` and the metadata-ratio percentage
+- `0` disables `max_single_value_bytes` and the metadata-ratio percentage
   rules.
 - `0` disables the tiny-chunk rule only when used for
-  `min_logical_chunk_bytes`; `min_logical_chunk_count = 0` by itself does not
-  disable that rule.
-- `max_walk_seconds = 0` does not disable the deadline.
-- `max_filter_expansion_ratio` is not read, so its value has no effect.
+  `min_logical_chunk_bytes`; `max_chunks_below_min_logical_bytes = 0` by itself
+  does not disable that rule.
+- `max_walk_seconds = 0` is invalid configuration.
+- `max_walk_operations = 0` is invalid configuration.
 
 ### Findings and control flow
 
@@ -88,30 +121,31 @@ that the enforcement site explicitly treats zero as off.
 
 | Field | `untrusted-strict` | `forensic` | `trusted-fast` | `legacy` |
 | --- | ---: | ---: | ---: | ---: |
-| `max_metadata_bytes` | 256 MiB | 1 GiB | 4 GiB | `UINT64_MAX` |
+| `max_accounted_metadata_bytes` | 256 MiB | 1 GiB | 4 GiB | `UINT64_MAX` |
 | `max_logical_dataset_bytes` | 64 GiB | `UINT64_MAX` | 16 TiB | `UINT64_MAX` |
-| `max_single_allocation_bytes` | 1 GiB | disabled | disabled | disabled |
+| `max_single_value_bytes` | 1 GiB | disabled | disabled | disabled |
 | `max_object_count` | 100,000 | 1,000,000 | 10,000,000 | `UINT64_MAX` |
 | `max_attribute_count` | 100,000 | 1,000,000 | 10,000,000 | `UINT64_MAX` |
 | `max_object_header_chunks` | 1,024 | 4,096 | 65,536 | `UINT64_MAX` |
 | `max_btree_depth` | 64 | 128 | 128 | `UINT64_MAX` |
 | `max_link_traversal_depth` | 64 | 128 | 128 | 128 |
 | `max_datatype_recursion_depth` | 64 | 128 | 128 | 128 |
+| `max_filter_parameter_recursion_depth` | 64 | 128 | 128 | 128 |
 | `max_chunk_count` | 10,000,000 | `UINT64_MAX` | `UINT64_MAX` | `UINT64_MAX` |
 | `min_logical_chunk_bytes` | 4 KiB | 0 | 0 | 0 |
-| `min_logical_chunk_count` | 4,096 | 0 | 0 | 0 |
+| `max_chunks_below_min_logical_bytes` | 4,096 | 0 | 0 | 0 |
 | `max_filter_count` | 32 | 64 | 64 | `UINT64_MAX` |
-| `max_filter_expansion_ratio` | 100 | 0 | 0 | 0 |
-| `max_rank` | 32 | 64 | 64 | `UINT64_MAX` |
+| `max_rank` | 32 | 32 | 32 | 32 |
 | `metadata_ratio_warn_percent` | 50 | 0 | 75 | 0 |
 | `metadata_ratio_warn_min_bytes` | 1 MiB | 0 | 16 MiB | 0 |
 | `metadata_ratio_reject_percent` | 75 | 0 | 0 | 0 |
 | `metadata_ratio_reject_min_bytes` | 16 MiB | 0 | 0 | 0 |
+| `max_walk_operations` | 10,000,000 | 50,000,000 | 50,000,000 | 100,000,000 |
 | `max_walk_seconds` | 10 | 30 | 20 | 60 |
 
 ## Counter and byte limits
 
-### `max_metadata_bytes`
+### `max_accounted_metadata_bytes`
 
 This limits `H5WalkContext.metadata_seen`, a file-wide accumulator shared by the
 main reachable-metadata walk. Each explicit accounting call adds a declared or
@@ -119,7 +153,7 @@ calculated metadata-structure size. If the addition would exceed the limit,
 the counter becomes the limit and h5policy emits:
 
 ```text
-H5_RESOURCE_METADATA_BYTES (resource)
+H5_RESOURCE_ACCOUNTED_METADATA_BYTES (resource)
 ```
 
 An accounting failure does not immediately stop the validator that made the
@@ -175,7 +209,7 @@ profile multiplication is evaluated.
 
 Zero is an active zero-byte limit. Unlimited presets use `UINT64_MAX`.
 
-### `max_single_allocation_bytes`
+### `max_single_value_bytes`
 
 This field currently applies to three declared sizes:
 
@@ -187,13 +221,13 @@ This field currently applies to three declared sizes:
 Each over-limit case emits:
 
 ```text
-H5_RESOURCE_SINGLE_ALLOCATION_BYTES (resource)
+H5_RESOURCE_SINGLE_VALUE_BYTES (resource)
 ```
 
 The payload or datatype validator continues after emitting the finding. The
-field does not currently constrain every mapping or every allocation a consumer
-might perform; in particular, its name does not imply a general maximum mapping
-size inside h5policy.
+field does not constrain raw dataset extents, general mapping sizes, or every
+allocation a consumer might perform; it is specifically a ceiling on one
+declared value handled at these three sites.
 
 Zero explicitly disables all three checks.
 
@@ -304,10 +338,12 @@ The check is `depth > max_btree_depth`, so depth equal to the limit is allowed.
 Exceeding it emits:
 
 ```text
-H5_CORRUPT_BTREE_DEPTH_EXCEEDED (corrupt)
+H5_RESOURCE_BTREE_DEPTH (resource)
 ```
 
-and returns from that tree branch. The field does not constrain every structure
+and returns from that tree branch. A tree can be valid HDF5 while exceeding the
+selected profile's analysis budget, so this finding does not claim corruption.
+The field does not constrain every structure
 that contains an on-disk B-tree depth. For example, the partial v2 chunk-index
 B-tree validator validates a header and root but does not recursively descend
 arbitrary internal nodes through this field.
@@ -326,38 +362,48 @@ The limit is checked both before enqueueing a child and again when dequeuing an
 object. The comparison is `depth > max_link_traversal_depth`. Exceeding it emits:
 
 ```text
-H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED (corrupt)
+H5_RESOURCE_LINK_TRAVERSAL_DEPTH (resource)
 ```
 
 The enqueue check declines to queue that target; the dequeue check skips the
-object. Zero permits only depth-zero objects. `UINT64_MAX` would be effectively
-unlimited, although no built-in profile uses it.
+object. A deeper valid link graph is therefore rejected as a resource-policy
+choice rather than corruption. Zero permits only depth-zero objects.
+`UINT64_MAX` would be effectively unlimited, although no built-in profile uses
+it.
 
 ### `max_datatype_recursion_depth`
 
-This bounds recursive datatype parsing and also the recursive walk of n-bit
-filter datatype parameters. Datatype messages have both a bounded iterative
-preflight for long single-child chains and the full recursive validator; both
-use the same profile field.
+This bounds recursive datatype parsing. Datatype messages have both a bounded
+iterative preflight for long single-child chains and the full recursive
+validator; both use this field.
 
 The check is `depth > max_datatype_recursion_depth`. A datatype over the limit
 emits:
 
 ```text
-H5_CORRUPT_DATATYPE_RECURSION_LIMIT (corrupt)
+H5_RESOURCE_DATATYPE_RECURSION_DEPTH (resource)
 ```
 
-and stops validating that datatype. An n-bit parameter tree over the limit
-instead emits:
+and stops validating that datatype. The configured ceiling is validator
+self-protection, so exceeding it does not by itself establish malformed HDF5.
+
+Zero permits only the depth-zero outer datatype. No built-in profile uses an
+unlimited value.
+
+### `max_filter_parameter_recursion_depth`
+
+This independently bounds the recursive walk of n-bit filter datatype
+parameters. A parameter tree over the limit emits:
 
 ```text
-H5_CORRUPT_NBIT_PARAMS_RECURSION (corrupt)
+H5_RESOURCE_FILTER_PARAMETER_RECURSION_DEPTH (resource)
 ```
 
-and returns its poison/failure value to the pipeline validator.
+and returns its poison/failure value to the pipeline validator. As with datatype
+depth, this is a resource-policy ceiling rather than a format-validity claim.
 
-Zero permits only the depth-zero outer datatype or parameter node. No built-in
-profile uses an unlimited value.
+Zero permits only the depth-zero outer parameter node. No built-in profile uses
+an unlimited value.
 
 ### `max_rank`
 
@@ -370,12 +416,12 @@ updates `max_rank_seen`, then applies two checks:
    `H5_RESOURCE_DATASPACE_RANK`.
 
 The profile finding is a resource finding and does not stop dimension parsing.
-Because the fixed check is also applied, built-in profile values of 32 or more
-do not cause a resource-only rejection for ranks above the fixed ceiling.
+All built-ins use 32. Profile validation rejects a value above the fixed
+ceiling, since it cannot make a rank accepted that the format/library check
+rejects. A custom lower value remains useful as a stricter resource policy.
 
 Zero permits rank-zero scalar/null dataspaces but treats every positive rank as
-over the resource limit. `UINT64_MAX` disables only the profile-level check in
-practice; the fixed rank check still applies.
+over the resource limit.
 
 ### `max_filter_count`
 
@@ -395,20 +441,14 @@ pipeline validator.
 Zero rejects every nonempty pipeline as a resource shape. `UINT64_MAX` is
 effectively unlimited.
 
-### `max_filter_expansion_ratio`
-
-No validator reads this field. It has no trigger, finding, metric, or control
-flow effect in the current implementation. In particular, filtered chunk
-metadata is not compared with this value.
-
 ## Compound resource rules
 
 ### Tiny logical chunks
 
-`min_logical_chunk_bytes` and `min_logical_chunk_count` form one per-dataset
-rule. It is evaluated only after h5policy knows a chunked layout, dataspace,
-datatype, non-overflowed dataset element count, nonzero chunk element count, and
-nonzero datatype logical size.
+`min_logical_chunk_bytes` and `max_chunks_below_min_logical_bytes` form one
+per-dataset rule. It is evaluated only after h5policy knows a chunked layout,
+dataspace, datatype, non-overflowed dataset element count, nonzero chunk element
+count, and nonzero datatype logical size.
 
 h5policy derives:
 
@@ -423,7 +463,7 @@ The finding is emitted only when all of the following are true:
 min_logical_chunk_bytes != 0
 logical chunk bytes < min_logical_chunk_bytes
 dataset element count != 0
-estimated chunks > min_logical_chunk_count
+estimated chunks > max_chunks_below_min_logical_bytes
 ```
 
 The finding is:
@@ -434,8 +474,10 @@ H5_RESOURCE_CHUNK_TOO_SMALL (resource)
 
 It does not stop dataset validation. Equality at either byte or count threshold
 does not trigger the rule. Setting `min_logical_chunk_bytes` to zero disables
-the complete rule. Setting only `min_logical_chunk_count` to zero means any
-positive estimated count can satisfy the count side of the rule.
+the complete rule, and a valid profile must then set the companion count
+threshold to zero as well. Setting only
+`max_chunks_below_min_logical_bytes` to zero while keeping the byte threshold
+enabled means any positive estimated count can satisfy the count side.
 
 ### Reachable-metadata ratios
 
@@ -473,13 +515,35 @@ H5_ADVISORY_METADATA_RATIO (warning)
 ```
 
 Both the absolute floor and percentage comparisons are strict `>` comparisons.
-A zero percentage disables its rule regardless of the corresponding minimum.
-A zero minimum does not disable a nonzero-percentage rule. A zero denominator
-causes the percentage helper to return false.
+A zero percentage disables its rule and requires the corresponding minimum to
+also be zero. A zero minimum does not disable a nonzero-percentage rule. A zero
+denominator causes the percentage helper to return false.
+
+Percentages must be at most 100. When both rules are enabled, the reject rule
+must be at least as strict in both percentage and byte floor and strictly
+stronger in at least one. Profile validation rejects redundant or weaker reject
+rules.
 
 The post-walk check runs after the top-level try/catch, so it can add a ratio
 finding even when another finding or caught exception has already determined
 the final decision.
+
+### `max_walk_operations`
+
+Every `h5policy_walk_tick` call charges an abstract cost for work such as
+bounded reads, checked arithmetic, recursive steps, and linear visited-set
+searches. The configured maximum is inclusive. A charge that would exceed it
+saturates `walk_operations` at the limit and raises a distinguished exception;
+the top-level handler emits:
+
+```text
+H5_UNSUPPORTED_WALK_OPERATION_BUDGET (unsupported)
+```
+
+This deterministic budget makes the same validation workload stop at the same
+charged cost regardless of machine speed. Zero is invalid profile
+configuration. `UINT64_MAX` is practically unlimited, although no built-in
+profile uses it.
 
 ### `max_walk_seconds`
 
@@ -496,12 +560,13 @@ Exceeding the deadline raises a distinguished internal exception. The top-level
 handler converts it to:
 
 ```text
-H5_UNSUPPORTED_WALK_BUDGET (unsupported)
+H5_UNSUPPORTED_WALK_TIME_BUDGET (unsupported)
 ```
 
-and normal validation does not resume. `max_walk_seconds = 0` sets the deadline
-to the current integer second; it does not disable deadline checking. Internal
-callers such as h5patch disable the in-pickle deadline by directly assigning
+and normal validation does not resume. `max_walk_seconds` must be between 1 and
+2,147,483,647, keeping signed deadline arithmetic bounded; profile validation
+rejects other values before file I/O. Internal callers such as h5patch disable
+the in-pickle deadline by directly assigning
 `h5policy_walk_deadline = 0`, outside `H5PolicyProfile`.
 
 The shell wrapper has a second, independent hard timeout: 20 seconds for the
@@ -512,8 +577,8 @@ legacy. If that timeout kills poke, the wrapper produces
 
 ## Built-in feature and mode presets
 
-All fields are `uint<8>`. Enforcement sites treat zero as false and nonzero as
-true; there is no validation restricting a custom value to exactly zero or one.
+All fields are `uint<8>` and valid profiles restrict them to exactly zero or
+one. Enforcement sites therefore receive canonical boolean values.
 
 | Field | `untrusted-strict` | `forensic` | `trusted-fast` | `legacy` |
 | --- | ---: | ---: | ---: | ---: |
@@ -523,7 +588,9 @@ true; there is no validation restricting a custom value to exactly zero or one.
 | `allow_dynamic_filters` | 0 | 0 | 1 | 1 |
 | `allow_unknown_messages` | 0 | 1 | 1 | 1 |
 | `allow_legacy_dangerous_messages` | 0 | 0 | 0 | 1 |
-| `forensic_mode` | 0 | 1 | 0 | 0 |
+| `default_nonstrict_mapping` | 0 | 1 | 0 | 0 |
+| `default_continue_after_corruption` | 0 | 1 | 0 | 0 |
+| `sweep_unreachable_metadata` | 0 | 1 | 0 | 0 |
 
 ### `allow_external_links`
 
@@ -623,53 +690,56 @@ H5_POLICY_LEGACY_DANGEROUS_MESSAGE (policy)
 When nonzero, that policy finding is suppressed. There is no corresponding
 feature counter in the JSON report.
 
-### `forensic_mode`
+### Analysis controls
 
-This field currently has three effects:
+`default_nonstrict_mapping` selects the mapping default when neither
+`--strict` nor `--non-strict` is supplied. Nonzero selects non-strict Poke
+mappings (`@!`); zero selects strict mappings (`@`).
 
-1. In the absence of a CLI mapping override, nonzero selects non-strict Poke
-   mappings (`@!`) and zero selects strict mappings (`@`).
-2. In the absence of `--continue-after-corruption`, nonzero enables continued
-   walking after a rejection and zero uses early exit between queued objects.
-3. After the reachable walk, nonzero enables the raw-file GCOL signature sweep
-   used to find orphaned global-heap zero-advance loops.
+`default_continue_after_corruption` independently selects whether the main
+walk continues between queued objects after a rejection when
+`--continue-after-corruption` is absent. The CLI flag can enable continuation
+for any profile.
 
-`--strict` or `--non-strict` can override the first default, and
-`--continue-after-corruption` can enable the second behavior for another
-profile. Those overrides do not disable or enable the GCOL sweep; the sweep is
-still controlled directly by `forensic_mode`.
+`sweep_unreachable_metadata` independently enables the raw-file GCOL signature
+sweep after the reachable walk. The sweep finds orphaned global-heap
+zero-advance loops and is not affected by either CLI override.
+
+The forensic preset enables all three fields. Splitting them makes their
+independent effects explicit without changing any built-in profile behavior.
 
 ## Current test coverage
 
 [`unit_limits.pk`](../tests/unit_limits.pk) constructs an independent copy of
 the strict profile, reduces one or two fields at a time, and drives synthetic
 in-memory metadata through the ordinary enforcement helpers. It also snapshots
-all 27 fields of each of the four built-in profiles. It characterizes current
+all 30 fields of each of the four built-in profiles. It characterizes current
 behavior without requiring production-scale files. The generated corpus
 remains the end-to-end and libhdf5-facing layer.
 
 | Field or rule | Current direct coverage |
 | --- | --- |
 | Built-in profile values | Every field in all four presets is compared with its documented value. The copy helper reconstructs every nested group, preventing test mutations from aliasing a shipped preset. |
-| `max_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. |
+| `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. |
 | `max_attribute_count` | A valid synthetic attribute is parsed at and above a reduced cumulative limit. |
 | `max_object_header_chunks` | A synthetic continuation message covers equality, over-limit saturation, and the fact that its later structural finding is independent. |
 | `max_chunk_count` | Defined chunk-index references cover equality and over-limit saturation; full index-format stopping behavior remains integration coverage. |
-| `max_single_allocation_bytes` | A fill value covers equality, over-limit resource classification, and zero-as-disabled. The datatype-size and attribute-value enforcement sites are not separately crossed. |
+| `max_single_value_bytes` | Fill values cover equality, over-limit resource classification, and zero-as-disabled; separate valid datatype and attribute blobs cross the other two enforcement sites. |
 | `max_logical_dataset_bytes` | Synthetic dataset facts cover equality and saturation. `resource/huge_logical_dataset.h5` requires the resource finding, and the same file is accepted under legacy. |
-| Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, and zero-byte disabling. `resource/tiny_chunks.h5` supplies end-to-end coverage. |
-| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the corrupt finding and early branch return. |
-| `max_link_traversal_depth` | Synthetic queue operations cover equality, the corrupt over-limit finding, and declining to enqueue the child. |
-| `max_datatype_recursion_depth` | `unit_datatype.pk` covers deep VLen and compound nesting; the CVE fixture also requires the recursion finding under legacy. |
-| `max_rank` | A valid rank-two dataspace covers equality and resource-only rejection below the fixed rank ceiling. |
+| Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, zero-byte disabling, and validation of the disabled pair. `resource/tiny_chunks.h5` supplies end-to-end coverage. |
+| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. |
+| `max_link_traversal_depth` | Synthetic queue operations cover equality, the resource over-limit finding, and declining to enqueue the child. |
+| `max_datatype_recursion_depth` | `unit_datatype.pk` covers deep VLen and compound nesting as resource rejection; the CVE fixture requires the same finding under legacy. |
+| `max_filter_parameter_recursion_depth` | A direct recursive call above a zero limit covers the resource finding and poison return; malformed n-bit parameter bounds and classes retain their synthetic coverage. |
+| `max_rank` | A valid rank-two dataspace covers equality and resource-only rejection below the fixed rank ceiling; profile validation rejects ceilings above 32. |
 | `max_filter_count` | A valid two-filter pipeline covers equality, resource classification, and continued descriptor parsing. |
-| Metadata-ratio rules | Synthetic counters cover the strict absolute/percentage boundaries, warning behavior, reject behavior, and reject-over-warning precedence. |
+| Metadata-ratio rules | Synthetic counters cover the strict absolute/percentage boundaries, warning behavior, reject behavior, and reject-over-warning precedence. Profile checks cover percentage bounds, disabled-rule floors, and warning/reject ordering. |
 | `allow_external_links`, `allow_external_storage`, `allow_vds`, `allow_dynamic_filters` | Each zero/nonzero policy branch and feature counter is covered synthetically. External-link and EFL corpus cases also compare restrictive and permissive profiles; VDS has a permissive source-path corpus case. |
 | `allow_unknown_messages` | Synthetic message policy covers denied-as-policy and allowed-as-unsupported behavior. |
 | `allow_legacy_dangerous_messages` | Synthetic message policy covers both zero and nonzero behavior. |
-| `forensic_mode` | Unit checks cover default mapping/continuation behavior and CLI mapping overrides. Forensic corpus cases exercise non-strict diagnostics, and the orphaned-GCOL fixture exercises the forensic-only sweep. |
-| `max_walk_seconds` | The four current preset values are snapshotted; deadline expiry is not induced because it is clock-dependent. |
-| `max_filter_expansion_ratio` | The four current preset values are snapshotted, but no enforcement exists to exercise. |
+| Analysis controls | Unit checks cover independent mapping and continuation defaults plus CLI overrides. Forensic corpus cases exercise non-strict diagnostics, and the orphaned-GCOL fixture exercises the unreachable-metadata sweep. |
+| `max_walk_operations` | Unit checks cover the inclusive boundary, saturated metric, distinguished exception, zero rejection, and all four preset values. |
+| `max_walk_seconds` | The four current preset values are snapshotted, all built-ins are validated, and zero/overflowing values are rejected directly. An already-expired synthetic deadline covers the distinguished time-budget exception. |
 
 The authoritative corpus decisions and required findings are in
 [`tests/expected`](../tests/expected). The two synthetic layers are

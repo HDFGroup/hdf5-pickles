@@ -13,8 +13,8 @@ controlled outcome; a change that alters any decision is surfaced for review.
   datatype validator (recursion cap and truncation handling), run under poke.
 - `unit_limits.pk` — reduced-limit, in-memory characterization checks for the
   current `H5PolicyProfile` boundaries, complete built-in preset values,
-  saturation, finding classes, compound rules, feature switches, and run-mode
-  defaults.
+  saturation, finding classes, profile validation, deterministic walk budgets,
+  compound rules, feature switches, and run-mode defaults.
 - `valid/ malformed/ policy/ resource/ coverage/ cve/` — generated fixtures
   (git-ignored build output; see below).
 
@@ -42,9 +42,11 @@ if `poke` or `python3` + `h5py` are unavailable.
 - **h5dump** / **h5debug** are independent "does `libhdf5` accept these bytes"
   signals (optional; skipped if not on `PATH`).
 
-It fails if h5policy accepts a file that `libhdf5` structurally rejects, calls a
-structurally valid file corrupt with no deeper `libhdf5` evidence, disagrees on
-external references, or over-counts a dataset's **rank**. A `reject_corrupt` on a
+It fails if h5policy accepts a file that `libhdf5` structurally rejects, returns
+an internal error instead of a safe refusal, calls a structurally valid file
+corrupt with no deeper `libhdf5` evidence, disagrees on external references, or
+over-counts a dataset's **rank**. A policy, resource, or coverage refusal where
+libhdf5 rejects is safe but retained as a classification warning. A `reject_corrupt` on a
 file that h5py can structurally traverse is downgraded to an `A+` warning when a
 bounded, out-of-process `libhdf5` probe also errors while inspecting attributes,
 reading small datasets, or running optional `libhdf5` tools; those eager catches

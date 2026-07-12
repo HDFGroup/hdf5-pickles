@@ -75,11 +75,11 @@ fun clone_policy_profile = (H5PolicyProfile profile) H5PolicyProfile:
     {
         limits = H5PolicyLimits
         {
-            max_metadata_bytes = profile.limits.max_metadata_bytes,
+            max_accounted_metadata_bytes = profile.limits.max_accounted_metadata_bytes,
             max_logical_dataset_bytes
                 = profile.limits.max_logical_dataset_bytes,
-            max_single_allocation_bytes
-                = profile.limits.max_single_allocation_bytes,
+            max_single_value_bytes
+                = profile.limits.max_single_value_bytes,
             max_object_count = profile.limits.max_object_count,
             max_attribute_count = profile.limits.max_attribute_count,
             max_object_header_chunks
@@ -89,6 +89,8 @@ fun clone_policy_profile = (H5PolicyProfile profile) H5PolicyProfile:
                 = profile.limits.max_link_traversal_depth,
             max_datatype_recursion_depth
                 = profile.limits.max_datatype_recursion_depth,
+            max_filter_parameter_recursion_depth
+                = profile.limits.max_filter_parameter_recursion_depth,
             max_chunk_count = profile.limits.max_chunk_count,
             max_filter_count = profile.limits.max_filter_count,
             max_rank = profile.limits.max_rank
@@ -97,10 +99,8 @@ fun clone_policy_profile = (H5PolicyProfile profile) H5PolicyProfile:
         {
             min_logical_chunk_bytes
                 = profile.heuristics.min_logical_chunk_bytes,
-            min_logical_chunk_count
-                = profile.heuristics.min_logical_chunk_count,
-            max_filter_expansion_ratio
-                = profile.heuristics.max_filter_expansion_ratio,
+            max_chunks_below_min_logical_bytes
+                = profile.heuristics.max_chunks_below_min_logical_bytes,
             metadata_ratio_warn_percent
                 = profile.heuristics.metadata_ratio_warn_percent,
             metadata_ratio_warn_min_bytes
@@ -122,8 +122,14 @@ fun clone_policy_profile = (H5PolicyProfile profile) H5PolicyProfile:
         },
         analysis = H5PolicyAnalysis
         {
+            max_walk_operations = profile.analysis.max_walk_operations,
             max_walk_seconds = profile.analysis.max_walk_seconds,
-            forensic_mode = profile.analysis.forensic_mode
+            default_nonstrict_mapping
+                = profile.analysis.default_nonstrict_mapping,
+            default_continue_after_corruption
+                = profile.analysis.default_continue_after_corruption,
+            sweep_unreachable_metadata
+                = profile.analysis.sweep_unreachable_metadata
         }
     };
 }
@@ -139,6 +145,7 @@ fun reset_limit_case = void:
     h5policy_reset_findings;
     h5policy_reset_traversal_state;
     h5policy_walk_deadline = 0L;
+    h5policy_walk_operation_limit = 0xffffffffffffffffUL;
     h5policy_eof = 0UL;
     h5policy_nonstrict = 0;
     h5policy_continue = 0;
@@ -160,6 +167,22 @@ var LIMIT_ATTRIBUTE =
      0UB, 0UB, 32UB, 0UB,
      2UB, 0UB, 0UB, 0UB,
      1UB, 2UB, 3UB, 4UB];
+
+/* Valid rank-one attribute with four one-byte elements.  This separates the
+   four-byte attribute value from the one-byte datatype element limit.  */
+var LIMIT_ATTRIBUTE_VALUE_4 =
+    [2UB, 0UB, 2UB, 0UB, 12UB, 0UB, 12UB, 0UB,
+     97UB, 0UB,
+     16UB, 0UB, 0UB, 0UB, 1UB, 0UB, 0UB, 0UB,
+     0UB, 0UB, 8UB, 0UB,
+     2UB, 1UB, 0UB, 1UB,
+     4UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     1UB, 2UB, 3UB, 4UB];
+
+/* Valid fixed-point datatype with a four-byte stored element.  */
+var LIMIT_DATATYPE_VALUE_4 =
+    [16UB, 0UB, 0UB, 0UB, 4UB, 0UB, 0UB, 0UB,
+     0UB, 0UB, 32UB, 0UB];
 
 /* One v1 continuation message.  The zero continuation size is deliberately
    corrupt, but the continuation counter is charged before that structural
@@ -219,6 +242,28 @@ fun run_limit_attribute = (H5PolicyProfile profile,
     return ctx;
 }
 
+fun run_limit_wide_attribute = (H5PolicyProfile profile,
+                                 H5WalkContext ctx) H5WalkContext:
+{
+    var ios = open("*limits*");
+    byte[LIMIT_ATTRIBUTE_VALUE_4'length] @ ios : 0#B = LIMIT_ATTRIBUTE_VALUE_4;
+    ctx = h5policy_validate_attribute_payload(
+        ios, profile, ctx, 0#B, LIMIT_ATTRIBUTE_VALUE_4'length, "/u");
+    close(ios);
+    return ctx;
+}
+
+fun run_limit_datatype = (H5PolicyProfile profile) H5WalkContext:
+{
+    var ios = open("*limits*");
+    byte[LIMIT_DATATYPE_VALUE_4'length] @ ios : 0#B = LIMIT_DATATYPE_VALUE_4;
+    var ctx = h5policy_new_walk_context;
+    ctx = h5policy_validate_dtype_payload(
+        ios, profile, ctx, 0#B, LIMIT_DATATYPE_VALUE_4'length, "/u");
+    close(ios);
+    return ctx;
+}
+
 fun run_limit_continuation = (H5PolicyProfile profile,
                               H5WalkContext ctx) H5WalkContext:
 {
@@ -274,18 +319,18 @@ fun run_limit_vds = (H5PolicyProfile profile) void:
 /* ---- Inclusive cumulative counters and saturation --------------------- */
 
 reset_limit_case;
-LIMIT_PROFILE.limits.max_metadata_bytes = 2UL;
+LIMIT_PROFILE.limits.max_accounted_metadata_bytes = 2UL;
 var ctx_metadata = h5policy_new_walk_context;
 ctx_metadata = h5policy_account_metadata(ctx_metadata, LIMIT_PROFILE, 2UL,
                                          0#B, "/u");
 expect_limit("metadata_equal_allowed",
              ctx_metadata.metadata_seen == 2UL
-             && !limit_has_code("H5_RESOURCE_METADATA_BYTES"));
+             && !limit_has_code("H5_RESOURCE_ACCOUNTED_METADATA_BYTES"));
 ctx_metadata = h5policy_account_metadata(ctx_metadata, LIMIT_PROFILE, 1UL,
                                          0#B, "/u");
 expect_limit("metadata_over_saturates_resource",
              ctx_metadata.metadata_seen == 2UL
-             && limit_has_code_class("H5_RESOURCE_METADATA_BYTES", "resource")
+             && limit_has_code_class("H5_RESOURCE_ACCOUNTED_METADATA_BYTES", "resource")
              && h5policy_decision == "reject_resource");
 
 reset_limit_case;
@@ -342,23 +387,41 @@ expect_limit("chunk_over_saturates_resource",
 /* ---- Per-value and per-dataset limits --------------------------------- */
 
 reset_limit_case;
-LIMIT_PROFILE.limits.max_single_allocation_bytes = 4UL;
+LIMIT_PROFILE.limits.max_single_value_bytes = 4UL;
 var ctx_fill_equal = run_limit_fill(LIMIT_PROFILE);
-expect_limit("single_allocation_equal_allowed",
-             !limit_has_code("H5_RESOURCE_SINGLE_ALLOCATION_BYTES"));
+expect_limit("single_value_equal_allowed",
+             !limit_has_code("H5_RESOURCE_SINGLE_VALUE_BYTES"));
 
 reset_limit_case;
-LIMIT_PROFILE.limits.max_single_allocation_bytes = 3UL;
+LIMIT_PROFILE.limits.max_single_value_bytes = 3UL;
 var ctx_fill_over = run_limit_fill(LIMIT_PROFILE);
-expect_limit("single_allocation_over_resource",
-             limit_has_code_class("H5_RESOURCE_SINGLE_ALLOCATION_BYTES",
+expect_limit("single_value_over_resource",
+             limit_has_code_class("H5_RESOURCE_SINGLE_VALUE_BYTES",
                                   "resource"));
 
 reset_limit_case;
-LIMIT_PROFILE.limits.max_single_allocation_bytes = 0UL;
+LIMIT_PROFILE.limits.max_single_value_bytes = 0UL;
 var ctx_fill_disabled = run_limit_fill(LIMIT_PROFILE);
-expect_limit("single_allocation_zero_disables",
-             !limit_has_code("H5_RESOURCE_SINGLE_ALLOCATION_BYTES"));
+expect_limit("single_value_zero_disables",
+             !limit_has_code("H5_RESOURCE_SINGLE_VALUE_BYTES"));
+
+reset_limit_case;
+LIMIT_PROFILE.limits.max_single_value_bytes = 2UL;
+var ctx_attribute_value_over = h5policy_new_walk_context;
+ctx_attribute_value_over = run_limit_wide_attribute(
+    LIMIT_PROFILE, ctx_attribute_value_over);
+expect_limit("single_value_attribute_payload_over_resource",
+             ctx_attribute_value_over.attribute_count == 1UL
+             && limit_has_code_class("H5_RESOURCE_SINGLE_VALUE_BYTES",
+                                     "resource"));
+
+reset_limit_case;
+LIMIT_PROFILE.limits.max_single_value_bytes = 3UL;
+var ctx_datatype_value_over = run_limit_datatype(LIMIT_PROFILE);
+expect_limit("single_value_datatype_element_over_resource",
+             ctx_datatype_value_over.datatype_size == 4UL
+             && limit_has_code_class("H5_RESOURCE_SINGLE_VALUE_BYTES",
+                                     "resource"));
 
 reset_limit_case;
 LIMIT_PROFILE.limits.max_logical_dataset_bytes = 6UL;
@@ -393,7 +456,7 @@ expect_limit("logical_dataset_over_saturates_resource",
 /* The tiny-chunk rule uses strict comparisons for both byte size and count. */
 reset_limit_case;
 LIMIT_PROFILE.heuristics.min_logical_chunk_bytes = 4UL;
-LIMIT_PROFILE.heuristics.min_logical_chunk_count = 3UL;
+LIMIT_PROFILE.heuristics.max_chunks_below_min_logical_bytes = 3UL;
 var ctx_tiny_count_equal = h5policy_new_walk_context;
 ctx_tiny_count_equal.has_chunked_layout = 1UB;
 ctx_tiny_count_equal.has_dataspace = 1UB;
@@ -409,7 +472,7 @@ expect_limit("tiny_chunk_count_equal_allowed",
 
 reset_limit_case;
 LIMIT_PROFILE.heuristics.min_logical_chunk_bytes = 4UL;
-LIMIT_PROFILE.heuristics.min_logical_chunk_count = 3UL;
+LIMIT_PROFILE.heuristics.max_chunks_below_min_logical_bytes = 3UL;
 var ctx_tiny_bytes_equal = h5policy_new_walk_context;
 ctx_tiny_bytes_equal.has_chunked_layout = 1UB;
 ctx_tiny_bytes_equal.has_dataspace = 1UB;
@@ -425,7 +488,7 @@ expect_limit("tiny_chunk_bytes_equal_allowed",
 
 reset_limit_case;
 LIMIT_PROFILE.heuristics.min_logical_chunk_bytes = 4UL;
-LIMIT_PROFILE.heuristics.min_logical_chunk_count = 3UL;
+LIMIT_PROFILE.heuristics.max_chunks_below_min_logical_bytes = 3UL;
 var ctx_tiny_over = h5policy_new_walk_context;
 ctx_tiny_over.has_chunked_layout = 1UB;
 ctx_tiny_over.has_dataspace = 1UB;
@@ -440,7 +503,7 @@ expect_limit("tiny_chunk_both_over_resource",
 
 reset_limit_case;
 LIMIT_PROFILE.heuristics.min_logical_chunk_bytes = 0UL;
-LIMIT_PROFILE.heuristics.min_logical_chunk_count = 0UL;
+LIMIT_PROFILE.heuristics.max_chunks_below_min_logical_bytes = 0UL;
 var ctx_tiny_disabled = h5policy_new_walk_context;
 ctx_tiny_disabled.has_chunked_layout = 1UB;
 ctx_tiny_disabled.has_dataspace = 1UB;
@@ -492,26 +555,40 @@ var ctx_depth = h5policy_new_walk_context;
 ctx_depth = h5policy_walk_chunk_btree(ios_depth, LIMIT_PROFILE, ctx_depth,
                                       0UL, 1UL, "/u", 1UL);
 close(ios_depth);
-expect_limit("btree_depth_over_is_corrupt",
-             limit_has_code_class("H5_CORRUPT_BTREE_DEPTH_EXCEEDED",
-                                  "corrupt"));
+expect_limit("btree_depth_over_is_resource",
+             limit_has_code_class("H5_RESOURCE_BTREE_DEPTH",
+                                  "resource"));
+
+reset_limit_case;
+LIMIT_PROFILE.limits.max_filter_parameter_recursion_depth = 0UL;
+var ios_filter_depth = open("*limits*");
+byte[1] @ ios_filter_depth : 0#B = [0UB];
+var filter_depth_result = h5policy_nbit_walk_params(
+    ios_filter_depth, LIMIT_PROFILE, 0#B, 1UL, 0UL, 1UL, 0#B, "/u");
+close(ios_filter_depth);
+expect_limit("filter_parameter_depth_over_is_resource",
+             filter_depth_result == 0xffffffffffffffffUL
+             && limit_has_code_class(
+                    "H5_RESOURCE_FILTER_PARAMETER_RECURSION_DEPTH",
+                    "resource"));
 
 reset_limit_case;
 LIMIT_PROFILE.limits.max_link_traversal_depth = 0UL;
 h5policy_enqueue_ohdr(LIMIT_PROFILE, 10UL, 0UL, "/", 0#B, "/");
 expect_limit("link_depth_equal_queues",
              h5policy_pending_ohdrs'length == 1UL
-             && !limit_has_code("H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED"));
+             && !limit_has_code("H5_RESOURCE_LINK_TRAVERSAL_DEPTH"));
 h5policy_enqueue_ohdr(LIMIT_PROFILE, 11UL, 1UL, "/child", 0#B, "/");
-expect_limit("link_depth_over_is_corrupt_and_not_queued",
+expect_limit("link_depth_over_is_resource_and_not_queued",
              h5policy_pending_ohdrs'length == 1UL
-             && limit_has_code_class("H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED",
-                                     "corrupt"));
+             && limit_has_code_class("H5_RESOURCE_LINK_TRAVERSAL_DEPTH",
+                                     "resource"));
 
 /* ---- Metadata-ratio compound rule ------------------------------------- */
 
 reset_limit_case;
 LIMIT_PROFILE.heuristics.metadata_ratio_reject_percent = 0UL;
+LIMIT_PROFILE.heuristics.metadata_ratio_reject_min_bytes = 0UL;
 LIMIT_PROFILE.heuristics.metadata_ratio_warn_percent = 50UL;
 LIMIT_PROFILE.heuristics.metadata_ratio_warn_min_bytes = 10UL;
 var ctx_ratio_floor = h5policy_new_walk_context;
@@ -522,6 +599,7 @@ expect_limit("metadata_ratio_equal_floor_allowed",
 
 reset_limit_case;
 LIMIT_PROFILE.heuristics.metadata_ratio_reject_percent = 0UL;
+LIMIT_PROFILE.heuristics.metadata_ratio_reject_min_bytes = 0UL;
 LIMIT_PROFILE.heuristics.metadata_ratio_warn_percent = 50UL;
 LIMIT_PROFILE.heuristics.metadata_ratio_warn_min_bytes = 10UL;
 var ctx_ratio_warn = h5policy_new_walk_context;
@@ -647,11 +725,11 @@ expect_limit("legacy_dangerous_message_allowed_no_policy",
 /* ---- Complete built-in preset snapshots ------------------------------ */
 
 expect_limit("untrusted_strict_preset_values",
-             H5_UNTRUSTED_STRICT.limits.max_metadata_bytes
+             H5_UNTRUSTED_STRICT.limits.max_accounted_metadata_bytes
                  == 256UL * 1024UL * 1024UL
              && H5_UNTRUSTED_STRICT.limits.max_logical_dataset_bytes
                  == 64UL * 1024UL * 1024UL * 1024UL
-             && H5_UNTRUSTED_STRICT.limits.max_single_allocation_bytes
+             && H5_UNTRUSTED_STRICT.limits.max_single_value_bytes
                  == 1024UL * 1024UL * 1024UL
              && H5_UNTRUSTED_STRICT.limits.max_object_count == 100000UL
              && H5_UNTRUSTED_STRICT.limits.max_attribute_count == 100000UL
@@ -659,12 +737,13 @@ expect_limit("untrusted_strict_preset_values",
              && H5_UNTRUSTED_STRICT.limits.max_btree_depth == 64UL
              && H5_UNTRUSTED_STRICT.limits.max_link_traversal_depth == 64UL
              && H5_UNTRUSTED_STRICT.limits.max_datatype_recursion_depth == 64UL
+             && H5_UNTRUSTED_STRICT.limits.max_filter_parameter_recursion_depth
+                 == 64UL
              && H5_UNTRUSTED_STRICT.limits.max_chunk_count == 10000000UL
              && H5_UNTRUSTED_STRICT.heuristics.min_logical_chunk_bytes
                  == 4UL * 1024UL
-             && H5_UNTRUSTED_STRICT.heuristics.min_logical_chunk_count == 4096UL
+             && H5_UNTRUSTED_STRICT.heuristics.max_chunks_below_min_logical_bytes == 4096UL
              && H5_UNTRUSTED_STRICT.limits.max_filter_count == 32UL
-             && H5_UNTRUSTED_STRICT.heuristics.max_filter_expansion_ratio == 100UL
              && H5_UNTRUSTED_STRICT.limits.max_rank == 32UL
              && H5_UNTRUSTED_STRICT.heuristics.metadata_ratio_warn_percent == 50UL
              && H5_UNTRUSTED_STRICT.heuristics.metadata_ratio_warn_min_bytes
@@ -672,6 +751,7 @@ expect_limit("untrusted_strict_preset_values",
              && H5_UNTRUSTED_STRICT.heuristics.metadata_ratio_reject_percent == 75UL
              && H5_UNTRUSTED_STRICT.heuristics.metadata_ratio_reject_min_bytes
                  == 16UL * 1024UL * 1024UL
+             && H5_UNTRUSTED_STRICT.analysis.max_walk_operations == 10000000UL
              && H5_UNTRUSTED_STRICT.analysis.max_walk_seconds == 10UL
              && H5_UNTRUSTED_STRICT.features.allow_external_links == 0UB
              && H5_UNTRUSTED_STRICT.features.allow_external_storage == 0UB
@@ -679,30 +759,35 @@ expect_limit("untrusted_strict_preset_values",
              && H5_UNTRUSTED_STRICT.features.allow_dynamic_filters == 0UB
              && H5_UNTRUSTED_STRICT.features.allow_unknown_messages == 0UB
              && H5_UNTRUSTED_STRICT.features.allow_legacy_dangerous_messages == 0UB
-             && H5_UNTRUSTED_STRICT.analysis.forensic_mode == 0UB);
+             && H5_UNTRUSTED_STRICT.analysis.default_nonstrict_mapping == 0UB
+             && H5_UNTRUSTED_STRICT.analysis.default_continue_after_corruption
+                 == 0UB
+             && H5_UNTRUSTED_STRICT.analysis.sweep_unreachable_metadata == 0UB);
 
 expect_limit("forensic_preset_values",
-             H5_FORENSIC.limits.max_metadata_bytes
+             H5_FORENSIC.limits.max_accounted_metadata_bytes
                  == 1024UL * 1024UL * 1024UL
              && H5_FORENSIC.limits.max_logical_dataset_bytes
                  == 0xffffffffffffffffUL
-             && H5_FORENSIC.limits.max_single_allocation_bytes == 0UL
+             && H5_FORENSIC.limits.max_single_value_bytes == 0UL
              && H5_FORENSIC.limits.max_object_count == 1000000UL
              && H5_FORENSIC.limits.max_attribute_count == 1000000UL
              && H5_FORENSIC.limits.max_object_header_chunks == 4096UL
              && H5_FORENSIC.limits.max_btree_depth == 128UL
              && H5_FORENSIC.limits.max_link_traversal_depth == 128UL
              && H5_FORENSIC.limits.max_datatype_recursion_depth == 128UL
+             && H5_FORENSIC.limits.max_filter_parameter_recursion_depth
+                 == 128UL
              && H5_FORENSIC.limits.max_chunk_count == 0xffffffffffffffffUL
              && H5_FORENSIC.heuristics.min_logical_chunk_bytes == 0UL
-             && H5_FORENSIC.heuristics.min_logical_chunk_count == 0UL
+             && H5_FORENSIC.heuristics.max_chunks_below_min_logical_bytes == 0UL
              && H5_FORENSIC.limits.max_filter_count == 64UL
-             && H5_FORENSIC.heuristics.max_filter_expansion_ratio == 0UL
-             && H5_FORENSIC.limits.max_rank == 64UL
+             && H5_FORENSIC.limits.max_rank == 32UL
              && H5_FORENSIC.heuristics.metadata_ratio_warn_percent == 0UL
              && H5_FORENSIC.heuristics.metadata_ratio_warn_min_bytes == 0UL
              && H5_FORENSIC.heuristics.metadata_ratio_reject_percent == 0UL
              && H5_FORENSIC.heuristics.metadata_ratio_reject_min_bytes == 0UL
+             && H5_FORENSIC.analysis.max_walk_operations == 50000000UL
              && H5_FORENSIC.analysis.max_walk_seconds == 30UL
              && H5_FORENSIC.features.allow_external_links == 0UB
              && H5_FORENSIC.features.allow_external_storage == 0UB
@@ -710,31 +795,35 @@ expect_limit("forensic_preset_values",
              && H5_FORENSIC.features.allow_dynamic_filters == 0UB
              && H5_FORENSIC.features.allow_unknown_messages == 1UB
              && H5_FORENSIC.features.allow_legacy_dangerous_messages == 0UB
-             && H5_FORENSIC.analysis.forensic_mode == 1UB);
+             && H5_FORENSIC.analysis.default_nonstrict_mapping == 1UB
+             && H5_FORENSIC.analysis.default_continue_after_corruption == 1UB
+             && H5_FORENSIC.analysis.sweep_unreachable_metadata == 1UB);
 
 expect_limit("trusted_fast_preset_values",
-             H5_TRUSTED_FAST.limits.max_metadata_bytes
+             H5_TRUSTED_FAST.limits.max_accounted_metadata_bytes
                  == 4UL * 1024UL * 1024UL * 1024UL
              && H5_TRUSTED_FAST.limits.max_logical_dataset_bytes
                  == 16UL * 1024UL * 1024UL * 1024UL * 1024UL
-             && H5_TRUSTED_FAST.limits.max_single_allocation_bytes == 0UL
+             && H5_TRUSTED_FAST.limits.max_single_value_bytes == 0UL
              && H5_TRUSTED_FAST.limits.max_object_count == 10000000UL
              && H5_TRUSTED_FAST.limits.max_attribute_count == 10000000UL
              && H5_TRUSTED_FAST.limits.max_object_header_chunks == 65536UL
              && H5_TRUSTED_FAST.limits.max_btree_depth == 128UL
              && H5_TRUSTED_FAST.limits.max_link_traversal_depth == 128UL
              && H5_TRUSTED_FAST.limits.max_datatype_recursion_depth == 128UL
+             && H5_TRUSTED_FAST.limits.max_filter_parameter_recursion_depth
+                 == 128UL
              && H5_TRUSTED_FAST.limits.max_chunk_count == 0xffffffffffffffffUL
              && H5_TRUSTED_FAST.heuristics.min_logical_chunk_bytes == 0UL
-             && H5_TRUSTED_FAST.heuristics.min_logical_chunk_count == 0UL
+             && H5_TRUSTED_FAST.heuristics.max_chunks_below_min_logical_bytes == 0UL
              && H5_TRUSTED_FAST.limits.max_filter_count == 64UL
-             && H5_TRUSTED_FAST.heuristics.max_filter_expansion_ratio == 0UL
-             && H5_TRUSTED_FAST.limits.max_rank == 64UL
+             && H5_TRUSTED_FAST.limits.max_rank == 32UL
              && H5_TRUSTED_FAST.heuristics.metadata_ratio_warn_percent == 75UL
              && H5_TRUSTED_FAST.heuristics.metadata_ratio_warn_min_bytes
                  == 16UL * 1024UL * 1024UL
              && H5_TRUSTED_FAST.heuristics.metadata_ratio_reject_percent == 0UL
              && H5_TRUSTED_FAST.heuristics.metadata_ratio_reject_min_bytes == 0UL
+             && H5_TRUSTED_FAST.analysis.max_walk_operations == 50000000UL
              && H5_TRUSTED_FAST.analysis.max_walk_seconds == 20UL
              && H5_TRUSTED_FAST.features.allow_external_links == 1UB
              && H5_TRUSTED_FAST.features.allow_external_storage == 1UB
@@ -742,13 +831,16 @@ expect_limit("trusted_fast_preset_values",
              && H5_TRUSTED_FAST.features.allow_dynamic_filters == 1UB
              && H5_TRUSTED_FAST.features.allow_unknown_messages == 1UB
              && H5_TRUSTED_FAST.features.allow_legacy_dangerous_messages == 0UB
-             && H5_TRUSTED_FAST.analysis.forensic_mode == 0UB);
+             && H5_TRUSTED_FAST.analysis.default_nonstrict_mapping == 0UB
+             && H5_TRUSTED_FAST.analysis.default_continue_after_corruption
+                 == 0UB
+             && H5_TRUSTED_FAST.analysis.sweep_unreachable_metadata == 0UB);
 
 expect_limit("legacy_preset_values",
-             H5_LEGACY.limits.max_metadata_bytes == 0xffffffffffffffffUL
+             H5_LEGACY.limits.max_accounted_metadata_bytes == 0xffffffffffffffffUL
              && H5_LEGACY.limits.max_logical_dataset_bytes
                  == 0xffffffffffffffffUL
-             && H5_LEGACY.limits.max_single_allocation_bytes == 0UL
+             && H5_LEGACY.limits.max_single_value_bytes == 0UL
              && H5_LEGACY.limits.max_object_count == 0xffffffffffffffffUL
              && H5_LEGACY.limits.max_attribute_count == 0xffffffffffffffffUL
              && H5_LEGACY.limits.max_object_header_chunks
@@ -756,16 +848,17 @@ expect_limit("legacy_preset_values",
              && H5_LEGACY.limits.max_btree_depth == 0xffffffffffffffffUL
              && H5_LEGACY.limits.max_link_traversal_depth == 128UL
              && H5_LEGACY.limits.max_datatype_recursion_depth == 128UL
+             && H5_LEGACY.limits.max_filter_parameter_recursion_depth == 128UL
              && H5_LEGACY.limits.max_chunk_count == 0xffffffffffffffffUL
              && H5_LEGACY.heuristics.min_logical_chunk_bytes == 0UL
-             && H5_LEGACY.heuristics.min_logical_chunk_count == 0UL
+             && H5_LEGACY.heuristics.max_chunks_below_min_logical_bytes == 0UL
              && H5_LEGACY.limits.max_filter_count == 0xffffffffffffffffUL
-             && H5_LEGACY.heuristics.max_filter_expansion_ratio == 0UL
-             && H5_LEGACY.limits.max_rank == 0xffffffffffffffffUL
+             && H5_LEGACY.limits.max_rank == 32UL
              && H5_LEGACY.heuristics.metadata_ratio_warn_percent == 0UL
              && H5_LEGACY.heuristics.metadata_ratio_warn_min_bytes == 0UL
              && H5_LEGACY.heuristics.metadata_ratio_reject_percent == 0UL
              && H5_LEGACY.heuristics.metadata_ratio_reject_min_bytes == 0UL
+             && H5_LEGACY.analysis.max_walk_operations == 100000000UL
              && H5_LEGACY.analysis.max_walk_seconds == 60UL
              && H5_LEGACY.features.allow_external_links == 1UB
              && H5_LEGACY.features.allow_external_storage == 1UB
@@ -773,14 +866,127 @@ expect_limit("legacy_preset_values",
              && H5_LEGACY.features.allow_dynamic_filters == 1UB
              && H5_LEGACY.features.allow_unknown_messages == 1UB
              && H5_LEGACY.features.allow_legacy_dangerous_messages == 1UB
-             && H5_LEGACY.analysis.forensic_mode == 0UB);
+             && H5_LEGACY.analysis.default_nonstrict_mapping == 0UB
+             && H5_LEGACY.analysis.default_continue_after_corruption == 0UB
+             && H5_LEGACY.analysis.sweep_unreachable_metadata == 0UB);
+
+expect_limit("built_in_profiles_are_valid",
+             h5policy_profile_is_valid(H5_UNTRUSTED_STRICT)
+             && h5policy_profile_is_valid(H5_FORENSIC)
+             && h5policy_profile_is_valid(H5_TRUSTED_FAST)
+             && h5policy_profile_is_valid(H5_LEGACY));
+
+reset_limit_case;
+LIMIT_PROFILE.analysis.max_walk_seconds = 0UL;
+expect_limit("zero_walk_seconds_is_invalid",
+             !h5policy_profile_is_valid(LIMIT_PROFILE)
+             && h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "max_walk_seconds must be greater than zero");
+
+reset_limit_case;
+LIMIT_PROFILE.analysis.max_walk_seconds = 0x80000000UL;
+expect_limit("walk_seconds_must_fit_deadline_arithmetic",
+             h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "max_walk_seconds must be at most 2147483647");
+
+reset_limit_case;
+LIMIT_PROFILE.analysis.max_walk_operations = 0UL;
+expect_limit("zero_walk_operations_is_invalid",
+             !h5policy_profile_is_valid(LIMIT_PROFILE)
+             && h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "max_walk_operations must be greater than zero");
+
+reset_limit_case;
+h5policy_walk_operation_limit = 2UL;
+h5policy_walk_tick(2UL);
+var operation_budget_raised = 0;
+try
+    {
+        h5policy_walk_tick(1UL);
+    }
+catch (Exception e)
+    {
+        if (e.code == H5POLICY_EC_WALK_OPERATION_BUDGET as int<32>)
+            operation_budget_raised = 1;
+    }
+expect_limit("walk_operation_budget_is_inclusive_and_saturates",
+             operation_budget_raised
+             && h5policy_walk_ops == h5policy_walk_operation_limit);
+
+reset_limit_case;
+h5policy_walk_deadline = -1L;
+var time_budget_raised = 0;
+try
+    {
+        h5policy_walk_tick(1UL);
+    }
+catch (Exception e)
+    {
+        if (e.code == H5POLICY_EC_WALK_TIME_BUDGET as int<32>)
+            time_budget_raised = 1;
+    }
+expect_limit("walk_time_budget_has_distinguished_exception",
+             time_budget_raised);
+
+reset_limit_case;
+LIMIT_PROFILE.features.allow_external_links = 2UB;
+expect_limit("feature_switch_must_be_boolean",
+             h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "allow_external_links must be 0 or 1");
+
+reset_limit_case;
+LIMIT_PROFILE.analysis.default_nonstrict_mapping = 2UB;
+expect_limit("analysis_switch_must_be_boolean",
+             h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "default_nonstrict_mapping must be 0 or 1");
+
+reset_limit_case;
+LIMIT_PROFILE.heuristics.metadata_ratio_warn_percent = 101UL;
+expect_limit("metadata_ratio_percent_must_be_bounded",
+             h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "metadata_ratio_warn_percent must be at most 100");
+
+reset_limit_case;
+LIMIT_PROFILE.heuristics.metadata_ratio_warn_percent = 0UL;
+LIMIT_PROFILE.heuristics.metadata_ratio_warn_min_bytes = 1UL;
+expect_limit("disabled_metadata_ratio_requires_zero_floor",
+             h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "disabled metadata warning ratio must have a zero byte floor");
+
+reset_limit_case;
+LIMIT_PROFILE.heuristics.metadata_ratio_reject_percent = 49UL;
+expect_limit("metadata_reject_ratio_cannot_be_weaker",
+             h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "metadata reject ratio must not be weaker than warning");
+
+reset_limit_case;
+LIMIT_PROFILE.heuristics.metadata_ratio_reject_percent
+    = LIMIT_PROFILE.heuristics.metadata_ratio_warn_percent;
+LIMIT_PROFILE.heuristics.metadata_ratio_reject_min_bytes
+    = LIMIT_PROFILE.heuristics.metadata_ratio_warn_min_bytes;
+expect_limit("metadata_reject_ratio_must_be_stricter",
+             h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "metadata reject ratio must be stricter than warning");
+
+reset_limit_case;
+LIMIT_PROFILE.heuristics.min_logical_chunk_bytes = 0UL;
+LIMIT_PROFILE.heuristics.max_chunks_below_min_logical_bytes = 1UL;
+expect_limit("disabled_tiny_chunk_rule_requires_zero_count_threshold",
+             h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "disabled tiny-chunk rule must have a zero chunk threshold");
+
+reset_limit_case;
+LIMIT_PROFILE.limits.max_rank = H5POLICY_H5S_MAX_RANK + 1UL;
+expect_limit("profile_rank_cannot_exceed_fixed_hdf5_ceiling",
+             h5policy_profile_validation_error(LIMIT_PROFILE)
+                 == "max_rank must not exceed the fixed HDF5 rank ceiling");
 
 /* ---- Run-mode defaults ----------------------------------------------- */
 
 reset_limit_case;
 LIMIT_PROFILE = H5_FORENSIC;
 h5policy_apply_run_mode(LIMIT_PROFILE);
-expect_limit("forensic_mode_defaults_non_strict_and_continue",
+expect_limit("forensic_defaults_non_strict_and_continue",
              h5policy_nonstrict == 1 && h5policy_continue == 1);
 
 reset_limit_case;
@@ -796,6 +1002,20 @@ h5policy_continue_arg = "yes";
 h5policy_apply_run_mode(LIMIT_PROFILE);
 expect_limit("strict_profile_run_mode_overrides",
              h5policy_nonstrict == 1 && h5policy_continue == 1);
+
+reset_limit_case;
+LIMIT_PROFILE.analysis.default_nonstrict_mapping = 1UB;
+LIMIT_PROFILE.analysis.default_continue_after_corruption = 0UB;
+h5policy_apply_run_mode(LIMIT_PROFILE);
+expect_limit("mapping_and_continue_defaults_are_independent",
+             h5policy_nonstrict == 1 && h5policy_continue == 0);
+
+reset_limit_case;
+LIMIT_PROFILE.analysis.default_nonstrict_mapping = 0UB;
+LIMIT_PROFILE.analysis.default_continue_after_corruption = 1UB;
+h5policy_apply_run_mode(LIMIT_PROFILE);
+expect_limit("continue_and_mapping_defaults_are_independent",
+             h5policy_nonstrict == 0 && h5policy_continue == 1);
 
 if (limit_failures != 0)
     {

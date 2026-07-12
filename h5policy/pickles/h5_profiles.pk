@@ -16,17 +16,22 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/* libhdf5's fixed public dataspace-rank ceiling.  Profile rank limits may be
+   lower but cannot meaningfully be higher.  */
+var H5POLICY_H5S_MAX_RANK = 32UL;
+
 type H5PolicyLimits = struct
 {
-    uint<64> max_metadata_bytes;
+    uint<64> max_accounted_metadata_bytes;
     uint<64> max_logical_dataset_bytes;
-    uint<64> max_single_allocation_bytes;
+    uint<64> max_single_value_bytes;
     uint<64> max_object_count;
     uint<64> max_attribute_count;
     uint<64> max_object_header_chunks;
     uint<64> max_btree_depth;
     uint<64> max_link_traversal_depth;
     uint<64> max_datatype_recursion_depth;
+    uint<64> max_filter_parameter_recursion_depth;
     uint<64> max_chunk_count;
     uint<64> max_filter_count;
     uint<64> max_rank;
@@ -35,8 +40,7 @@ type H5PolicyLimits = struct
 type H5PolicyHeuristics = struct
 {
     uint<64> min_logical_chunk_bytes;
-    uint<64> min_logical_chunk_count;
-    uint<64> max_filter_expansion_ratio;
+    uint<64> max_chunks_below_min_logical_bytes;
     uint<64> metadata_ratio_warn_percent;
     uint<64> metadata_ratio_warn_min_bytes;
     uint<64> metadata_ratio_reject_percent;
@@ -55,18 +59,22 @@ type H5PolicyFeaturePolicy = struct
 
 type H5PolicyAnalysis = struct
 {
+    /* Deterministic ceiling on abstract work charged by h5policy_walk_tick. */
+    uint<64> max_walk_operations;
     /* Wall-clock ceiling (seconds) on the reachable-metadata walk.
        Some traversal de-dup sets are linear-scan arrays (O(N^2)); this
        guarantees a preflight always terminates in bounded time, even in
        forensic (unlimited object/byte budgets).  Exceeding it yields
        unsupported_coverage_gap.  */
     uint<64> max_walk_seconds;
-    uint<8> forensic_mode;
+    uint<8> default_nonstrict_mapping;
+    uint<8> default_continue_after_corruption;
+    uint<8> sweep_unreachable_metadata;
 };
 
-/* A profile is configuration for one validation run.  The nested groups are
-   organizational only: their fields retain the same values and enforcement
-   semantics as the former flat H5PolicyLimits value.  */
+/* A profile is configuration for one validation run.  The nested groups keep
+   resource ceilings, compound heuristics, feature policy, and analysis
+   behavior explicit and independently reviewable.  */
 type H5PolicyProfile = struct
 {
     H5PolicyLimits limits;
@@ -75,20 +83,96 @@ type H5PolicyProfile = struct
     H5PolicyAnalysis analysis;
 };
 
+fun h5policy_profile_boolean = (uint<8> value) int:
+{
+    return value == 0UB || value == 1UB;
+}
+
+/* Return an empty string for a usable profile or a stable explanation of the
+   first configuration error.  Keep this pure so synthetic tests and other
+   pickle consumers can validate a profile before starting file I/O.  */
+fun h5policy_profile_validation_error = (H5PolicyProfile profile) string:
+{
+    if (profile.analysis.max_walk_operations == 0UL)
+        return "max_walk_operations must be greater than zero";
+    if (profile.analysis.max_walk_seconds == 0UL)
+        return "max_walk_seconds must be greater than zero";
+    if (profile.analysis.max_walk_seconds > 0x7fffffffUL)
+        return "max_walk_seconds must be at most 2147483647";
+
+    if (!h5policy_profile_boolean(
+            profile.analysis.default_nonstrict_mapping))
+        return "default_nonstrict_mapping must be 0 or 1";
+    if (!h5policy_profile_boolean(
+            profile.analysis.default_continue_after_corruption))
+        return "default_continue_after_corruption must be 0 or 1";
+    if (!h5policy_profile_boolean(
+            profile.analysis.sweep_unreachable_metadata))
+        return "sweep_unreachable_metadata must be 0 or 1";
+
+    if (!h5policy_profile_boolean(profile.features.allow_external_links))
+        return "allow_external_links must be 0 or 1";
+    if (!h5policy_profile_boolean(profile.features.allow_external_storage))
+        return "allow_external_storage must be 0 or 1";
+    if (!h5policy_profile_boolean(profile.features.allow_vds))
+        return "allow_vds must be 0 or 1";
+    if (!h5policy_profile_boolean(profile.features.allow_dynamic_filters))
+        return "allow_dynamic_filters must be 0 or 1";
+    if (!h5policy_profile_boolean(profile.features.allow_unknown_messages))
+        return "allow_unknown_messages must be 0 or 1";
+    if (!h5policy_profile_boolean(
+            profile.features.allow_legacy_dangerous_messages))
+        return "allow_legacy_dangerous_messages must be 0 or 1";
+
+    if (profile.heuristics.min_logical_chunk_bytes == 0UL
+        && profile.heuristics.max_chunks_below_min_logical_bytes != 0UL)
+        return "disabled tiny-chunk rule must have a zero chunk threshold";
+    if (profile.limits.max_rank > H5POLICY_H5S_MAX_RANK)
+        return "max_rank must not exceed the fixed HDF5 rank ceiling";
+
+    var warn_percent = profile.heuristics.metadata_ratio_warn_percent;
+    var warn_min = profile.heuristics.metadata_ratio_warn_min_bytes;
+    var reject_percent = profile.heuristics.metadata_ratio_reject_percent;
+    var reject_min = profile.heuristics.metadata_ratio_reject_min_bytes;
+
+    if (warn_percent > 100UL)
+        return "metadata_ratio_warn_percent must be at most 100";
+    if (reject_percent > 100UL)
+        return "metadata_ratio_reject_percent must be at most 100";
+    if (warn_percent == 0UL && warn_min != 0UL)
+        return "disabled metadata warning ratio must have a zero byte floor";
+    if (reject_percent == 0UL && reject_min != 0UL)
+        return "disabled metadata reject ratio must have a zero byte floor";
+    if (warn_percent != 0UL && reject_percent != 0UL)
+        {
+            if (reject_percent < warn_percent || reject_min < warn_min)
+                return "metadata reject ratio must not be weaker than warning";
+            if (reject_percent == warn_percent && reject_min == warn_min)
+                return "metadata reject ratio must be stricter than warning";
+        }
+    return "";
+}
+
+fun h5policy_profile_is_valid = (H5PolicyProfile profile) int:
+{
+    return h5policy_profile_validation_error(profile) == "";
+}
+
 
 var H5_UNTRUSTED_STRICT = H5PolicyProfile
 {
     limits = H5PolicyLimits
     {
-        max_metadata_bytes = 256UL * 1024UL * 1024UL,
+        max_accounted_metadata_bytes = 256UL * 1024UL * 1024UL,
         max_logical_dataset_bytes = 64UL * 1024UL * 1024UL * 1024UL,
-        max_single_allocation_bytes = 1024UL * 1024UL * 1024UL,
+        max_single_value_bytes = 1024UL * 1024UL * 1024UL,
         max_object_count = 100000UL,
         max_attribute_count = 100000UL,
         max_object_header_chunks = 1024UL,
         max_btree_depth = 64UL,
         max_link_traversal_depth = 64UL,
         max_datatype_recursion_depth = 64UL,
+        max_filter_parameter_recursion_depth = 64UL,
         max_chunk_count = 10000000UL,
         max_filter_count = 32UL,
         max_rank = 32UL
@@ -96,8 +180,7 @@ var H5_UNTRUSTED_STRICT = H5PolicyProfile
     heuristics = H5PolicyHeuristics
     {
         min_logical_chunk_bytes = 4UL * 1024UL,
-        min_logical_chunk_count = 4096UL,
-        max_filter_expansion_ratio = 100UL,
+        max_chunks_below_min_logical_bytes = 4096UL,
         metadata_ratio_warn_percent = 50UL,
         metadata_ratio_warn_min_bytes = 1UL * 1024UL * 1024UL,
         metadata_ratio_reject_percent = 75UL,
@@ -114,8 +197,11 @@ var H5_UNTRUSTED_STRICT = H5PolicyProfile
     },
     analysis = H5PolicyAnalysis
     {
+        max_walk_operations = 10000000UL,
         max_walk_seconds = 10UL,       /* strict: fast reject */
-        forensic_mode = 0UB
+        default_nonstrict_mapping = 0UB,
+        default_continue_after_corruption = 0UB,
+        sweep_unreachable_metadata = 0UB
     }
 };
 
@@ -123,24 +209,24 @@ var H5_FORENSIC = H5PolicyProfile
 {
     limits = H5PolicyLimits
     {
-        max_metadata_bytes = 1024UL * 1024UL * 1024UL,
+        max_accounted_metadata_bytes = 1024UL * 1024UL * 1024UL,
         max_logical_dataset_bytes = 0xffffffffffffffffUL,
-        max_single_allocation_bytes = 0UL,
+        max_single_value_bytes = 0UL,
         max_object_count = 1000000UL,
         max_attribute_count = 1000000UL,
         max_object_header_chunks = 4096UL,
         max_btree_depth = 128UL,
         max_link_traversal_depth = 128UL,
         max_datatype_recursion_depth = 128UL,
+        max_filter_parameter_recursion_depth = 128UL,
         max_chunk_count = 0xffffffffffffffffUL,
         max_filter_count = 64UL,
-        max_rank = 64UL
+        max_rank = 32UL
     },
     heuristics = H5PolicyHeuristics
     {
         min_logical_chunk_bytes = 0UL,
-        min_logical_chunk_count = 0UL,
-        max_filter_expansion_ratio = 0UL,
+        max_chunks_below_min_logical_bytes = 0UL,
         metadata_ratio_warn_percent = 0UL,
         metadata_ratio_warn_min_bytes = 0UL,
         metadata_ratio_reject_percent = 0UL,
@@ -157,8 +243,11 @@ var H5_FORENSIC = H5PolicyProfile
     },
     analysis = H5PolicyAnalysis
     {
+        max_walk_operations = 50000000UL,
         max_walk_seconds = 30UL,       /* forensic: deep analysis, still bounded */
-        forensic_mode = 1UB
+        default_nonstrict_mapping = 1UB,
+        default_continue_after_corruption = 1UB,
+        sweep_unreachable_metadata = 1UB
     }
 };
 
@@ -171,25 +260,25 @@ var H5_TRUSTED_FAST = H5PolicyProfile
 {
     limits = H5PolicyLimits
     {
-        max_metadata_bytes = 4UL * 1024UL * 1024UL * 1024UL,
+        max_accounted_metadata_bytes = 4UL * 1024UL * 1024UL * 1024UL,
         max_logical_dataset_bytes
             = 16UL * 1024UL * 1024UL * 1024UL * 1024UL,
-        max_single_allocation_bytes = 0UL,
+        max_single_value_bytes = 0UL,
         max_object_count = 10000000UL,
         max_attribute_count = 10000000UL,
         max_object_header_chunks = 65536UL,
         max_btree_depth = 128UL,
         max_link_traversal_depth = 128UL,
         max_datatype_recursion_depth = 128UL,
+        max_filter_parameter_recursion_depth = 128UL,
         max_chunk_count = 0xffffffffffffffffUL,
         max_filter_count = 64UL,
-        max_rank = 64UL
+        max_rank = 32UL
     },
     heuristics = H5PolicyHeuristics
     {
         min_logical_chunk_bytes = 0UL,
-        min_logical_chunk_count = 0UL,
-        max_filter_expansion_ratio = 0UL,
+        max_chunks_below_min_logical_bytes = 0UL,
         metadata_ratio_warn_percent = 75UL,
         metadata_ratio_warn_min_bytes = 16UL * 1024UL * 1024UL,
         metadata_ratio_reject_percent = 0UL,
@@ -206,8 +295,11 @@ var H5_TRUSTED_FAST = H5PolicyProfile
     },
     analysis = H5PolicyAnalysis
     {
+        max_walk_operations = 50000000UL,
         max_walk_seconds = 20UL,       /* trusted_fast */
-        forensic_mode = 0UB
+        default_nonstrict_mapping = 0UB,
+        default_continue_after_corruption = 0UB,
+        sweep_unreachable_metadata = 0UB
     }
 };
 
@@ -220,24 +312,24 @@ var H5_LEGACY = H5PolicyProfile
 {
     limits = H5PolicyLimits
     {
-        max_metadata_bytes = 0xffffffffffffffffUL,
+        max_accounted_metadata_bytes = 0xffffffffffffffffUL,
         max_logical_dataset_bytes = 0xffffffffffffffffUL,
-        max_single_allocation_bytes = 0UL,
+        max_single_value_bytes = 0UL,
         max_object_count = 0xffffffffffffffffUL,
         max_attribute_count = 0xffffffffffffffffUL,
         max_object_header_chunks = 0xffffffffffffffffUL,
         max_btree_depth = 0xffffffffffffffffUL,
         max_link_traversal_depth = 128UL,
         max_datatype_recursion_depth = 128UL,
+        max_filter_parameter_recursion_depth = 128UL,
         max_chunk_count = 0xffffffffffffffffUL,
         max_filter_count = 0xffffffffffffffffUL,
-        max_rank = 0xffffffffffffffffUL
+        max_rank = 32UL
     },
     heuristics = H5PolicyHeuristics
     {
         min_logical_chunk_bytes = 0UL,
-        min_logical_chunk_count = 0UL,
-        max_filter_expansion_ratio = 0UL,
+        max_chunks_below_min_logical_bytes = 0UL,
         metadata_ratio_warn_percent = 0UL,
         metadata_ratio_warn_min_bytes = 0UL,
         metadata_ratio_reject_percent = 0UL,
@@ -254,7 +346,10 @@ var H5_LEGACY = H5PolicyProfile
     },
     analysis = H5PolicyAnalysis
     {
+        max_walk_operations = 100000000UL,
         max_walk_seconds = 60UL,       /* legacy: most permissive, still finite */
-        forensic_mode = 0UB
+        default_nonstrict_mapping = 0UB,
+        default_continue_after_corruption = 0UB,
+        sweep_unreachable_metadata = 0UB
     }
 };
