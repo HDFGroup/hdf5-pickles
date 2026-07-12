@@ -71,6 +71,10 @@ Profiles differ in feature policy and resource budgets, not in whether corrupt
 metadata is rejected. A truncated or checksum-bad file is corrupt under every
 profile.
 
+For an implementation-level reference covering every current profile field,
+including its scope, sentinel behavior, finding class, and test coverage, see
+[`H5PolicyLimits`: Current Semantics](docs/H5PolicyLimits.md).
+
 | Profile            | Mapping     | Resource budgets | Feature policy                         |
 | ------------------ | ----------- | ---------------- | -------------------------------------- |
 | `legacy`           | strict      | unlimited        | all features allowed                   |
