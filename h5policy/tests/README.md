@@ -11,6 +11,9 @@ controlled outcome; a change that alters any decision is surfaced for review.
   `write`).
 - `unit_datatype.pk` — synthetic checks for the bounded, depth-guarded
   datatype validator (recursion cap and truncation handling), run under poke.
+- `unit_limits.pk` — reduced-limit, in-memory characterization checks for the
+  current `H5PolicyLimits` boundaries, saturation, finding classes, compound
+  rules, feature switches, and run-mode defaults.
 - `valid/ malformed/ policy/ resource/ coverage/ cve/` — generated fixtures
   (git-ignored build output; see below).
 
@@ -20,9 +23,9 @@ controlled outcome; a change that alters any decision is surfaced for review.
 ./run.sh
 ```
 
-This regenerates the fixtures, runs the datatype unit checks, runs `h5policy`
-over every `expected/*.yml` case and asserts the result, then runs the
-differential harness.
+This regenerates the fixtures, runs the datatype and profile-limit unit checks,
+runs `h5policy` over every `expected/*.yml` case and asserts the result, then
+runs the differential harness.
 
 The suite is also wired into CTest (top-level `CMakeLists.txt`), so
 `ctest -R h5policy_regression` runs it from a CMake build. The test is skipped

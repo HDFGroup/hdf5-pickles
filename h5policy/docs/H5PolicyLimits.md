@@ -629,25 +629,35 @@ still controlled directly by `forensic_mode`.
 
 ## Current test coverage
 
-The generated corpus exercises most validator paths below their configured
-limits, but only a subset of fields has an explicit threshold or policy-branch
-assertion.
+[`unit_limits.pk`](../tests/unit_limits.pk) copies the strict profile, reduces
+one or two fields at a time, and drives synthetic in-memory metadata through the
+ordinary enforcement helpers. It characterizes current behavior without
+requiring production-scale files. The generated corpus remains the end-to-end
+and libhdf5-facing layer.
 
 | Field or rule | Current direct coverage |
 | --- | --- |
-| `max_logical_dataset_bytes` | `resource/huge_logical_dataset.h5` requires the resource finding; the same file is accepted under legacy. |
-| Tiny logical chunks | `resource/tiny_chunks.h5` requires `H5_RESOURCE_CHUNK_TOO_SMALL`. |
-| `max_datatype_recursion_depth` | Synthetic unit cases cover deep VLen and compound nesting; the CVE fixture also requires the recursion finding under legacy. |
-| `allow_external_links` | The same external-link file is rejected under untrusted-strict and accepted under trusted-fast. |
-| `allow_external_storage` | The same EFL feature is rejected under untrusted-strict and accepted with path advisories under permissive profiles. |
-| `allow_vds` | The permissive legacy path is covered by the absolute-source advisory; the denying `H5_POLICY_VDS` branch is not required by a corpus specification. |
-| `forensic_mode` | Forensic corpus cases exercise non-strict mapping/continued diagnostics, and the orphaned-GCOL fixture exercises the forensic-only sweep. The three effects are not isolated as separate unit boundaries. |
-| All other enforced numeric limits | Their validators or counters may be exercised below the preset value, but the corpus does not currently require their over-limit finding. |
-| `allow_dynamic_filters` | No corpus specification currently requires the dynamic-filter policy branch or its permissive counterpart. |
-| `allow_unknown_messages` | No corpus specification currently requires either the policy-denied or allowed-as-unsupported branch. |
-| `allow_legacy_dangerous_messages` | No corpus specification currently requires either branch. |
-| `max_filter_expansion_ratio` | No enforcement exists to test. |
+| `max_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. |
+| `max_attribute_count` | A valid synthetic attribute is parsed at and above a reduced cumulative limit. |
+| `max_object_header_chunks` | A synthetic continuation message covers equality, over-limit saturation, and the fact that its later structural finding is independent. |
+| `max_chunk_count` | Defined chunk-index references cover equality and over-limit saturation; full index-format stopping behavior remains integration coverage. |
+| `max_single_allocation_bytes` | A fill value covers equality, over-limit resource classification, and zero-as-disabled. The datatype-size and attribute-value enforcement sites are not separately crossed. |
+| `max_logical_dataset_bytes` | Synthetic dataset facts cover equality and saturation. `resource/huge_logical_dataset.h5` requires the resource finding, and the same file is accepted under legacy. |
+| Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, and zero-byte disabling. `resource/tiny_chunks.h5` supplies end-to-end coverage. |
+| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the corrupt finding and early branch return. |
+| `max_link_traversal_depth` | Synthetic queue operations cover equality, the corrupt over-limit finding, and declining to enqueue the child. |
+| `max_datatype_recursion_depth` | `unit_datatype.pk` covers deep VLen and compound nesting; the CVE fixture also requires the recursion finding under legacy. |
+| `max_rank` | A valid rank-two dataspace covers equality and resource-only rejection below the fixed rank ceiling. |
+| `max_filter_count` | A valid two-filter pipeline covers equality, resource classification, and continued descriptor parsing. |
+| Metadata-ratio rules | Synthetic counters cover the strict absolute/percentage boundaries, warning behavior, reject behavior, and reject-over-warning precedence. |
+| `allow_external_links`, `allow_external_storage`, `allow_vds`, `allow_dynamic_filters` | Each zero/nonzero policy branch and feature counter is covered synthetically. External-link and EFL corpus cases also compare restrictive and permissive profiles; VDS has a permissive source-path corpus case. |
+| `allow_unknown_messages` | Synthetic message policy covers denied-as-policy and allowed-as-unsupported behavior. |
+| `allow_legacy_dangerous_messages` | Synthetic message policy covers both zero and nonzero behavior. |
+| `forensic_mode` | Unit checks cover default mapping/continuation behavior and CLI mapping overrides. Forensic corpus cases exercise non-strict diagnostics, and the orphaned-GCOL fixture exercises the forensic-only sweep. |
+| `max_walk_seconds` | The four current preset values are snapshotted; deadline expiry is not induced because it is clock-dependent. |
+| `max_filter_expansion_ratio` | The four current preset values are snapshotted, but no enforcement exists to exercise. |
 
-The authoritative expected decisions and required findings are in
-[`tests/expected`](../tests/expected), and the synthetic datatype checks are in
+The authoritative corpus decisions and required findings are in
+[`tests/expected`](../tests/expected). The two synthetic layers are
+[`unit_limits.pk`](../tests/unit_limits.pk) and
 [`unit_datatype.pk`](../tests/unit_datatype.pk).

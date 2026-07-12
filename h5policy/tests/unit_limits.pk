@@ -1,0 +1,624 @@
+/* unit_limits.pk - Characterize the current H5PolicyLimits behavior with
+   reduced limits and synthetic in-memory metadata.
+
+   These tests intentionally describe the implementation as it exists.  They
+   exercise inclusive boundaries, saturating counters, finding classes,
+   compound resource rules, feature-policy switches, and run-mode defaults
+   without constructing files at the built-in profiles' production-scale
+   limits.  Structural datatype recursion remains covered by unit_datatype.pk.
+
+   Prints one "PASS <name>" / "FAIL <name>" line per case and exits 0 only if
+   every case passed.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+load h5_policy;
+
+var LIMIT_PROFILE = H5_UNTRUSTED_STRICT;
+var limit_failures = 0;
+
+fun expect_limit = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else
+        {
+            printf("FAIL %s\n", name);
+            limit_failures = limit_failures + 1;
+        }
+}
+
+fun limit_has_code = (string code) int:
+{
+    var i = 0UL;
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[i] == code)
+                return 1;
+            i = i + 1UL;
+        }
+    return 0;
+}
+
+fun limit_has_code_class = (string code, string klass) int:
+{
+    var i = 0UL;
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[i] == code
+                && h5policy_finding_classes[i] == klass)
+                return 1;
+            i = i + 1UL;
+        }
+    return 0;
+}
+
+/* Each case starts from the shipped strict profile but can lower one field.
+   File-width globals are set explicitly because these unit blobs do not pass
+   through a superblock mapping.  */
+fun reset_limit_case = void:
+{
+    LIMIT_PROFILE = H5_UNTRUSTED_STRICT;
+    h5policy_reset_findings;
+    h5policy_reset_traversal_state;
+    h5policy_walk_deadline = 0L;
+    h5policy_eof = 0UL;
+    h5policy_nonstrict = 0;
+    h5policy_continue = 0;
+    h5policy_mapping_arg = "";
+    h5policy_continue_arg = "";
+    global_sizeof_offsets = 8UB;
+    global_sizeof_lengths = 8UB;
+}
+
+/* Valid old fill-value message: four-byte length followed by four bytes.  */
+var LIMIT_FILL = [4UB, 0UB, 0UB, 0UB, 1UB, 2UB, 3UB, 4UB];
+
+/* Valid v2 attribute: "a\0", fixed-point u32 datatype, scalar dataspace,
+   followed by four value bytes.  */
+var LIMIT_ATTRIBUTE =
+    [2UB, 0UB, 2UB, 0UB, 12UB, 0UB, 4UB, 0UB,
+     97UB, 0UB,
+     16UB, 0UB, 0UB, 0UB, 4UB, 0UB, 0UB, 0UB,
+     0UB, 0UB, 32UB, 0UB,
+     2UB, 0UB, 0UB, 0UB,
+     1UB, 2UB, 3UB, 4UB];
+
+/* One v1 continuation message.  The zero continuation size is deliberately
+   corrupt, but the continuation counter is charged before that structural
+   finding and can therefore be characterized independently.  */
+var LIMIT_CONTINUATION =
+    [16UB, 0UB, 16UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     0xffUB, 0xffUB, 0xffUB, 0xffUB,
+     0xffUB, 0xffUB, 0xffUB, 0xffUB,
+     0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+
+/* Valid rank-two simple dataspace with dimensions [1, 1].  */
+var LIMIT_DATASPACE_RANK_2 =
+    [2UB, 2UB, 0UB, 1UB,
+     1UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     1UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+
+/* Valid v2 pipeline with two non-decoding core filters: shuffle and
+   fletcher32, both with empty client-data arrays.  */
+var LIMIT_TWO_FILTERS =
+    [2UB, 2UB,
+     2UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     3UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+
+/* Valid v2 pipeline with one non-core filter (ID 256).  */
+var LIMIT_DYNAMIC_FILTER =
+    [2UB, 1UB, 0UB, 1UB, 0UB, 0UB, 0UB, 0UB];
+
+/* Valid external-link message named "x".  Its value contains the version byte,
+   target file "f\0", and an empty target object path.  */
+var LIMIT_EXTERNAL_LINK =
+    [1UB, 8UB, 64UB, 1UB, 120UB,
+     4UB, 0UB, 0UB, 102UB, 0UB, 0UB];
+
+/* A v4 VDS layout prefix.  The short payload intentionally causes a structural
+   VDS-layout finding after the feature counter and policy branch have run.  */
+var LIMIT_VDS_LAYOUT = [4UB, 3UB];
+
+fun run_limit_fill = (H5PolicyLimits profile) H5WalkContext:
+{
+    var ios = open("*limits*");
+    byte[LIMIT_FILL'length] @ ios : 0#B = LIMIT_FILL;
+    var ctx = h5policy_new_walk_context;
+    ctx = h5policy_validate_fill_payload(ios, profile, ctx, 0#B,
+                                         LIMIT_FILL'length, "/u", 1);
+    close(ios);
+    return ctx;
+}
+
+fun run_limit_attribute = (H5PolicyLimits profile,
+                           H5WalkContext ctx) H5WalkContext:
+{
+    var ios = open("*limits*");
+    byte[LIMIT_ATTRIBUTE'length] @ ios : 0#B = LIMIT_ATTRIBUTE;
+    ctx = h5policy_validate_attribute_payload(ios, profile, ctx, 0#B,
+                                              LIMIT_ATTRIBUTE'length, "/u");
+    close(ios);
+    return ctx;
+}
+
+fun run_limit_continuation = (H5PolicyLimits profile,
+                              H5WalkContext ctx) H5WalkContext:
+{
+    var ios = open("*limits*");
+    byte[LIMIT_CONTINUATION'length] @ ios : 0#B = LIMIT_CONTINUATION;
+    ctx = h5policy_validate_msg_chunk(ios, profile, ctx, 1UB, 8, 1,
+                                      0#B, LIMIT_CONTINUATION'length, "/u");
+    close(ios);
+    return ctx;
+}
+
+fun run_limit_dataspace = (H5PolicyLimits profile) H5WalkContext:
+{
+    var ios = open("*limits*");
+    byte[LIMIT_DATASPACE_RANK_2'length] @ ios : 0#B = LIMIT_DATASPACE_RANK_2;
+    var ctx = h5policy_new_walk_context;
+    ctx = h5policy_validate_dataspace_payload(ios, profile, ctx, 0#B,
+                                              LIMIT_DATASPACE_RANK_2'length,
+                                              "/u");
+    close(ios);
+    return ctx;
+}
+
+fun run_limit_pipeline = (H5PolicyLimits profile, byte[] blob) int:
+{
+    var ios = open("*limits*");
+    byte[blob'length] @ ios : 0#B = blob;
+    var result = h5policy_validate_filter_pipeline_payload(
+        ios, profile, 0#B, blob'length, "/u", 0);
+    close(ios);
+    return result;
+}
+
+fun run_limit_external_link = (H5PolicyLimits profile) void:
+{
+    var ios = open("*limits*");
+    byte[LIMIT_EXTERNAL_LINK'length] @ ios : 0#B = LIMIT_EXTERNAL_LINK;
+    h5policy_validate_link_payload(ios, profile, 0#B,
+                                   LIMIT_EXTERNAL_LINK'length, "/u");
+    close(ios);
+}
+
+fun run_limit_vds = (H5PolicyLimits profile) void:
+{
+    var ios = open("*limits*");
+    byte[LIMIT_VDS_LAYOUT'length] @ ios : 0#B = LIMIT_VDS_LAYOUT;
+    var ctx = h5policy_new_walk_context;
+    ctx = h5policy_validate_layout_payload(ios, profile, ctx, 0#B,
+                                           LIMIT_VDS_LAYOUT'length, "/u");
+    close(ios);
+}
+
+/* ---- Inclusive cumulative counters and saturation --------------------- */
+
+reset_limit_case;
+LIMIT_PROFILE.max_metadata_bytes = 2UL;
+var ctx_metadata = h5policy_new_walk_context;
+ctx_metadata = h5policy_account_metadata(ctx_metadata, LIMIT_PROFILE, 2UL,
+                                         0#B, "/u");
+expect_limit("metadata_equal_allowed",
+             ctx_metadata.metadata_seen == 2UL
+             && !limit_has_code("H5_RESOURCE_METADATA_BYTES"));
+ctx_metadata = h5policy_account_metadata(ctx_metadata, LIMIT_PROFILE, 1UL,
+                                         0#B, "/u");
+expect_limit("metadata_over_saturates_resource",
+             ctx_metadata.metadata_seen == 2UL
+             && limit_has_code_class("H5_RESOURCE_METADATA_BYTES", "resource")
+             && h5policy_decision == "reject_resource");
+
+reset_limit_case;
+LIMIT_PROFILE.max_object_count = 1UL;
+var ctx_objects = h5policy_new_walk_context;
+ctx_objects = h5policy_count_object(ctx_objects, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("object_equal_allowed",
+             ctx_objects.object_count == 1UL
+             && !limit_has_code("H5_RESOURCE_OBJECT_COUNT"));
+ctx_objects = h5policy_count_object(ctx_objects, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("object_over_saturates_resource",
+             ctx_objects.object_count == 1UL
+             && limit_has_code_class("H5_RESOURCE_OBJECT_COUNT", "resource"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_attribute_count = 1UL;
+var ctx_attributes = h5policy_new_walk_context;
+ctx_attributes = run_limit_attribute(LIMIT_PROFILE, ctx_attributes);
+expect_limit("attribute_equal_allowed",
+             ctx_attributes.attribute_count == 1UL
+             && !limit_has_code("H5_RESOURCE_ATTRIBUTE_COUNT"));
+ctx_attributes = run_limit_attribute(LIMIT_PROFILE, ctx_attributes);
+expect_limit("attribute_over_saturates_resource",
+             ctx_attributes.attribute_count == 1UL
+             && limit_has_code_class("H5_RESOURCE_ATTRIBUTE_COUNT", "resource"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_object_header_chunks = 1UL;
+var ctx_continuations = h5policy_new_walk_context;
+ctx_continuations = run_limit_continuation(LIMIT_PROFILE, ctx_continuations);
+expect_limit("continuation_equal_allowed",
+             ctx_continuations.object_header_chunk_count == 1UL
+             && !limit_has_code("H5_RESOURCE_OBJECT_HEADER_CHUNKS"));
+ctx_continuations = run_limit_continuation(LIMIT_PROFILE, ctx_continuations);
+expect_limit("continuation_over_saturates_resource",
+             ctx_continuations.object_header_chunk_count == 1UL
+             && limit_has_code_class("H5_RESOURCE_OBJECT_HEADER_CHUNKS",
+                                     "resource"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_chunk_count = 1UL;
+var ctx_chunks = h5policy_new_walk_context;
+ctx_chunks = h5policy_note_chunk_index_addr(ctx_chunks, LIMIT_PROFILE, 1UL,
+                                            0#B, "/u");
+expect_limit("chunk_equal_allowed",
+             ctx_chunks.chunk_index_count == 1UL
+             && !limit_has_code("H5_RESOURCE_CHUNK_COUNT"));
+ctx_chunks = h5policy_note_chunk_index_addr(ctx_chunks, LIMIT_PROFILE, 2UL,
+                                            0#B, "/u");
+expect_limit("chunk_over_saturates_resource",
+             ctx_chunks.chunk_index_count == 1UL
+             && limit_has_code_class("H5_RESOURCE_CHUNK_COUNT", "resource"));
+
+/* ---- Per-value and per-dataset limits --------------------------------- */
+
+reset_limit_case;
+LIMIT_PROFILE.max_single_allocation_bytes = 4UL;
+var ctx_fill_equal = run_limit_fill(LIMIT_PROFILE);
+expect_limit("single_allocation_equal_allowed",
+             !limit_has_code("H5_RESOURCE_SINGLE_ALLOCATION_BYTES"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_single_allocation_bytes = 3UL;
+var ctx_fill_over = run_limit_fill(LIMIT_PROFILE);
+expect_limit("single_allocation_over_resource",
+             limit_has_code_class("H5_RESOURCE_SINGLE_ALLOCATION_BYTES",
+                                  "resource"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_single_allocation_bytes = 0UL;
+var ctx_fill_disabled = run_limit_fill(LIMIT_PROFILE);
+expect_limit("single_allocation_zero_disables",
+             !limit_has_code("H5_RESOURCE_SINGLE_ALLOCATION_BYTES"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_logical_dataset_bytes = 6UL;
+var ctx_logical_equal = h5policy_new_walk_context;
+ctx_logical_equal.has_dataspace = 1UB;
+ctx_logical_equal.has_datatype = 1UB;
+ctx_logical_equal.dataset_element_count = 2UL;
+ctx_logical_equal.datatype_size = 3UL;
+ctx_logical_equal.datatype_logical_size = 3UL;
+ctx_logical_equal = h5policy_update_logical_dataset_size(
+    ctx_logical_equal, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("logical_dataset_equal_allowed",
+             ctx_logical_equal.logical_dataset_bytes == 6UL
+             && !limit_has_code("H5_RESOURCE_LOGICAL_DATASET_BYTES"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_logical_dataset_bytes = 5UL;
+var ctx_logical_over = h5policy_new_walk_context;
+ctx_logical_over.has_dataspace = 1UB;
+ctx_logical_over.has_datatype = 1UB;
+ctx_logical_over.dataset_element_count = 2UL;
+ctx_logical_over.datatype_size = 3UL;
+ctx_logical_over.datatype_logical_size = 3UL;
+ctx_logical_over = h5policy_update_logical_dataset_size(
+    ctx_logical_over, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("logical_dataset_over_saturates_resource",
+             ctx_logical_over.logical_dataset_bytes == 5UL
+             && ctx_logical_over.max_logical_dataset_bytes_seen == 5UL
+             && limit_has_code_class("H5_RESOURCE_LOGICAL_DATASET_BYTES",
+                                     "resource"));
+
+/* The tiny-chunk rule uses strict comparisons for both byte size and count. */
+reset_limit_case;
+LIMIT_PROFILE.min_logical_chunk_bytes = 4UL;
+LIMIT_PROFILE.min_logical_chunk_count = 3UL;
+var ctx_tiny_count_equal = h5policy_new_walk_context;
+ctx_tiny_count_equal.has_chunked_layout = 1UB;
+ctx_tiny_count_equal.has_dataspace = 1UB;
+ctx_tiny_count_equal.has_datatype = 1UB;
+ctx_tiny_count_equal.dataset_element_count = 9UL;
+ctx_tiny_count_equal.chunk_dataset_element_count = 3UL;
+ctx_tiny_count_equal.datatype_logical_size = 1UL;
+ctx_tiny_count_equal = h5policy_update_chunk_resource_pressure(
+    ctx_tiny_count_equal, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("tiny_chunk_count_equal_allowed",
+             ctx_tiny_count_equal.chunk_logical_bytes == 3UL
+             && !limit_has_code("H5_RESOURCE_CHUNK_TOO_SMALL"));
+
+reset_limit_case;
+LIMIT_PROFILE.min_logical_chunk_bytes = 4UL;
+LIMIT_PROFILE.min_logical_chunk_count = 3UL;
+var ctx_tiny_bytes_equal = h5policy_new_walk_context;
+ctx_tiny_bytes_equal.has_chunked_layout = 1UB;
+ctx_tiny_bytes_equal.has_dataspace = 1UB;
+ctx_tiny_bytes_equal.has_datatype = 1UB;
+ctx_tiny_bytes_equal.dataset_element_count = 16UL;
+ctx_tiny_bytes_equal.chunk_dataset_element_count = 4UL;
+ctx_tiny_bytes_equal.datatype_logical_size = 1UL;
+ctx_tiny_bytes_equal = h5policy_update_chunk_resource_pressure(
+    ctx_tiny_bytes_equal, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("tiny_chunk_bytes_equal_allowed",
+             ctx_tiny_bytes_equal.chunk_logical_bytes == 4UL
+             && !limit_has_code("H5_RESOURCE_CHUNK_TOO_SMALL"));
+
+reset_limit_case;
+LIMIT_PROFILE.min_logical_chunk_bytes = 4UL;
+LIMIT_PROFILE.min_logical_chunk_count = 3UL;
+var ctx_tiny_over = h5policy_new_walk_context;
+ctx_tiny_over.has_chunked_layout = 1UB;
+ctx_tiny_over.has_dataspace = 1UB;
+ctx_tiny_over.has_datatype = 1UB;
+ctx_tiny_over.dataset_element_count = 12UL;
+ctx_tiny_over.chunk_dataset_element_count = 3UL;
+ctx_tiny_over.datatype_logical_size = 1UL;
+ctx_tiny_over = h5policy_update_chunk_resource_pressure(
+    ctx_tiny_over, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("tiny_chunk_both_over_resource",
+             limit_has_code_class("H5_RESOURCE_CHUNK_TOO_SMALL", "resource"));
+
+reset_limit_case;
+LIMIT_PROFILE.min_logical_chunk_bytes = 0UL;
+LIMIT_PROFILE.min_logical_chunk_count = 0UL;
+var ctx_tiny_disabled = h5policy_new_walk_context;
+ctx_tiny_disabled.has_chunked_layout = 1UB;
+ctx_tiny_disabled.has_dataspace = 1UB;
+ctx_tiny_disabled.has_datatype = 1UB;
+ctx_tiny_disabled.dataset_element_count = 12UL;
+ctx_tiny_disabled.chunk_dataset_element_count = 3UL;
+ctx_tiny_disabled.datatype_logical_size = 1UL;
+ctx_tiny_disabled = h5policy_update_chunk_resource_pressure(
+    ctx_tiny_disabled, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("tiny_chunk_zero_bytes_disables",
+             !limit_has_code("H5_RESOURCE_CHUNK_TOO_SMALL"));
+
+/* ---- Decoder-local limits --------------------------------------------- */
+
+reset_limit_case;
+LIMIT_PROFILE.max_rank = 2UL;
+var ctx_rank_equal = run_limit_dataspace(LIMIT_PROFILE);
+expect_limit("rank_equal_allowed",
+             ctx_rank_equal.max_rank_seen == 2UL
+             && !limit_has_code("H5_RESOURCE_DATASPACE_RANK"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_rank = 1UL;
+var ctx_rank_over = run_limit_dataspace(LIMIT_PROFILE);
+expect_limit("rank_over_resource_continues",
+             ctx_rank_over.dataspace_rank == 2UL
+             && limit_has_code_class("H5_RESOURCE_DATASPACE_RANK", "resource")
+             && !limit_has_code("H5_CORRUPT_DATASPACE_RANK_TOO_LARGE"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_filter_count = 2UL;
+var pipeline_equal = run_limit_pipeline(LIMIT_PROFILE, LIMIT_TWO_FILTERS);
+expect_limit("filter_count_equal_allowed",
+             pipeline_equal
+             && !limit_has_code("H5_RESOURCE_FILTER_COUNT"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_filter_count = 1UL;
+var pipeline_over = run_limit_pipeline(LIMIT_PROFILE, LIMIT_TWO_FILTERS);
+expect_limit("filter_count_over_resource_continues",
+             pipeline_over
+             && limit_has_code_class("H5_RESOURCE_FILTER_COUNT", "resource"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_btree_depth = 0UL;
+var ios_depth = open("*limits*");
+byte[1] @ ios_depth : 0#B = [0UB];
+var ctx_depth = h5policy_new_walk_context;
+ctx_depth = h5policy_walk_chunk_btree(ios_depth, LIMIT_PROFILE, ctx_depth,
+                                      0UL, 1UL, "/u", 1UL);
+close(ios_depth);
+expect_limit("btree_depth_over_is_corrupt",
+             limit_has_code_class("H5_CORRUPT_BTREE_DEPTH_EXCEEDED",
+                                  "corrupt"));
+
+reset_limit_case;
+LIMIT_PROFILE.max_link_traversal_depth = 0UL;
+h5policy_enqueue_ohdr(LIMIT_PROFILE, 10UL, 0UL, "/", 0#B, "/");
+expect_limit("link_depth_equal_queues",
+             h5policy_pending_ohdrs'length == 1UL
+             && !limit_has_code("H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED"));
+h5policy_enqueue_ohdr(LIMIT_PROFILE, 11UL, 1UL, "/child", 0#B, "/");
+expect_limit("link_depth_over_is_corrupt_and_not_queued",
+             h5policy_pending_ohdrs'length == 1UL
+             && limit_has_code_class("H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED",
+                                     "corrupt"));
+
+/* ---- Metadata-ratio compound rule ------------------------------------- */
+
+reset_limit_case;
+LIMIT_PROFILE.metadata_ratio_reject_percent = 0UL;
+LIMIT_PROFILE.metadata_ratio_warn_percent = 50UL;
+LIMIT_PROFILE.metadata_ratio_warn_min_bytes = 10UL;
+var ctx_ratio_floor = h5policy_new_walk_context;
+ctx_ratio_floor.metadata_seen = 10UL;
+h5policy_check_metadata_ratio(ctx_ratio_floor, LIMIT_PROFILE, 20UL);
+expect_limit("metadata_ratio_equal_floor_allowed",
+             !limit_has_code("H5_ADVISORY_METADATA_RATIO"));
+
+reset_limit_case;
+LIMIT_PROFILE.metadata_ratio_reject_percent = 0UL;
+LIMIT_PROFILE.metadata_ratio_warn_percent = 50UL;
+LIMIT_PROFILE.metadata_ratio_warn_min_bytes = 10UL;
+var ctx_ratio_warn = h5policy_new_walk_context;
+ctx_ratio_warn.metadata_seen = 11UL;
+h5policy_check_metadata_ratio(ctx_ratio_warn, LIMIT_PROFILE, 20UL);
+expect_limit("metadata_ratio_warn_both_over",
+             limit_has_code_class("H5_ADVISORY_METADATA_RATIO", "warning")
+             && h5policy_decision == "accept_with_warnings");
+
+reset_limit_case;
+LIMIT_PROFILE.metadata_ratio_reject_percent = 75UL;
+LIMIT_PROFILE.metadata_ratio_reject_min_bytes = 10UL;
+LIMIT_PROFILE.metadata_ratio_warn_percent = 50UL;
+LIMIT_PROFILE.metadata_ratio_warn_min_bytes = 0UL;
+var ctx_ratio_reject_equal = h5policy_new_walk_context;
+ctx_ratio_reject_equal.metadata_seen = 15UL;
+h5policy_check_metadata_ratio(ctx_ratio_reject_equal, LIMIT_PROFILE, 20UL);
+expect_limit("metadata_ratio_reject_equal_falls_to_warning",
+             !limit_has_code("H5_RESOURCE_METADATA_RATIO")
+             && limit_has_code("H5_ADVISORY_METADATA_RATIO"));
+
+reset_limit_case;
+LIMIT_PROFILE.metadata_ratio_reject_percent = 75UL;
+LIMIT_PROFILE.metadata_ratio_reject_min_bytes = 10UL;
+LIMIT_PROFILE.metadata_ratio_warn_percent = 50UL;
+LIMIT_PROFILE.metadata_ratio_warn_min_bytes = 0UL;
+var ctx_ratio_reject = h5policy_new_walk_context;
+ctx_ratio_reject.metadata_seen = 16UL;
+h5policy_check_metadata_ratio(ctx_ratio_reject, LIMIT_PROFILE, 20UL);
+expect_limit("metadata_ratio_reject_suppresses_warning",
+             limit_has_code_class("H5_RESOURCE_METADATA_RATIO", "resource")
+             && !limit_has_code("H5_ADVISORY_METADATA_RATIO"));
+
+/* ---- Feature-policy switches ----------------------------------------- */
+
+reset_limit_case;
+LIMIT_PROFILE.allow_external_links = 0UB;
+run_limit_external_link(LIMIT_PROFILE);
+expect_limit("external_link_denied_policy",
+             h5policy_feature_external_links == 1UL
+             && limit_has_code_class("H5_POLICY_EXTERNAL_LINK", "policy"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_external_links = 1UB;
+run_limit_external_link(LIMIT_PROFILE);
+expect_limit("external_link_allowed_no_policy",
+             h5policy_feature_external_links == 1UL
+             && !limit_has_code("H5_POLICY_EXTERNAL_LINK"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_external_storage = 0UB;
+h5policy_validate_message_policy(0x07UL, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("external_storage_denied_policy",
+             h5policy_feature_external_storage == 1UL
+             && limit_has_code_class("H5_POLICY_EXTERNAL_STORAGE", "policy"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_external_storage = 1UB;
+h5policy_validate_message_policy(0x07UL, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("external_storage_allowed_no_policy",
+             h5policy_feature_external_storage == 1UL
+             && !limit_has_code("H5_POLICY_EXTERNAL_STORAGE"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_vds = 0UB;
+run_limit_vds(LIMIT_PROFILE);
+expect_limit("vds_denied_policy",
+             h5policy_feature_vds == 1UL
+             && limit_has_code_class("H5_POLICY_VDS", "policy"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_vds = 1UB;
+run_limit_vds(LIMIT_PROFILE);
+expect_limit("vds_allowed_no_policy",
+             h5policy_feature_vds == 1UL
+             && !limit_has_code("H5_POLICY_VDS"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_dynamic_filters = 0UB;
+var dynamic_denied = run_limit_pipeline(LIMIT_PROFILE, LIMIT_DYNAMIC_FILTER);
+expect_limit("dynamic_filter_denied_policy",
+             dynamic_denied
+             && h5policy_feature_dynamic_filters'length == 1UL
+             && limit_has_code_class("H5_POLICY_DYNAMIC_FILTER", "policy"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_dynamic_filters = 1UB;
+var dynamic_allowed = run_limit_pipeline(LIMIT_PROFILE, LIMIT_DYNAMIC_FILTER);
+expect_limit("dynamic_filter_allowed_no_policy",
+             dynamic_allowed
+             && h5policy_feature_dynamic_filters'length == 1UL
+             && !limit_has_code("H5_POLICY_DYNAMIC_FILTER"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_unknown_messages = 0UB;
+h5policy_validate_message_policy(0x19UL, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("unknown_message_denied_policy",
+             h5policy_feature_unknown_messages == 1UL
+             && limit_has_code_class("H5_POLICY_UNKNOWN_MESSAGE", "policy"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_unknown_messages = 1UB;
+h5policy_validate_message_policy(0x19UL, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("unknown_message_allowed_is_unsupported",
+             h5policy_feature_unknown_messages == 1UL
+             && limit_has_code_class("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                     "unsupported")
+             && h5policy_decision == "unsupported_coverage_gap");
+
+reset_limit_case;
+LIMIT_PROFILE.allow_legacy_dangerous_messages = 0UB;
+h5policy_validate_message_policy(0x09UL, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("legacy_dangerous_message_denied_policy",
+             limit_has_code_class("H5_POLICY_LEGACY_DANGEROUS_MESSAGE",
+                                  "policy"));
+
+reset_limit_case;
+LIMIT_PROFILE.allow_legacy_dangerous_messages = 1UB;
+h5policy_validate_message_policy(0x09UL, LIMIT_PROFILE, 0#B, "/u");
+expect_limit("legacy_dangerous_message_allowed_no_policy",
+             !limit_has_code("H5_POLICY_LEGACY_DANGEROUS_MESSAGE"));
+
+/* ---- Run-mode defaults and selected preset values -------------------- */
+
+reset_limit_case;
+LIMIT_PROFILE = H5_FORENSIC;
+h5policy_apply_run_mode(LIMIT_PROFILE);
+expect_limit("forensic_mode_defaults_non_strict_and_continue",
+             h5policy_nonstrict == 1 && h5policy_continue == 1);
+
+reset_limit_case;
+LIMIT_PROFILE = H5_FORENSIC;
+h5policy_mapping_arg = "strict";
+h5policy_apply_run_mode(LIMIT_PROFILE);
+expect_limit("forensic_mapping_override_preserves_continue",
+             h5policy_nonstrict == 0 && h5policy_continue == 1);
+
+reset_limit_case;
+h5policy_mapping_arg = "non_strict";
+h5policy_continue_arg = "yes";
+h5policy_apply_run_mode(LIMIT_PROFILE);
+expect_limit("strict_profile_run_mode_overrides",
+             h5policy_nonstrict == 1 && h5policy_continue == 1);
+
+expect_limit("walk_seconds_presets",
+             H5_UNTRUSTED_STRICT.max_walk_seconds == 10UL
+             && H5_FORENSIC.max_walk_seconds == 30UL
+             && H5_TRUSTED_FAST.max_walk_seconds == 20UL
+             && H5_LEGACY.max_walk_seconds == 60UL);
+
+expect_limit("unused_filter_expansion_ratio_presets",
+             H5_UNTRUSTED_STRICT.max_filter_expansion_ratio == 100UL
+             && H5_FORENSIC.max_filter_expansion_ratio == 0UL
+             && H5_TRUSTED_FAST.max_filter_expansion_ratio == 0UL
+             && H5_LEGACY.max_filter_expansion_ratio == 0UL);
+
+if (limit_failures != 0)
+    {
+        printf("UNIT LIMITS: %i32d failure(s)\n", limit_failures);
+        exit(1);
+    }
+printf("UNIT LIMITS: all passed\n");
+
