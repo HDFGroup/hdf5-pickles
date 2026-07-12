@@ -7,27 +7,34 @@ suggests broader behavior than the validators currently implement, the
 narrower implemented behavior is documented.
 
 The types and four built-in values are defined in
-[`h5_profiles.pk`](../pickles/h5_profiles.pk). The command-line wrapper maps the
-public profile names to those values, and [`h5_policy.pk`](../pickles/h5_policy.pk)
-selects one value for a run.
+[`h5_profiles.pk`](../pickles/h5_profiles.pk). The effective option snapshot and
+resolver are in [`h5_run_options.pk`](../pickles/h5_run_options.pk). The
+command-line wrapper maps public profile names to the built-in values, and
+[`h5_policy.pk`](../pickles/h5_policy.pk) selects and resolves them for a run.
 
 ## Model structure
 
-`H5PolicyProfile` separates the former flat configuration into four groups:
+`H5PolicyProfile` contains four groups:
 
-- `limits` (`H5PolicyLimits`) contains hard numeric resource, shape, and depth
-  ceilings;
-- `heuristics` (`H5PolicyHeuristics`) contains the tiny-chunk and metadata-ratio
+- `resources` (`H5ResourceLimits`) contains hard numeric resource, shape,
+  depth, and walk-work ceilings;
+- `heuristics` (`H5HeuristicPolicy`) contains the tiny-chunk and metadata-ratio
   thresholds;
-- `features` (`H5PolicyFeaturePolicy`) contains the six `allow_*` switches; and
-- `analysis` (`H5PolicyAnalysis`) contains deterministic and wall-clock walk
-  budgets plus three
-  independent run-analysis controls.
+- `features` (`H5FeaturePolicy`) contains the six `allow_*` switches; and
+- `analysis_defaults` (`H5AnalysisDefaults`) contains three independent preset
+  choices for run-analysis behavior.
 
-This grouping is organizational. It did not change any preset value,
-comparison, sentinel convention, finding, or validator control-flow decision.
-The field descriptions below generally use the leaf field name; validator code
-accesses it through the group shown above.
+`H5RunOptions` is deliberately outside `H5PolicyProfile`. At the beginning of
+each invocation, `h5policy_resolve_run_options` combines the selected
+`analysis_defaults` with CLI overrides and produces one effective value for
+mapping strictness, continuation after corruption, and unreachable-metadata
+sweeping. Walk deadlines and counters remain execution state rather than
+profile or option fields.
+
+This grouping is organizational. Its introduction did not change any preset
+value, comparison, sentinel convention, finding, or validator control-flow
+decision. The field descriptions below generally use the leaf field name;
+validator code accesses it through the group shown above.
 
 ### Semantic normalization from the characterized model
 
@@ -66,6 +73,11 @@ Finding identifiers were normalized with the fields:
 invalid selected profile emits `H5_INTERNAL_INVALID_PROFILE`, prints a normal
 report, and returns without opening or validating the input file. Callers that
 construct profiles directly can use `h5policy_profile_is_valid` first.
+
+For report compatibility, the validation text for invalid
+`analysis_defaults.nonstrict_mapping` and
+`analysis_defaults.continue_after_corruption` values retains the former
+`default_nonstrict_mapping` and `default_continue_after_corruption` leaf names.
 
 ### Comparisons and saturation
 
@@ -412,7 +424,7 @@ updates `max_rank_seen`, then applies two checks:
 
 1. rank greater than the fixed `H5POLICY_H5S_MAX_RANK` value of 32 emits
    `H5_CORRUPT_DATASPACE_RANK_TOO_LARGE`;
-2. rank greater than `profile.limits.max_rank` emits
+2. rank greater than `profile.resources.max_rank` emits
    `H5_RESOURCE_DATASPACE_RANK`.
 
 The profile finding is a resource finding and does not stop dimension parsing.
@@ -575,7 +587,7 @@ legacy. If that timeout kills poke, the wrapper produces
 `H5_UNSUPPORTED_WALK_TIMEOUT`. Those wrapper values are not derived from
 `max_walk_seconds`.
 
-## Built-in feature and mode presets
+## Built-in feature and analysis-default presets
 
 All fields are `uint<8>` and valid profiles restrict them to exactly zero or
 one. Enforcement sites therefore receive canonical boolean values.
@@ -588,8 +600,8 @@ one. Enforcement sites therefore receive canonical boolean values.
 | `allow_dynamic_filters` | 0 | 0 | 1 | 1 |
 | `allow_unknown_messages` | 0 | 1 | 1 | 1 |
 | `allow_legacy_dangerous_messages` | 0 | 0 | 0 | 1 |
-| `default_nonstrict_mapping` | 0 | 1 | 0 | 0 |
-| `default_continue_after_corruption` | 0 | 1 | 0 | 0 |
+| `nonstrict_mapping` | 0 | 1 | 0 | 0 |
+| `continue_after_corruption` | 0 | 1 | 0 | 0 |
 | `sweep_unreachable_metadata` | 0 | 1 | 0 | 0 |
 
 ### `allow_external_links`
@@ -692,21 +704,25 @@ feature counter in the JSON report.
 
 ### Analysis controls
 
-`default_nonstrict_mapping` selects the mapping default when neither
+`analysis_defaults.nonstrict_mapping` selects the mapping default when neither
 `--strict` nor `--non-strict` is supplied. Nonzero selects non-strict Poke
 mappings (`@!`); zero selects strict mappings (`@`).
 
-`default_continue_after_corruption` independently selects whether the main
+`analysis_defaults.continue_after_corruption` independently selects whether the main
 walk continues between queued objects after a rejection when
 `--continue-after-corruption` is absent. The CLI flag can enable continuation
 for any profile.
 
-`sweep_unreachable_metadata` independently enables the raw-file GCOL signature
-sweep after the reachable walk. The sweep finds orphaned global-heap
-zero-advance loops and is not affected by either CLI override.
+`analysis_defaults.sweep_unreachable_metadata` independently enables the
+raw-file GCOL signature sweep after the reachable walk. The sweep finds
+orphaned global-heap zero-advance loops and is not affected by either CLI
+override.
 
-The forensic preset enables all three fields. Splitting them makes their
-independent effects explicit without changing any built-in profile behavior.
+The resolver copies or overrides these values into the same-named fields of
+`H5RunOptions`. Validators consult that effective run value rather than the
+preset defaults directly. The forensic preset enables all three fields;
+splitting defaults from effective options makes their provenance explicit
+without changing built-in behavior.
 
 ## Current test coverage
 

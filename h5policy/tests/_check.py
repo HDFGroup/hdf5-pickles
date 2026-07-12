@@ -46,7 +46,7 @@ PROFILE_NAMES = {
 }
 
 PROFILE_OVERRIDE_FIELDS = {
-    "limits": {
+    "resources": {
         "max_accounted_metadata_bytes": "UL",
         "max_logical_dataset_bytes": "UL",
         "max_single_value_bytes": "UL",
@@ -60,6 +60,8 @@ PROFILE_OVERRIDE_FIELDS = {
         "max_chunk_count": "UL",
         "max_filter_count": "UL",
         "max_rank": "UL",
+        "max_walk_operations": "UL",
+        "max_walk_seconds": "UL",
     },
     "heuristics": {
         "min_logical_chunk_bytes": "UL",
@@ -77,11 +79,9 @@ PROFILE_OVERRIDE_FIELDS = {
         "allow_unknown_messages": "UB",
         "allow_legacy_dangerous_messages": "UB",
     },
-    "analysis": {
-        "max_walk_operations": "UL",
-        "max_walk_seconds": "UL",
-        "default_nonstrict_mapping": "UB",
-        "default_continue_after_corruption": "UB",
+    "analysis_defaults": {
+        "nonstrict_mapping": "UB",
+        "continue_after_corruption": "UB",
         "sweep_unreachable_metadata": "UB",
     },
 }

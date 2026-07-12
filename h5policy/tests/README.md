@@ -58,7 +58,7 @@ An expectation can additionally assert `forbidden_findings`, exact subsets of
 file: integration/value_sites.h5
 profile: untrusted-strict
 profile_overrides:
-  limits:
+  resources:
     max_single_value_bytes: 2
 expected_decision: reject_resource
 expected_exit: 4
