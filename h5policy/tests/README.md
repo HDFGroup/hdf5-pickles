@@ -67,6 +67,14 @@ expected_metrics:
   attribute_count: 1
 ```
 
+The reduced-boundary layer also reuses valid nested datatypes, multi-level
+dense-link B-trees, and continuation-heavy object headers to distinguish
+resource ceilings from structural corruption. A focused
+`integration/multi_filter_dataset.h5` fixture supplies both a four-chunk
+fixed-array index and a two-filter shuffle+gzip pipeline: its baseline case is
+valid with the normal gzip advisory, while separate overrides reduce only the
+chunk or filter count ceiling.
+
 ## Differential harness
 
 `../tools/h5policy-diff` cross-checks h5policy's independent parse against
