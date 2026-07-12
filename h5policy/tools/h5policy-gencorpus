@@ -437,6 +437,8 @@ def _gen_malformed(root):
         f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
     _make_scaleoffset_size_mismatch(
         f"{root}/malformed/scaleoffset_size_mismatch.h5")
+    _make_chunk_size_uint32_wrap(
+        f"{root}/malformed/chunk_size_uint32_wrap.h5")
     _make_bad_reference_datatype_version(
         f"{root}/malformed/bad_reference_datatype_version.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
@@ -852,6 +854,47 @@ def _make_scaleoffset_size_mismatch(path):
     driving the same out-of-bounds write.  h5policy rejects it because the
     declared element size disagrees with the dataset's datatype size."""
     _scaleoffset_cd_patch(path, 4, 131073)
+
+
+def _make_chunk_size_uint32_wrap(path):
+    """A v4 chunked layout whose encoded chunk dimensions multiply to a byte size
+    of 2**32 + 256.  libhdf5 stores the per-chunk byte size in a uint32_t
+    (H5O_layout_chunk_t.size) computed as the product of all encoded dims (the
+    trailing dim is the element size), so the product wraps to 256: a 256-byte
+    chunk buffer is allocated while the chunk covers ~4 GiB, an out-of-bounds
+    write on read.  No valid file reaches this state -- H5Pset_chunk rejects
+    chunks >= 4 GiB at creation -- so build a single-chunk dataset whose chunk
+    dimension needs four encoded bytes (2**24, no data written -> tiny file) and
+    patch that dimension to 0x40000040, repairing the object-header checksum."""
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", shape=(1 << 24,), chunks=(1 << 24,),
+                                   dtype="i4"))
+    for o in range(len(raw) - 4):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        p = cur + size_w
+        end = cur + size_w + chunk0
+        while p < end - 3:
+            mtype = raw[p]
+            msize = struct.unpack_from("<H", raw, p + 1)[0]
+            mbody = p + 4 + (2 if flags & 0x04 else 0)
+            # Data Layout (0x08), version 4, class 2 (chunked): dims follow
+            # version/class/flags/dimensionality/enc_bytes_per_dim.
+            if mtype == 0x08 and raw[mbody] == 4 and raw[mbody + 1] == 2:
+                enc = raw[mbody + 4]
+                if enc < 4:
+                    raise RuntimeError(
+                        "chunk dim encoding too narrow to patch a wrapping value")
+                struct.pack_into("<I", raw, mbody + 5, 0x40000040)
+                _fix_v2_ohdr_checksum(raw, o)
+                _patch(path, bytes(raw))
+                return
+            p = mbody + msize
+    raise RuntimeError("could not locate the v4 chunked layout message")
 
 
 def _make_bad_reference_datatype_version(path):

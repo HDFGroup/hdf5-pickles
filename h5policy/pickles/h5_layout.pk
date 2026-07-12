@@ -95,6 +95,34 @@ fun h5policy_check_contiguous_extent = (int ios, H5PolicyProfile profile,
     return ctx;
 }
 
+/* Accumulate a chunk's byte size across its encoded dimensions, guarding the
+   32-bit field libhdf5 stores it in.  H5O_layout_chunk_t.size is a uint32_t
+   computed as the product of *all* encoded chunk dims (the trailing dim is the
+   element size in bytes); on decode libhdf5 multiplies them without an overflow
+   check, so a product >= 2^32 wraps to a small value and the per-chunk buffer is
+   under-allocated -- a heap-overflow primitive on the subsequent chunk read.
+   No valid file reaches here: H5Pset_chunk rejects chunks >= 4 GiB at creation.
+
+   Call once per (nonzero) dimension with the running product, starting at 1.
+   Returns the new product, or a poison sentinel once the 32-bit bound is blown;
+   the sentinel emits the finding exactly once and is carried through the rest of
+   the loop.  The `dim != 0` division guard is safe because zero dims are rejected
+   separately by the caller before this runs.  */
+fun h5policy_chunk_size32_accum = (uint<64> acc, uint<64> dim,
+                                   off64 loc, string object) uint<64>:
+{
+    if (acc == 0xffffffffffffffffUL)
+        return acc;                     /* already flagged; stay poisoned */
+    if (dim != 0UL && acc > 0xffffffffUL / dim)
+        {
+            h5policy_emit_error("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT",
+                                "corrupt", loc, object,
+                                "chunk byte size exceeds the 32-bit chunk-size field; libhdf5 wraps it and under-allocates the chunk buffer");
+            return 0xffffffffffffffffUL;
+        }
+    return acc * dim;
+}
+
 /* v4 chunked layout: validate the chunk dimensions and dispatch on the
    chunk-index type (single/implicit/fixed-array/extensible-array/v2-btree).
    Split out of h5policy_validate_layout_payload.  */
@@ -120,6 +148,7 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyProfile profile,
                                                "chunk dimension byte count overflow");
     var idx_type_rel = dims_rel4 + dims_bytes4;
     var chunk_elem_count = 1UL;
+    var chunk_byte_size = 1UL;
     var chunk_dims_ok = 1UB;
     if (h5policy_payload_range_ok(msg_size, dims_rel4,
                                   dims_bytes4,
@@ -148,13 +177,21 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyProfile profile,
                                                 payload_off, object,
                                                 "chunk dimension is zero");
                         }
-                    else if (k + 1UL < ndims4)
-                        chunk_elem_count =
-                            h5policy_checked_mul_u64(chunk_elem_count, dim4,
-                                                     0xffffffffffffffffUL,
-                                                     "H5_CORRUPT_LENGTH_OVERFLOW",
-                                                     "corrupt", payload_off, object,
-                                                     "chunk element count overflow");
+                    else
+                        {
+                            if (k + 1UL < ndims4)
+                                chunk_elem_count =
+                                    h5policy_checked_mul_u64(chunk_elem_count, dim4,
+                                                             0xffffffffffffffffUL,
+                                                             "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                             "corrupt", payload_off, object,
+                                                             "chunk element count overflow");
+                            /* All dims (incl. the trailing element-size dim)
+                               multiply into libhdf5's 32-bit chunk.size. */
+                            chunk_byte_size =
+                                h5policy_chunk_size32_accum(chunk_byte_size, dim4,
+                                                            payload_off, object);
+                        }
                     k = k + 1UL;
                 }
             if (chunk_dims_ok != 0UB)
@@ -375,6 +412,7 @@ fun h5policy_validate_layout_payload = (int ios,
                             var i = 0UL;
                             var chunk_dims_ok = 1UB;
                             var chunk_elem_count = 1UL;
+                            var chunk_byte_size = 1UL;
                             while (i < ndims)
                                 {
                                     var dim = h5policy_msg_u64_at(ios, profile,
@@ -389,14 +427,23 @@ fun h5policy_validate_layout_payload = (int ios,
                                                                 payload_off, object,
                                                                 "chunk dimension is zero");
                                         }
-                                    else if (i + 1UL < ndims)
-                                        chunk_elem_count =
-                                            h5policy_checked_mul_u64(chunk_elem_count, dim,
-                                                                     0xffffffffffffffffUL,
-                                                                     "H5_CORRUPT_LENGTH_OVERFLOW",
-                                                                     "corrupt",
-                                                                     payload_off, object,
-                                                                     "chunk element count overflow");
+                                    else
+                                        {
+                                            if (i + 1UL < ndims)
+                                                chunk_elem_count =
+                                                    h5policy_checked_mul_u64(chunk_elem_count, dim,
+                                                                             0xffffffffffffffffUL,
+                                                                             "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                                             "corrupt",
+                                                                             payload_off, object,
+                                                                             "chunk element count overflow");
+                                            /* All dims (incl. the trailing element-size
+                                               dim) multiply into libhdf5's 32-bit
+                                               chunk.size. */
+                                            chunk_byte_size =
+                                                h5policy_chunk_size32_accum(chunk_byte_size, dim,
+                                                                            payload_off, object);
+                                        }
                                     i = i + 1UL;
                                 }
                             if (chunk_dims_ok != 0UB)
@@ -512,6 +559,7 @@ fun h5policy_validate_layout_payload = (int ios,
                                     var j = 0UL;
                                     var chunk_dims3_ok = 1UB;
                                     var chunk_elem3_count = 1UL;
+                                    var chunk_byte3_size = 1UL;
                                     while (j < ndims3)
                                         {
                                             var dim3 = h5policy_msg_u64_at(ios, profile,
@@ -526,14 +574,23 @@ fun h5policy_validate_layout_payload = (int ios,
                                                                         payload_off, object,
                                                                         "chunk dimension is zero");
                                                 }
-                                            else if (j + 1UL < ndims3)
-                                                chunk_elem3_count =
-                                                    h5policy_checked_mul_u64(chunk_elem3_count, dim3,
-                                                                             0xffffffffffffffffUL,
-                                                                             "H5_CORRUPT_LENGTH_OVERFLOW",
-                                                                             "corrupt",
-                                                                             payload_off, object,
-                                                                             "chunk element count overflow");
+                                            else
+                                                {
+                                                    if (j + 1UL < ndims3)
+                                                        chunk_elem3_count =
+                                                            h5policy_checked_mul_u64(chunk_elem3_count, dim3,
+                                                                                     0xffffffffffffffffUL,
+                                                                                     "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                                                     "corrupt",
+                                                                                     payload_off, object,
+                                                                                     "chunk element count overflow");
+                                                    /* All dims (incl. the trailing
+                                                       element-size dim) multiply into
+                                                       libhdf5's 32-bit chunk.size. */
+                                                    chunk_byte3_size =
+                                                        h5policy_chunk_size32_accum(chunk_byte3_size, dim3,
+                                                                                    payload_off, object);
+                                                }
                                             j = j + 1UL;
                                         }
                                     if (chunk_dims3_ok != 0UB)
