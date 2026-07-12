@@ -710,38 +710,46 @@ independent effects explicit without changing any built-in profile behavior.
 
 ## Current test coverage
 
-[`unit_limits.pk`](../tests/unit_limits.pk) constructs an independent copy of
-the strict profile, reduces one or two fields at a time, and drives synthetic
-in-memory metadata through the ordinary enforcement helpers. It also snapshots
-all 30 fields of each of the four built-in profiles. It characterizes current
-behavior without requiring production-scale files. The generated corpus
-remains the end-to-end and libhdf5-facing layer.
+[`unit_limits.pk`](../tests/unit_limits.pk) clones the strict profile, reduces
+one or two fields at a time, and drives synthetic in-memory metadata through the
+ordinary enforcement helpers. It also snapshots all 30 fields of each of the
+four built-in profiles. It characterizes exact helper boundaries without
+requiring production-scale files.
+
+The generated corpus is the end-to-end and libhdf5-facing layer. Its shipped-
+preset cases lock down public behavior. Its reduced-boundary cases clone a
+named preset, apply strictly typed and allowlisted test-only overrides, and call
+the ordinary `h5policy_run` entry point. Thus compact files can exercise the
+complete parser and walk without exposing configurable limits in the public
+CLI.
 
 | Field or rule | Current direct coverage |
 | --- | --- |
-| Built-in profile values | Every field in all four presets is compared with its documented value. The copy helper reconstructs every nested group, preventing test mutations from aliasing a shipped preset. |
-| `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. |
+| Built-in profile values | Every field in all four presets is compared with its documented value. The production clone helper reconstructs every nested group; unit mutation checks verify that clones cannot alias a shipped preset. |
+| `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. A reduced full-file case also saturates `metadata_bytes_seen` at its exact ceiling. |
 | `max_attribute_count` | A valid synthetic attribute is parsed at and above a reduced cumulative limit. |
 | `max_object_header_chunks` | A synthetic continuation message covers equality, over-limit saturation, and the fact that its later structural finding is independent. |
 | `max_chunk_count` | Defined chunk-index references cover equality and over-limit saturation; full index-format stopping behavior remains integration coverage. |
-| `max_single_value_bytes` | Fill values cover equality, over-limit resource classification, and zero-as-disabled; separate valid datatype and attribute blobs cross the other two enforcement sites. |
+| `max_single_value_bytes` | Fill values cover equality, over-limit resource classification, and zero-as-disabled; separate valid datatype and attribute blobs cross the other two enforcement sites. A compact valid file isolates the attribute-value enforcement site during a full walk. |
 | `max_logical_dataset_bytes` | Synthetic dataset facts cover equality and saturation. `resource/huge_logical_dataset.h5` requires the resource finding, and the same file is accepted under legacy. |
 | Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, zero-byte disabling, and validation of the disabled pair. `resource/tiny_chunks.h5` supplies end-to-end coverage. |
 | `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. |
-| `max_link_traversal_depth` | Synthetic queue operations cover equality, the resource over-limit finding, and declining to enqueue the child. |
+| `max_link_traversal_depth` | Synthetic queue operations cover equality, the resource over-limit finding, and declining to enqueue the child. A real depth-66 hierarchy rejects under unchanged strict and accepts under unchanged forensic. |
 | `max_datatype_recursion_depth` | `unit_datatype.pk` covers deep VLen and compound nesting as resource rejection; the CVE fixture requires the same finding under legacy. |
-| `max_filter_parameter_recursion_depth` | A direct recursive call above a zero limit covers the resource finding and poison return; malformed n-bit parameter bounds and classes retain their synthetic coverage. |
-| `max_rank` | A valid rank-two dataspace covers equality and resource-only rejection below the fixed rank ceiling; profile validation rejects ceilings above 32. |
+| `max_filter_parameter_recursion_depth` | A direct recursive call above a zero limit covers the resource finding and poison return; malformed n-bit parameter bounds and classes retain their synthetic coverage. A valid n-bit-filtered dataset reaches the same resource path end to end under a reduced ceiling. |
+| `max_rank` | A valid rank-two dataspace covers equality and resource-only rejection below the fixed rank ceiling; profile validation rejects ceilings above 32. A full-file rank-one case confirms that the corrected limit is not reported as fixed-format corruption. |
 | `max_filter_count` | A valid two-filter pipeline covers equality, resource classification, and continued descriptor parsing. |
-| Metadata-ratio rules | Synthetic counters cover the strict absolute/percentage boundaries, warning behavior, reject behavior, and reject-over-warning precedence. Profile checks cover percentage bounds, disabled-rule floors, and warning/reject ordering. |
+| Metadata-ratio rules | Synthetic counters cover the strict absolute/percentage boundaries, warning behavior, reject behavior, and reject-over-warning precedence. Profile checks cover percentage bounds, disabled-rule floors, and warning/reject ordering. Full-walk cases separately require the warning and rejection decisions and verify rejection suppresses the advisory. |
 | `allow_external_links`, `allow_external_storage`, `allow_vds`, `allow_dynamic_filters` | Each zero/nonzero policy branch and feature counter is covered synthetically. External-link and EFL corpus cases also compare restrictive and permissive profiles; VDS has a permissive source-path corpus case. |
 | `allow_unknown_messages` | Synthetic message policy covers denied-as-policy and allowed-as-unsupported behavior. |
 | `allow_legacy_dangerous_messages` | Synthetic message policy covers both zero and nonzero behavior. |
-| Analysis controls | Unit checks cover independent mapping and continuation defaults plus CLI overrides. Forensic corpus cases exercise non-strict diagnostics, and the orphaned-GCOL fixture exercises the unreachable-metadata sweep. |
-| `max_walk_operations` | Unit checks cover the inclusive boundary, saturated metric, distinguished exception, zero rejection, and all four preset values. |
-| `max_walk_seconds` | The four current preset values are snapshotted, all built-ins are validated, and zero/overflowing values are rejected directly. An already-expired synthetic deadline covers the distinguished time-budget exception. |
+| Analysis controls | Unit checks cover independent mapping and continuation defaults plus CLI overrides. Integration cases isolate non-strict mapping from the other forensic controls and show that disabling the sweep suppresses an otherwise reachable orphaned-GCOL diagnostic. |
+| `max_walk_operations` | Unit checks cover the inclusive boundary, saturated metric, distinguished exception, zero rejection, and all four preset values. A dense-link full walk reaches the deterministic operation exception with the metric exactly saturated at the reduced ceiling and no time-budget finding. |
+| `max_walk_seconds` | The four current preset values are snapshotted, all built-ins are validated, and zero/overflowing values are rejected directly. An already-expired synthetic deadline covers the distinguished time-budget exception. An invalid-profile integration case uses a deliberately missing input to prove validation happens before file I/O. |
 
-The authoritative corpus decisions and required findings are in
-[`tests/expected`](../tests/expected). The two synthetic layers are
+The authoritative corpus decisions, required findings, forbidden findings, and
+selected metric/feature assertions are in
+[`tests/expected`](../tests/expected). The two focused synthetic suites are
 [`unit_limits.pk`](../tests/unit_limits.pk) and
-[`unit_datatype.pk`](../tests/unit_datatype.pk).
+[`unit_datatype.pk`](../tests/unit_datatype.pk); the two integration tiers are
+documented in [`tests/README.md`](../tests/README.md).

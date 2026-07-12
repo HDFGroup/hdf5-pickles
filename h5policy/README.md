@@ -158,7 +158,8 @@ crashes on them:
 - [`tools/h5policy-fuzzlib`](tools/h5policy-fuzzlib): shared fuzzing engine
   (mutation strategies, seed loading, guided corpus) imported by both fuzzers.
 - [`tools/h5policy-gencorpus`](tools/h5policy-gencorpus): regenerates the valid,
-  malformed, policy, resource, coverage, and CVE regression fixtures.
+  malformed, policy, resource, coverage, integration, and CVE regression
+  fixtures.
 
 See [`tests/README.md`](tests/README.md) for the corpus, differential harness,
 and fuzzing workflow.
