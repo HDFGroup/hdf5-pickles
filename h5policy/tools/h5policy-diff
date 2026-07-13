@@ -31,8 +31,11 @@ metrics) and compares against:
 Cross-invariants (a hard failure exits non-zero; a warning is informational):
 
   A  libhdf5 structurally opens => h5policy is not reject_corrupt  (no false +)
-     unless a deeper libhdf5 probe also rejects attrs/data/tools (A+, warning)
-  A' libhdf5 rejects           => h5policy decision is reject_corrupt (no false -)
+     unless a deeper libhdf5 probe also rejects attrs/data/tools (A+, warning);
+     "tools" includes h5dump reading data (no -H), which unlike the header-only
+     probe exercises filter/decompression rejections
+  A' libhdf5 rejects           => h5policy explicitly refuses the file (no false -)
+     a non-corrupt refusal (policy/resource/coverage) is retained as a warning
   B  (h5py sees an external link)  <=>  (h5policy external_links > 0)
   C  h5policy max logical dataset bytes  <=  h5py's                (no overcount)
   D  h5policy max rank seen  <=  h5py's                            (no overcount)
@@ -77,6 +80,22 @@ def reference_rc(tool, path):
     args = [tool, "-pBH", path] if tool == "h5dump" else [tool, path]
     try:
         return subprocess.run(args, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=60).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+
+
+def h5dump_data_rc(path):
+    """rc of h5dump *reading dataset data* (no -H), or None if unavailable.
+
+    The header-only reference_rc probe never decodes chunks, so it cannot see a
+    filter/decompression rejection (e.g. an n-bit/scale-offset chunk element
+    count that mismatches the real chunk).  This probe forces the data path so
+    that a data-level tool rejection counts as deeper A+ evidence."""
+    if shutil.which("h5dump") is None:
+        return None
+    try:
+        return subprocess.run(["h5dump", "-pB", path], stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=60).returncode
     except subprocess.TimeoutExpired:
         return 124
@@ -288,7 +307,7 @@ def eager_probe_isolated(path):
         return {"probe_error": f"unparseable JSON: {_err(exc)}"}
 
 
-def eager_evidence(eager, h5dump_rc, h5debug_rc):
+def eager_evidence(eager, h5dump_rc, h5debug_rc, h5dump_data=None):
     """Summarise deeper libhdf5 rejection evidence for A+ demotion."""
     parts = []
     if eager.get("probe_error"):
@@ -301,7 +320,8 @@ def eager_evidence(eager, h5dump_rc, h5debug_rc):
         n = len(eager.get(key, []))
         if n:
             parts.append(f"{label}={n}")
-    for tool, rc in (("h5dump", h5dump_rc), ("h5debug", h5debug_rc)):
+    for tool, rc in (("h5dump", h5dump_rc), ("h5debug", h5debug_rc),
+                     ("h5dump-data", h5dump_data)):
         if rc not in (None, 0):
             parts.append(f"{tool} rc={rc}")
     return parts
@@ -327,7 +347,8 @@ def check(path):
     if ref["opens"]:
         if decision == "reject_corrupt":
             eager = eager_probe_isolated(path)
-            evidence = eager_evidence(eager, h5dump_rc, h5debug_rc)
+            evidence = eager_evidence(eager, h5dump_rc, h5debug_rc,
+                                      h5dump_data_rc(path))
             if evidence:
                 soft(False,
                      "A+ libhdf5 opens structurally; h5policy eager "
@@ -340,8 +361,18 @@ def check(path):
             hard(True,
                  f"A  libhdf5 opens => not reject_corrupt (got {decision})")
     else:
-        hard(decision == "reject_corrupt",
-             f"A' libhdf5 rejects => reject_corrupt (got {decision})")
+        safe_rejections = {
+            "reject_corrupt",
+            "reject_policy",
+            "reject_resource",
+            "unsupported_coverage_gap",
+        }
+        hard(decision in safe_rejections,
+             f"A' libhdf5 rejects => explicit rejection (got {decision})")
+        if decision in safe_rejections and decision != "reject_corrupt":
+            soft(False,
+                 "A' libhdf5 rejects as corrupt; h5policy safely refuses "
+                 f"earlier as {decision}")
 
     # Independent oracles should agree with h5py on open-ability.
     for tool, rc in (("h5dump", h5dump_rc), ("h5debug", h5debug_rc)):
@@ -360,7 +391,7 @@ def check(path):
         # a smaller PACKED size for padded compounds (and a different size again
         # for VLEN).  A security oracle using the larger declared size is
         # conservative and correct, so a mismatch is informational.  Rank (D)
-        # and corruption agreement (A/A') remain the hard offset-bug guards.
+        # and safe rejection agreement (A/A') remain the hard offset-bug guards.
         pmax, rmax = feat.get("max_logical_dataset_bytes_seen", 0), ref["max_logical"]
         note = "" if pmax == rmax else \
             (" (declared>packed; conservative)" if pmax > rmax

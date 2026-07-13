@@ -26,19 +26,25 @@
    dimensionality from the layout message (dataset rank + 1); a type-1 key is
    chunk_size(4) + filter_mask(4) + ndims 8-byte offsets.  This validates the
    index structure under budget; it does not read chunk contents.  */
-fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                  uint<64> btree_addr, uint<64> ndims,
                                  string object, uint<64> btree_depth) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
     var file_size = h5policy_ceiling(ios);
 
+    /* A previous leaf has already proved that the file-wide chunk ceiling was
+       exceeded.  The resource decision is established, so do not chase more
+       of this recursively encoded index. */
+    if (ctx.chunk_count_exceeded != 0UB)
+        return ctx;
+
     /* The recursive v1 B-tree walker is the only chunk-index path that follows
        arbitrary tree depth today.  The profile depth limit and visited set
        bound both normal nesting and corrupt cycles.  */
-    if (btree_depth > profile.max_btree_depth)
+    if (btree_depth > profile.resources.max_btree_depth)
         {
-            h5policy_emit_error("H5_CORRUPT_BTREE_DEPTH_EXCEEDED", "corrupt",
+            h5policy_emit_error("H5_RESOURCE_BTREE_DEPTH", "resource",
                                 btree_addr#B, object,
                                 "chunk B-tree depth exceeds the selected profile limit");
             return ctx;
@@ -56,7 +62,7 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
                                      btree_addr#B, object))
         return ctx;
 
-    if (h5policy_msg_bytes(ios, profile, btree_addr#B, 4UL) != H5POLICY_TREE_SIG)
+    if (h5policy_msg_bytes(ios, profile, btree_addr#B, 4UL) != H5_FORMAT_TREE_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
                                 btree_addr#B, object,
@@ -91,10 +97,14 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
                                             "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
                                             btree_addr#B, object,
                                             "chunk B-tree node capacity overflow");
+    var entry_count_valid = 1;
     if (entries_used > capacity)
-        h5policy_emit_error("H5_CORRUPT_BTREE_NODE_ENTRY_COUNT", "corrupt",
-                            btree_addr#B, object,
-                            "chunk B-tree node uses more entries than its superblock K permits");
+        {
+            h5policy_emit_error("H5_CORRUPT_BTREE_NODE_ENTRY_COUNT", "corrupt",
+                                btree_addr#B, object,
+                                "chunk B-tree node uses more entries than its superblock K permits");
+            entry_count_valid = 0;
+        }
     var body = h5policy_checked_mul_u64(capacity, pair, 0xffffffffffffffffUL,
                                         "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
                                         btree_addr#B, object,
@@ -114,12 +124,57 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
 
     ctx = h5policy_account_metadata(ctx, profile, total, btree_addr#B, object);
 
+    /* Preserve capacity-sized node bounds and metadata accounting above, but
+       do not turn a corrupt entry count into a resource claim or use it to
+       iterate beyond the validated body. */
+    if (!entry_count_valid)
+        return ctx;
+
+    if (node_level == 0UL)
+        {
+            /* A validated leaf header proves how many chunk records it holds.
+               Claim them in one operation so a leaf that crosses the exact
+               ceiling cannot disappear behind an equality early return.  Only
+               inspect the entries within the remaining resource allowance. */
+            var inspect_entries = entries_used;
+            var limit = profile.resources.max_chunk_count;
+            if (ctx.accounted_chunk_count >= limit)
+                inspect_entries = 0UL;
+            else if (inspect_entries > limit - ctx.accounted_chunk_count)
+                inspect_entries = limit - ctx.accounted_chunk_count;
+
+            ctx = h5policy_count_chunks(
+                ctx, profile, entries_used, btree_addr#B, object,
+                "chunk count exceeds the selected profile limit");
+
+            var i = 0UL;
+            while (i < inspect_entries)
+                {
+                    var key_off = btree_addr + hdr + (i * pair);
+                    var child_raw = h5policy_msg_bytes(ios, profile,
+                                                       (key_off + key_size)#B, o);
+                    var child_addr = bytes_to_u64_le(child_raw);
+                    var chunk_size = h5policy_msg_u64_at(ios, profile,
+                                                         key_off#B, 4UL);
+                    if (!h5policy_msg_addr_is_undef(child_raw))
+                        {
+                            var ok = h5policy_checked_addr_range(
+                                child_addr, chunk_size, file_size,
+                                "chunk data outside file", key_off#B, object);
+                        }
+                    i = i + 1UL;
+                }
+
+            return ctx;
+        }
+
+    /* Internal nodes do not reveal subtree record totals.  At exact equality,
+       continue through validated child nodes until either the tree ends (the
+       count was exactly the ceiling) or a nonempty leaf proves overflow. */
     var i = 0UL;
     while (i < entries_used)
         {
-            /* Bounded traversal: stop once the chunk budget is reached. */
-            if (profile.max_chunk_count != 0xffffffffffffffffUL
-                && ctx.chunk_index_count >= profile.max_chunk_count)
+            if (ctx.chunk_count_exceeded != 0UB)
                 return ctx;
 
             var key_off = btree_addr + hdr + (i * pair);
@@ -127,51 +182,23 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyLimits profile, H5WalkContext 
                                                (key_off + key_size)#B, o);
             var child_addr = bytes_to_u64_le(child_raw);
 
-            if (node_level > 0UL)
+            if (!h5policy_msg_addr_is_undef(child_raw))
                 {
-                    /* Internal nodes point at more v1 B-tree nodes.  Undefined
-                       children are skipped; defined children recurse with the
-                       same layout dimensionality and an incremented depth.  */
-                    if (!h5policy_msg_addr_is_undef(child_raw))
-                        {
-                            if (child_addr >= file_size)
-                                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
-                                                    "corrupt",
-                                                    (key_off + key_size)#B, object,
-                                                    "chunk B-tree child address outside file");
-                            else
-                                ctx = h5policy_walk_chunk_btree(ios, profile, ctx,
-                                                                child_addr, ndims,
-                                                                object, btree_depth + 1UL);
-                        }
-                }
-            else
-                {
-                    /* Leaf: child pointer is the raw data chunk; key = its size. */
-                    var chunk_size = h5policy_msg_u64_at(ios, profile, key_off#B, 4UL);
-                    ctx.chunk_index_count =
-                        h5policy_checked_add_u64(ctx.chunk_index_count, 1UL,
-                                                 profile.max_chunk_count,
-                                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
-                                                 btree_addr#B, object,
-                                                 "chunk count exceeds the selected profile limit");
-                    if (!h5policy_msg_addr_is_undef(child_raw))
-                        {
-                            var ok = h5policy_checked_addr_range(child_addr, chunk_size,
-                                                                 file_size,
-                                                                 "chunk data outside file",
-                                                                 key_off#B, object);
-                        }
+                    if (child_addr >= file_size)
+                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                            "corrupt",
+                                            (key_off + key_size)#B, object,
+                                            "chunk B-tree child address outside file");
+                    else
+                        ctx = h5policy_walk_chunk_btree(ios, profile, ctx,
+                                                        child_addr, ndims,
+                                                        object, btree_depth + 1UL);
                 }
             i = i + 1UL;
         }
 
     return ctx;
 }
-
-var H5POLICY_BTHD_SIG = [0x42UB, 0x54UB, 0x48UB, 0x44UB];   /* "BTHD" */
-var H5POLICY_BTLF_SIG = [0x42UB, 0x54UB, 0x4cUB, 0x46UB];   /* "BTLF" */
-var H5POLICY_BTIN_SIG = [0x42UB, 0x54UB, 0x49UB, 0x4eUB];   /* "BTIN" */
 
 /* All v2 B-tree clients use the same node-capacity initialization.  In
    libhdf5 that calculation divides the usable node bytes by record_size, so a
@@ -209,7 +236,7 @@ fun h5policy_validate_v2_btree_geometry = (uint<64> node_size,
    address.  Deep trees are validated at the root under the count budget (the
    audit's "validate the index root under a budget"); the variable-width
    internal-node child pointers are not decoded.  */
-fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                      uint<64> hdr_addr, off64 loc,
                                      string object) H5WalkContext:
 {
@@ -222,7 +249,7 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
                                      "v2 B-tree header outside file", loc, object))
         return ctx;
 
-    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL) != H5POLICY_BTHD_SIG)
+    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL) != H5_FORMAT_BTHD_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
                                 hdr_addr#B, object,
@@ -272,12 +299,9 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
         }
 
     /* Total record count == chunk count: enforce the resource budget. */
-    ctx.chunk_index_count =
-        h5policy_checked_add_u64(ctx.chunk_index_count, total_nrec,
-                                 profile.max_chunk_count,
-                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
-                                 hdr_addr#B, object,
-                                 "chunk count exceeds the selected profile limit");
+    ctx = h5policy_count_chunks(
+        ctx, profile, total_nrec, hdr_addr#B, object,
+        "chunk count exceeds the selected profile limit");
 
     ctx = h5policy_account_metadata(ctx, profile, hdr_size, hdr_addr#B, object);
 
@@ -310,7 +334,7 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
                                              "v2 B-tree leaf outside file",
                                              root_addr#B, object))
                 return ctx;
-            if (h5policy_msg_bytes(ios, profile, root_addr#B, 4UL) != H5POLICY_BTLF_SIG)
+            if (h5policy_msg_bytes(ios, profile, root_addr#B, 4UL) != H5_FORMAT_BTLF_SIGNATURE)
                 {
                     h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
                                         root_addr#B, object,
@@ -345,7 +369,7 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
                                              "v2 B-tree internal node outside file",
                                              root_addr#B, object))
                 return ctx;
-            if (h5policy_msg_bytes(ios, profile, root_addr#B, 4UL) != H5POLICY_BTIN_SIG)
+            if (h5policy_msg_bytes(ios, profile, root_addr#B, 4UL) != H5_FORMAT_BTIN_SIGNATURE)
                 {
                     h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
                                         root_addr#B, object,
@@ -363,10 +387,7 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyLimits profile, H5WalkCont
     return ctx;
 }
 
-var H5POLICY_FAHD_SIG = [0x46UB, 0x41UB, 0x48UB, 0x44UB];   /* "FAHD" */
-var H5POLICY_FADB_SIG = [0x46UB, 0x41UB, 0x44UB, 0x42UB];   /* "FADB" */
-
-fun h5policy_chunkindex_verify_trailing_checksum = (int ios, H5PolicyLimits profile,
+fun h5policy_chunkindex_verify_trailing_checksum = (int ios, H5PolicyProfile profile,
                                                      uint<64> addr, uint<64> total_size,
                                                      uint<64> file_size, string object,
                                                      string what) int:
@@ -400,7 +421,7 @@ fun h5policy_chunkindex_verify_trailing_checksum = (int ios, H5PolicyLimits prof
    count (= chunk count) and data-block address; the data block holds one
    element per chunk whose leading offset-sized field is the chunk address.
    Paged data blocks (very large arrays) fall back to a coverage gap.  */
-fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                         uint<64> hdr_addr, off64 loc,
                                         string object) H5WalkContext:
 {
@@ -412,7 +433,7 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
     if (!h5policy_checked_addr_range(hdr_addr, hdr_size, file_size,
                                      "fixed array header outside file", loc, object))
         return ctx;
-    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL) != H5POLICY_FAHD_SIG)
+    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL) != H5_FORMAT_FAHD_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", hdr_addr#B, object,
                                 "fixed array header signature mismatch");
@@ -450,12 +471,9 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
 
     /* Fixed-array element count is the chunk count.  Count it from the header
        before deciding whether individual chunk addresses are inline or paged. */
-    ctx.chunk_index_count =
-        h5policy_checked_add_u64(ctx.chunk_index_count, nelmts,
-                                 profile.max_chunk_count,
-                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
-                                 hdr_addr#B, object,
-                                 "chunk count exceeds the selected profile limit");
+    ctx = h5policy_count_chunks(
+        ctx, profile, nelmts, hdr_addr#B, object,
+        "chunk count exceeds the selected profile limit");
     ctx = h5policy_account_metadata(ctx, profile, hdr_size, hdr_addr#B, object);
 
     if (h5policy_msg_addr_is_undef(dblk_raw))
@@ -490,7 +508,7 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
                                              "fixed array data block body outside file",
                                              dblk_addr#B, object))
                 return ctx;
-            if (h5policy_msg_bytes(ios, profile, dblk_addr#B, 4UL) != H5POLICY_FADB_SIG)
+            if (h5policy_msg_bytes(ios, profile, dblk_addr#B, 4UL) != H5_FORMAT_FADB_SIGNATURE)
                 {
                     h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", dblk_addr#B, object,
                                         "fixed array data block signature mismatch");
@@ -548,7 +566,7 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
                                      "fixed array paged data block outside file",
                                      dblk_addr#B, object))
         return ctx;
-    if (h5policy_msg_bytes(ios, profile, dblk_addr#B, 4UL) != H5POLICY_FADB_SIG)
+    if (h5policy_msg_bytes(ios, profile, dblk_addr#B, 4UL) != H5_FORMAT_FADB_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", dblk_addr#B, object,
                                 "fixed array data block signature mismatch");
@@ -613,9 +631,6 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyLimits profile, H5WalkC
     return ctx;
 }
 
-var H5POLICY_EAHD_SIG = [0x45UB, 0x41UB, 0x48UB, 0x44UB];   /* "EAHD" */
-var H5POLICY_EAIB_SIG = [0x45UB, 0x41UB, 0x49UB, 0x42UB];   /* "EAIB" */
-
 /* Extensible arrays grow along an unlimited dimension.  The header provides the
    total element count for resource accounting; the index block gives inline
    addresses for the first segment of chunks, which h5policy bounds-checks.  */
@@ -625,7 +640,7 @@ var H5POLICY_EAIB_SIG = [0x45UB, 0x41UB, 0x49UB, 0x42UB];   /* "EAIB" */
    stores the first `idx_blk_elmts` chunk addresses inline (validated here);
    deeper data/secondary blocks are counted via the header under budget rather
    than fully walked ("validate the index root under a budget").  */
-fun h5policy_walk_ext_array_chunks = (int ios, H5PolicyLimits profile, H5WalkContext ctx,
+fun h5policy_walk_ext_array_chunks = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                       uint<64> hdr_addr, off64 loc,
                                       string object) H5WalkContext:
 {
@@ -637,7 +652,7 @@ fun h5policy_walk_ext_array_chunks = (int ios, H5PolicyLimits profile, H5WalkCon
     if (!h5policy_checked_addr_range(hdr_addr, hdr_size, file_size,
                                      "extensible array header outside file", loc, object))
         return ctx;
-    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL) != H5POLICY_EAHD_SIG)
+    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL) != H5_FORMAT_EAHD_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", hdr_addr#B, object,
                                 "extensible array header signature mismatch");
@@ -675,12 +690,9 @@ fun h5policy_walk_ext_array_chunks = (int ios, H5PolicyLimits profile, H5WalkCon
 
     /* The extensible-array header's element count is the complete chunk count,
        even when only the inline index-block entries are decoded below.  */
-    ctx.chunk_index_count =
-        h5policy_checked_add_u64(ctx.chunk_index_count, nelmts,
-                                 profile.max_chunk_count,
-                                 "H5_RESOURCE_CHUNK_COUNT", "resource",
-                                 hdr_addr#B, object,
-                                 "chunk count exceeds the selected profile limit");
+    ctx = h5policy_count_chunks(
+        ctx, profile, nelmts, hdr_addr#B, object,
+        "chunk count exceeds the selected profile limit");
     ctx = h5policy_account_metadata(ctx, profile, hdr_size, hdr_addr#B, object);
 
     if (h5policy_msg_addr_is_undef(idx_raw))
@@ -701,7 +713,7 @@ fun h5policy_walk_ext_array_chunks = (int ios, H5PolicyLimits profile, H5WalkCon
                                      "extensible array index block body outside file",
                                      idx_blk_addr#B, object))
         return ctx;
-    if (h5policy_msg_bytes(ios, profile, idx_blk_addr#B, 4UL) != H5POLICY_EAIB_SIG)
+    if (h5policy_msg_bytes(ios, profile, idx_blk_addr#B, 4UL) != H5_FORMAT_EAIB_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", idx_blk_addr#B, object,
                                 "extensible array index block signature mismatch");

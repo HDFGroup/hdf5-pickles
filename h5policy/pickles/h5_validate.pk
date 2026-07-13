@@ -22,7 +22,6 @@
 
 /* Superblock discovery state is global because the JSON report and h5patch both
    need to know whether a legal superblock offset was found.  */
-var H5POLICY_SIGNATURE = [0x89UB, 'H', 'D', 'F', '\r', '\n', 0x1aUB, '\n'];
 var h5policy_super_found = 0;
 var h5policy_super_off = 0UL#B;
 
@@ -63,7 +62,7 @@ fun h5policy_signature_at = (int ios, offset<uint<64>,B> off) int:
 {
     if ((off/#B + 8UL) > iosize(ios)/#B)
         return 0;
-    return (byte[8] @ ios : off) == H5POLICY_SIGNATURE;
+    return (byte[8] @ ios : off) == H5_FORMAT_FILE_SIGNATURE;
 }
 
 /* Legal superblock offsets are byte 0 or userblock offsets at powers of two
@@ -96,26 +95,26 @@ fun h5policy_locate_superblock = (int ios) void:
 }
 
 /* Superblock and byte mapping wrappers mirror the message mapping wrappers:
-   strict profiles reject malformed mappings immediately, while forensic mode
-   maps non-strictly so nearby fields can still be classified.  */
-fun h5policy_map_super = (int ios, H5PolicyLimits profile,
+   strict mapping rejects malformed mappings immediately, while non-strict
+   mapping lets nearby fields still be classified.  */
+fun h5policy_map_super = (int ios, H5PolicyProfile profile,
                           offset<uint<64>,B> off) superblock:
 {
-    if (h5policy_nonstrict != 0)
+    if (h5policy_run_options.nonstrict_mapping != 0UB)
         return superblock @! ios : off;
     return superblock @ ios : off;
 }
 
-fun h5policy_map_bytes = (int ios, H5PolicyLimits profile,
+fun h5policy_map_bytes = (int ios, H5PolicyProfile profile,
                           offset<uint<64>,B> off,
                           uint<64> size) byte[]:
 {
-    if (h5policy_nonstrict != 0)
+    if (h5policy_run_options.nonstrict_mapping != 0UB)
         return byte[size] @! ios : off;
     return byte[size] @ ios : off;
 }
 
-fun h5policy_read_u64_le_at = (int ios, H5PolicyLimits profile,
+fun h5policy_read_u64_le_at = (int ios, H5PolicyProfile profile,
                                offset<uint<64>,B> off,
                                uint<64> size) uint<64>:
 {
@@ -177,7 +176,7 @@ fun h5policy_root_addr = (superblock sb) offset<uint<64>,B>:
    widths, K values for legacy indexes, declared EOA, root and optional metadata
    addresses, and v2/v3 checksum integrity.  */
 fun h5policy_validate_superblock = (int ios, superblock sb,
-                                    H5PolicyLimits profile,
+                                    H5PolicyProfile profile,
                                     H5WalkContext ctx,
                                     offset<uint<64>,B> super_off) H5WalkContext:
 {
@@ -338,13 +337,38 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
         h5policy_emit_error("H5_CORRUPT_DATASET_MISSING_LAYOUT",
                             "corrupt", loc, object,
                             "dataset object header has no data layout message");
+
+    /* n-bit / scale-offset carry the chunk element count libhdf5 derives from
+       the chunk dataspace (cd_values[2]).  Their decompressors trust it to size
+       the per-chunk output buffer, so it must match the real chunk shape; a
+       larger value drives writes past the buffer (and wraps a 32-bit size_t when
+       multiplied by the element size).  Filters require chunked storage, so the
+       chunk element count is always available here once the layout is seen.  */
+    if (h5policy_pipeline_has_decode_nelmts != 0UB
+        && ctx.has_chunked_layout != 0UB
+        && ctx.chunk_dataset_element_count != 0UL
+        && h5policy_pipeline_decode_nelmts != ctx.chunk_dataset_element_count)
+        h5policy_emit_error("H5_CORRUPT_FILTER_NELMTS_MISMATCH",
+                            "corrupt", loc, object,
+                            "n-bit/scale-offset filter element count does not match the chunk element count");
+
+    /* The other decompressed-buffer factor: scale-offset's cd_values[4] must be
+       the real datatype element size.  Inflating it overflows nelmts * size just
+       as an inflated element count does, even when the count is left consistent.  */
+    if (h5policy_pipeline_has_decode_size != 0UB
+        && ctx.has_datatype != 0UB
+        && ctx.datatype_size != 0UL
+        && h5policy_pipeline_decode_size != ctx.datatype_size)
+        h5policy_emit_error("H5_CORRUPT_FILTER_ELEMENT_SIZE_MISMATCH",
+                            "corrupt", loc, object,
+                            "scale-offset filter element size does not match the datatype size");
 }
 
 /* Validate one object header at a known byte offset.  The per-object dataset
    scratch fields are cleared before parsing so messages from a previous object
    do not affect cross-message checks for this one.  */
 fun h5policy_validate_ohdr_raw = (int ios,
-                                  H5PolicyLimits profile,
+                                  H5PolicyProfile profile,
                                   H5WalkContext ctx,
                                   offset<uint<64>,B> root_off,
                                   string object,
@@ -379,12 +403,16 @@ fun h5policy_validate_ohdr_raw = (int ios,
     ctx.chunk_logical_bytes = 0UL;
     ctx.logical_dataset_bytes = 0UL;
     ctx.has_chunked_layout = 0UB;
+    h5policy_pipeline_decode_nelmts = 0UL;
+    h5policy_pipeline_has_decode_nelmts = 0UB;
+    h5policy_pipeline_decode_size = 0UL;
+    h5policy_pipeline_has_decode_size = 0UB;
 
     ctx = h5policy_count_object(ctx, profile, root_off, object);
 
     /* Version-2 object headers are self-describing: optional creation/access
        metadata, chunk-0 size width, message data, and a trailing checksum.  */
-    if (sig == V2_SIG)
+    if (sig == H5_FORMAT_OHDR_SIGNATURE)
         {
             var version = h5policy_read_u64_le_at(ios, profile,
                                                   root_off + 4#B, 1UL) as uint<8>;
@@ -526,7 +554,7 @@ fun h5policy_validate_ohdr_raw = (int ios,
    and gives continue-after-corruption mode a single place to decide whether to
    keep draining queued objects.  */
 fun h5policy_walk_reachable_metadata = (int ios,
-                                        H5PolicyLimits profile,
+                                        H5PolicyProfile profile,
                                         H5WalkContext ctx,
                                         offset<uint<64>,B> root_off,
                                         uint<64> ext_addr) H5WalkContext:
@@ -562,7 +590,7 @@ fun h5policy_walk_reachable_metadata = (int ios,
             var path = h5policy_pending_paths[h5policy_pending_index];
             h5policy_pending_index = h5policy_pending_index + 1UL;
 
-            if (h5policy_continue == 0
+            if (h5policy_run_options.continue_after_corruption == 0UB
                 && h5policy_exit_code != H5POLICY_EXIT_ACCEPT
                 && h5policy_exit_code != H5POLICY_EXIT_WARN)
                 return ctx;
@@ -570,10 +598,10 @@ fun h5policy_walk_reachable_metadata = (int ios,
             if (!h5policy_mark_visited_ohdr(addr))
                 continue;
 
-            if (depth > profile.max_link_traversal_depth)
+            if (depth > profile.resources.max_link_traversal_depth)
                 {
-                    h5policy_emit_error("H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED",
-                                        "corrupt", addr#B, path,
+                    h5policy_emit_error("H5_RESOURCE_LINK_TRAVERSAL_DEPTH",
+                                        "resource", addr#B, path,
                                         "link traversal depth exceeds the selected profile limit");
                     continue;
                 }
@@ -615,7 +643,7 @@ fun h5policy_align8 = (uint<64> n) uint<64>:
    contains an object that does not advance the parse cursor -- the libhdf5
    infinite-loop shape.  The header/size/alignment gates also reject the four
    signature bytes occurring incidentally in data.  */
-fun h5policy_check_gcol = (int ios, H5PolicyLimits profile,
+fun h5policy_check_gcol = (int ios, H5PolicyProfile profile,
                            uint<64> g, uint<64> file_size) void:
 {
     var len_size = global_sizeof_lengths as uint<64>;
@@ -670,15 +698,14 @@ fun h5policy_check_gcol = (int ios, H5PolicyLimits profile,
         }
 }
 
-/* Scan the whole file for GCOL signatures (forensic mode only).  poke maps
+/* Scan the whole file for GCOL signatures when the profile selects the
+   unreachable-metadata sweep.  poke maps
    arrays lazily and re-reads IO on every random index, so the scan iterates
    sequentially with `for (b in ...)` -- which streams the bytes -- and matches
    the four-byte signature through a rolling window.  The rolling bytes and the
    absolute position carry across map windows, so a signature straddling a
    window boundary is still seen while memory stays bounded to one window.  */
-var H5POLICY_GCOL_SIG = [0x47UB, 0x43UB, 0x4fUB, 0x4cUB];   /* "GCOL" */
-
-fun h5policy_forensic_gcol_sweep = (int ios, H5PolicyLimits profile) void:
+fun h5policy_unreachable_gcol_sweep = (int ios, H5PolicyProfile profile) void:
 {
     var file_size = h5policy_ceiling(ios);
     if (file_size < 16UL)
@@ -697,8 +724,8 @@ fun h5policy_forensic_gcol_sweep = (int ios, H5PolicyLimits profile) void:
                 {
                     b0 = b1; b1 = b2; b2 = b3; b3 = b;
                     if (pos >= 3UL
-                        && b0 == H5POLICY_GCOL_SIG[0] && b1 == H5POLICY_GCOL_SIG[1]
-                        && b2 == H5POLICY_GCOL_SIG[2] && b3 == H5POLICY_GCOL_SIG[3])
+                        && b0 == H5_FORMAT_GCOL_SIGNATURE[0] && b1 == H5_FORMAT_GCOL_SIGNATURE[1]
+                        && b2 == H5_FORMAT_GCOL_SIGNATURE[2] && b3 == H5_FORMAT_GCOL_SIGNATURE[3])
                         h5policy_check_gcol(ios, profile, pos - 3UL, file_size);
                     pos = pos + 1UL;
                 }

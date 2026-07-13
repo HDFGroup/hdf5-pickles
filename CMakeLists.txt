@@ -101,7 +101,7 @@ add_custom_target(docs-check
 )
 
 # ---- h5policy regression suite (CTest) -------------------------------------
-# Runs h5policy/tests/run.sh: datatype unit checks, the corpus, and the
+# Runs h5policy/tests/run.sh: synthetic unit checks, the corpus, and the
 # differential harness.  Requires GNU poke and python3 with h5py; if either is
 # missing the test is skipped rather than reported as a failure (h5dump/h5debug
 # are optional and the harness degrades gracefully without them).

@@ -43,30 +43,46 @@ var h5policy_finding_messages = string[]();
 var h5policy_exit_code = H5POLICY_EXIT_ACCEPT;
 var h5policy_exit_rank = 0;
 
-/* Walk time budget.  Some traversal de-dup sets are linear-scan arrays, so a
-   walk over N reachable structures can be O(N^2); on a pathological file
-   (especially in forensic, which keeps walking past corruption) that can run
-   for a long time without ever looping forever.  A metadata preflight must
-   terminate in bounded *wall-clock* time, so h5policy_walk_tick samples the
-   clock periodically and
-   raises a distinguished exception once the profile's second-budget is passed;
-   the top-level catch turns it into unsupported_coverage_gap.  The op counter is
-   kept for observability and to cheaply pace the clock samples.  */
+/* Walk work and time budgets.  Some traversal de-dup sets are linear-scan
+   arrays, so a walk over N reachable structures can be O(N^2).  On a
+   pathological file (especially when continued walking is enabled), that can
+   run for a long time without ever looping forever.  The deterministic
+   operation ceiling is checked on every tick; the wall clock remains an
+   independent backstop sampled periodically.  */
 var h5policy_walk_ops = 0UL;
+var h5policy_walk_operation_limit = 0xffffffffffffffffUL;
 var h5policy_walk_next_check = 0UL;
 var h5policy_walk_deadline = 0L;          /* gettime seconds; 0 = no deadline */
-var H5POLICY_EC_WALK_BUDGET = 0x7701UL;   /* private exception code (not a poke EC_*) */
+var H5POLICY_EC_WALK_TIME_BUDGET = 0x7701UL;
+var H5POLICY_EC_WALK_OPERATION_BUDGET = 0x7702UL;
+
+fun h5policy_raise_walk_operation_budget = void:
+{
+    h5policy_walk_ops = h5policy_walk_operation_limit;
+    raise Exception
+    {
+        code = H5POLICY_EC_WALK_OPERATION_BUDGET as int<32>,
+        name = "walk operation budget exceeded"
+    };
+}
 
 fun h5policy_walk_tick = (uint<64> cost) void:
 {
+    if (h5policy_walk_ops > h5policy_walk_operation_limit)
+        h5policy_raise_walk_operation_budget;
+    if (cost > h5policy_walk_operation_limit - h5policy_walk_ops)
+        h5policy_raise_walk_operation_budget;
     h5policy_walk_ops = h5policy_walk_ops + cost;
     if (h5policy_walk_deadline != 0L
         && h5policy_walk_ops >= h5policy_walk_next_check)
         {
-            h5policy_walk_next_check = h5policy_walk_ops + 200000UL;
+            if (h5policy_walk_ops > 0xffffffffffffffffUL - 200000UL)
+                h5policy_walk_next_check = 0xffffffffffffffffUL;
+            else
+                h5policy_walk_next_check = h5policy_walk_ops + 200000UL;
             var now = gettime;
             if (now[0] > h5policy_walk_deadline)
-                raise Exception { code = H5POLICY_EC_WALK_BUDGET as int<32>,
+                raise Exception { code = H5POLICY_EC_WALK_TIME_BUDGET as int<32>,
                                   name = "walk time budget exceeded" };
         }
 }
@@ -77,13 +93,6 @@ fun h5policy_walk_tick = (uint<64> cost) void:
 var H5POLICY_MAX_FINDINGS = 4096UL;
 var h5policy_findings_truncated = 0;
 var h5policy_emitted_resource_codes = string[]();
-
-/* Effective run mode, decoupled from the profile (h5policy_run computes these
-   from the profile default and any CLI override).  Mapping strictness (@ vs @!)
-   and continue-after-corruption are independent axes: e.g. untrusted-strict
-   policy with continue-after-corruption collects every finding for triage.  */
-var h5policy_nonstrict = 0;
-var h5policy_continue = 0;
 
 var h5policy_feature_external_links = 0UL;
 var h5policy_feature_external_storage = 0UL;
@@ -254,7 +263,7 @@ fun h5policy_emit = (string severity, string code, string klass,
         return;
 
     /* Resource-budget findings re-fire on every increment past the limit
-       (and forensic mode never stops the walk).  Record the decision once,
+       (and continued-walk analysis need not stop).  Record the decision once,
        but store only the first finding for each resource code.  */
     if (klass == "resource"
         && h5policy_string_seen(h5policy_emitted_resource_codes, code))
@@ -388,7 +397,7 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
                                   uint<64> object_count,
                                   uint<64> attribute_count,
                                   uint<64> object_header_chunk_count,
-                                  uint<64> chunk_index_count,
+                                  uint<64> accounted_chunk_count,
                                   uint<64> max_rank_seen,
                                   uint<64> max_logical_dataset_bytes_seen,
                                   uint<64> visited_object_headers,
@@ -439,7 +448,9 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
     printf("    \"attribute_count\": %u64d,\n", attribute_count);
     printf("    \"object_header_chunk_count\": %u64d,\n",
            object_header_chunk_count);
-    printf("    \"chunk_index_refs\": %u64d,\n", chunk_index_count);
+    /* Retain the established JSON key for report compatibility even though
+       the internal value is an accounted chunk count across index formats. */
+    printf("    \"chunk_index_refs\": %u64d,\n", accounted_chunk_count);
     printf("    \"visited_object_headers\": %u64d,\n",
            visited_object_headers);
     printf("    \"visited_continuations\": %u64d,\n",

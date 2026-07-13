@@ -10,7 +10,8 @@ repairs.
 ## What's Here
 
 - [`pickles/`](pickles/) contains the reusable HDF5 format definitions loaded by
-  GNU poke.
+  GNU poke. Its `h5_format_constants.pk` module is the canonical source for
+  literals shared by declarative mappings and independent validators.
 - [`h5policy/`](h5policy/) contains the policy oracle, focused validators,
   security profiles, regression corpus, differential harness, and fuzzing tools.
 - [`h5patch/`](h5patch/) contains the experimental metadata repair planner,

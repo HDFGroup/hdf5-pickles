@@ -17,9 +17,10 @@
 """Generate the h5policy regression corpus.
 
 Writes small, deterministic HDF5 fixtures into a corpus tree (default
-``h5policy/tests``), grouped by the decision they are expected to produce.
-Valid fixtures use h5py; malformed fixtures are byte-patched from a valid base
-so no assumption is made about libhdf5 accepting them.
+``h5policy/tests``), grouped by role or expected decision. Valid fixtures use
+h5py; malformed fixtures are byte-patched from a valid base so no assumption is
+made about libhdf5 accepting them. The ``integration`` group contains compact
+valid files reused across full-walk profile-semantics cases.
 
 The generated ``*.h5`` files are build artifacts (git-ignored); the tracked
 specification lives in ``tests/expected/*.yml`` and is checked by ``run.sh``.
@@ -124,6 +125,13 @@ def _gen_valid(root):
                        + dtype_vlen_wrapper * 5000
                        + dtype_rec_suffix)
     _patch(f"{root}/cve/dtype_unbounded_recursion.h5", dtype_recursion)
+    # The same recursion CVE in its *compound* form: a single-member version-3
+    # compound nested deeply.  h5policy's cheap linear-depth preflight treats a
+    # single-member compound as a one-child chain (like the VLen wrappers above),
+    # so this is rejected as a resource violation without descending the whole
+    # depth.  Assembled rather than patched -- no libhdf5 writes a type this deep.
+    _make_dtype_compound_recursion(
+        f"{root}/cve/dtype_compound_unbounded_recursion.h5")
     # h5py does not expose the file-creation SOHM controls.  Repack a normal
     # file through libhdf5 to force a list-backed shared dataspace index; this
     # exercises SMTB/SMLI validation plus managed fractal-heap ID resolution.
@@ -142,6 +150,36 @@ def _gen_valid(root):
            lambda h: h.create_dataset(
                "d", data=np.arange(100, dtype="i4").reshape(10, 10),
                chunks=(5, 5), compression="gzip"))
+    # A well-formed scale-offset dataset: accepted (with the decode advisory).
+    # Its cd_values[2]/cd_values[4] match the real chunk element count and the
+    # datatype size, so the filter chunk-consistency checks must NOT fire -- the
+    # regression guard against a false positive in those checks (and against the
+    # v4 chunk element-count computation double-counting the element-size dim).
+    _write(f"{root}/valid/scaleoffset_filter.h5",
+           lambda h: h.create_dataset(
+               "d", data=np.arange(100, dtype="i4").reshape(10, 10),
+               chunks=(5, 5), scaleoffset=0))
+    # A well-formed n-bit dataset with a compound datatype.  h5py cannot write
+    # n-bit, so repack a normal compound dataset through libhdf5.  Accepted (with
+    # the decode advisory); its cd_values type tree is consistent, so the n-bit
+    # parameter-bounds walk must NOT fire -- the regression guard (against real
+    # libhdf5 output) that the walk does not false-reject a valid n-bit tree.
+    nbit_src = f"{root}/valid/.nbit_source.h5"
+    _write(nbit_src,
+           lambda h: h.create_dataset(
+               "d", data=np.zeros(8, dtype=np.dtype([("a", "<i4"), ("b", "<i2")])),
+               chunks=(4,)))
+    subprocess.run(["h5repack", "-f", "NBIT", nbit_src,
+                    f"{root}/valid/nbit_filter.h5"], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.unlink(nbit_src)
+    # A dataset carrying a non-empty object comment (name message, type 0x0D).
+    # Accepted -- the regression guard that the empty-name check does not reject a
+    # well-formed, NUL-terminated comment string.
+    def _object_comment(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"))
+        h5py.h5o.set_comment(d.id, b"a valid object comment")
+    _write(f"{root}/valid/object_comment.h5", _object_comment)
     # Regression guard for v1 object headers that contain zero-size NIL
     # messages.  libhdf5 may emit these as placeholders while growing a header
     # into continuation chunks; they still count toward the declared message
@@ -251,6 +289,15 @@ def _gen_resource(root):
                         "d", data=np.arange(100, dtype="i4").reshape(10, 10),
                         chunks=(5, 5)))
 
+    # A multi-level legacy chunk index.  A v1 B-tree node holds at most 2*K
+    # entries (64 with the generated superblock's indexed-storage K), so 130
+    # allocated one-element chunks force internal-node recursion.  Reduced
+    # chunk-count cases use this to prove that exact equality does not stop the
+    # parent before a later child can establish overflow.
+    _write_earliest(f"{root}/valid/chunked_v1_btree_deep.h5",
+                    lambda h: h.create_dataset(
+                        "d", data=np.arange(130, dtype="i4"), chunks=(1,)))
+
     # Modern chunked dataset with two unlimited dimensions uses a v4 layout
     # version-2 B-tree chunk index.  Data is written so the index has records;
     # exercises the v2 B-tree header, count budget, and leaf chunk records.
@@ -328,6 +375,36 @@ def _gen_resource(root):
                         for i in range(1000)])
 
 
+def _gen_integration(root):
+    # ---- integration/ : compact full-file profile-boundary fixtures -----
+    # The one-byte datatype and fill value remain below a reduced value limit,
+    # while the four-byte attribute payload crosses it.  This isolates the
+    # attribute enforcement site through the ordinary object-header walk.
+    def _value_sites(h):
+        d = h.create_dataset("d", shape=(4,), dtype="u1",
+                             fillvalue=np.uint8(7))
+        d.attrs.create("bytes", np.arange(4, dtype="u1"))
+    _write(f"{root}/integration/value_sites.h5", _value_sites)
+
+    # A small, otherwise ordinary dataset with two standard filters.  Keeping
+    # this separate from the older v1 object-header regression isolates the
+    # per-pipeline filter-count ceiling during a complete metadata walk.
+    _write(f"{root}/integration/multi_filter_dataset.h5",
+           lambda h: h.create_dataset(
+               "d", data=np.arange(100, dtype="i4").reshape(10, 10),
+               chunks=(5, 5), shuffle=True, compression="gzip"))
+
+    # A legal hard-link hierarchy whose deepest object is at traversal depth
+    # 66.  The strict preset stops beyond 64 as a resource-policy decision;
+    # forensic's 128-depth budget validates the same file completely.
+    def _deep_hard_link_chain(h):
+        parent = h
+        for i in range(66):
+            parent = parent.create_group(f"level_{i:02d}")
+    _write(f"{root}/integration/deep_hard_link_chain.h5",
+           _deep_hard_link_chain)
+
+
 def _gen_coverage(root):
     # ---- coverage/ : not yet classified, expected `unsupported_coverage_gap`
     # An attribute whose datatype is a committed (shared) datatype; the shared
@@ -354,6 +431,14 @@ def _gen_malformed(root):
         f"{root}/malformed/compound_member_array_nelem_overflow.h5")
     _make_compound_member_array_bounds(
         f"{root}/malformed/compound_member_array_bounds.h5")
+    _make_compound_member_offset_oob(
+        f"{root}/malformed/compound_member_offset_oob.h5")
+    _make_scaleoffset_nelmts_mismatch(
+        f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
+    _make_scaleoffset_size_mismatch(
+        f"{root}/malformed/scaleoffset_size_mismatch.h5")
+    _make_chunk_size_uint32_wrap(
+        f"{root}/malformed/chunk_size_uint32_wrap.h5")
     _make_bad_reference_datatype_version(
         f"{root}/malformed/bad_reference_datatype_version.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
@@ -480,6 +565,7 @@ def generate(root):
     _gen_valid(root)
     _gen_policy(root)
     _gen_resource(root)
+    _gen_integration(root)
     _gen_coverage(root)
     _gen_malformed(root)
 
@@ -669,6 +755,148 @@ def _make_compound_member_array_bounds(path):
     _splice_compact_datatype(path, dt, 16)
 
 
+def _v1_compound_plain_member(elem_size, member_off, base_size, base_precision):
+    """Bytes of a version-1 compound datatype with a single *plain* member "a"
+    (rank-0 legacy array block) placed at byte offset `member_off`.  Unlike
+    `_v1_compound_array_member` this fixes the member footprint at one base type
+    and instead lets the caller drive the member's byte offset -- used to stress
+    the offset side of the member-bounds check (a member that starts past the
+    parent element)."""
+    dt = bytes([0x16]) + b"\x01\x00\x00" + struct.pack("<I", elem_size)  # compound v1, 1 member
+    name = b"a\x00"
+    name += b"\x00" * ((8 - len(name) % 8) % 8)                          # name padded to 8
+    dt += name + struct.pack("<I", member_off)                          # member name + byte offset
+    dt += bytes([0]) + b"\x00" * 3                                       # rank 0 + reserved
+    dt += struct.pack("<I", 0) + struct.pack("<I", 0)                   # permutation + reserved
+    dt += struct.pack("<I", 0) * 4                                       # 4 dimension-size slots
+    dt += bytes([0x10]) + b"\x00" * 3 + struct.pack("<I", base_size) \
+        + struct.pack("<H", 0) + struct.pack("<H", base_precision)      # integer base type
+    return dt
+
+
+def _make_compound_member_offset_oob(path):
+    """A version-1 compound whose single member starts at a byte offset far past
+    the compound element.
+
+    The member "a" (a 4-byte integer) declares byte offset 0xFFFFFF00 inside a
+    compound element of only 16 bytes.  libhdf5 accumulates member offset + size
+    and, on a 32-bit size_t, 0xFFFFFF00 + 4 wraps back below the element size --
+    the classic integer-overflow path to a member landing outside the element
+    (any conversion or access to it is an out-of-bounds heap write).  h5policy
+    reasons about the raw on-disk offset in 64 bits and guards `member_off >
+    elm_size` before subtracting, so it rejects the member as extending outside
+    its parent type regardless of target pointer size.  Built by splicing a
+    hand-built v1 compound datatype into a compact dataset of matching element
+    size (modern libhdf5 no longer writes this legacy member encoding)."""
+    dt = _v1_compound_plain_member(16, 0xFFFFFF00, 4, 32)
+    _splice_compact_datatype(path, dt, 16)
+
+
+def _scaleoffset_cd_patch(path, cd_index, value):
+    """Build a chunked scale-offset dataset (4-element chunk of i4) and overwrite
+    cd_values[cd_index] in its v2 filter pipeline message, repairing the object-
+    header checksum.  Shared by the element-count and element-size fixtures.
+
+    The pipeline payload is: version(1) nfilters(1); then the descriptor id(2)
+    flags(2) cd_nelmts(2), followed by the 32-bit client-data words, so
+    cd_values[i] lives at mbody + 8 + 4*i."""
+    def _build(h):
+        h.create_dataset("d", data=np.arange(8, dtype="i4"),
+                         chunks=(4,), scaleoffset=0, track_times=False)
+    raw = _base_bytes(_build)
+
+    for o in range(len(raw) - 4):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        p = cur + size_w
+        end = cur + size_w + chunk0
+        while p < end - 3:
+            mtype = raw[p]
+            msize = struct.unpack_from("<H", raw, p + 1)[0]
+            mbody = p + 4 + (2 if flags & 0x04 else 0)
+            if (mtype == 0x0b and raw[mbody] == 2 and raw[mbody + 1] == 1
+                    and struct.unpack_from("<H", raw, mbody + 2)[0] == 6):
+                struct.pack_into("<I", raw, mbody + 8 + 4 * cd_index, value)
+                _fix_v2_ohdr_checksum(raw, o)
+                _patch(path, bytes(raw))
+                return
+            p = mbody + msize
+    raise RuntimeError("could not locate the scale-offset filter descriptor")
+
+
+def _make_scaleoffset_nelmts_mismatch(path):
+    """A chunked dataset whose scale-offset filter declares a chunk element count
+    (cd_values[2], H5Z_SCALEOFFSET_PARM_NELMTS) larger than the real chunk.
+
+    libhdf5 auto-derives cd_values[2] from the chunk dataspace in
+    H5Z__set_local_scaleoffset; its decompressor then sizes the per-chunk output
+    buffer as cd_values[2] * element_size.  Inflating that count (here 4 -> 65537
+    for a 4-element chunk) makes the decompressor write past the buffer sized from
+    the real chunk -- and on a 32-bit size_t the 65537 * element_size product
+    wraps and under-allocates, the classic filter integer-overflow OOB write.
+    n-bit (filter 5) shares the identical cd_values[2] convention and code path;
+    scale-offset is used here only because h5py can write it directly."""
+    _scaleoffset_cd_patch(path, 2, 65537)
+
+
+def _make_scaleoffset_size_mismatch(path):
+    """A chunked dataset whose scale-offset filter declares a per-element size
+    (cd_values[4], H5Z_SCALEOFFSET_PARM_SIZE) larger than the real datatype.
+
+    cd_values[4] is the second factor libhdf5 multiplies into the decompressed
+    buffer (nelmts * size).  Leaving the element count consistent and inflating
+    only the size (here 4 -> 131073 for an i4 datatype) still overflows that
+    product on a 32-bit size_t (131073 * 131073 wraps below the real chunk),
+    driving the same out-of-bounds write.  h5policy rejects it because the
+    declared element size disagrees with the dataset's datatype size."""
+    _scaleoffset_cd_patch(path, 4, 131073)
+
+
+def _make_chunk_size_uint32_wrap(path):
+    """A v4 chunked layout whose encoded chunk dimensions multiply to a byte size
+    of 2**32 + 256.  libhdf5 stores the per-chunk byte size in a uint32_t
+    (H5O_layout_chunk_t.size) computed as the product of all encoded dims (the
+    trailing dim is the element size), so the product wraps to 256: a 256-byte
+    chunk buffer is allocated while the chunk covers ~4 GiB, an out-of-bounds
+    write on read.  No valid file reaches this state -- H5Pset_chunk rejects
+    chunks >= 4 GiB at creation -- so build a single-chunk dataset whose chunk
+    dimension needs four encoded bytes (2**24, no data written -> tiny file) and
+    patch that dimension to 0x40000040, repairing the object-header checksum."""
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", shape=(1 << 24,), chunks=(1 << 24,),
+                                   dtype="i4"))
+    for o in range(len(raw) - 4):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        p = cur + size_w
+        end = cur + size_w + chunk0
+        while p < end - 3:
+            mtype = raw[p]
+            msize = struct.unpack_from("<H", raw, p + 1)[0]
+            mbody = p + 4 + (2 if flags & 0x04 else 0)
+            # Data Layout (0x08), version 4, class 2 (chunked): dims follow
+            # version/class/flags/dimensionality/enc_bytes_per_dim.
+            if mtype == 0x08 and raw[mbody] == 4 and raw[mbody + 1] == 2:
+                enc = raw[mbody + 4]
+                if enc < 4:
+                    raise RuntimeError(
+                        "chunk dim encoding too narrow to patch a wrapping value")
+                struct.pack_into("<I", raw, mbody + 5, 0x40000040)
+                _fix_v2_ohdr_checksum(raw, o)
+                _patch(path, bytes(raw))
+                return
+            p = mbody + msize
+    raise RuntimeError("could not locate the v4 chunked layout message")
+
+
 def _make_bad_reference_datatype_version(path):
     """Datatype header patched to class reference with an unsupported version.
 
@@ -742,6 +970,60 @@ def _jenkins_lookup3():
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod.jenkins_lookup3
+
+
+def _make_dtype_compound_recursion(path, levels=5000):
+    """A single-member compound datatype nested ``levels`` deep in the modern
+    (version-3) encoding: each level is a compound with one 1-char-named member
+    whose type is the next compound, bottoming out in a fixed-point leaf.  This
+    is the datatype-recursion CVE in its compound form -- libhdf5's
+    H5O__dtype_decode_helper recurses once per level and overflows the stack.
+    h5policy caps nesting at profile.resources.max_datatype_recursion_depth and
+    rejects it as reject_resource (H5_RESOURCE_DATATYPE_RECURSION_DEPTH).
+
+    Companion to the single-child VLen sibling (dtype_unbounded_recursion.h5):
+    h5policy's cheap linear-depth preflight recognises a single-member compound
+    as a one-child chain too, so both are rejected from the datatype prefix alone
+    without descending the whole depth or checksumming the giant object header --
+    the crisp resource rejection lands well inside the tightest wall-clock
+    regardless of how deep the file claims to nest.
+
+    Assembled from scratch (superblock + dataset object header + root-group
+    object header) rather than byte-patched, because no libhdf5 writes a type this
+    deep.  The fixed message encodings mirror the VLen sibling's envelope; both
+    Jenkins checksums are recomputed for the compound datatype's length.
+    """
+    jenkins = _jenkins_lookup3()
+
+    # Fixed envelope pieces, byte-identical to the known-good VLen recursion
+    # fixture (superblock header, the dataset's dataspace/fill/layout messages,
+    # and the root-group object header whose link points at the dataset OH @0x30).
+    sb_head = bytes.fromhex("894844460d0a1a0a02080800")           # sig + v2 + 8B off/len + flags
+    dataspace_msg = bytes.fromhex("0104000002000002")             # dataspace message (hdr + body)
+    ds_trailer = bytes.fromhex("0502000003060804000003000000")    # fill-value + data-layout messages
+    root_group_oh = bytes.fromhex(
+        "4f484452020030021200000000ffffffffffffffffffffffffffffffff"
+        "0a020000000006100000010005706f6331363000000000000000d7543402")
+
+    # One version-3 compound level: header (class 6, version 3, 1 member, element
+    # size 1 -> 1-byte member-offset field), the 1-char member name "a", and the
+    # member's byte offset.  The member type is the next compound (11 bytes/level).
+    wrapper = bytes.fromhex("3601000001000000") + b"a\x00" + b"\x00"
+    leaf = bytes.fromhex("100000000100000000000800")              # fixed-point leaf, size 1
+    dtype_data = wrapper * levels + leaf
+
+    dtype_msg = bytes([0x03]) + struct.pack("<H", len(dtype_data)) + b"\x00" + dtype_data
+    chunk0 = dataspace_msg + dtype_msg + ds_trailer
+    dataset_oh = b"OHDR" + bytes([2, 1]) + struct.pack("<H", len(chunk0)) + chunk0
+    dataset_oh += struct.pack("<I", jenkins(dataset_oh))
+
+    root_addr = 48 + len(dataset_oh)                              # the superblock is 48 bytes
+    eof = root_addr + len(root_group_oh)
+    sb = (sb_head + struct.pack("<Q", 0) + b"\xff" * 8
+          + struct.pack("<Q", eof) + struct.pack("<Q", root_addr))
+    sb += struct.pack("<I", jenkins(sb))
+
+    _patch(path, sb + dataset_oh + root_group_oh)
 
 
 def _make_vds_nentries_overflow(path, base_path):

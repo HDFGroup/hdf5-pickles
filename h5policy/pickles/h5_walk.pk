@@ -47,7 +47,11 @@ type H5WalkContext = struct
     uint<64> chunk_logical_bytes;
     uint<64> logical_dataset_bytes;
     uint<64> max_logical_dataset_bytes_seen;
-    uint<64> chunk_index_count;
+    uint<64> accounted_chunk_count;
+    /* The public count saturates at the selected ceiling, so equality alone
+       cannot say whether the walk observed exactly the limit or proved an
+       additional chunk.  Keep that proof as internal traversal state. */
+    uint<8> chunk_count_exceeded;
     uint<8> has_dataspace;
     uint<8> has_datatype;
     uint<8> has_dataset_layout;
@@ -86,12 +90,21 @@ var h5policy_current_object_depth = 0UL;
 var h5policy_current_object_msg_count = 0UL;
 var h5policy_current_object_root_msg_count = 0UL;
 var h5policy_dense_handled = 0;
+/* Chunk element count (cd_values[2]) recorded from a dataset's n-bit/scale-offset
+   filter, checked against the real chunk shape at object finalization.  Only the
+   dataset dispatch path records it; fractal-heap pipeline checks never do, so a
+   filtered dense-storage heap cannot pollute a dataset's chunk-consistency check.  */
+var h5policy_pipeline_decode_nelmts = 0UL;
+var h5policy_pipeline_has_decode_nelmts = 0UB;
+/* Scale-offset's per-element size (cd_values[4]), the other factor libhdf5
+   multiplies into the decompressed chunk buffer.  Checked against the real
+   datatype size at finalization so an inflated size can't overflow the product
+   even when the element count is left consistent.  */
+var h5policy_pipeline_decode_size = 0UL;
+var h5policy_pipeline_has_decode_size = 0UB;
 var h5policy_super_stab_leaf_k = 4UL;
 var h5policy_super_stab_internal_k = 16UL;
 var h5policy_super_indexed_internal_k = 32UL;
-var H5POLICY_H5S_MAX_RANK = 32UL;
-var H5POLICY_LAYOUT_MAX_DIMS = 33UL;  /* H5O_LAYOUT_NDIMS = H5S_MAX_RANK + 1 */
-
 /* Reset per-walk state, including the wall-clock budget counters.  This is
    called by the top-level metadata walk and also by h5patch when it asks
    h5policy to recount a single object header.  */
@@ -166,17 +179,17 @@ fun h5policy_join_path = (string parent, string name) string:
 /* Enqueue one object header discovered through a hard link or old-style group
    record.  Depth is checked before enqueueing so a single deep branch cannot
    grow the pending list past the selected profile's link traversal limit.  */
-fun h5policy_enqueue_ohdr = (H5PolicyLimits profile,
+fun h5policy_enqueue_ohdr = (H5PolicyProfile profile,
                              uint<64> addr,
                              uint<64> depth,
                              string path,
                              off64 loc,
                              string object) void:
 {
-    if (depth > profile.max_link_traversal_depth)
+    if (depth > profile.resources.max_link_traversal_depth)
         {
-            h5policy_emit_error("H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED",
-                                "corrupt", loc, object,
+            h5policy_emit_error("H5_RESOURCE_LINK_TRAVERSAL_DEPTH",
+                                "resource", loc, object,
                                 "link traversal depth exceeds the selected profile limit");
             return;
         }
@@ -217,7 +230,8 @@ fun h5policy_new_walk_context = H5WalkContext:
         chunk_logical_bytes = 0UL,
         logical_dataset_bytes = 0UL,
         max_logical_dataset_bytes_seen = 0UL,
-        chunk_index_count = 0UL,
+        accounted_chunk_count = 0UL,
+        chunk_count_exceeded = 0UB,
         has_dataspace = 0UB,
         has_datatype = 0UB,
         has_dataset_layout = 0UB,
@@ -236,12 +250,12 @@ fun h5policy_new_walk_context = H5WalkContext:
 /* Resource counters are updated through checked arithmetic so over-budget and
    overflow cases become explicit findings instead of wrapping silently.  */
 fun h5policy_count_object = (H5WalkContext ctx,
-                             H5PolicyLimits profile,
+                             H5PolicyProfile profile,
                              off64 loc,
                              string object) H5WalkContext:
 {
     var next = h5policy_checked_add_u64(ctx.object_count, 1UL,
-                                        profile.max_object_count,
+                                        profile.resources.max_object_count,
                                         "H5_RESOURCE_OBJECT_COUNT",
                                         "resource",
                                         loc, object,
@@ -251,46 +265,79 @@ fun h5policy_count_object = (H5WalkContext ctx,
 }
 
 fun h5policy_account_metadata = (H5WalkContext ctx,
-                                 H5PolicyLimits profile,
+                                 H5PolicyProfile profile,
                                  uint<64> bytes,
                                  off64 loc,
                                  string object) H5WalkContext:
 {
     var next = h5policy_checked_add_u64(ctx.metadata_seen, bytes,
-                                        profile.max_metadata_bytes,
-                                        "H5_RESOURCE_METADATA_BYTES",
+                                        profile.resources.max_accounted_metadata_bytes,
+                                        "H5_RESOURCE_ACCOUNTED_METADATA_BYTES",
                                         "resource",
                                         loc, object,
-                                        "metadata byte budget exceeded");
+                                        "accounted metadata byte budget exceeded");
     ctx.metadata_seen = next;
     return ctx;
 }
 
+/* Claim one or more chunks against the file-wide resource ceiling.  The
+   reported counter saturates at the ceiling, while chunk_count_exceeded keeps
+   the otherwise-lost distinction between exact equality and proven overflow.
+   Emit the resource finding only for the first proof of overflow. */
+fun h5policy_count_chunks = (H5WalkContext ctx,
+                             H5PolicyProfile profile,
+                             uint<64> chunks,
+                             off64 loc,
+                             string object,
+                             string message) H5WalkContext:
+{
+    var limit = profile.resources.max_chunk_count;
+    var exceeds = chunks > limit;
+
+    h5policy_walk_tick(1UL);
+    if (!exceeds
+        && ctx.accounted_chunk_count > limit - chunks)
+        exceeds = 1;
+
+    if (exceeds)
+        {
+            if (ctx.chunk_count_exceeded == 0UB)
+                h5policy_emit_error("H5_RESOURCE_CHUNK_COUNT", "resource",
+                                    loc, object, message);
+            ctx.accounted_chunk_count = limit;
+            ctx.chunk_count_exceeded = 1UB;
+        }
+    else
+        ctx.accounted_chunk_count = ctx.accounted_chunk_count + chunks;
+
+    return ctx;
+}
+
 /* These mapping wrappers centralize strict/non-strict behavior.  Strict mode
-   uses ordinary mappings; forensic mode uses @! so corrupt structures can be
+   uses ordinary mappings; non-strict mode uses @! so corrupt structures can be
    inspected long enough to collect nearby findings.  */
-fun h5policy_map_msg_prefix = (int ios, H5PolicyLimits profile,
+fun h5policy_map_msg_prefix = (int ios, H5PolicyProfile profile,
                                offset<uint<64>,B> off) msg_prefix:
 {
-    if (h5policy_nonstrict != 0)
+    if (h5policy_run_options.nonstrict_mapping != 0UB)
         return msg_prefix @! ios : off;
     return msg_prefix @ ios : off;
 }
 
-fun h5policy_map_cont = (int ios, H5PolicyLimits profile,
+fun h5policy_map_cont = (int ios, H5PolicyProfile profile,
                          offset<uint<64>,B> off) oh_msg_cont:
 {
-    if (h5policy_nonstrict != 0)
+    if (h5policy_run_options.nonstrict_mapping != 0UB)
         return oh_msg_cont @! ios : off;
     return oh_msg_cont @ ios : off;
 }
 
-fun h5policy_msg_bytes = (int ios, H5PolicyLimits profile,
+fun h5policy_msg_bytes = (int ios, H5PolicyProfile profile,
                           offset<uint<64>,B> off,
                           uint<64> size) byte[]:
 {
     h5policy_walk_tick(size + 1UL);   /* account the bytes touched, not just the call */
-    if (h5policy_nonstrict != 0)
+    if (h5policy_run_options.nonstrict_mapping != 0UB)
         return byte[size] @! ios : off;
     return byte[size] @ ios : off;
 }
@@ -331,7 +378,7 @@ fun h5policy_decode_u64_raw = (byte[] raw, off64 loc,
     return bytes_to_u64_le_at(raw, 0UL, 8UL);
 }
 
-fun h5policy_msg_u64_at = (int ios, H5PolicyLimits profile,
+fun h5policy_msg_u64_at = (int ios, H5PolicyProfile profile,
                            offset<uint<64>,B> off,
                            uint<64> size) uint<64>:
 {
@@ -377,7 +424,7 @@ fun h5policy_msg_addr_is_undef = (byte[] raw) int:
 
 /* Decode bounded, NUL-terminated names out of metadata payloads.  The caller
    supplies a validated byte window; this routine never scans beyond it.  */
-fun h5policy_string_from_payload = (int ios, H5PolicyLimits profile,
+fun h5policy_string_from_payload = (int ios, H5PolicyProfile profile,
                                     offset<uint<64>,B> off,
                                     uint<64> size) string:
 {
@@ -427,7 +474,7 @@ fun h5policy_filter_name = (uint<64> filter_id) string:
 /* Some index formats are counted but not decoded yet.  Record the address once
    as visited, emit a coverage-gap finding, and keep the caller's resource
    accounting in sync without recursively chasing an unsupported structure.  */
-fun h5policy_note_btree_addr = (H5PolicyLimits profile,
+fun h5policy_note_btree_addr = (H5PolicyProfile profile,
                                 uint<64> addr,
                                 off64 loc,
                                 string object,
@@ -442,7 +489,7 @@ fun h5policy_note_btree_addr = (H5PolicyLimits profile,
 }
 
 fun h5policy_note_chunk_index_addr = (H5WalkContext ctx,
-                                      H5PolicyLimits profile,
+                                      H5PolicyProfile profile,
                                       uint<64> addr,
                                       off64 loc,
                                       string object) H5WalkContext:
@@ -450,13 +497,8 @@ fun h5policy_note_chunk_index_addr = (H5WalkContext ctx,
     if (addr == 0UL || addr == 0xffffffffffffffffUL)
         return ctx;
 
-    ctx.chunk_index_count =
-        h5policy_checked_add_u64(ctx.chunk_index_count, 1UL,
-                                 profile.max_chunk_count,
-                                 "H5_RESOURCE_CHUNK_COUNT",
-                                 "resource",
-                                 loc, object,
-                                 "chunk index budget exceeded");
+    ctx = h5policy_count_chunks(ctx, profile, 1UL, loc, object,
+                                "chunk index budget exceeded");
 
     h5policy_note_btree_addr(profile, addr, loc, object,
                              "chunk index traversal is bounded but not decoded yet");
@@ -476,27 +518,27 @@ fun h5policy_percent_exceeded = (uint<64> numer,
 }
 
 fun h5policy_check_metadata_ratio = (H5WalkContext ctx,
-                                     H5PolicyLimits profile,
+                                     H5PolicyProfile profile,
                                      uint<64> file_size) void:
 {
-    if (profile.metadata_ratio_reject_percent != 0UL
-        && ctx.metadata_seen > profile.metadata_ratio_reject_min_bytes
+    if (profile.heuristics.metadata_ratio_reject_percent != 0UL
+        && ctx.metadata_seen > profile.heuristics.metadata_ratio_reject_min_bytes
         && h5policy_percent_exceeded(ctx.metadata_seen, file_size,
-                                     profile.metadata_ratio_reject_percent))
+                                     profile.heuristics.metadata_ratio_reject_percent))
         h5policy_emit_error("H5_RESOURCE_METADATA_RATIO", "resource",
                             0UL#B, "metadata",
                             "reachable metadata exceeds the selected profile's file-size ratio");
-    else if (profile.metadata_ratio_warn_percent != 0UL
-             && ctx.metadata_seen > profile.metadata_ratio_warn_min_bytes
+    else if (profile.heuristics.metadata_ratio_warn_percent != 0UL
+             && ctx.metadata_seen > profile.heuristics.metadata_ratio_warn_min_bytes
              && h5policy_percent_exceeded(ctx.metadata_seen, file_size,
-                                          profile.metadata_ratio_warn_percent))
+                                          profile.heuristics.metadata_ratio_warn_percent))
         h5policy_emit_warning("H5_ADVISORY_METADATA_RATIO",
                               0UL#B, "metadata",
                               "reachable metadata is a large fraction of the file size");
 }
 
 fun h5policy_update_chunk_resource_pressure = (H5WalkContext ctx,
-                                               H5PolicyLimits profile,
+                                               H5PolicyProfile profile,
                                                off64 loc,
                                                string object) H5WalkContext:
 {
@@ -515,8 +557,8 @@ fun h5policy_update_chunk_resource_pressure = (H5WalkContext ctx,
         ctx.chunk_logical_bytes =
             ctx.chunk_dataset_element_count * ctx.datatype_logical_size;
 
-    if (profile.min_logical_chunk_bytes != 0UL
-        && ctx.chunk_logical_bytes < profile.min_logical_chunk_bytes
+    if (profile.heuristics.min_logical_chunk_bytes != 0UL
+        && ctx.chunk_logical_bytes < profile.heuristics.min_logical_chunk_bytes
         && ctx.dataset_element_count != 0UL)
         {
             var adjusted = ctx.dataset_element_count;
@@ -528,7 +570,7 @@ fun h5policy_update_chunk_resource_pressure = (H5WalkContext ctx,
                 adjusted = 0xffffffffffffffffUL;
 
             var nchunks = adjusted / ctx.chunk_dataset_element_count;
-            if (nchunks > profile.min_logical_chunk_count)
+            if (nchunks > profile.heuristics.max_chunks_below_min_logical_bytes)
                 h5policy_emit_error("H5_RESOURCE_CHUNK_TOO_SMALL", "resource",
                                     loc, object,
                                     "logical chunk size is too small for the estimated chunk count");
@@ -542,7 +584,7 @@ fun h5policy_update_chunk_resource_pressure = (H5WalkContext ctx,
    here after updating its part of ctx.  The function is idempotent and only
    emits checks whose prerequisites have been seen.  */
 fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
-                                            H5PolicyLimits profile,
+                                            H5PolicyProfile profile,
                                             off64 loc,
                                             string object) H5WalkContext:
 {
@@ -584,7 +626,7 @@ fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
             ctx.logical_dataset_bytes =
                 h5policy_checked_mul_u64(ctx.dataset_element_count,
                                          ctx.datatype_logical_size,
-                                         profile.max_logical_dataset_bytes,
+                                         profile.resources.max_logical_dataset_bytes,
                                          "H5_RESOURCE_LOGICAL_DATASET_BYTES",
                                          "resource",
                                          loc, object,
