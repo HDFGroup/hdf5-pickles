@@ -38,41 +38,8 @@ mapping strictness, continuation after corruption, and unreachable-metadata
 sweeping. Walk deadlines and counters remain execution state rather than
 profile or option fields.
 
-This grouping is organizational. Its introduction did not change any preset
-value, comparison, sentinel convention, finding, or validator control-flow
-decision. The field descriptions below generally use the leaf field name;
-validator code accesses it through the group shown above.
-
-### Semantic normalization from the characterized model
-
-The subsequent field-by-field cleanup made these intentional API and behavior
-changes:
-
-- removed the unenforced `max_filter_expansion_ratio` field;
-- renamed `max_metadata_bytes` to `max_accounted_metadata_bytes` and
-  `max_single_allocation_bytes` to `max_single_value_bytes`;
-- renamed `min_logical_chunk_count` to
-  `max_chunks_below_min_logical_bytes`;
-- split `forensic_mode` into the three independent analysis controls documented
-  below;
-- added deterministic `max_walk_operations` and independent
-  `max_filter_parameter_recursion_depth` limits;
-- added profile validation for booleans, percentages, paired rules, walk
-  budgets, and rank; and
-- classified configurable depth ceilings as resource limits rather than proof
-  of corrupt HDF5.
-
-Finding identifiers were normalized with the fields:
-
-| Former finding | Current finding |
-| --- | --- |
-| `H5_RESOURCE_METADATA_BYTES` | `H5_RESOURCE_ACCOUNTED_METADATA_BYTES` |
-| `H5_RESOURCE_SINGLE_ALLOCATION_BYTES` | `H5_RESOURCE_SINGLE_VALUE_BYTES` |
-| `H5_CORRUPT_BTREE_DEPTH_EXCEEDED` | `H5_RESOURCE_BTREE_DEPTH` |
-| `H5_CORRUPT_LINK_TRAVERSAL_DEPTH_EXCEEDED` | `H5_RESOURCE_LINK_TRAVERSAL_DEPTH` |
-| `H5_CORRUPT_DATATYPE_RECURSION_LIMIT` | `H5_RESOURCE_DATATYPE_RECURSION_DEPTH` |
-| `H5_CORRUPT_NBIT_PARAMS_RECURSION` | `H5_RESOURCE_FILTER_PARAMETER_RECURSION_DEPTH` |
-| `H5_UNSUPPORTED_WALK_BUDGET` | `H5_UNSUPPORTED_WALK_TIME_BUDGET` |
+This grouping is organizational. The field descriptions below generally use
+the leaf field name; validator code accesses it through the group shown above.
 
 ## General behavior
 
@@ -81,10 +48,9 @@ invalid selected profile emits `H5_INTERNAL_INVALID_PROFILE`, prints a normal
 report, and returns without opening or validating the input file. Callers that
 construct profiles directly can use `h5policy_profile_is_valid` first.
 
-For report compatibility, the validation text for invalid
-`analysis_defaults.nonstrict_mapping` and
-`analysis_defaults.continue_after_corruption` values retains the former
-`default_nonstrict_mapping` and `default_continue_after_corruption` leaf names.
+The validation text for invalid `analysis_defaults.nonstrict_mapping` and
+`analysis_defaults.continue_after_corruption` values uses the leaf names
+`default_nonstrict_mapping` and `default_continue_after_corruption`.
 
 ### Comparisons and saturation
 
@@ -206,9 +172,9 @@ known, h5policy calculates:
 dataset element count * datatype logical size
 ```
 
-The logical size normally equals the datatype's stored element size. Revised
-references with the recognized compact on-disk encoding use 64 bytes as their
-logical size to match the libhdf5-facing metric.
+The logical size normally equals the datatype's stored element size. References
+with the recognized compact on-disk encoding use 64 bytes as their logical size
+to match the libhdf5-facing metric.
 
 If the multiplication exceeds the profile limit, h5policy emits:
 
@@ -733,9 +699,7 @@ override.
 
 The resolver copies or overrides these values into the same-named fields of
 `H5RunOptions`. Validators consult that effective run value rather than the
-preset defaults directly. The forensic preset enables all three fields;
-splitting defaults from effective options makes their provenance explicit
-without changing built-in behavior.
+preset defaults directly. The forensic preset enables all three fields.
 
 ## Current test coverage
 
@@ -762,11 +726,11 @@ CLI.
 | `max_single_value_bytes` | Fill values cover equality, over-limit resource classification, and zero-as-disabled; separate valid datatype and attribute blobs cross the other two enforcement sites. A compact valid file isolates the attribute-value enforcement site during a full walk. |
 | `max_logical_dataset_bytes` | Synthetic dataset facts cover equality and saturation. `resource/huge_logical_dataset.h5` requires the resource finding, and the same file is accepted under legacy. |
 | Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, zero-byte disabling, and validation of the disabled pair. `resource/tiny_chunks.h5` supplies end-to-end coverage. |
-| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. A valid multi-level dense-link v2 B-tree also rejects as resource policy under a reduced full-walk ceiling, with the former corruption finding forbidden. |
-| `max_link_traversal_depth` | Synthetic queue operations cover equality, the resource over-limit finding, and declining to enqueue the child. A real depth-66 hierarchy rejects under unchanged strict and accepts under unchanged forensic. |
-| `max_datatype_recursion_depth` | `unit_datatype.pk` covers deep VLen and compound nesting as resource rejection; the CVE fixture requires the same finding under legacy. A valid compound-with-array datatype crosses a reduced full-walk depth ceiling while explicitly forbidding the former corruption finding. |
+| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. A valid multi-level dense-link v2 B-tree also rejects as resource policy under a reduced full-walk ceiling. |
+| `max_link_traversal_depth` | Synthetic queue operations cover equality, the resource over-limit finding, and declining to enqueue the child. A real depth-66 hierarchy rejects under the built-in strict profile and accepts under the built-in forensic profile. |
+| `max_datatype_recursion_depth` | `unit_datatype.pk` covers deep VLen and compound nesting as resource rejection; the CVE fixture requires the same finding under legacy. A valid compound-with-array datatype crosses a reduced full-walk depth ceiling as a resource rejection. |
 | `max_filter_parameter_recursion_depth` | A direct recursive call above a zero limit covers the resource finding and poison return; malformed n-bit parameter bounds and classes retain their synthetic coverage. A valid n-bit-filtered dataset reaches the same resource path end to end under a reduced ceiling. |
-| `max_rank` | A valid rank-two dataspace covers equality and resource-only rejection below the fixed rank ceiling; profile validation rejects ceilings above 32. A full-file rank-one case confirms that the corrected limit is not reported as fixed-format corruption. |
+| `max_rank` | A valid rank-two dataspace covers equality and resource rejection below the fixed rank ceiling; profile validation rejects ceilings above 32. A full-file rank-one case confirms enforcement of the configured profile limit. |
 | `max_filter_count` | A valid two-filter pipeline covers equality, resource classification, and continued descriptor parsing synthetically. The same shape is exercised end to end by a valid shuffle+gzip dataset: lowering only the filter ceiling retains both the decode advisory and all four chunk records. |
 | Metadata-ratio rules | Synthetic counters cover the strict absolute/percentage boundaries, warning behavior, reject behavior, and reject-over-warning precedence. Profile checks cover percentage bounds, disabled-rule floors, and warning/reject ordering. Full-walk cases separately require the warning and rejection decisions and verify rejection suppresses the advisory. |
 | `allow_external_links`, `allow_external_storage`, `allow_vds`, `allow_dynamic_filters` | Each zero/nonzero policy branch and feature counter is covered synthetically. External-link and EFL corpus cases also compare restrictive and permissive profiles; VDS has a permissive source-path corpus case. |
