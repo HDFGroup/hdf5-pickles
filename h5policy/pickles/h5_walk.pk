@@ -73,6 +73,68 @@ var h5policy_visited_ohdrs = uint<64>[]();
 var h5policy_visited_conts = uint<64>[]();
 var h5policy_visited_btrees = uint<64>[]();
 
+/* Reachability record: the structures the walk actually read, with the kind it
+   read them as.  The visited sets above cannot answer this -- they exist to
+   break cycles, so they only hold the kinds that need deduplicating, and a
+   consumer asking "did the walk reach these bytes?" about a heap or an array
+   block would get a false negative from them.
+
+   Append-only, and deliberately NOT deduplicated.  h5policy_seen_u64 charges
+   its linear scan to the walk's operation budget, so a deduplicated set here
+   would add an O(N^2) term to that budget and could push a large file past
+   max_walk_operations -- turning a reporting record into a decision change.
+   Recording must never move a verdict, so h5policy_mark_reached does no
+   membership test and never ticks: it is O(1) and walk-budget neutral.  The
+   membership test belongs to the reader, at report time, outside the walk.
+
+   Duplicates are therefore expected: a structure read twice is recorded twice.
+   That is bounded, because the number of reads is already bounded by the walk
+   budget, and capped again below.  */
+var h5policy_reached_addrs = uint<64>[]();
+var h5policy_reached_kinds = string[]();
+var h5policy_reached_truncated = 0;
+
+/* Ceiling on the reachability record.  Past it, recording stops and the flag
+   above says so, exactly as H5POLICY_MAX_FINDINGS caps findings: a reader must
+   be able to tell "not reached" from "we stopped writing this down".  */
+var H5POLICY_MAX_REACHED = 65536UL;
+
+/* Record that the walk read a structure of KIND at ADDR.  KIND is the on-disk
+   signature tag ("OHDR", "FAHD", "HEAP", ...) or a logical name where the
+   structure carries no signature ("OHDR" for version 1 headers, "SUPER").
+
+   Deliberately does not call h5policy_walk_tick: see above.  Keeping this
+   walk-budget neutral is what makes it provable that adding the record changes
+   no decision -- the CLI report stays byte-identical.  */
+fun h5policy_mark_reached = (uint<64> addr, string kind) void:
+{
+    if (h5policy_reached_truncated)
+        return;
+    if (h5policy_reached_addrs'length as uint<64> >= H5POLICY_MAX_REACHED)
+        {
+            h5policy_reached_truncated = 1;
+            return;
+        }
+    h5policy_reached_addrs += [addr];
+    h5policy_reached_kinds += [kind];
+}
+
+/* Report-time lookup: the kind the walk read at ADDR, or "" if it never read
+   it.  Linear, and intentionally so -- this runs once per query after the walk
+   has finished, so it is outside the operation budget and must not tick.  */
+fun h5policy_reached_kind_at = (uint<64> addr) string:
+{
+    for (var i = 0UL; i < h5policy_reached_addrs'length as uint<64>; i = i + 1UL)
+        if (h5policy_reached_addrs[i] == addr)
+            return h5policy_reached_kinds[i];
+    return "";
+}
+
+fun h5policy_was_reached = (uint<64> addr) int:
+{
+    return h5policy_reached_kind_at(addr) != "";
+}
+
 /* Object headers are walked breadth-first.  Link messages enqueue child object
    headers here; h5policy_walk_reachable_metadata drains the queue while
    enforcing max link depth and continue-after-corruption policy.  */
@@ -113,6 +175,9 @@ fun h5policy_reset_traversal_state = void:
     h5policy_visited_ohdrs = uint<64>[]();
     h5policy_visited_conts = uint<64>[]();
     h5policy_visited_btrees = uint<64>[]();
+    h5policy_reached_addrs = uint<64>[]();
+    h5policy_reached_kinds = string[]();
+    h5policy_reached_truncated = 0;
     h5policy_pending_ohdrs = uint<64>[]();
     h5policy_pending_depths = uint<64>[]();
     h5policy_pending_paths = string[]();
