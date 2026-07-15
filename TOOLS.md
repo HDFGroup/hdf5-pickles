@@ -73,11 +73,18 @@ TREE            0x00000000000001DF (479)
 `h5explain` starts GNU poke with the repository pickles loaded and installs a small command layer for incremental HDF5 byte-level exploration:
 
 ```sh
-./tools/h5explain [-n|--non-strict] FILE [OFFSET]
+./tools/h5explain [OPTIONS] FILE [OFFSET]
 ./tools/h5explain --help
 ```
 
 `OFFSET` may be decimal or hexadecimal, for example `48` or `0x30`. Without an offset, the tool starts at the HDF5 superblock.
+
+Commands supplied with `-c`/`--command` or on a piped standard input run as a batch session that exits instead of entering the REPL:
+
+```sh
+printf 'root\nls\n' | ./tools/h5explain file.h5
+./tools/h5explain -c root -c ls file.h5
+```
 
 **Navigation commands:** `root`, `h5super`, `cd ("NAME")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
 

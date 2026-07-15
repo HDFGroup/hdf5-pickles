@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage:
-  h5explain [-n|--non-strict] FILE [OFFSET]
+  h5explain [OPTIONS] FILE [OFFSET]
   h5explain -h|--help
 
 Arguments:
@@ -14,6 +14,20 @@ Arguments:
 Options:
   -h, --help           show this help
   -n, --non-strict     use non-strict poke mapping to keep exploring
+  -c, --command CMD    run CMD after startup; may be repeated
+  -b, --batch          run commands and exit instead of entering the REPL
+  -q, --quiet          suppress the startup banner
+
+Commands come from --command options, or, when none are given and standard
+input is not a terminal, from standard input.  Either source implies --batch
+and --quiet, so a scripted session works without extra flags:
+
+  printf 'root\nls\n' | h5explain file.h5
+  h5explain -c root -c ls file.h5
+
+Batch mode exits with poke's status.  Note that poke reports an unhandled
+exception on stderr and continues, so scripted callers should assert on
+output rather than on the exit status alone.
 EOF
 }
 
@@ -27,6 +41,9 @@ script_dir="$(cd -- "$(dirname -- "$source_path")" && pwd)"
 h5explain_dir="$(cd -- "$script_dir/.." && pwd)"
 repo_dir="$(cd -- "$h5explain_dir/.." && pwd)"
 non_strict=0
+batch=0
+quiet=0
+commands=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -36,6 +53,27 @@ while [[ $# -gt 0 ]]; do
             ;;
         -n|--non-strict)
             non_strict=1
+            shift
+            ;;
+        -b|--batch)
+            batch=1
+            shift
+            ;;
+        -q|--quiet)
+            quiet=1
+            shift
+            ;;
+        -c|--command)
+            if [[ $# -lt 2 ]]; then
+                printf 'h5explain: %s requires an argument\n\n' "$1" >&2
+                usage >&2
+                exit 2
+            fi
+            commands+=("$2")
+            shift 2
+            ;;
+        --command=*)
+            commands+=("${1#--command=}")
             shift
             ;;
         --)
@@ -76,6 +114,22 @@ if [[ -n "$offset" && ! "$offset" =~ ^([0-9]+|0[xX][0-9A-Fa-f]+)$ ]]; then
     exit 2
 fi
 
+# Commands come from --command options, or failing that from a piped stdin.
+# poke reads its own stdin as the REPL, so a scripted session has to be
+# collected here and replayed through the startup script instead.  Only drain
+# stdin when no --command was given: a caller that passed --command may leave
+# stdin open forever, and draining it would hang the session.
+if [[ ${#commands[@]} -eq 0 && ! -t 0 ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        commands+=("$line")
+    done
+fi
+
+if [[ ${#commands[@]} -gt 0 ]]; then
+    batch=1
+    quiet=1
+fi
+
 escape_poke_file_arg() {
     local value=$1
     local tab=$'\t'
@@ -108,10 +162,19 @@ trap 'rm -f "$cmd_file"' EXIT
     printf '.set omode tree\n'
     printf 'load h5explain\n'
     printf 'h5explain_non_strict = %d\n' "$non_strict"
+    printf 'h5explain_quiet = %d\n' "$quiet"
     if [[ -n "$offset" ]]; then
         printf 'h5explain_start ("%s")\n' "$(escape_poke_string "$offset")"
     else
         printf 'h5explain_start\n'
+    fi
+    if [[ ${#commands[@]} -gt 0 ]]; then
+        printf '%s\n' "${commands[@]}"
+    fi
+    # poke keeps reading its stdin as a REPL once the startup script ends, so
+    # batch mode has to close the session explicitly.
+    if [[ $batch -eq 1 ]]; then
+        printf '.exit\n'
     fi
 } >"$cmd_file"
 
