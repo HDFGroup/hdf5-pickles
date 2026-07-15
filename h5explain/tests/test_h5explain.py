@@ -509,7 +509,7 @@ BAD_BTREE = "malformed/bad_btree_key.h5"
 def test_check_accepts_a_clean_file():
     out = explain("latest.h5", "root", "check")
     assert "h5policy: accept" in out, out
-    assert "the walk reached it" in out, out
+    assert "The walk reached it." in out, out
 
 
 def test_check_reports_the_profile_it_used():
@@ -587,7 +587,7 @@ def test_forensic_profile_resolves_a_halted_walk():
     assert "stopped early" in strict, strict
     forensic = explain_path(corpus(BAD_BTREE), 'profile ("forensic")',
                             'gos ("800")', "check")
-    assert "the walk reached it" in forensic, forensic
+    assert "The walk reached it." in forensic, forensic
 
 
 def test_profile_shows_and_sets():
@@ -621,6 +621,76 @@ def test_check_preserves_learned_btree_context():
     assert infos[0] == infos[1], infos
     # The learned rank must survive, not fall back to the ndims=1 decode.
     assert "set_bt1_ndims" not in out, out
+
+
+# -- finding-cap truncation and the offset-0 placeholder ---------------------
+
+# A corpus fixture that yields several findings under forensic, so capping the
+# finding limit truncates a real run rather than an artificial one.
+MULTI_FINDING = "malformed/bad_compact_layout_overrun.h5"
+
+# Lowering a production ceiling to make a boundary testable is the same tactic
+# h5policy's own suite uses for its reduced-boundary cases (tests/README.md);
+# the real cap is 4096, which no small fixture can reach.
+CAP_ONE = "H5POLICY_MAX_FINDINGS = 1UL;"
+
+
+def test_check_reports_that_the_finding_limit_was_reached():
+    out = explain_path(corpus(MULTI_FINDING), CAP_ONE, 'profile ("forensic")',
+                       "h5super", "check")
+    assert "finding limit was reached" in out, out
+
+
+def test_check_does_not_claim_no_findings_once_truncated():
+    # Past the cap, "no findings here" is unsupportable: a finding on these
+    # bytes may have been dropped rather than never raised.
+    out = explain_path(corpus(MULTI_FINDING), CAP_ONE, 'profile ("forensic")',
+                       "h5super", "check")
+    assert "may have been dropped rather than never raised" in out, out
+    assert "No findings at this primitive." not in out, out
+
+
+def test_untruncated_check_makes_the_plain_claim():
+    # The hedge must appear only when it is earned.
+    out = explain("latest.h5", "root", "check")
+    assert "No findings at this primitive." in out, out
+    assert "may have been dropped" not in out, out
+
+
+def test_placeholder_offset_findings_do_not_anchor_to_the_superblock():
+    # h5policy reports the truncation marker at offset 0, its "no location"
+    # placeholder -- not because the superblock is at fault.  A file whose
+    # superblock sits at 0 must not collect it.
+    out = explain_path(corpus(MULTI_FINDING), CAP_ONE, 'profile ("forensic")',
+                       "h5super", "check")
+    assert "H5_POLICY_FINDINGS_TRUNCATED" not in out, out
+
+
+def test_genuine_offset_zero_finding_still_anchors_by_object():
+    # The one real offset-0 finding: a bad superblock signature.  Excluding 0
+    # from byte-anchoring must not lose it -- the object path carries it.
+    out = explain("bad_signature.h5", "check")
+    assert "H5_CORRUPT_BAD_SIGNATURE" in out, out
+    assert "bearing on superblock" in out, out
+
+
+# -- opening a file whose superblock does not decode -------------------------
+
+def test_session_opens_despite_an_undecodable_superblock():
+    out = explain("bad_signature.h5", "pwd")
+    assert "superblock at 0UL#B (HDF5 superblock)" in out, out
+    assert "unhandled" not in out, out
+
+
+def test_undecodable_superblock_is_reported_not_raised():
+    out = explain("bad_signature.h5", "pwd")
+    assert "did not decode" in out, out
+
+
+def test_navigation_still_works_after_a_bad_superblock():
+    # The session must remain usable: dump reads bytes regardless of decoding.
+    out = explain("bad_signature.h5", "dump")
+    assert "unhandled" not in out, out
 
 
 def test_banner_advertises_policy_commands():

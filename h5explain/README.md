@@ -76,6 +76,14 @@ bears on the cursor when its bytes fall inside the current primitive **or** when
 it is about the object the cursor is parked on — h5policy anchors each finding
 both at the offending bytes and at the object path, and the two often differ.
 
+Findings that h5policy reports at offset 0 are not treated as bytes at offset 0.
+That offset is its "no location" placeholder — used by the finding-limit marker,
+the walk-budget and mapping-failure findings, and any finding whose real
+location was not printable — and most files put the superblock there, which
+would otherwise collect all of them. Those findings name their scope in the
+object field instead, and a genuine finding at offset 0 (a bad superblock
+signature, object `superblock`) is matched by object path.
+
 When nothing bears on the cursor, `check` says which of four things it means:
 
 - **reached** — the walk went here and found nothing.
@@ -88,6 +96,11 @@ When nothing bears on the cursor, `check` says which of four things it means:
 - **stopped early** — the walk halted (corruption under a profile that does not
   continue, or a resource budget), so absence proves nothing. The `forensic`
   profile keeps walking past corruption and restores the distinction.
+
+h5policy stores at most 4096 findings per run. Past that cap `check` stops
+claiming there are none on the cursor, because a finding on those very bytes may
+have been dropped rather than never raised; it says so and reports reachability
+separately.
 
 Loading the policy pickles costs roughly 0.2s of extra startup on every session.
 
@@ -106,6 +119,12 @@ Reaching the same address through `root`, `cd`, or another structural pointer
 corroborates the kind, so no marker appears.  A primitive that then fails to
 decode is reported as a warning naming the offset, rather than as a poke
 exception.
+
+The same holds at startup: a file whose superblock does not decode still opens.
+`h5explain` reports the failure, notes that the B-tree constants are unset, and
+leaves the cursor on the superblock, so `dump`, `check`, and manual navigation
+all still work — a superblock that does not parse is exactly the case worth
+exploring.
 
 Inspection:
 

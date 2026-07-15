@@ -86,11 +86,27 @@ def make_chunked(path):
                          maxshape=(None, None), chunks=(4, 4))
 
 
+def make_bad_signature(path):
+    """A file whose superblock signature is broken.
+
+    The explorer has to open this: a superblock that does not decode is exactly
+    the case worth exploring, and h5policy reports it at offset 0 -- the same
+    offset it uses as its "no location" placeholder.
+    """
+    make_latest(path)
+    with open(path, "rb") as fh:
+        raw = bytearray(fh.read())
+    raw[0] ^= 0xFF
+    with open(path, "wb") as fh:
+        fh.write(raw)
+
+
 FIXTURES = {
     "earliest.h5": make_earliest,
     "latest.h5": make_latest,
     "dense.h5": make_dense,
     "chunked.h5": make_chunked,
+    "bad_signature.h5": make_bad_signature,
 }
 
 
