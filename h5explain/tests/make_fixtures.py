@@ -61,6 +61,13 @@ def make_latest(path):
         f["top"].attrs["units"] = "m"
 
 
+def make_userblock(path, libver):
+    """A shifted superblock whose metadata addresses are base-relative."""
+    with h5py.File(path, "w", libver=libver, userblock_size=512) as f:
+        g = f.create_group("group_a")
+        g.create_dataset("values", data=np.arange(8, dtype="<i4"))
+
+
 def make_dense(path):
     """Dense link storage: fractal heap plus a v2 B-tree name index."""
     with h5py.File(path, "w", libver="latest") as f:
@@ -104,6 +111,8 @@ def make_bad_signature(path):
 FIXTURES = {
     "earliest.h5": make_earliest,
     "latest.h5": make_latest,
+    "userblock_latest.h5": lambda path: make_userblock(path, "latest"),
+    "userblock_earliest.h5": lambda path: make_userblock(path, "earliest"),
     "dense.h5": make_dense,
     "chunked.h5": make_chunked,
     "bad_signature.h5": make_bad_signature,

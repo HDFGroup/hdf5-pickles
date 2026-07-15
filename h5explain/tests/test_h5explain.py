@@ -162,6 +162,16 @@ def test_cd_labels_the_path():
     assert "(object header)" in out, out
 
 
+def test_userblock_files_translate_metadata_addresses():
+    for name in ("userblock_latest.h5", "userblock_earliest.h5"):
+        out = explain(name, "h5super", "root", 'cd ("group_a/values")', "pwd",
+                      "check")
+        assert "superblock at 512UL#B" in out, (name, out)
+        assert "/group_a/values" in out, (name, out)
+        assert "h5policy: accept" in out, (name, out)
+        assert "did not decode" not in out, (name, out)
+
+
 def test_cd_unknown_link_reports_and_stays_put():
     out = explain("latest.h5", "root", 'cd ("no_such_link")', "pwd")
     assert 'no hard link named "no_such_link"' in out, out

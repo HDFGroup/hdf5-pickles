@@ -111,6 +111,13 @@ def nested_datatypes(path: Path) -> None:
         h5.create_dataset("compound", data=data)
 
 
+def userblock_latest(path: Path) -> None:
+    """Create a modern file whose superblock starts after a 512-byte user block."""
+    with h5py.File(path, "w", libver="latest", userblock_size=512) as h5:
+        group = h5.create_group("group")
+        group.create_dataset("data", data=np.arange(4, dtype=np.int16))
+
+
 def main() -> None:
     args = parse_args()
     output_dir = args.output_dir.expanduser().resolve()
@@ -124,6 +131,7 @@ def main() -> None:
         "chunk_extensible_array.h5": chunk_extensible_array,
         "chunk_v2_btree.h5": chunk_v2_btree,
         "nested_datatypes.h5": nested_datatypes,
+        "userblock_latest.h5": userblock_latest,
     }
 
     for name, writer in fixtures.items():

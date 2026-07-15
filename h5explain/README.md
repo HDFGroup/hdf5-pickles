@@ -5,6 +5,9 @@ exploration.  It opens an HDF5 file, loads the reusable format pickles from the
 repository, and installs navigation commands for moving through superblocks,
 object headers, links, B-trees, heaps, and chunk indexes.
 
+HDF5 user blocks are detected automatically at legal superblock boundaries;
+navigation and policy findings report physical file offsets.
+
 Run from the repository root:
 
 ```sh

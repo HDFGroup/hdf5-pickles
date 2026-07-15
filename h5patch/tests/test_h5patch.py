@@ -186,6 +186,17 @@ def test_depth0_btree_total_count_repair(tmp):
     assert_accept(repaired)
 
 
+def test_userblock_files_need_no_repairs(tmp):
+    for name in ("userblock_latest.h5", "userblock_earliest.h5"):
+        src = os.path.join(CORPUS, "valid", name)
+        plan = os.path.join(tmp, name + ".plan.json")
+        run([H5PATCH, "plan", src, "-o", plan])
+        spec = json.load(open(plan))
+        assert spec["input"]["superblock_offset"] == 512, spec
+        assert spec["policy"]["pre_decision"] == "accept", spec
+        assert spec["actions"] == [], spec
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="h5patch-test-") as tmp:
         test_signature_repair(tmp)
@@ -193,6 +204,7 @@ def main():
         test_v1_object_header_message_count_repair(tmp)
         test_snod_symbol_count_repair(tmp)
         test_depth0_btree_total_count_repair(tmp)
+        test_userblock_files_need_no_repairs(tmp)
     print("h5patch tests passed")
 
 

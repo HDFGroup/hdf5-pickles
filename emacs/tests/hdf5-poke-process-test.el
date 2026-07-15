@@ -318,4 +318,21 @@
                    (goto-char (point-min))
                    (search-forward "GNU poke datatype view" nil t))))))))
 
+(ert-deftest hdf5-poke-process-translates-userblock-addresses ()
+  (let ((hdf5-poke-default-superblock-offset "512#B"))
+    (hdf5-poke-process-test--with-session
+     "userblock_latest.h5"
+     (lambda (session)
+       (with-current-buffer session
+         (goto-char (point-min))
+         (should (search-forward "Offset: 512" nil t))
+         (should (search-forward "Root object header: 560" nil t))
+         (hdf5-poke-browse))
+       (hdf5-poke-process-test--wait session)
+       (let* ((buffer "*hdf5-poke-links:userblock_latest.h5@560*")
+              (rows (hdf5-poke-process-test--row-ids buffer)))
+         (should (cl-find "group" rows
+                          :key (lambda (row) (plist-get row :name))
+                          :test #'equal)))))))
+
 ;;; hdf5-poke-process-test.el ends here

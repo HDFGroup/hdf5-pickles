@@ -4,6 +4,10 @@
 HDF5 bytes independently of `libhdf5`, validates the metadata it can reach, applies
 a security profile, and emits a stable JSON decision.
 
+Files with an HDF5 user block are supported. The superblock is discovered at a
+legal boundary and base-relative HDF5 addresses are translated to physical file
+offsets before metadata is mapped.
+
 The tool is intentionally a metadata-only boundary:
 
 - no libhdf5 calls
