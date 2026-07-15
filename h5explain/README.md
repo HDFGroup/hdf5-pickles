@@ -76,13 +76,11 @@ bears on the cursor when its bytes fall inside the current primitive **or** when
 it is about the object the cursor is parked on — h5policy anchors each finding
 both at the offending bytes and at the object path, and the two often differ.
 
-Findings that h5policy reports at offset 0 are not treated as bytes at offset 0.
-That offset is its "no location" placeholder — used by the finding-limit marker,
-the walk-budget and mapping-failure findings, and any finding whose real
-location was not printable — and most files put the superblock there, which
-would otherwise collect all of them. Those findings name their scope in the
-object field instead, and a genuine finding at offset 0 (a bad superblock
-signature, object `superblock`) is matched by object path.
+Each finding says explicitly whether it has a byte location. Locationless
+findings — such as finding-limit, walk-budget, and mapping-failure reports — do
+not attach to the superblock merely because their numeric offset is zero. A
+genuine finding at byte zero remains a normal located finding and matches the
+primitive covering that byte.
 
 When nothing bears on the cursor, `check` says which of five things it means:
 
@@ -98,8 +96,9 @@ When nothing bears on the cursor, `check` says which of five things it means:
 - **record full** — the reachability record hit its ceiling, so absence proves
   nothing.
 
-The answers come from h5policy's reachability record: the structures its walk
-actually read, with the kind it read each as. That record is why the superblock
+The answers come from h5policy's reachability record and explicit walk status:
+the structures its walk actually read, the kind it read each as, and whether the
+walk completed or why it stopped. That record is why the superblock
 gets no special case — it is reached when the walk located it, and a file whose
 signature was never found has no located superblock, which is exactly where
 "reached by definition" would have lied.

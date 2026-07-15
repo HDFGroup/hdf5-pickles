@@ -39,11 +39,11 @@ Run `h5policy` against an HDF5 file:
 ./tools/h5policy --profile untrusted-strict file.h5
 ```
 
-Try the regression suite:
+Run every regression suite through CTest:
 
 ```sh
-cd h5policy/tests
-./run.sh
+cmake -S . -B build
+ctest --test-dir build --output-on-failure -j4
 ```
 
 Create a what-if metadata repair plan:

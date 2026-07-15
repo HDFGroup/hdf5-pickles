@@ -741,17 +741,17 @@ def test_untruncated_check_makes_the_plain_claim():
 
 
 def test_placeholder_offset_findings_do_not_anchor_to_the_superblock():
-    # h5policy reports the truncation marker at offset 0, its "no location"
-    # placeholder -- not because the superblock is at fault.  A file whose
-    # superblock sits at 0 must not collect it.
+    # The truncation marker has no byte location. Its numeric offset remains 0
+    # for report compatibility, but the explicit validity bit prevents it from
+    # attaching to a superblock that genuinely begins at byte 0.
     out = explain_path(corpus(MULTI_FINDING), CAP_ONE, 'profile ("forensic")',
                        "h5super", "check")
     assert "H5_POLICY_FINDINGS_TRUNCATED" not in out, out
 
 
 def test_genuine_offset_zero_finding_still_anchors_by_object():
-    # The one real offset-0 finding: a bad superblock signature.  Excluding 0
-    # from byte-anchoring must not lose it -- the object path carries it.
+    # A bad superblock signature genuinely lives at byte 0, so the location bit
+    # lets it anchor by extent without treating zero as a sentinel.
     out = explain("bad_signature.h5", "check")
     assert "H5_CORRUPT_BAD_SIGNATURE" in out, out
     assert "bearing on superblock" in out, out

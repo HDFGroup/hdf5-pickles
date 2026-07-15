@@ -69,9 +69,10 @@ JSON output includes:
 
 Consumers that load `h5_policy.pk` should call `h5policy_analyze` and inspect
 the result through the read-only `h5policy_result_*` functions defined in
-`pickles/h5_consumer.pk`.  The API exposes the decision, exit code, findings,
-truncation state, and reachability queries as scalars and strings.  The parallel
-finding and traversal vectors remain implementation details.
+`pickles/h5_consumer.pk`. The API exposes the decision, exit code, findings,
+location validity, truncation state, reachability queries, and explicit walk
+start/completion/stop state as scalars and strings. The parallel finding and
+traversal vectors remain implementation details.
 
 ## Profiles
 

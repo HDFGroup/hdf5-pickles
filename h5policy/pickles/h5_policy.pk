@@ -42,7 +42,6 @@ load "h5_messages.pk";
 load "h5_dense_attrs.pk";
 load "h5_dispatch.pk";
 load "h5_validate.pk";
-load "h5_consumer.pk";
 
 var h5policy_profile_name = "untrusted_strict";
 var h5policy_file_name = "";
@@ -96,6 +95,7 @@ fun h5policy_analyze = (int ios, H5PolicyProfile profile) H5WalkContext:
        reachable walk starts, and the reachability record has to survive it to
        keep what was read before the walk (see h5policy_reset_reached).  */
     h5policy_reset_reached;
+    h5policy_reset_walk_status;
 
     var ctx = h5policy_new_walk_context;
 
@@ -105,8 +105,9 @@ fun h5policy_analyze = (int ios, H5PolicyProfile profile) H5WalkContext:
     var profile_error = h5policy_profile_validation_error(profile);
     if (profile_error != "")
         {
-            h5policy_emit_error("H5_INTERNAL_INVALID_PROFILE", "internal",
-                                0UL#B, "profile", profile_error);
+            h5policy_walk_stop_reason = "invalid_profile";
+            h5policy_emit_unlocated_error("H5_INTERNAL_INVALID_PROFILE", "internal",
+                                          "profile", profile_error);
             return ctx;
         }
 
@@ -125,6 +126,13 @@ fun h5policy_analyze = (int ios, H5PolicyProfile profile) H5WalkContext:
                     h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE",
                                         "corrupt", 0UL#B, "superblock",
                                         "HDF5 signature was not found at a valid superblock offset");
+                    if (h5policy_run_options.continue_after_corruption != 0UB)
+                        {
+                            h5policy_walk_completed = 1;
+                            h5policy_walk_stop_reason = "";
+                        }
+                    else
+                        h5policy_walk_stop_reason = "prewalk_rejection";
                 }
             else
                 {
@@ -143,6 +151,15 @@ fun h5policy_analyze = (int ios, H5PolicyProfile profile) H5WalkContext:
                                                                    ctx, root_addr,
                                                                    ext_addr);
                         }
+                    else if (h5policy_run_options.continue_after_corruption == 0UB
+                             && h5policy_exit_code != H5POLICY_EXIT_ACCEPT
+                             && h5policy_exit_code != H5POLICY_EXIT_WARN)
+                        h5policy_walk_stop_reason = "prewalk_rejection";
+                    else
+                        {
+                            h5policy_walk_completed = 1;
+                            h5policy_walk_stop_reason = "";
+                        }
 
                     /* When selected independently by the run options, sweep
                        for structures outside the reachable graph, such as
@@ -158,24 +175,35 @@ fun h5policy_analyze = (int ios, H5PolicyProfile profile) H5WalkContext:
                to fully vet within this profile's ceiling.  That is a coverage
                limit, not a corruption verdict.  */
             if (e.code == H5POLICY_EC_WALK_OPERATION_BUDGET as int<32>)
-                h5policy_emit_error("H5_UNSUPPORTED_WALK_OPERATION_BUDGET",
-                                    "unsupported", 0UL#B, "metadata",
-                                    "file exceeds the selected profile's deterministic walk operation budget");
+                {
+                    if (!h5policy_walk_completed)
+                        h5policy_walk_stop_reason = "operation_budget";
+                    h5policy_emit_unlocated_error("H5_UNSUPPORTED_WALK_OPERATION_BUDGET",
+                                                  "unsupported", "metadata",
+                                                  "file exceeds the selected profile's deterministic walk operation budget");
+                }
             else if (e.code == H5POLICY_EC_WALK_TIME_BUDGET as int<32>)
-                h5policy_emit_error("H5_UNSUPPORTED_WALK_TIME_BUDGET",
-                                    "unsupported",
-                                    0UL#B, "metadata",
-                                    "file exceeds the selected profile's wall-clock walk budget");
+                {
+                    if (!h5policy_walk_completed)
+                        h5policy_walk_stop_reason = "time_budget";
+                    h5policy_emit_unlocated_error("H5_UNSUPPORTED_WALK_TIME_BUDGET",
+                                                  "unsupported", "metadata",
+                                                  "file exceeds the selected profile's wall-clock walk budget");
+                }
             /* Only exceptions that arise from mapping attacker-controlled
                bytes/offsets mean "the file is corrupt/hostile".  Anything
                else is a defect in this validator and must surface as
                internal_error (exit 70), not be laundered as reject_corrupt.  */
             else if (e.code == EC_constraint || e.code == EC_eof
                 || e.code == EC_io || e.code == EC_map)
-                h5policy_emit_error("H5_CORRUPT_MAPPING_FAILED",
-                                    "corrupt", 0UL#B, "metadata",
-                                    "metadata mapping failed under the selected profile ("
-                                    + e.name + ")");
+                {
+                    if (!h5policy_walk_completed)
+                        h5policy_walk_stop_reason = "mapping_failed";
+                    h5policy_emit_unlocated_error("H5_CORRUPT_MAPPING_FAILED",
+                                                  "corrupt", "metadata",
+                                                  "metadata mapping failed under the selected profile ("
+                                                  + e.name + ")");
+                }
             else if (h5policy_exit_rank >= h5policy_class_rank("unsupported"))
                 /* An unanticipated exception (overflow, out-of-bounds, ...) but a
                    rejection was ALREADY established: the file is known-bad, and
@@ -183,19 +211,29 @@ fun h5policy_analyze = (int ios, H5PolicyProfile profile) H5WalkContext:
                    threw.  This is a downstream symptom of the corruption, not an
                    h5policy defect, so keep it a rejection rather than laundering
                    it up to internal_error (which outranks corrupt).  */
-                h5policy_emit_error("H5_CORRUPT_MAPPING_FAILED",
-                                    "corrupt", 0UL#B, "metadata",
-                                    "metadata processing failed on already-rejected input ("
-                                    + e.name + ")");
+                {
+                    if (!h5policy_walk_completed)
+                        h5policy_walk_stop_reason = "mapping_failed";
+                    h5policy_emit_unlocated_error("H5_CORRUPT_MAPPING_FAILED",
+                                                  "corrupt", "metadata",
+                                                  "metadata processing failed on already-rejected input ("
+                                                  + e.name + ")");
+                }
             else
-                h5policy_emit_error("H5_INTERNAL_ERROR",
-                                    "internal", 0UL#B, "metadata",
-                                    "internal validator error (" + e.name + ")");
+                {
+                    if (!h5policy_walk_completed)
+                        h5policy_walk_stop_reason = "internal_error";
+                    h5policy_emit_unlocated_error("H5_INTERNAL_ERROR", "internal",
+                                                  "metadata", "internal validator error ("
+                                                  + e.name + ")");
+                }
         }
 
     h5policy_check_metadata_ratio(ctx, profile, h5policy_ceiling(ios));
     return ctx;
 }
+
+load "h5_consumer.pk";
 
 /* Command-line entry point: open the file named by h5policy_file_name, analyze
    it, and print the JSON report plus the exit-code marker the wrapper reads.  */
@@ -212,8 +250,10 @@ fun h5policy_run = void:
         {
             h5policy_reset_findings;
             h5policy_reset_traversal_state;
-            h5policy_emit_error("H5_INTERNAL_INVALID_PROFILE", "internal",
-                                0UL#B, "profile", profile_error);
+            h5policy_reset_walk_status;
+            h5policy_walk_stop_reason = "invalid_profile";
+            h5policy_emit_unlocated_error("H5_INTERNAL_INVALID_PROFILE", "internal",
+                                          "profile", profile_error);
             h5policy_print_json_report(h5policy_profile_name,
                                        h5policy_file_name, "strict",
                                        0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL,
