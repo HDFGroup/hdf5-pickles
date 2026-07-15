@@ -86,7 +86,9 @@ printf 'root\nls\n' | ./tools/h5explain file.h5
 ./tools/h5explain -c root -c ls file.h5
 ```
 
-**Navigation commands:** `root`, `h5super`, `cd ("NAME")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
+**Navigation commands:** `root`, `h5super`, `cd ("PATH")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
+
+`cd` accepts a link name, a relative or absolute path, and `.`/`..` components. `back` retraces the full history one step per call. `go`/`gos` refuse offsets at or past the end of the file.
 
 **Inspection commands:** `explain`, `explain (N)`, `explain_msg (N)`, `info`, `msgs`, `cur`, `ls` / `links`, `traverse`, `dump`, `h5dump`
 

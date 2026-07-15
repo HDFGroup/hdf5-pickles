@@ -74,10 +74,15 @@ var h5explain_linfo_fheap_addr = 0UL#B;
 var h5explain_linfo_name_bt2_addr = 0UL#B;
 var h5explain_linfo_corder_bt2_addr = 0UL#B;
 
-var h5explain_prev_off = 0UL#B;
-var h5explain_prev_kind = H5EX_KIND_RAW;
-var h5explain_prev_label = "";
-var h5explain_has_prev = 0;
+/* Location history, oldest first.  back pops one entry, so a walk of any depth
+   can be retraced; the three arrays are always the same length.  */
+var h5explain_hist_off = offset<uint<64>,B>[]();
+var h5explain_hist_kind = int[]();
+var h5explain_hist_label = string[]();
+
+/* Deepest history retained.  A long traversal should not grow without bound,
+   and retracing more than this by hand is not a realistic session.  */
+var H5EX_HIST_MAX = 256UL;
 
 /* Scratch variables written by h5explain_load_ohdr_ctx, consumed by
    h5explain_scan_ohdr_context, links, cd, and the stab searcher.  */
@@ -266,10 +271,28 @@ fun h5explain_map_layout = (offset<uint<64>,B> off) oh_msg_layout:
     return oh_msg_layout @ off;
 }
 
+/* 1 if OFF is a byte offset inside the open file.  */
+fun h5explain_off_in_file = (offset<uint<64>,B> off) int:
+{
+    return off/#B < iosize()/#B;
+}
+
+/* 1 if COUNT bytes starting at OFF all lie inside the open file.  */
+fun h5explain_span_in_file = (offset<uint<64>,B> off, uint<64> count) int:
+{
+    var size = iosize()/#B;
+    var start = off/#B;
+    if (start > size) return 0;
+    return count <= size - start;
+}
+
 /* Identify HDF5 primitive type; the v1-OHDR path uses a heuristic because v1
-   has no signature. */
+   has no signature.  Anything without room for a full signature is raw: the
+   probes below map fixed-width fields and must not read past EOF. */
 fun h5explain_detect_kind = (offset<uint<64>,B> off) int:
 {
+    if (!h5explain_span_in_file(off, 4UL)) return H5EX_KIND_RAW;
+
     var sig = h5explain_map_b4(off);
 
     if (sig[0] == H5_FORMAT_FILE_SIGNATURE[0]
@@ -531,12 +554,13 @@ fun h5explain_banner = void:
     printf("Navigation:\n");
     printf("  root                       jump to the root group object header\n");
     printf("  h5super                    jump to the HDF5 superblock\n");
-    printf("  cd (\"NAME\")                follow a hard link from the current group header\n");
+    printf("  cd (\"PATH\")                follow a hard link path from the current group header\n");
+    printf("                             PATH may be a name, \"a/b\", \"/a/b\", \"..\", or \".\"\n");
     printf("  go (OFF#B)                 parse a primitive at an absolute file address\n");
     printf("  go (OFF#B, \"PATH\")         parse with an explicit path label\n");
     printf("  gos (\"0xADDR\")             parse an address supplied as text\n");
     printf("  gos (\"0xADDR\", \"PATH\")    parse with an explicit path label\n");
-    printf("  back                       return to the previous location\n");
+    printf("  back                       return to the previous location; repeat to retrace\n");
     printf("  pwd                        show current label, offset, and kind\n\n");
     printf("Inspection:\n");
     printf("  explain                    describe what the current primitive means\n");
@@ -2171,25 +2195,36 @@ fun ls = void:
 
 fun h5explain_push_cur = void:
 {
-    h5explain_prev_off = h5explain_cur_off;
-    h5explain_prev_kind = h5explain_cur_kind;
-    h5explain_prev_label = h5explain_cur_label;
-    h5explain_has_prev = 1;
+    apush (h5explain_hist_off, h5explain_cur_off);
+    apush (h5explain_hist_kind, h5explain_cur_kind);
+    apush (h5explain_hist_label, h5explain_cur_label);
+
+    /* Drop the oldest entry once the history is full.  poke arrays have no
+       shift, so rebuild without the first element.  */
+    if (h5explain_hist_off'length as uint<64> > H5EX_HIST_MAX) {
+        var off2 = offset<uint<64>,B>[]();
+        var kind2 = int[]();
+        var label2 = string[]();
+        for (var i = 1UL; i < h5explain_hist_off'length as uint<64>; i = i + 1UL) {
+            apush (off2, h5explain_hist_off[i]);
+            apush (kind2, h5explain_hist_kind[i]);
+            apush (label2, h5explain_hist_label[i]);
+        }
+        h5explain_hist_off = off2;
+        h5explain_hist_kind = kind2;
+        h5explain_hist_label = label2;
+    }
 }
 
-/* Navigate into a hard link by name; searches both new-style link messages and
-   old-style symbol table, then pushes the current location. */
-fun cd = (string name) void:
+/* Resolve one hard link name in the object header at OFF; searches new-style
+   link messages, dense link storage, and the old-style symbol table.  Sets
+   h5explain_link_addr and returns 1 on success.  */
+fun h5explain_lookup_link = (offset<uint<64>,B> off, string name) int:
 {
-    if (h5explain_cur_kind != H5EX_KIND_OHDR) {
-        printf("cd is only available when the current primitive is an object header.\n");
-        return;
-    }
-
     h5explain_link_found = 0;
     h5explain_link_addr = 0UL#B;
 
-    h5explain_load_ohdr_ctx(h5explain_cur_off);
+    h5explain_load_ohdr_ctx(off);
 
     var ignored = h5explain_links_in_chunk(h5explain_ctx_version, h5explain_ctx_pfx,
                                            h5explain_ctx_chunk_off, h5explain_ctx_chunk_size,
@@ -2209,19 +2244,124 @@ fun cd = (string name) void:
         ignored = ignored + h5explain_links_in_v1_btree(h5explain_stab_btree_addr,
                                                         h5explain_stab_heap_addr,
                                                         name, 0);
-    if (!h5explain_link_found) {
-        printf("no hard link named \"%s\" in current object header\n", name);
+    return h5explain_link_found;
+}
+
+/* Split PATH on '/', dropping empty components so "/a//b/" yields [a, b].  */
+fun h5explain_split_path = (string path) string[]:
+{
+    var comps = string[]();
+    var cur = "";
+    for (var i = 0UL; i < path'length as uint<64>; i = i + 1UL) {
+        if (path[i] == '/') {
+            if (cur != "") apush (comps, cur);
+            cur = "";
+        } else
+            cur = cur + path[i] as string;
+    }
+    if (cur != "") apush (comps, cur);
+    return comps;
+}
+
+fun h5explain_join_path = (string[] comps) string:
+{
+    if (comps'length == 0) return "/";
+    var label = "";
+    for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL)
+        label = label + "/" + comps[i];
+    return label;
+}
+
+/* Normalize COMPS in place, resolving "." and "..".  A ".." above the root is
+   clamped there, matching how a shell treats "/..".  */
+fun h5explain_normalize_path = (string[] comps) string[]:
+{
+    var out = string[]();
+    for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL) {
+        if (comps[i] == ".") continue;
+        if (comps[i] == "..") {
+            if (out'length > 0) {
+                var dropped = apop (out);
+            }
+            continue;
+        }
+        apush (out, comps[i]);
+    }
+    return out;
+}
+
+fun h5explain_path_has_updir = (string[] comps) int:
+{
+    for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL)
+        if (comps[i] == "..") return 1;
+    return 0;
+}
+
+/* Navigate to PATH, which may be a single link name ("values"), a multi-level
+   relative path ("group_a/values"), an absolute path ("/group_a/values"), or
+   any of those with "." and ".." components.
+
+   A path that is absolute or reaches upwards is resolved from the root, so it
+   needs the current label to know where it started; a purely downward relative
+   path is walked from the current header and works even when the cursor was
+   parked on an unlabeled header by go/gos.  */
+fun cd = (string path) void:
+{
+    if (h5explain_cur_kind != H5EX_KIND_OHDR) {
+        printf("cd is only available when the current primitive is an object header.\n");
         return;
     }
 
-    h5explain_push_cur;
-    var label = name;
-    if (h5explain_cur_label == "" || h5explain_cur_label == "/")
-        label = "/" + name;
-    else
-        label = h5explain_cur_label + "/" + name;
+    var absolute = path'length > 0 && path[0] == '/';
+    var comps = h5explain_split_path(path);
+    var upwards = h5explain_path_has_updir(comps);
 
-    h5explain_set_current(H5EX_KIND_OHDR, h5explain_link_addr, label);
+    if (comps'length == 0 && !absolute) return;  /* cd (""), cd (".") */
+
+    var start_off = h5explain_cur_off;
+    var start_label = "";
+
+    if (absolute || upwards) {
+        if (!absolute && h5explain_cur_label == "") {
+            printf("cd: cannot resolve \"%s\" from an unlabeled header; use an absolute path or go to a known one first\n",
+                   path);
+            return;
+        }
+        var full = string[]();
+        if (!absolute) {
+            var base = h5explain_split_path(h5explain_cur_label);
+            for (var i = 0UL; i < base'length as uint<64>; i = i + 1UL)
+                apush (full, base[i]);
+        }
+        for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL)
+            apush (full, comps[i]);
+        comps = h5explain_normalize_path(full);
+        start_off = h5explain_root_addr;
+        start_label = "/";
+    } else {
+        comps = h5explain_normalize_path(comps);
+        start_label = h5explain_cur_label;
+    }
+
+    /* Walk the whole path before moving, so a failure part-way leaves the
+       cursor where it was rather than stranding it mid-path.  */
+    var off = start_off;
+    var label = start_label;
+    for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL) {
+        if (!h5explain_lookup_link(off, comps[i])) {
+            printf("no hard link named \"%s\" in %s\n", comps[i],
+                   label == "" ? "current object header" : label);
+            return;
+        }
+        off = h5explain_link_addr;
+        if (label == "" || label == "/")
+            label = "/" + comps[i];
+        else
+            label = label + "/" + comps[i];
+    }
+
+    h5explain_push_cur;
+    h5explain_set_current(H5EX_KIND_OHDR, off, label);
 }
 
 fun msgs = void:
@@ -2249,19 +2389,22 @@ fun help = void:
 
 fun back = void:
 {
-    if (!h5explain_has_prev) {
+    if (h5explain_hist_off'length == 0) {
         printf("no previous location\n");
         return;
     }
-    var off = h5explain_prev_off;
-    var kind = h5explain_prev_kind;
-    var label = h5explain_prev_label;
-    h5explain_has_prev = 0;
+    var off = apop (h5explain_hist_off);
+    var kind = apop (h5explain_hist_kind);
+    var label = apop (h5explain_hist_label);
     h5explain_set_current(kind, off, label);
 }
 
 fun go = (offset<uint<64>,B> off, string label = "") void:
 {
+    if (!h5explain_off_in_file(off)) {
+        printf("go: offset %v is past the end of the file (%v)\n", off, iosize());
+        return;
+    }
     h5explain_push_cur;
     var kind = h5explain_detect_kind(off);
     if (kind == H5EX_KIND_SUPER) h5explain_super_off = off;
@@ -2295,6 +2438,11 @@ fun h5explain_start = (string offset_text = "") void:
         h5explain_set_current(H5EX_KIND_SUPER, h5explain_super_off, "superblock");
     else {
         var off = h5explain_parse_addr(offset_text);
+        if (!h5explain_off_in_file(off)) {
+            printf("h5explain: offset %v is past the end of the file (%v)\n",
+                   off, iosize());
+            raise E_inval;
+        }
         var kind = h5explain_detect_kind(off);
         if (kind == H5EX_KIND_SUPER) h5explain_super_off = off;
         h5explain_set_current(kind, off, "");

@@ -174,6 +174,121 @@ def test_cd_requires_an_object_header():
     assert "only available when the current primitive is an object header" in out, out
 
 
+def test_cd_walks_a_multi_component_relative_path():
+    out = explain("latest.h5", "root", 'cd ("group_a/values")', "pwd")
+    assert "/group_a/values at" in out, out
+
+
+def test_cd_walks_an_absolute_path():
+    out = explain("latest.h5", "root", 'cd ("group_a")', 'cd ("/top")', "pwd")
+    assert "/top at" in out, out
+
+
+def test_cd_parent_goes_up_one_level():
+    out = explain("latest.h5", "root", 'cd ("group_a/values")', 'cd ("..")', "pwd")
+    assert "/group_a at" in out, out
+
+
+def test_cd_parent_clamps_at_the_root():
+    out = explain("latest.h5", "root", 'cd ("..")', 'cd ("..")', "pwd")
+    assert "/ at" in out, out
+
+
+def test_cd_mixed_updir_path():
+    out = explain("latest.h5", "root", 'cd ("group_a")',
+                  'cd ("../group_a/./values")', "pwd")
+    assert "/group_a/values at" in out, out
+
+
+def test_cd_failure_part_way_leaves_the_cursor_alone():
+    # The walk resolves the whole path before moving, so a bad component must
+    # not strand the cursor half-way down it.
+    out = explain("latest.h5", "root", 'cd ("group_a/no_such_link")', "pwd")
+    assert 'no hard link named "no_such_link"' in out, out
+    assert "/ at" in out, out
+
+
+def test_cd_parent_from_unlabeled_header_explains_itself():
+    off = signature_offset("latest.h5", b"OHDR")
+    out = explain("latest.h5", 'gos ("%d")' % off, 'cd ("..")', "pwd")
+    assert "cannot resolve" in out, out
+    assert "(unlabeled) at" in out, out
+
+
+def test_cd_relative_still_works_from_an_unlabeled_header():
+    off = signature_offset("latest.h5", b"OHDR")
+    out = explain("latest.h5", 'gos ("%d")' % off, 'cd ("group_a")', "pwd")
+    assert "group_a at" in out, out
+
+
+def test_cd_dense_multi_component_path():
+    out = explain("dense.h5", "root", 'cd ("dense/child_03")', "pwd")
+    assert "/dense/child_03 at" in out, out
+
+
+def test_cd_symbol_table_multi_component_path():
+    out = explain("earliest.h5", "root", 'cd ("group_a/values")', "pwd")
+    assert "/group_a/values at" in out, out
+
+
+# -- history ----------------------------------------------------------------
+
+def test_back_retraces_more_than_one_step():
+    out = explain("latest.h5", "root", 'cd ("group_a")', 'cd ("values")',
+                  "back", "pwd", "back", "pwd", "back", "pwd")
+    lines = [l for l in out.splitlines() if " at " in l and "current:" not in l]
+    assert len(lines) == 3, out
+    assert "/group_a at" in lines[0], lines
+    assert "/ at" in lines[1], lines
+    assert "superblock at" in lines[2], lines
+
+
+def test_back_reports_an_exhausted_history():
+    out = explain("latest.h5", "back", "back")
+    assert out.count("no previous location") == 2, out
+
+
+def test_failed_cd_does_not_push_history():
+    # A cd that found nothing never moved, so back must not treat it as a step.
+    out = explain("latest.h5", "root", 'cd ("no_such_link")', "back", "pwd")
+    assert "superblock at" in out, out
+
+
+# -- bounds -----------------------------------------------------------------
+
+def test_go_past_eof_is_refused():
+    size = os.path.getsize(fixture("latest.h5"))
+    out = explain("latest.h5", 'gos ("%d")' % (size + 1000), "pwd")
+    assert "past the end of the file" in out, out
+    assert "unhandled" not in out, out
+    # The refused go must leave the cursor where it was.
+    assert "superblock at" in out, out
+
+
+def test_go_to_eof_offset_is_refused():
+    size = os.path.getsize(fixture("latest.h5"))
+    out = explain("latest.h5", 'gos ("%d")' % size, "pwd")
+    assert "past the end of the file" in out, out
+
+
+def test_go_near_eof_decodes_as_raw_without_raising():
+    # The last byte is in range but has no room for a 4-byte signature; kind
+    # detection must fall back to raw rather than read past the end.
+    size = os.path.getsize(fixture("latest.h5"))
+    out = explain("latest.h5", 'gos ("%d")' % (size - 1), "pwd")
+    assert "raw bytes" in out, out
+    assert "unhandled" not in out, out
+
+
+def test_start_offset_past_eof_is_refused():
+    size = os.path.getsize(fixture("latest.h5"))
+    proc = subprocess.run([H5EXPLAIN, "-c", "pwd", fixture("latest.h5"),
+                           str(size + 1000)],
+                          capture_output=True, text=True, input="")
+    out = proc.stdout + proc.stderr
+    assert "past the end of the file" in out, out
+
+
 # -- link listing across the three storage layouts --------------------------
 
 def test_ls_lists_compact_links():
