@@ -776,6 +776,55 @@ def test_navigation_still_works_after_a_bad_superblock():
     assert "unhandled" not in out, out
 
 
+# -- policy pickles are loaded only when the session may use them ------------
+
+def test_policy_command_in_a_batch_session_loads_the_pickles():
+    # Naming a policy command is what pulls them in; the real check answers.
+    out = explain("latest.h5", "root", "check")
+    assert "h5policy: accept" in out, out
+    assert "are not loaded in this session" not in out, out
+
+
+def test_batch_session_without_policy_commands_says_so_if_asked():
+    # --no-policy stands in for the auto-skip: the commands never mention a
+    # policy command, so the pickles are absent and check must explain itself
+    # rather than surface poke's "undefined variable".
+    proc = subprocess.run([H5EXPLAIN, "--no-policy", "-c", "check",
+                           fixture("latest.h5")],
+                          capture_output=True, text=True, input="")
+    combined = proc.stdout + proc.stderr
+    assert "are not loaded in this session" in combined, combined
+    assert "Rerun with --policy" in combined, combined
+    assert "undefined variable" not in combined, combined
+
+
+def test_no_policy_stubs_cover_every_policy_command():
+    for cmd in ("check", "check_all", 'profile ("forensic")'):
+        proc = subprocess.run([H5EXPLAIN, "--no-policy", "-c", cmd,
+                               fixture("latest.h5")],
+                              capture_output=True, text=True, input="")
+        combined = proc.stdout + proc.stderr
+        assert "are not loaded in this session" in combined, (cmd, combined)
+        assert "undefined variable" not in combined, (cmd, combined)
+
+
+def test_policy_flag_forces_the_pickles_in():
+    proc = subprocess.run([H5EXPLAIN, "--policy", "-c", "check",
+                           fixture("latest.h5")],
+                          capture_output=True, text=True, input="")
+    combined = proc.stdout + proc.stderr
+    assert "h5policy: accept" in combined, combined
+
+
+def test_interactive_sessions_always_load_the_policy_pickles():
+    # No commands are known up front, so the user may type check at any prompt.
+    # The banner advertising the policy commands proves they were loaded.
+    proc = subprocess.run([H5EXPLAIN, fixture("latest.h5")],
+                          stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True)
+    assert "Policy:" in proc.stdout, proc.stdout
+
+
 def test_banner_advertises_policy_commands():
     proc = subprocess.run([H5EXPLAIN, fixture("latest.h5")],
                           stdin=subprocess.DEVNULL, capture_output=True, text=True)

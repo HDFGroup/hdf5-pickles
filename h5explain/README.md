@@ -114,7 +114,25 @@ claiming there are none on the cursor, because a finding on those very bytes may
 have been dropped rather than never raised; it says so and reports reachability
 separately.
 
-Loading the policy pickles costs roughly 0.2s of extra startup on every session.
+### When the policy pickles load
+
+They roughly double startup (~0.3s), so they load only when the session may use
+them. An interactive session always loads them: the user can type `check` at any
+prompt. A batch session has all of its commands up front, and reaching a policy
+command means naming it, so the commands decide:
+
+```sh
+h5explain -c root -c ls file.h5        # no policy command -> not loaded, ~0.35s
+h5explain -c root -c check file.h5     # names check -> loaded, ~0.59s
+h5explain --no-policy -c ls file.h5    # never load
+h5explain --policy -c 'load "mine.pk"' file.h5   # force, e.g. when a script
+                                                 # reaches check indirectly
+```
+
+GNU poke does not allow `load` inside a function, so `check` cannot pull its own
+implementation in on demand; the decision has to be made before poke starts.
+When the pickles are absent, the policy commands say so and name the flag rather
+than failing as undefined variables.
 
 ## Confidence
 
