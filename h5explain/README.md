@@ -56,6 +56,22 @@ unlabeled one.  A `cd` that fails part-way leaves the cursor where it was.
 `back` retraces the full location history one step at a time, not just the last
 move.  `go` and `gos` refuse an offset at or past the end of the file.
 
+## Confidence
+
+Most HDF5 primitives start with a signature, so `h5explain` can confirm what it
+is looking at.  Version 1 object headers carry none: there, `go`/`gos` guess
+from the version and message count, and raw data can match that probe.  When
+the kind was guessed rather than confirmed, `pwd` and `info` say so:
+
+```text
+(unlabeled) at 401UL#B (object header) (inferred: no signature)
+```
+
+Reaching the same address through `root`, `cd`, or another structural pointer
+corroborates the kind, so no marker appears.  A primitive that then fails to
+decode is reported as a warning naming the offset, rather than as a poke
+exception.
+
 Inspection:
 
 ```text

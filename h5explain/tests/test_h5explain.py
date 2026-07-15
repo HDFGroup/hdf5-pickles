@@ -336,6 +336,68 @@ def test_detect_kind_names_each_signed_primitive():
         assert expected in out, (name, sig, expected, out)
 
 
+def heuristic_false_positive_offset(name):
+    """An offset the v1-header probe accepts but that is not a header.
+
+    latest.h5 only has signature-bearing v2 headers, so anything the probe
+    (version 1, reserved 0, 1..255 messages) accepts there is a false positive.
+    """
+    with open(fixture(name), "rb") as fh:
+        raw = fh.read()
+    for off in range(len(raw) - 4):
+        if raw[off] == 1 and raw[off + 1] == 0:
+            count = raw[off + 2] | (raw[off + 3] << 8)
+            if 1 <= count <= 255:
+                return off
+    raise AssertionError(f"{name} has no heuristic false positive to test")
+
+
+def test_inferred_kind_is_marked_as_such():
+    # earliest.h5's root is a v1 header: reachable, but signature-free.  Going
+    # there blind means the kind was guessed, and pwd has to say so.
+    out = explain("earliest.h5", 'gos ("96")', "pwd")
+    assert "(object header)" in out, out
+    assert "inferred: no signature" in out, out
+
+
+def test_signature_confirmed_kind_is_not_marked():
+    off = signature_offset("latest.h5", b"OHDR")
+    out = explain("latest.h5", 'gos ("%d")' % off, "pwd")
+    assert "(object header)" in out, out
+    assert "inferred" not in out, out
+
+
+def test_structurally_reached_v1_header_is_not_marked():
+    # Same signature-free header as above, but reached through the superblock's
+    # root address: the pointer corroborates the kind, so no warning is due.
+    out = explain("earliest.h5", "root", "pwd")
+    assert "(object header)" in out, out
+    assert "inferred" not in out, out
+
+
+def test_inferred_marking_survives_back():
+    # Confidence is part of the location, so retracing to it must restore it.
+    out = explain("earliest.h5", 'gos ("96")', "root", "back", "pwd")
+    assert "inferred: no signature" in out, out
+
+
+def test_heuristic_false_positive_is_flagged_and_fails_cleanly():
+    off = heuristic_false_positive_offset("latest.h5")
+    out = explain("latest.h5", 'gos ("%d")' % off, "pwd", "info")
+    # The probe misfires here, so the marker is the only thing standing between
+    # the user and a confident-looking decode of unrelated bytes.
+    assert "inferred: no signature" in out, out
+    assert "does not decode" in out, out
+    # A misfire must not surface as a raw poke backtrace.
+    assert "unhandled" not in out, out
+
+
+def test_info_on_undecodable_primitive_points_at_dump():
+    off = heuristic_false_positive_offset("latest.h5")
+    out = explain("latest.h5", 'gos ("%d")' % off, "info")
+    assert "use dump to inspect the raw bytes" in out, out
+
+
 def test_detect_kind_finds_v1_object_header_without_signature():
     # earliest.h5 has v1 headers, which carry no signature; root must still
     # resolve to an object header via the version/message-count heuristic.

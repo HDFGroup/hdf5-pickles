@@ -90,6 +90,8 @@ printf 'root\nls\n' | ./tools/h5explain file.h5
 
 `cd` accepts a link name, a relative or absolute path, and `.`/`..` components. `back` retraces the full history one step per call. `go`/`gos` refuse offsets at or past the end of the file.
 
+Version 1 object headers have no signature, so `go`/`gos` infer them from the version and message count. When a kind was inferred rather than confirmed by a signature, `pwd` and `info` mark it `(inferred: no signature)`; reaching the same address through `root` or `cd` corroborates it and the marker disappears.
+
 **Inspection commands:** `explain`, `explain (N)`, `explain_msg (N)`, `info`, `msgs`, `cur`, `ls` / `links`, `traverse`, `dump`, `h5dump`
 
 Use `msgs` to list object-header messages, then `explain (N)` or `explain_msg (N)` to explain message `N` in the current object header. Type `help` at the prompt for a full description of each command.
