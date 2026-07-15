@@ -100,7 +100,7 @@ add_custom_target(docs-check
     USES_TERMINAL
 )
 
-# ---- h5policy regression suite (CTest) -------------------------------------
+# ---- regression suites (CTest) ----------------------------------------------
 # Runs h5policy/tests/run.sh: synthetic unit checks, the corpus, and the
 # differential harness.  Requires GNU poke and python3 with h5py; if either is
 # missing the test is skipped rather than reported as a failure (h5dump/h5debug
@@ -127,44 +127,41 @@ if(POKE_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0)
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
     set_tests_properties(h5patch_regression PROPERTIES TIMEOUT 120)
-    message(STATUS "h5policy regression test enabled (poke: ${POKE_EXECUTABLE})")
+    add_test(
+        NAME h5explain_regression
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5explain/tests/run.sh"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(h5explain_regression PROPERTIES TIMEOUT 180)
+    message(STATUS "h5policy/h5patch/h5explain regression tests enabled (poke: ${POKE_EXECUTABLE})")
 else()
-    message(STATUS "h5policy/h5patch regression tests skipped (needs poke and python3 h5py)")
+    message(STATUS "h5policy/h5patch/h5explain regression tests skipped (needs poke and python3 h5py)")
 endif()
 
 # ---- emacs-check target ------------------------------------------------------
 
-set(EMACS_EXECUTABLE "emacs" CACHE STRING "Emacs executable used by emacs-check")
-set(EMACS_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/emacs/hdf5-poke-core.el"
-    "${CMAKE_CURRENT_SOURCE_DIR}/emacs/hdf5-poke-ui.el"
-    "${CMAKE_CURRENT_SOURCE_DIR}/emacs/hdf5-poke.el"
-)
-set(EMACS_BYTE_COMPILE_DIR "${CMAKE_CURRENT_BINARY_DIR}/emacs-byte-compile")
-set(EMACS_BYTE_COMPILE_DEST_EXPR
-    "(setq byte-compile-dest-file-function (lambda (file) (expand-file-name (concat (file-name-nondirectory file) \"c\") \"${EMACS_BYTE_COMPILE_DIR}\")))"
-)
-set(EMACS_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/emacs/tests/fixtures")
-
-add_custom_target(emacs-check
-    COMMAND "${CMAKE_COMMAND}" -E make_directory
-            "${EMACS_BYTE_COMPILE_DIR}"
-            "${EMACS_FIXTURE_DIR}"
-    COMMAND "${EMACS_EXECUTABLE}" -Q --batch -L "${CMAKE_CURRENT_SOURCE_DIR}/emacs"
-            --eval "${EMACS_BYTE_COMPILE_DEST_EXPR}"
-            -f batch-byte-compile ${EMACS_SOURCES}
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/emacs/tests/fixtures/make_hdf5_fixtures.py"
-            "${EMACS_FIXTURE_DIR}"
-    COMMAND "${EMACS_EXECUTABLE}" -Q --batch
-            -l "${CMAKE_CURRENT_SOURCE_DIR}/emacs/tests/hdf5-poke-test.el"
-            -f ert-run-tests-batch-and-exit
-    COMMAND "${CMAKE_COMMAND}" -E env
-            "HDF5_POKE_TEST_FIXTURES=${EMACS_FIXTURE_DIR}"
-            "${EMACS_EXECUTABLE}" -Q --batch
-            -l "${CMAKE_CURRENT_SOURCE_DIR}/emacs/tests/hdf5-poke-process-test.el"
-            -f ert-run-tests-batch-and-exit
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    COMMENT "Running Emacs byte compilation and ERT tests"
-    VERBATIM
-    USES_TERMINAL
-)
+find_program(EMACS_EXECUTABLE emacs)
+if(EMACS_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0 AND POKE_EXECUTABLE)
+    set(EMACS_TEST_COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "EMACS=${EMACS_EXECUTABLE}"
+        "PYTHON=${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/emacs/tests/run.sh"
+        "${CMAKE_CURRENT_BINARY_DIR}/emacs/tests"
+    )
+    add_custom_target(emacs-check
+        COMMAND ${EMACS_TEST_COMMAND}
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Running Emacs byte compilation and ERT tests"
+        VERBATIM
+        USES_TERMINAL
+    )
+    add_test(
+        NAME emacs_regression
+        COMMAND ${EMACS_TEST_COMMAND}
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(emacs_regression PROPERTIES TIMEOUT 120)
+else()
+    message(STATUS "Emacs regression test skipped (needs emacs, poke, and python3 h5py)")
+endif()

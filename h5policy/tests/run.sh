@@ -20,8 +20,9 @@
 #   1. (re)generates the corpus fixtures with h5policy-gencorpus,
 #   2. runs the synthetic datatype-validator and profile-limit checks under poke,
 #   3. runs the reachability-record checks, including its walk-budget neutrality,
-#   4. runs the h5policy_analyze seam checks that in-process consumers rely on,
-#   5. runs h5policy over every tests/expected/*.yml case and asserts the
+#   4. checks the stable, read-only API exposed to in-process consumers,
+#   5. runs the h5policy_analyze seam checks that in-process consumers rely on,
+#   6. runs h5policy over every tests/expected/*.yml case and asserts the
 #      decision, exit code, required findings, and forbidden outcomes.
 #
 # Exit status is 0 only if every check passes.
@@ -47,6 +48,10 @@ echo "== reachability record checks =="
 poke --quiet -L "$tests_dir/unit_reached.pk"
 reached_status=$?
 
+echo "== consumer result API checks =="
+poke --quiet -L "$tests_dir/unit_consumer.pk"
+consumer_status=$?
+
 # The seam cases open corpus fixtures, so they need the tests directory; -c is
 # processed before -L, which is what puts the variable in scope for the load.
 echo "== h5policy_analyze seam checks =="
@@ -64,9 +69,10 @@ echo "== differential vs libhdf5 (h5py / h5dump / h5debug) =="
 diff_status=${PIPESTATUS[0]}
 
 if [[ $unit_status -eq 0 && $limits_status -eq 0 && $reached_status -eq 0 \
+      && $consumer_status -eq 0 \
       && $seam_status -eq 0 && $corpus_status -eq 0 && $diff_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status limits=$limits_status reached=$reached_status seam=$seam_status corpus=$corpus_status diff=$diff_status)"
+echo "TESTS FAILED (unit=$unit_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status corpus=$corpus_status diff=$diff_status)"
 exit 1
