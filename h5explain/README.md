@@ -56,6 +56,41 @@ unlabeled one.  A `cd` that fails part-way leaves the cursor where it was.
 `back` retraces the full location history one step at a time, not just the last
 move.  `go` and `gos` refuse an offset at or past the end of the file.
 
+## Policy checks
+
+`check` runs the [`h5policy`](../h5policy/) oracle over the open file and reports
+what bears on the cursor; `check_all` reports every finding. `profile` shows or
+sets the profile they use (`untrusted_strict`, `forensic`, `trusted_fast`,
+`legacy`).
+
+```text
+check
+check_all
+profile
+profile ("forensic")
+```
+
+h5policy is a whole-file oracle: it walks metadata reachable from the
+superblock, so `check` always runs the full analysis and then filters. A finding
+bears on the cursor when its bytes fall inside the current primitive **or** when
+it is about the object the cursor is parked on — h5policy anchors each finding
+both at the offending bytes and at the object path, and the two often differ.
+
+When nothing bears on the cursor, `check` says which of four things it means:
+
+- **reached** — the walk went here and found nothing.
+- **not reached** — the walk completed without ever coming here, so nothing
+  vouches for these bytes. h5policy only vets reachable metadata.
+- **not recorded** — h5policy marks visited addresses to break cycles, not to
+  record coverage, so only object headers and continuations can be reported as
+  reached or not. For heaps, fixed/extensible array blocks, and B-tree headers
+  it says so rather than guessing.
+- **stopped early** — the walk halted (corruption under a profile that does not
+  continue, or a resource budget), so absence proves nothing. The `forensic`
+  profile keeps walking past corruption and restores the distinction.
+
+Loading the policy pickles costs roughly 0.2s of extra startup on every session.
+
 ## Confidence
 
 Most HDF5 primitives start with a signature, so `h5explain` can confirm what it
@@ -109,6 +144,8 @@ address is needed they scan for the primitive's signature instead.
 - [`tools/h5explain`](tools/h5explain) is the shell driver.
 - [`pickles/h5explain.pk`](pickles/h5explain.pk) is the interactive command
   layer.
+- [`pickles/h5explain_check.pk`](pickles/h5explain_check.pk) adds the h5policy
+  commands. It must load after `h5explain.pk`; its header explains why.
 - [`tests/`](tests/) contains the fixture generator and the regression suite.
 - [`../pickles/`](../pickles/) contains the shared HDF5 format definitions that
   `h5explain` loads.

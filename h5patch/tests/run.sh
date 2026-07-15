@@ -19,5 +19,8 @@ set -euo pipefail
 tests_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "$tests_dir/../.." && pwd)"
 
-"$repo_dir/h5policy/tools/h5policy-gencorpus" "$repo_dir/h5policy/tests"
+# Generate into our own tree, not h5policy/tests.  Writing there would have this
+# suite regenerating another suite's fixtures underneath it, which races as soon
+# as the two run concurrently.  A private copy costs ~0.3s and ~1MB.
+"$repo_dir/h5policy/tools/h5policy-gencorpus" "$tests_dir/corpus"
 python3 "$tests_dir/test_h5patch.py"

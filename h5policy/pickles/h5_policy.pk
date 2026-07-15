@@ -76,24 +76,33 @@ fun h5policy_mapping_mode = string:
     return "strict";
 }
 
-fun h5policy_run = void:
+/* Analyze the file behind IOS under PROFILE and return the walk context.  The
+   decision, exit code, and findings are left in the h5policy_* globals for the
+   caller to report; nothing is printed here.
+
+   This is the execution seam for pickle consumers that already hold the file
+   open -- notably h5explain, which cannot let h5policy open its own handle
+   because GNU poke refuses a second IOS on an already-open file.  The
+   command-line report lives in h5policy_run.
+
+   Findings and traversal state are reset on entry, so each call reports
+   exactly what this analysis found.  */
+fun h5policy_analyze = (int ios, H5PolicyProfile profile) H5WalkContext:
 {
     h5policy_reset_findings;
     h5policy_reset_traversal_state;
 
-    var profile = h5policy_profile;
+    var ctx = h5policy_new_walk_context;
+
+    /* Defensive: h5policy_run screens the profile before it opens anything, but
+       a direct caller can hand us any profile at all.  An unvalidated profile
+       has unusable limits, so refuse to walk rather than enforce garbage.  */
     var profile_error = h5policy_profile_validation_error(profile);
     if (profile_error != "")
         {
             h5policy_emit_error("H5_INTERNAL_INVALID_PROFILE", "internal",
                                 0UL#B, "profile", profile_error);
-            h5policy_print_json_report(h5policy_profile_name,
-                                       h5policy_file_name, "strict",
-                                       0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL,
-                                       0UL, 0UL, 0UL);
-            printf("__H5POLICY_EXIT_CODE=%u32d\n",
-                   h5policy_exit_code as uint<32>);
-            return;
+            return ctx;
         }
 
     h5policy_run_options = h5policy_resolve_run_options(
@@ -102,9 +111,6 @@ fun h5policy_run = void:
     var walk_start = gettime;
     h5policy_walk_deadline = walk_start[0]
         + (profile.resources.max_walk_seconds as int<64>);
-    var mode = h5policy_mapping_mode;
-    var ios = open(h5policy_file_name, IOS_M_RDONLY);
-    var ctx = h5policy_new_walk_context;
 
     try
         {
@@ -183,8 +189,42 @@ fun h5policy_run = void:
         }
 
     h5policy_check_metadata_ratio(ctx, profile, h5policy_ceiling(ios));
+    return ctx;
+}
 
-    h5policy_print_json_report(h5policy_profile_name, h5policy_file_name, mode,
+/* Command-line entry point: open the file named by h5policy_file_name, analyze
+   it, and print the JSON report plus the exit-code marker the wrapper reads.  */
+fun h5policy_run = void:
+{
+    var profile = h5policy_profile;
+
+    /* Screen the profile before opening anything.  An invalid profile means no
+       analysis was authorized, and h5policy_file_name need not even be
+       openable -- reaching open() first would turn a clean internal-error
+       report into an unhandled exception.  */
+    var profile_error = h5policy_profile_validation_error(profile);
+    if (profile_error != "")
+        {
+            h5policy_reset_findings;
+            h5policy_reset_traversal_state;
+            h5policy_emit_error("H5_INTERNAL_INVALID_PROFILE", "internal",
+                                0UL#B, "profile", profile_error);
+            h5policy_print_json_report(h5policy_profile_name,
+                                       h5policy_file_name, "strict",
+                                       0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL,
+                                       0UL, 0UL, 0UL);
+            printf("__H5POLICY_EXIT_CODE=%u32d\n",
+                   h5policy_exit_code as uint<32>);
+            return;
+        }
+
+    var ios = open(h5policy_file_name, IOS_M_RDONLY);
+    var ctx = h5policy_analyze(ios, profile);
+
+    /* h5policy_analyze resolved the run options, so the mapping mode it
+       reports is this run's, not a previous one's.  */
+    h5policy_print_json_report(h5policy_profile_name, h5policy_file_name,
+                               h5policy_mapping_mode,
                                ctx.metadata_seen,
                                ctx.object_count,
                                ctx.attribute_count,

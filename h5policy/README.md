@@ -145,6 +145,40 @@ crashes on them:
   under invariant A' while retaining a classification warning when libhdf5
   rejects the same file as corrupt.
 
+## Embedding h5policy
+
+`h5policy_run` is the command-line entry point: it opens the file named by
+`h5policy_file_name`, analyzes it, and prints the JSON report plus the exit-code
+marker the shell wrapper reads.
+
+In-process consumers use the seam underneath it:
+
+```text
+fun h5policy_analyze = (int ios, H5PolicyProfile profile) H5WalkContext
+```
+
+`h5policy_analyze` takes an IOS the caller already opened and prints nothing.
+The decision, exit code, and findings are left in the `h5policy_*` globals
+(`h5policy_decision`, `h5policy_exit_code`, and the parallel
+`h5policy_finding_severities` / `_codes` / `_classes` / `_offsets` / `_objects` /
+`_messages` arrays); the returned `H5WalkContext` carries the walk metrics.
+Findings and traversal state are reset on entry, so each call reports exactly
+what that analysis found.
+
+This exists because GNU poke refuses a second IOS on an already-open file, so a
+consumer holding the file open — `h5explain`, for instance — cannot call
+`h5policy_run`. Two constraints come with it:
+
+- Pass offsets and scalars, not mapped values. `load` re-executes a pickle, so
+  a session that loads both `h5explain` and `h5policy` holds two bindings of the
+  shared format types and globals (see the note in
+  [`../pickles/stab.pk`](../pickles/stab.pk)). Values mapped by one side are not
+  interchangeable with the other's types.
+- The caller owns the IOS and closes it. `h5policy_analyze` never opens or
+  closes one.
+
+`tests/unit_seam.pk` pins these properties.
+
 ## Companion Tools
 
 - [`tools/h5policy`](tools/h5policy): the policy oracle.

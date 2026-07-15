@@ -94,6 +94,10 @@ Version 1 object headers have no signature, so `go`/`gos` infer them from the ve
 
 **Inspection commands:** `explain`, `explain (N)`, `explain_msg (N)`, `info`, `msgs`, `cur`, `ls` / `links`, `traverse`, `dump`, `h5dump`
 
+**Policy commands:** `check`, `check_all`, `profile`, `profile ("NAME")`
+
+`check` runs the h5policy oracle over the open file and reports the findings that bear on the cursor — matched by byte extent or by object path, since h5policy anchors findings both ways. When nothing bears on the cursor it distinguishes *reached*, *not reached*, *not recorded for this kind*, and *walk stopped early*, so silence is never mistaken for a clean bill of health. See [`h5explain/README.md`](h5explain/README.md#policy-checks).
+
 Use `msgs` to list object-header messages, then `explain (N)` or `explain_msg (N)` to explain message `N` in the current object header. Type `help` at the prompt for a full description of each command.
 
 `traverse` is the only command that recursively walks chunk indexes. Ordinary navigation and `info` map the current primitive only, so large chunk indexes are not traversed accidentally.

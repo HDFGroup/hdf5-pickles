@@ -1,0 +1,232 @@
+/* h5explain_check.pk - Run the h5policy oracle from inside the explorer.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* This file must be loaded AFTER h5explain.pk, never before and never from
+   inside it.  Loading h5_policy.pk re-executes the shared pickles, and GNU poke
+   binds a fresh copy of their globals on every load (see the note in
+   ../../pickles/stab.pk).  Functions compiled before that point keep the
+   original binding, so h5explain's decoding keeps the superblock context it
+   primed while h5policy's validators use their own.  The two sides therefore
+   exchange only offsets and scalars here -- never a mapped value, whose type
+   identity belongs to one binding or the other.  */
+load "h5_policy.pk";
+
+/* Cursor reachability.  h5policy marks visited addresses to break cycles, not
+   to record coverage, so only the structures it dedups can be reported as
+   reached or not reached.  Object headers and continuations are dedup'd
+   exhaustively; heaps, fixed/extensible array blocks, and B-tree headers are
+   validated inline without being marked, so claiming "not reached" for those
+   would be a lie rather than a caveat.  */
+var H5EX_REACH_REACHED = 0;
+var H5EX_REACH_NOT_REACHED = 1;
+var H5EX_REACH_UNRECORDED = 2;   /* h5policy does not mark this kind */
+var H5EX_REACH_INCOMPLETE = 3;   /* the walk stopped early; absence proves nothing */
+
+fun h5explain_check_has_code = (string code) int:
+{
+    for (var i = 0UL; i < h5policy_finding_codes'length as uint<64>; i = i + 1UL)
+        if (h5policy_finding_codes[i] == code) return 1;
+    return 0;
+}
+
+/* A walk that stopped early leaves most of the file unvisited, so "not in the
+   visited set" would mean "we never got there", not "nothing points here".
+   Under a profile that halts on corruption, any rejection ends the walk; the
+   forensic profile continues and keeps reachability meaningful.  */
+fun h5explain_walk_completed = int:
+{
+    if (h5explain_check_has_code("H5_UNSUPPORTED_WALK_OPERATION_BUDGET")) return 0;
+    if (h5explain_check_has_code("H5_UNSUPPORTED_WALK_TIME_BUDGET")) return 0;
+    if (h5explain_check_has_code("H5_CORRUPT_MAPPING_FAILED")) return 0;
+    if (h5explain_check_has_code("H5_INTERNAL_ERROR")) return 0;
+
+    if (h5policy_run_options.continue_after_corruption == 0UB
+        && h5policy_exit_code != H5POLICY_EXIT_ACCEPT
+        && h5policy_exit_code != H5POLICY_EXIT_WARN)
+        return 0;
+    return 1;
+}
+
+fun h5explain_cursor_reachability = int:
+{
+    var addr = h5explain_cur_off/#B;
+
+    /* The superblock is where the walk starts; it is reached by definition. */
+    if (h5explain_cur_kind == H5EX_KIND_SUPER)
+        return H5EX_REACH_REACHED;
+
+    if (h5explain_cur_kind != H5EX_KIND_OHDR)
+        return H5EX_REACH_UNRECORDED;
+
+    if (h5policy_seen_u64(h5policy_visited_ohdrs, addr)
+        || h5policy_seen_u64(h5policy_visited_conts, addr))
+        return H5EX_REACH_REACHED;
+
+    /* Absence only means "unreachable" if the walk ran to the end. */
+    if (!h5explain_walk_completed)
+        return H5EX_REACH_INCOMPLETE;
+
+    return H5EX_REACH_NOT_REACHED;
+}
+
+/* Byte extent of the current primitive, for deciding which findings sit on it.
+   A primitive that does not decode has no known extent, so fall back to the
+   first byte: better to under-claim than to sweep in a neighbour's findings. */
+fun h5explain_cursor_extent_bytes = uint<64>:
+{
+    var bytes = 1UL;
+    try
+        {
+            var value = cur;
+            var bits = (value'size)/#b;
+            bytes = bits / 8UL;
+            if (bits % 8UL != 0UL) bytes = bytes + 1UL;
+            if (bytes == 0UL) bytes = 1UL;
+        }
+    catch (Exception e)
+        {
+            bytes = 1UL;
+        }
+    return bytes;
+}
+
+/* A finding bears on the cursor if its bytes sit inside the current primitive,
+   or if it is about the object the cursor is parked on.  h5policy anchors a
+   finding twice -- at the offset of the offending bytes and at the object path
+   they belong to -- and those diverge: a bad group B-tree key is reported at
+   the heap offset it points into, while the object it condemns is the group
+   whose header lives elsewhere.  Filtering on the offset alone would tell a
+   user standing on that very group that nothing was found about it.  */
+fun h5explain_finding_is_here = (uint<64> i, uint<64> lo, uint<64> hi) int:
+{
+    var at = h5policy_finding_offsets[i];
+    if (at >= lo && at < hi) return 1;
+    if (h5explain_cur_label != ""
+        && h5policy_finding_objects[i] == h5explain_cur_label) return 1;
+    return 0;
+}
+
+fun h5explain_print_finding = (uint<64> i) void:
+{
+    printf("  @0x%u64x %s %s", h5policy_finding_offsets[i],
+           h5policy_finding_severities[i], h5policy_finding_codes[i]);
+    if (h5policy_finding_objects[i] != "")
+        printf("  [%s]", h5policy_finding_objects[i]);
+    printf("\n    %s\n", h5policy_finding_messages[i]);
+}
+
+fun h5explain_run_policy = void:
+{
+    var ignored = h5policy_analyze(get_ios, h5policy_profile);
+}
+
+fun h5explain_print_decision = void:
+{
+    printf("h5policy: %s (profile %s)\n", h5policy_decision,
+           h5policy_profile_name);
+    if (h5policy_findings_truncated)
+        printf("note: the finding limit was reached, so some findings were not stored.\n");
+}
+
+/* check - analyze the whole file and report what bears on the cursor.
+
+   h5policy is a whole-file oracle: it walks reachable metadata from the
+   superblock, so there is no per-structure entry point to call.  The walk runs
+   in full and the findings are filtered to the current primitive.  */
+fun check = void:
+{
+    h5explain_run_policy;
+    h5explain_print_decision;
+
+    var lo = h5explain_cur_off/#B;
+    var hi = lo + h5explain_cursor_extent_bytes;
+
+    var here = 0UL;
+    for (var i = 0UL; i < h5policy_finding_codes'length as uint<64>; i = i + 1UL)
+        {
+            if (h5explain_finding_is_here(i, lo, hi))
+                {
+                    if (here == 0UL)
+                        printf("Findings bearing on %s (%v):\n",
+                               h5explain_cur_label != "" ? h5explain_cur_label
+                                                         : "the current primitive",
+                               h5explain_cur_off);
+                    here = here + 1UL;
+                    h5explain_print_finding(i);
+                }
+        }
+
+    var total = h5policy_finding_codes'length as uint<64>;
+    if (here == 0UL)
+        {
+            var reach = h5explain_cursor_reachability;
+            if (reach == H5EX_REACH_REACHED)
+                printf("No findings at this primitive; the walk reached it.\n");
+            else if (reach == H5EX_REACH_NOT_REACHED)
+                printf("No findings at this primitive: the walk never reached it, so nothing vouched for it. Reachable metadata is what h5policy vets.\n");
+            else if (reach == H5EX_REACH_INCOMPLETE)
+                printf("No findings at this primitive, but the walk stopped early (%s), so its absence proves nothing. The forensic profile keeps walking past corruption.\n",
+                       h5policy_decision);
+            else
+                printf("No findings at this primitive. h5policy records reachability only for object headers and continuations, so whether the walk reached this %s is unknown.\n",
+                       h5explain_kind_name(h5explain_cur_kind));
+        }
+
+    if (total > here)
+        printf("%u64d further finding(s) elsewhere in the file; use check_all.\n",
+               total - here);
+}
+
+/* check_all - analyze the whole file and report every finding. */
+fun check_all = void:
+{
+    h5explain_run_policy;
+    h5explain_print_decision;
+
+    var total = h5policy_finding_codes'length as uint<64>;
+    if (total == 0UL)
+        {
+            printf("No findings.\n");
+            return;
+        }
+    printf("%u64d finding(s):\n", total);
+    for (var i = 0UL; i < total; i = i + 1UL)
+        h5explain_print_finding(i);
+}
+
+/* Let the banner advertise the policy commands now that they exist. */
+h5explain_have_check = 1;
+
+/* profile - show or set the h5policy profile used by check. */
+fun profile = (string name = "") void:
+{
+    if (name == "")
+        {
+            printf("h5policy profile: %s\n", h5policy_profile_name);
+            return;
+        }
+    if (name != "untrusted_strict" && name != "forensic"
+        && name != "trusted_fast" && name != "legacy")
+        {
+            printf("unknown profile \"%s\"; expected untrusted_strict, forensic, trusted_fast, or legacy\n",
+                   name);
+            return;
+        }
+    h5policy_profile_name = name;
+    printf("h5policy profile: %s\n", h5policy_profile_name);
+}
