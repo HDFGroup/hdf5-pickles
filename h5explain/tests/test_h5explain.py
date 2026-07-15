@@ -556,20 +556,103 @@ def test_check_says_not_reached_for_an_unreachable_header():
     assert "never reached it" in out, out
 
 
-def test_check_does_not_claim_reachability_for_unrecorded_kinds():
-    # h5policy validates the fixed array index but does not mark it visited, so
-    # "not reached" would be false here.  It must say it does not know.
+def test_check_resolves_reachability_for_a_fixed_array_header():
+    # h5policy's reachability record covers what its walk read, so a chunk index
+    # is answerable now; it used to report that reachability was unknown here.
     off = signature_offset("chunked.h5", b"FAHD")
     out = explain("chunked.h5", 'gos ("%d")' % off, "check")
-    assert "records reachability only for object headers" in out, out
-    assert "never reached it" not in out, out
+    assert "The walk reached it." in out, out
 
 
-def test_check_does_not_claim_reachability_for_a_local_heap():
+def test_check_resolves_reachability_for_a_local_heap():
     off = signature_offset("earliest.h5", b"HEAP")
     out = explain("earliest.h5", 'gos ("%d")' % off, "check")
-    assert "records reachability only for object headers" in out, out
-    assert "never reached it" not in out, out
+    assert "The walk reached it." in out, out
+
+
+def test_check_resolves_reachability_for_array_and_btree_structures():
+    for name, sig in (("chunked.h5", b"EAHD"), ("chunked.h5", b"BTHD"),
+                      ("chunked.h5", b"FADB"), ("earliest.h5", b"SNOD"),
+                      ("earliest.h5", b"TREE")):
+        off = signature_offset(name, sig)
+        out = explain(name, 'gos ("%d")' % off, "check")
+        assert "The walk reached it." in out, (name, sig, out)
+
+
+# The reachability states, queried directly.  h5explain_cursor_reachability is
+# the decision point, and some of its branches are masked in `check` output --
+# a finding on the cursor suppresses the reachability line entirely.
+REACH_REACHED, REACH_NOT_REACHED, REACH_UNRECORDED = 0, 1, 2
+REACH_INCOMPLETE, REACH_RECORD_FULL = 3, 4
+
+
+def reachability(name, *setup):
+    cmds = list(setup) + ["h5explain_run_policy;",
+                          'printf("REACH=%i32d\\n", h5explain_cursor_reachability);']
+    out = explain(name, *cmds)
+    for line in out.splitlines():
+        if line.startswith("REACH="):
+            return int(line.split("=")[1])
+    raise AssertionError(f"no reachability reported\n{out}")
+
+
+def test_reachability_of_a_located_superblock():
+    assert reachability("latest.h5", "h5super") == REACH_REACHED
+
+
+def test_unlocated_superblock_is_not_claimed_as_reached():
+    # The superblock is not "reached by definition": this file's signature was
+    # never located, so the walk never reached one.  Under untrusted-strict the
+    # walk also halts, which is the weaker of the two honest answers.
+    assert reachability("bad_signature.h5", "h5super") == REACH_INCOMPLETE
+
+
+def test_forensic_proves_an_unlocated_superblock_was_never_reached():
+    # forensic keeps walking past corruption, so the walk completes and the
+    # absence becomes provable rather than merely unknown.
+    assert reachability("bad_signature.h5", 'profile ("forensic")',
+                        "h5super") == REACH_NOT_REACHED
+
+
+def test_unwalked_kinds_are_still_not_claimed():
+    # h5policy accounts for extensible-array secondary and data blocks from the
+    # index header rather than walking them, so the record cannot speak to them.
+    off = heuristic_false_positive_offset("latest.h5")
+    for kind in ("H5EX_KIND_EA_SBLOCK", "H5EX_KIND_EA_DBLOCK"):
+        got = reachability("latest.h5", 'gos ("%d")' % off,
+                           "h5explain_cur_kind = %s;" % kind)
+        assert got == REACH_UNRECORDED, (kind, got)
+
+
+def test_the_same_address_answers_by_kind():
+    # The contrast that shows the kind decides whether silence is informative:
+    # one address, walked-kind vs unwalked-kind.
+    off = heuristic_false_positive_offset("latest.h5")
+    assert reachability("latest.h5", 'gos ("%d")' % off) == REACH_NOT_REACHED
+    assert reachability("latest.h5", 'gos ("%d")' % off,
+                        "h5explain_cur_kind = H5EX_KIND_EA_SBLOCK;") \
+        == REACH_UNRECORDED
+
+
+def test_unwalked_kind_message_explains_why():
+    off = heuristic_false_positive_offset("latest.h5")
+    out = explain("latest.h5", 'gos ("%d")' % off,
+                  "h5explain_cur_kind = H5EX_KIND_EA_SBLOCK;", "check")
+    assert "from its index header rather than walking it" in out, out
+
+
+def test_kind_mismatch_is_surfaced():
+    # h5policy read a superblock at 0; tell the cursor it is something else and
+    # the disagreement must be reported -- two structures cannot share bytes.
+    out = explain("latest.h5", "h5super",
+                  "h5explain_cur_kind = H5EX_KIND_LHEAP;", "check")
+    assert "read a SUPER at this address" in out, out
+    assert "one of the two readings is wrong" in out, out
+
+
+def test_no_mismatch_note_when_the_kinds_agree():
+    out = explain("latest.h5", "h5super", "check")
+    assert "one of the two readings is wrong" not in out, out
 
 
 def test_check_does_not_claim_not_reached_when_the_walk_stopped_early():

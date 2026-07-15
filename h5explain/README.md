@@ -84,18 +84,30 @@ would otherwise collect all of them. Those findings name their scope in the
 object field instead, and a genuine finding at offset 0 (a bad superblock
 signature, object `superblock`) is matched by object path.
 
-When nothing bears on the cursor, `check` says which of four things it means:
+When nothing bears on the cursor, `check` says which of five things it means:
 
-- **reached** — the walk went here and found nothing.
+- **reached** — the walk read this structure and found nothing wrong with it.
 - **not reached** — the walk completed without ever coming here, so nothing
   vouches for these bytes. h5policy only vets reachable metadata.
-- **not recorded** — h5policy marks visited addresses to break cycles, not to
-  record coverage, so only object headers and continuations can be reported as
-  reached or not. For heaps, fixed/extensible array blocks, and B-tree headers
-  it says so rather than guessing.
+- **not recorded** — h5policy accounts for extensible-array secondary and data
+  blocks from the index header rather than walking them, so the record cannot
+  speak to them either way. Only those two kinds land here.
 - **stopped early** — the walk halted (corruption under a profile that does not
   continue, or a resource budget), so absence proves nothing. The `forensic`
   profile keeps walking past corruption and restores the distinction.
+- **record full** — the reachability record hit its ceiling, so absence proves
+  nothing.
+
+The answers come from h5policy's reachability record: the structures its walk
+actually read, with the kind it read each as. That record is why the superblock
+gets no special case — it is reached when the walk located it, and a file whose
+signature was never found has no located superblock, which is exactly where
+"reached by definition" would have lied.
+
+Because the record carries the kind, `check` also reports when the two readings
+disagree — h5policy read a B-tree header where the cursor decoded a local heap,
+say. Two structures cannot share those bytes, so one reading is wrong, and that
+is worth knowing on its own.
 
 h5policy stores at most 4096 findings per run. Past that cap `check` stops
 claiming there are none on the cursor, because a finding on those very bytes may

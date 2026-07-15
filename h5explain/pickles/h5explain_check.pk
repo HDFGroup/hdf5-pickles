@@ -26,16 +26,45 @@
    identity belongs to one binding or the other.  */
 load "h5_policy.pk";
 
-/* Cursor reachability.  h5policy marks visited addresses to break cycles, not
-   to record coverage, so only the structures it dedups can be reported as
-   reached or not reached.  Object headers and continuations are dedup'd
-   exhaustively; heaps, fixed/extensible array blocks, and B-tree headers are
-   validated inline without being marked, so claiming "not reached" for those
-   would be a lie rather than a caveat.  */
+/* Cursor reachability, answered from h5policy's reachability record: every
+   structure its walk actually read, with the kind it read it as.  The record
+   covers each structure h5explain can park on except extensible-array secondary
+   and data blocks, which h5policy deliberately never walks -- it accounts for
+   them from the index header under budget instead (see the note above
+   h5policy_walk_ext_array_chunks).  Those stay unrecorded, and saying "not
+   reached" for them would be a lie rather than a caveat.  */
 var H5EX_REACH_REACHED = 0;
 var H5EX_REACH_NOT_REACHED = 1;
-var H5EX_REACH_UNRECORDED = 2;   /* h5policy does not mark this kind */
+var H5EX_REACH_UNRECORDED = 2;   /* h5policy never walks this kind */
 var H5EX_REACH_INCOMPLETE = 3;   /* the walk stopped early; absence proves nothing */
+var H5EX_REACH_RECORD_FULL = 4;  /* the record hit its ceiling; absence proves nothing */
+
+/* The tag h5policy records for each kind h5explain can sit on, or "" where it
+   has none.  Used both to read the record and to notice when the two disagree
+   about what lives at an address.  */
+fun h5explain_kind_tag = (int kind) string:
+{
+    if (kind == H5EX_KIND_SUPER) return "SUPER";
+    if (kind == H5EX_KIND_OHDR) return "OHDR";
+    if (kind == H5EX_KIND_V1_BTREE) return "TREE";
+    if (kind == H5EX_KIND_V2_BTREE_HDR) return "BTHD";
+    if (kind == H5EX_KIND_V2_BTREE_INTERNAL) return "BTIN";
+    if (kind == H5EX_KIND_V2_BTREE_LEAF) return "BTLF";
+    if (kind == H5EX_KIND_SNOD) return "SNOD";
+    if (kind == H5EX_KIND_FA_HDR) return "FAHD";
+    if (kind == H5EX_KIND_FA_DBLOCK) return "FADB";
+    if (kind == H5EX_KIND_EA_HDR) return "EAHD";
+    if (kind == H5EX_KIND_EA_IBLOCK) return "EAIB";
+    if (kind == H5EX_KIND_LHEAP) return "HEAP";
+    return "";
+}
+
+/* 1 for the kinds h5policy accounts for from a parent header rather than
+   walking, so the record can never speak to them either way.  */
+fun h5explain_kind_is_unwalked = (int kind) int:
+{
+    return kind == H5EX_KIND_EA_SBLOCK || kind == H5EX_KIND_EA_DBLOCK;
+}
 
 fun h5explain_check_has_code = (string code) int:
 {
@@ -66,22 +95,39 @@ fun h5explain_cursor_reachability = int:
 {
     var addr = h5explain_cur_off/#B;
 
-    /* The superblock is where the walk starts; it is reached by definition. */
-    if (h5explain_cur_kind == H5EX_KIND_SUPER)
+    /* A hit is authoritative whatever else went wrong: the walk demonstrably
+       read these bytes.  Checked before the caveats below for that reason --
+       the superblock included.  It is not "reached by definition": a file whose
+       signature was never located has no located superblock, and that is
+       exactly the file where the question is worth asking.  */
+    if (h5policy_was_reached(addr))
         return H5EX_REACH_REACHED;
 
-    if (h5explain_cur_kind != H5EX_KIND_OHDR)
+    if (h5explain_kind_is_unwalked(h5explain_cur_kind))
         return H5EX_REACH_UNRECORDED;
 
-    if (h5policy_seen_u64(h5policy_visited_ohdrs, addr)
-        || h5policy_seen_u64(h5policy_visited_conts, addr))
-        return H5EX_REACH_REACHED;
-
-    /* Absence only means "unreachable" if the walk ran to the end. */
+    /* Absence only means "unreachable" if the record is complete and the walk
+       ran to the end.  Either ceiling makes silence uninformative.  */
+    if (h5policy_reached_truncated)
+        return H5EX_REACH_RECORD_FULL;
     if (!h5explain_walk_completed)
         return H5EX_REACH_INCOMPLETE;
 
     return H5EX_REACH_NOT_REACHED;
+}
+
+/* h5explain decoded one structure here and h5policy's walk read another.  Both
+   are reading the same bytes, so a disagreement is a fact about the file, not a
+   preference: overlapping structures, a stale pointer, or a kind h5explain
+   guessed wrong.  Worth surfacing on its own account.  */
+fun h5explain_print_kind_mismatch = void:
+{
+    var recorded = h5policy_reached_kind_at(h5explain_cur_off/#B);
+    var tag = h5explain_kind_tag(h5explain_cur_kind);
+    if (recorded == "" || tag == "" || recorded == tag)
+        return;
+    printf("Note: h5policy's walk read a %s at this address, but the cursor decoded a %s. Two structures cannot both live here; one of the two readings is wrong.\n",
+           recorded, tag);
 }
 
 /* Byte extent of the current primitive, for deciding which findings sit on it.
@@ -178,8 +224,10 @@ fun h5explain_print_reachability = void:
     else if (reach == H5EX_REACH_INCOMPLETE)
         printf("The walk stopped early (%s), so its absence proves nothing. The forensic profile keeps walking past corruption.\n",
                h5policy_decision);
+    else if (reach == H5EX_REACH_RECORD_FULL)
+        printf("The reachability record hit its ceiling, so its absence proves nothing.\n");
     else
-        printf("h5policy records reachability only for object headers and continuations, so whether the walk reached this %s is unknown.\n",
+        printf("h5policy accounts for this %s from its index header rather than walking it, so whether the walk reached it is unknown.\n",
                h5explain_kind_name(h5explain_cur_kind));
 }
 
@@ -217,6 +265,7 @@ fun check = void:
             h5explain_print_no_findings;
             h5explain_print_reachability;
         }
+    h5explain_print_kind_mismatch;
 
     if (total > here)
         printf("%u64d further finding(s) elsewhere in the file; use check_all.\n",
