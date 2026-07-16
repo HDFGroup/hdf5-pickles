@@ -108,6 +108,25 @@ add_custom_target(docs-check
 enable_testing()
 
 find_program(POKE_EXECUTABLE poke)
+
+# The shared format pickles have synthetic byte-level unit tests that require
+# GNU poke but do not require libhdf5 or h5py.
+if(POKE_EXECUTABLE)
+    add_test(
+        NAME pickle_ohdr_msgs_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_ohdr_msgs.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(pickle_ohdr_msgs_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
+    message(STATUS "shared pickle regression tests enabled (poke: ${POKE_EXECUTABLE})")
+else()
+    message(STATUS "shared pickle regression tests skipped (needs poke)")
+endif()
+
 execute_process(
     COMMAND "${Python3_EXECUTABLE}" -c "import h5py"
     RESULT_VARIABLE H5POLICY_H5PY_RC
