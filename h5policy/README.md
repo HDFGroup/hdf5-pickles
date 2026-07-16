@@ -4,6 +4,10 @@
 HDF5 bytes independently of `libhdf5`, validates the metadata it can reach, applies
 a security profile, and emits a stable JSON decision.
 
+Files with an HDF5 user block are supported. The superblock is discovered at a
+legal boundary and base-relative HDF5 addresses are translated to physical file
+offsets before metadata is mapped.
+
 The tool is intentionally a metadata-only boundary:
 
 - no libhdf5 calls
@@ -64,6 +68,15 @@ JSON output includes:
   storage, VDS, dynamic filters, unknown messages, maximum rank, and maximum
   logical dataset bytes.
 - `metrics`: traversal and accounting counters used by profile budgets.
+
+## In-process consumer API
+
+Consumers that load `h5_policy.pk` should call `h5policy_analyze` and inspect
+the result through the read-only `h5policy_result_*` functions defined in
+`pickles/h5_consumer.pk`. The API exposes the decision, exit code, findings,
+location validity, truncation state, reachability queries, and explicit walk
+start/completion/stop state as scalars and strings. The parallel finding and
+traversal vectors remain implementation details.
 
 ## Profiles
 
@@ -144,6 +157,40 @@ crashes on them:
   not process the file. The differential harness accepts that explicit refusal
   under invariant A' while retaining a classification warning when libhdf5
   rejects the same file as corrupt.
+
+## Embedding h5policy
+
+`h5policy_run` is the command-line entry point: it opens the file named by
+`h5policy_file_name`, analyzes it, and prints the JSON report plus the exit-code
+marker the shell wrapper reads.
+
+In-process consumers use the seam underneath it:
+
+```text
+fun h5policy_analyze = (int ios, H5PolicyProfile profile) H5WalkContext
+```
+
+`h5policy_analyze` takes an IOS the caller already opened and prints nothing.
+The decision, exit code, and findings are left in the `h5policy_*` globals
+(`h5policy_decision`, `h5policy_exit_code`, and the parallel
+`h5policy_finding_severities` / `_codes` / `_classes` / `_offsets` / `_objects` /
+`_messages` arrays); the returned `H5WalkContext` carries the walk metrics.
+Findings and traversal state are reset on entry, so each call reports exactly
+what that analysis found.
+
+This exists because GNU poke refuses a second IOS on an already-open file, so a
+consumer holding the file open — `h5explain`, for instance — cannot call
+`h5policy_run`. Two constraints come with it:
+
+- Pass offsets and scalars, not mapped values. `load` re-executes a pickle, so
+  a session that loads both `h5explain` and `h5policy` holds two bindings of the
+  shared format types and globals (see the note in
+  [`../pickles/stab.pk`](../pickles/stab.pk)). Values mapped by one side are not
+  interchangeable with the other's types.
+- The caller owns the IOS and closes it. `h5policy_analyze` never opens or
+  closes one.
+
+`tests/unit_seam.pk` pins these properties.
 
 ## Companion Tools
 

@@ -37,11 +37,26 @@ var h5policy_finding_severities = string[]();
 var h5policy_finding_codes = string[]();
 var h5policy_finding_classes = string[]();
 var h5policy_finding_offsets = uint<64>[]();
+var h5policy_finding_has_locations = uint<8>[]();
 var h5policy_finding_objects = string[]();
 var h5policy_finding_messages = string[]();
 
 var h5policy_exit_code = H5POLICY_EXIT_ACCEPT;
 var h5policy_exit_rank = 0;
+
+/* Explicit execution state for in-process consumers.  "Completed" describes
+   the reachable-metadata phase: it may be complete without starting a BFS when
+   no root graph exists (for example, forensic analysis of a bad signature). */
+var h5policy_walk_started = 0;
+var h5policy_walk_completed = 0;
+var h5policy_walk_stop_reason = "not_started";
+
+fun h5policy_reset_walk_status = void:
+{
+    h5policy_walk_started = 0;
+    h5policy_walk_completed = 0;
+    h5policy_walk_stop_reason = "not_started";
+}
 
 /* Walk work and time budgets.  Some traversal de-dup sets are linear-scan
    arrays, so a walk over N reachable structures can be O(N^2).  On a
@@ -240,6 +255,7 @@ fun h5policy_reset_findings = void:
     h5policy_finding_codes = string[]();
     h5policy_finding_classes = string[]();
     h5policy_finding_offsets = uint<64>[]();
+    h5policy_finding_has_locations = uint<8>[]();
     h5policy_finding_objects = string[]();
     h5policy_finding_messages = string[]();
     h5policy_exit_code = H5POLICY_EXIT_ACCEPT;
@@ -252,8 +268,9 @@ fun h5policy_reset_findings = void:
 /* Store a finding unless the report cap or dedup rules suppress it.  The final
    decision is updated before suppression so the exit code remains correct even
    if many repeated resource findings are collapsed.  */
-fun h5policy_emit = (string severity, string code, string klass,
-                     off64 loc, string object, string message) void:
+fun h5policy_emit_with_location = (string severity, string code, string klass,
+                                   off64 loc, int has_location,
+                                   string object, string message) void:
 {
     /* The decision always reflects this finding's severity, even if the
        finding itself is deduplicated or dropped past the storage cap.  */
@@ -274,6 +291,7 @@ fun h5policy_emit = (string severity, string code, string klass,
     var out_klass = klass;
     var out_object = object;
     var out_message = message;
+    var out_has_location = has_location ? 1UB : 0UB;
     /* Some corrupt files carry high-bit addresses that GNU poke can represent
        as offsets but not convert back to a JSON-safe byte count without raising
        overflow.  A diagnostic location must not turn a corrupt verdict into an
@@ -287,6 +305,7 @@ fun h5policy_emit = (string severity, string code, string klass,
     catch (Exception e)
         {
             out_offset = 0UL;
+            out_has_location = 0UB;
         }
 
     if (h5policy_finding_codes'length >= H5POLICY_MAX_FINDINGS)
@@ -300,6 +319,7 @@ fun h5policy_emit = (string severity, string code, string klass,
             out_object = "";
             out_message = "finding limit reached; additional findings suppressed";
             out_offset = 0UL;
+            out_has_location = 0UB;
         }
     else if (klass == "resource")
         h5policy_emitted_resource_codes += [code];
@@ -308,8 +328,15 @@ fun h5policy_emit = (string severity, string code, string klass,
     h5policy_finding_codes += [out_code];
     h5policy_finding_classes += [out_klass];
     h5policy_finding_offsets += [out_offset];
+    h5policy_finding_has_locations += [out_has_location];
     h5policy_finding_objects += [out_object];
     h5policy_finding_messages += [out_message];
+}
+
+fun h5policy_emit = (string severity, string code, string klass,
+                     off64 loc, string object, string message) void:
+{
+    h5policy_emit_with_location(severity, code, klass, loc, 1, object, message);
 }
 
 fun h5policy_emit_error = (string code, string klass,
@@ -322,6 +349,20 @@ fun h5policy_emit_warning = (string code,
                              off64 loc, string object, string message) void:
 {
     h5policy_emit("warning", code, "warning", loc, object, message);
+}
+
+fun h5policy_emit_unlocated_error = (string code, string klass,
+                                     string object, string message) void:
+{
+    h5policy_emit_with_location("error", code, klass, 0UL#B, 0,
+                                object, message);
+}
+
+fun h5policy_emit_unlocated_warning = (string code,
+                                       string object, string message) void:
+{
+    h5policy_emit_with_location("warning", code, "warning", 0UL#B, 0,
+                                object, message);
 }
 
 var H5POLICY_HEX_DIGITS = "0123456789abcdef";
@@ -473,6 +514,8 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
             printf("      \"class\": ");
             h5policy_print_json_string(h5policy_finding_classes[i]);
             printf(",\n");
+            printf("      \"has_location\": %s,\n",
+                   h5policy_finding_has_locations[i] != 0UB ? "true" : "false");
             printf("      \"offset\": %u64d,\n", h5policy_finding_offsets[i]);
             printf("      \"object\": ");
             h5policy_print_json_string(h5policy_finding_objects[i]);

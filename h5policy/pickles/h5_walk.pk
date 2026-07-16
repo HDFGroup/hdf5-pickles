@@ -73,6 +73,82 @@ var h5policy_visited_ohdrs = uint<64>[]();
 var h5policy_visited_conts = uint<64>[]();
 var h5policy_visited_btrees = uint<64>[]();
 
+/* Reachability record: the structures the walk actually read, with the kind it
+   read them as.  The visited sets above cannot answer this -- they exist to
+   break cycles, so they only hold the kinds that need deduplicating, and a
+   consumer asking "did the walk reach these bytes?" about a heap or an array
+   block would get a false negative from them.
+
+   Append-only, and deliberately NOT deduplicated.  h5policy_seen_u64 charges
+   its linear scan to the walk's operation budget, so a deduplicated set here
+   would add an O(N^2) term to that budget and could push a large file past
+   max_walk_operations -- turning a reporting record into a decision change.
+   Recording must never move a verdict, so h5policy_mark_reached does no
+   membership test and never ticks: it is O(1) and walk-budget neutral.  The
+   membership test belongs to the reader, at report time, outside the walk.
+
+   Duplicates are therefore expected: a structure read twice is recorded twice.
+   That is bounded, because the number of reads is already bounded by the walk
+   budget, and capped again below.  */
+var h5policy_reached_addrs = uint<64>[]();
+var h5policy_reached_kinds = string[]();
+var h5policy_reached_truncated = 0;
+
+/* Ceiling on the reachability record.  Past it, recording stops and the flag
+   above says so, exactly as H5POLICY_MAX_FINDINGS caps findings: a reader must
+   be able to tell "not reached" from "we stopped writing this down".  */
+var H5POLICY_MAX_REACHED = 65536UL;
+
+/* Record that the walk read a structure of KIND at ADDR.  KIND is the on-disk
+   signature tag ("OHDR", "FAHD", "HEAP", ...) or a logical name where the
+   structure carries no signature ("OHDR" for version 1 headers, "SUPER").
+
+   Deliberately does not call h5policy_walk_tick: see above.  Keeping this
+   walk-budget neutral is what makes it provable that adding the record changes
+   no decision -- the CLI report stays byte-identical.  */
+fun h5policy_mark_reached = (uint<64> addr, string kind) void:
+{
+    if (h5policy_reached_truncated)
+        return;
+    if (h5policy_reached_addrs'length as uint<64> >= H5POLICY_MAX_REACHED)
+        {
+            h5policy_reached_truncated = 1;
+            return;
+        }
+    h5policy_reached_addrs += [addr];
+    h5policy_reached_kinds += [kind];
+}
+
+/* Report-time lookup: the kind the walk read at ADDR, or "" if it never read
+   it.  Linear, and intentionally so -- this runs once per query after the walk
+   has finished, so it is outside the operation budget and must not tick.  */
+fun h5policy_reached_kind_at = (uint<64> addr) string:
+{
+    for (var i = 0UL; i < h5policy_reached_addrs'length as uint<64>; i = i + 1UL)
+        if (h5policy_reached_addrs[i] == addr)
+            return h5policy_reached_kinds[i];
+    return "";
+}
+
+fun h5policy_was_reached = (uint<64> addr) int:
+{
+    return h5policy_reached_kind_at(addr) != "";
+}
+
+/* Clearing the record is deliberately NOT part of h5policy_reset_traversal_state.
+   That runs twice per analysis -- once up front and again inside
+   h5policy_walk_reachable_metadata, which restarts the BFS bookkeeping -- so
+   folding the record into it would silently discard everything read before the
+   reachable walk began: the superblock itself, and whatever superblock
+   validation follows.  The record spans the whole analysis, so only
+   h5policy_analyze resets it, exactly once.  */
+fun h5policy_reset_reached = void:
+{
+    h5policy_reached_addrs = uint<64>[]();
+    h5policy_reached_kinds = string[]();
+    h5policy_reached_truncated = 0;
+}
+
 /* Object headers are walked breadth-first.  Link messages enqueue child object
    headers here; h5policy_walk_reachable_metadata drains the queue while
    enforcing max link depth and continue-after-corruption policy.  */
@@ -386,6 +462,16 @@ fun h5policy_msg_u64_at = (int ios, H5PolicyProfile profile,
     return h5policy_decode_u64_raw(raw, off, "metadata");
 }
 
+/* Decode an HDF5 file address and translate it through the superblock base.
+   Keep this distinct from h5policy_msg_u64_at: most variable-width integers are
+   lengths, counts, or logical offsets and must never receive base translation. */
+fun h5policy_msg_addr_at = (int ios, H5PolicyProfile profile,
+                            offset<uint<64>,B> off,
+                            uint<64> size) uint<64>:
+{
+    return hdf5_addr_to_file_u64(h5policy_msg_u64_at(ios, profile, off, size));
+}
+
 /* All message validators use payload-relative bounds checks before reading
    variable-length fields.  That keeps malformed size fields from turning into
    poke map exceptions that would otherwise abort the surrounding analysis.  */
@@ -525,16 +611,16 @@ fun h5policy_check_metadata_ratio = (H5WalkContext ctx,
         && ctx.metadata_seen > profile.heuristics.metadata_ratio_reject_min_bytes
         && h5policy_percent_exceeded(ctx.metadata_seen, file_size,
                                      profile.heuristics.metadata_ratio_reject_percent))
-        h5policy_emit_error("H5_RESOURCE_METADATA_RATIO", "resource",
-                            0UL#B, "metadata",
-                            "reachable metadata exceeds the selected profile's file-size ratio");
+        h5policy_emit_unlocated_error("H5_RESOURCE_METADATA_RATIO", "resource",
+                                      "metadata",
+                                      "reachable metadata exceeds the selected profile's file-size ratio");
     else if (profile.heuristics.metadata_ratio_warn_percent != 0UL
              && ctx.metadata_seen > profile.heuristics.metadata_ratio_warn_min_bytes
              && h5policy_percent_exceeded(ctx.metadata_seen, file_size,
                                           profile.heuristics.metadata_ratio_warn_percent))
-        h5policy_emit_warning("H5_ADVISORY_METADATA_RATIO",
-                              0UL#B, "metadata",
-                              "reachable metadata is a large fraction of the file size");
+        h5policy_emit_unlocated_warning("H5_ADVISORY_METADATA_RATIO",
+                                        "metadata",
+                                        "reachable metadata is a large fraction of the file size");
 }
 
 fun h5policy_update_chunk_resource_pressure = (H5WalkContext ctx,

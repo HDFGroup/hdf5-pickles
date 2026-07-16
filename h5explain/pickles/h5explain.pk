@@ -28,6 +28,15 @@ load "lookup3.pk";
 
 var h5explain_non_strict = 0;
 
+/* Set by the --quiet driver option (implied by --batch) to suppress the
+   startup banner so scripted sessions produce stable, diffable output.  */
+var h5explain_quiet = 0;
+
+/* Set by h5explain_check.pk when it is loaded on top of this pickle.  The
+   banner only advertises the policy commands when they actually exist, so
+   h5explain still loads and runs standalone without h5policy.  */
+var h5explain_have_check = 0;
+
 var H5EX_KIND_RAW = 0;
 var H5EX_KIND_SUPER = 1;
 var H5EX_KIND_OHDR = 2;
@@ -58,6 +67,17 @@ var h5explain_cur_off = 0UL#B;
 var h5explain_cur_kind = H5EX_KIND_RAW;
 var h5explain_cur_label = "";
 
+/* 1 when the current primitive's kind was inferred rather than confirmed by a
+   signature, so the cursor may well be sitting on something else entirely.
+   Only the v1-object-header probe in h5explain_detect_kind can set this: every
+   other kind is signature-checked, and a kind reached through a structural
+   pointer (root, cd, h5super) is corroborated by the pointer itself.  */
+var h5explain_cur_heuristic = 0;
+
+/* Scratch: set by h5explain_detect_kind, read by its callers before they
+   commit the result with h5explain_set_current.  */
+var h5explain_detect_heuristic = 0;
+
 var h5explain_link_found = 0;
 var h5explain_link_addr = 0UL#B;
 
@@ -70,10 +90,16 @@ var h5explain_linfo_fheap_addr = 0UL#B;
 var h5explain_linfo_name_bt2_addr = 0UL#B;
 var h5explain_linfo_corder_bt2_addr = 0UL#B;
 
-var h5explain_prev_off = 0UL#B;
-var h5explain_prev_kind = H5EX_KIND_RAW;
-var h5explain_prev_label = "";
-var h5explain_has_prev = 0;
+/* Location history, oldest first.  back pops one entry, so a walk of any depth
+   can be retraced; the three arrays are always the same length.  */
+var h5explain_hist_off = offset<uint<64>,B>[]();
+var h5explain_hist_kind = int[]();
+var h5explain_hist_label = string[]();
+var h5explain_hist_heuristic = int[]();
+
+/* Deepest history retained.  A long traversal should not grow without bound,
+   and retracing more than this by hand is not a realistic session.  */
+var H5EX_HIST_MAX = 256UL;
 
 /* Scratch variables written by h5explain_load_ohdr_ctx, consumed by
    h5explain_scan_ohdr_context, links, cd, and the stab searcher.  */
@@ -262,10 +288,30 @@ fun h5explain_map_layout = (offset<uint<64>,B> off) oh_msg_layout:
     return oh_msg_layout @ off;
 }
 
+/* 1 if OFF is a byte offset inside the open file.  */
+fun h5explain_off_in_file = (offset<uint<64>,B> off) int:
+{
+    return off/#B < iosize()/#B;
+}
+
+/* 1 if COUNT bytes starting at OFF all lie inside the open file.  */
+fun h5explain_span_in_file = (offset<uint<64>,B> off, uint<64> count) int:
+{
+    var size = iosize()/#B;
+    var start = off/#B;
+    if (start > size) return 0;
+    return count <= size - start;
+}
+
 /* Identify HDF5 primitive type; the v1-OHDR path uses a heuristic because v1
-   has no signature. */
+   has no signature.  Anything without room for a full signature is raw: the
+   probes below map fixed-width fields and must not read past EOF. */
 fun h5explain_detect_kind = (offset<uint<64>,B> off) int:
 {
+    h5explain_detect_heuristic = 0;
+
+    if (!h5explain_span_in_file(off, 4UL)) return H5EX_KIND_RAW;
+
     var sig = h5explain_map_b4(off);
 
     if (sig[0] == H5_FORMAT_FILE_SIGNATURE[0]
@@ -289,8 +335,10 @@ fun h5explain_detect_kind = (offset<uint<64>,B> off) int:
     if (h5explain_map_byte(off) == 1UB && h5explain_map_byte(off + 1#B) == 0UB) {
         var msg_count = (h5explain_map_byte(off + 2#B) as uint<64>)
                         | ((h5explain_map_byte(off + 3#B) as uint<64>) <<. 8UL);
-        if (msg_count >= 1UL && msg_count <= 255UL)
+        if (msg_count >= 1UL && msg_count <= 255UL) {
+            h5explain_detect_heuristic = 1;
             return H5EX_KIND_OHDR;
+        }
     }
 
     return H5EX_KIND_RAW;
@@ -453,40 +501,60 @@ fun h5explain_prime_superblock = void:
 
 /* Extract metadata that must be known before a structure can be decoded
    (B-tree k values, ndims, nrec sizes). */
+/* Priming decodes the primitive to learn context, so it is the first thing to
+   fail when the cursor is parked on something that is not what it looks like.
+   Report that as a warning rather than letting the raw exception escape: the
+   move itself already happened, and the user needs to be told the decode is
+   untrustworthy, not handed a poke backtrace.  */
 fun h5explain_prime_current = void:
 {
-    if (h5explain_cur_kind == H5EX_KIND_SUPER) {
-        h5explain_super_off = h5explain_cur_off;
-        h5explain_prime_superblock;
-    } else if (h5explain_cur_kind == H5EX_KIND_OHDR) {
-        h5explain_scan_ohdr_context(h5explain_cur_off);
-    } else if (h5explain_cur_kind == H5EX_KIND_V2_BTREE_HDR) {
-        var bt2 = h5explain_map_v2_btree_hdr(h5explain_cur_off);
-        set_bt2_nrec_size_from_hdr(bt2.node_size, bt2.record_size);
-        set_bt2_nrec_subtree_size_from_hdr(bt2.node_size, bt2.record_size, bt2.depth);
-        set_bt2_nrec(bt2.num_root_records);
-        if (bt2.record_type == 10UB)
-            set_bt2_ndims(((bt2.record_size as uint<16>)
-                           - (global_sizeof_offsets as uint<16>)) / 8UH as uint<8>);
-        else if (bt2.record_type == 11UB)
-            set_bt2_ndims(((bt2.record_size as uint<16>)
-                           - (global_sizeof_offsets as uint<16>)
-                           - (global_sizeof_lengths as uint<16>)
-                           - 4UH) / 8UH as uint<8>);
+    try {
+        if (h5explain_cur_kind == H5EX_KIND_SUPER) {
+            h5explain_super_off = h5explain_cur_off;
+            h5explain_prime_superblock;
+        } else if (h5explain_cur_kind == H5EX_KIND_OHDR) {
+            h5explain_scan_ohdr_context(h5explain_cur_off);
+        } else if (h5explain_cur_kind == H5EX_KIND_V2_BTREE_HDR) {
+            var bt2 = h5explain_map_v2_btree_hdr(h5explain_cur_off);
+            set_bt2_nrec_size_from_hdr(bt2.node_size, bt2.record_size);
+            set_bt2_nrec_subtree_size_from_hdr(bt2.node_size, bt2.record_size, bt2.depth);
+            set_bt2_nrec(bt2.num_root_records);
+            if (bt2.record_type == 10UB)
+                set_bt2_ndims(((bt2.record_size as uint<16>)
+                               - (global_sizeof_offsets as uint<16>)) / 8UH as uint<8>);
+            else if (bt2.record_type == 11UB)
+                set_bt2_ndims(((bt2.record_size as uint<16>)
+                               - (global_sizeof_offsets as uint<16>)
+                               - (global_sizeof_lengths as uint<16>)
+                               - 4UH) / 8UH as uint<8>);
+        }
+    } catch (Exception e) {
+        printf("warning: the %s at %v did not decode (%s); its context is unset and fields may be garbage\n",
+               h5explain_kind_name(h5explain_cur_kind), h5explain_cur_off, e.name);
     }
 }
 
+/* Describes how far the current kind can be trusted.  Empty when a signature
+   confirmed it, so the common case stays quiet.  */
+fun h5explain_confidence_note = void:
+{
+    if (h5explain_cur_heuristic)
+        printf(" (inferred: no signature)");
+}
+
 fun h5explain_set_current = (int kind, offset<uint<64>,B> off,
-                             string label = "") void:
+                             string label = "", int heuristic = 0) void:
 {
     h5explain_cur_kind = kind;
     h5explain_cur_off = off;
     h5explain_cur_label = label;
+    h5explain_cur_heuristic = heuristic;
     h5explain_prime_current;
 
     printf("current: %s at %v", h5explain_kind_name(h5explain_cur_kind),
            h5explain_cur_off);
     if (h5explain_cur_label != "") printf(" [%s]", h5explain_cur_label);
+    h5explain_confidence_note;
     printf("\n");
 }
 
@@ -527,12 +595,13 @@ fun h5explain_banner = void:
     printf("Navigation:\n");
     printf("  root                       jump to the root group object header\n");
     printf("  h5super                    jump to the HDF5 superblock\n");
-    printf("  cd (\"NAME\")                follow a hard link from the current group header\n");
+    printf("  cd (\"PATH\")                follow a hard link path from the current group header\n");
+    printf("                             PATH may be a name, \"a/b\", \"/a/b\", \"..\", or \".\"\n");
     printf("  go (OFF#B)                 parse a primitive at an absolute file address\n");
     printf("  go (OFF#B, \"PATH\")         parse with an explicit path label\n");
     printf("  gos (\"0xADDR\")             parse an address supplied as text\n");
     printf("  gos (\"0xADDR\", \"PATH\")    parse with an explicit path label\n");
-    printf("  back                       return to the previous location\n");
+    printf("  back                       return to the previous location; repeat to retrace\n");
     printf("  pwd                        show current label, offset, and kind\n\n");
     printf("Inspection:\n");
     printf("  explain                    describe what the current primitive means\n");
@@ -545,6 +614,13 @@ fun h5explain_banner = void:
     printf("  traverse                   fully traverse a chunk index (may be slow for large datasets)\n");
     printf("  dump                       hex-dump from the current primitive offset\n");
     printf("  h5dump                     hex-dump the current primitive extent\n\n");
+    if (h5explain_have_check) {
+        printf("Policy:\n");
+        printf("  check                      run h5policy and report what bears on the cursor\n");
+        printf("  check_all                  run h5policy and report every finding\n");
+        printf("  profile                    show the h5policy profile used by check\n");
+        printf("  profile (\"NAME\")           set it: untrusted_strict, forensic, trusted_fast, legacy\n\n");
+    }
     printf("Type help to show this message again.\n\n");
 }
 
@@ -793,8 +869,8 @@ fun h5explain_explain_super = void:
     if (sb.super_vers < 2UB) {
         printf("  sizeof_offsets=%v, sizeof_lengths=%v\n",
                sb.super.v0_v1.sizeof_offsets, sb.super.v0_v1.sizeof_lengths);
-        printf("  base_addr=%v\n", bytes_to_off(sb.super.v0_v1.base_addr_raw));
-        printf("  eof_addr=%v\n", bytes_to_off(sb.super.v0_v1.eof_addr_raw));
+        printf("  base_addr=%v\n", bytes_to_u64_le(sb.super.v0_v1.base_addr_raw)#B);
+        printf("  eof_addr=%v\n", bytes_to_u64_le(sb.super.v0_v1.eof_addr_raw)#B);
         printf("  root_object_header=%v\n",
                bytes_to_off(sb.super.v0_v1.root_stab_ent.ohdr_addr_raw));
         printf("  status_flags=%v\n", sb.super.v0_v1.status_flags);
@@ -803,8 +879,8 @@ fun h5explain_explain_super = void:
     } else {
         printf("  sizeof_offsets=%v, sizeof_lengths=%v\n",
                sb.super.v2_v3.sizeof_offsets, sb.super.v2_v3.sizeof_lengths);
-        printf("  base_addr=%v\n", bytes_to_off(sb.super.v2_v3.base_addr_raw));
-        printf("  eof_addr=%v\n", bytes_to_off(sb.super.v2_v3.eof_addr_raw));
+        printf("  base_addr=%v\n", bytes_to_u64_le(sb.super.v2_v3.base_addr_raw)#B);
+        printf("  eof_addr=%v\n", bytes_to_u64_le(sb.super.v2_v3.eof_addr_raw)#B);
         printf("  extension_addr=%v\n", bytes_to_off(sb.super.v2_v3.ext_addr_raw));
         printf("  root_object_header=%v\n", bytes_to_off(sb.super.v2_v3.root_obj_addr_raw));
         if (sb.super_vers == 2UB)
@@ -1485,6 +1561,23 @@ fun explain = (int msg_index = -1) void:
    guidance beyond the raw struct. */
 fun info = void:
 {
+    /* Warn before mapping, not after: an inferred kind is exactly the case
+       where the map is liable to fail, and the warning explains why.  */
+    if (h5explain_cur_heuristic)
+        printf("Note: this kind was inferred, not confirmed by a signature. Version 1 object headers carry none, so h5explain guessed from the version and message count; raw data can match that probe. Reaching this address through root, cd, or a structural pointer would corroborate it.\n");
+
+    /* Probe the mapping first so a primitive that does not decode reports why
+       and points at dump, instead of raising through the whole command.  */
+    var mappable = 1;
+    try {
+        var probe = cur;
+    } catch (Exception e) {
+        mappable = 0;
+        printf("info: the %s at %v does not decode (%s); use dump to inspect the raw bytes\n",
+               h5explain_kind_name(h5explain_cur_kind), h5explain_cur_off, e.name);
+    }
+    if (!mappable) return;
+
     var value = cur;
 
     printf("%s at %v", h5explain_kind_name(h5explain_cur_kind),
@@ -2167,25 +2260,40 @@ fun ls = void:
 
 fun h5explain_push_cur = void:
 {
-    h5explain_prev_off = h5explain_cur_off;
-    h5explain_prev_kind = h5explain_cur_kind;
-    h5explain_prev_label = h5explain_cur_label;
-    h5explain_has_prev = 1;
+    apush (h5explain_hist_off, h5explain_cur_off);
+    apush (h5explain_hist_kind, h5explain_cur_kind);
+    apush (h5explain_hist_label, h5explain_cur_label);
+    apush (h5explain_hist_heuristic, h5explain_cur_heuristic);
+
+    /* Drop the oldest entry once the history is full.  poke arrays have no
+       shift, so rebuild without the first element.  */
+    if (h5explain_hist_off'length as uint<64> > H5EX_HIST_MAX) {
+        var off2 = offset<uint<64>,B>[]();
+        var kind2 = int[]();
+        var label2 = string[]();
+        var heur2 = int[]();
+        for (var i = 1UL; i < h5explain_hist_off'length as uint<64>; i = i + 1UL) {
+            apush (off2, h5explain_hist_off[i]);
+            apush (kind2, h5explain_hist_kind[i]);
+            apush (label2, h5explain_hist_label[i]);
+            apush (heur2, h5explain_hist_heuristic[i]);
+        }
+        h5explain_hist_off = off2;
+        h5explain_hist_kind = kind2;
+        h5explain_hist_label = label2;
+        h5explain_hist_heuristic = heur2;
+    }
 }
 
-/* Navigate into a hard link by name; searches both new-style link messages and
-   old-style symbol table, then pushes the current location. */
-fun cd = (string name) void:
+/* Resolve one hard link name in the object header at OFF; searches new-style
+   link messages, dense link storage, and the old-style symbol table.  Sets
+   h5explain_link_addr and returns 1 on success.  */
+fun h5explain_lookup_link = (offset<uint<64>,B> off, string name) int:
 {
-    if (h5explain_cur_kind != H5EX_KIND_OHDR) {
-        printf("cd is only available when the current primitive is an object header.\n");
-        return;
-    }
-
     h5explain_link_found = 0;
     h5explain_link_addr = 0UL#B;
 
-    h5explain_load_ohdr_ctx(h5explain_cur_off);
+    h5explain_load_ohdr_ctx(off);
 
     var ignored = h5explain_links_in_chunk(h5explain_ctx_version, h5explain_ctx_pfx,
                                            h5explain_ctx_chunk_off, h5explain_ctx_chunk_size,
@@ -2205,19 +2313,124 @@ fun cd = (string name) void:
         ignored = ignored + h5explain_links_in_v1_btree(h5explain_stab_btree_addr,
                                                         h5explain_stab_heap_addr,
                                                         name, 0);
-    if (!h5explain_link_found) {
-        printf("no hard link named \"%s\" in current object header\n", name);
+    return h5explain_link_found;
+}
+
+/* Split PATH on '/', dropping empty components so "/a//b/" yields [a, b].  */
+fun h5explain_split_path = (string path) string[]:
+{
+    var comps = string[]();
+    var cur = "";
+    for (var i = 0UL; i < path'length as uint<64>; i = i + 1UL) {
+        if (path[i] == '/') {
+            if (cur != "") apush (comps, cur);
+            cur = "";
+        } else
+            cur = cur + path[i] as string;
+    }
+    if (cur != "") apush (comps, cur);
+    return comps;
+}
+
+fun h5explain_join_path = (string[] comps) string:
+{
+    if (comps'length == 0) return "/";
+    var label = "";
+    for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL)
+        label = label + "/" + comps[i];
+    return label;
+}
+
+/* Normalize COMPS in place, resolving "." and "..".  A ".." above the root is
+   clamped there, matching how a shell treats "/..".  */
+fun h5explain_normalize_path = (string[] comps) string[]:
+{
+    var out = string[]();
+    for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL) {
+        if (comps[i] == ".") continue;
+        if (comps[i] == "..") {
+            if (out'length > 0) {
+                var dropped = apop (out);
+            }
+            continue;
+        }
+        apush (out, comps[i]);
+    }
+    return out;
+}
+
+fun h5explain_path_has_updir = (string[] comps) int:
+{
+    for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL)
+        if (comps[i] == "..") return 1;
+    return 0;
+}
+
+/* Navigate to PATH, which may be a single link name ("values"), a multi-level
+   relative path ("group_a/values"), an absolute path ("/group_a/values"), or
+   any of those with "." and ".." components.
+
+   A path that is absolute or reaches upwards is resolved from the root, so it
+   needs the current label to know where it started; a purely downward relative
+   path is walked from the current header and works even when the cursor was
+   parked on an unlabeled header by go/gos.  */
+fun cd = (string path) void:
+{
+    if (h5explain_cur_kind != H5EX_KIND_OHDR) {
+        printf("cd is only available when the current primitive is an object header.\n");
         return;
     }
 
-    h5explain_push_cur;
-    var label = name;
-    if (h5explain_cur_label == "" || h5explain_cur_label == "/")
-        label = "/" + name;
-    else
-        label = h5explain_cur_label + "/" + name;
+    var absolute = path'length > 0 && path[0] == '/';
+    var comps = h5explain_split_path(path);
+    var upwards = h5explain_path_has_updir(comps);
 
-    h5explain_set_current(H5EX_KIND_OHDR, h5explain_link_addr, label);
+    if (comps'length == 0 && !absolute) return;  /* cd (""), cd (".") */
+
+    var start_off = h5explain_cur_off;
+    var start_label = "";
+
+    if (absolute || upwards) {
+        if (!absolute && h5explain_cur_label == "") {
+            printf("cd: cannot resolve \"%s\" from an unlabeled header; use an absolute path or go to a known one first\n",
+                   path);
+            return;
+        }
+        var full = string[]();
+        if (!absolute) {
+            var base = h5explain_split_path(h5explain_cur_label);
+            for (var i = 0UL; i < base'length as uint<64>; i = i + 1UL)
+                apush (full, base[i]);
+        }
+        for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL)
+            apush (full, comps[i]);
+        comps = h5explain_normalize_path(full);
+        start_off = h5explain_root_addr;
+        start_label = "/";
+    } else {
+        comps = h5explain_normalize_path(comps);
+        start_label = h5explain_cur_label;
+    }
+
+    /* Walk the whole path before moving, so a failure part-way leaves the
+       cursor where it was rather than stranding it mid-path.  */
+    var off = start_off;
+    var label = start_label;
+    for (var i = 0UL; i < comps'length as uint<64>; i = i + 1UL) {
+        if (!h5explain_lookup_link(off, comps[i])) {
+            printf("no hard link named \"%s\" in %s\n", comps[i],
+                   label == "" ? "current object header" : label);
+            return;
+        }
+        off = h5explain_link_addr;
+        if (label == "" || label == "/")
+            label = "/" + comps[i];
+        else
+            label = label + "/" + comps[i];
+    }
+
+    h5explain_push_cur;
+    h5explain_set_current(H5EX_KIND_OHDR, off, label);
 }
 
 fun msgs = void:
@@ -2232,11 +2445,31 @@ fun msgs = void:
 
 fun pwd = void:
 {
-    printf("%s at %v (%s)\n",
+    printf("%s at %v (%s)",
            h5explain_cur_label != "" ? h5explain_cur_label : "(unlabeled)",
            h5explain_cur_off,
            h5explain_kind_name(h5explain_cur_kind));
+    h5explain_confidence_note;
+    printf("\n");
 }
+
+/* Placeholders for the policy commands, replaced wholesale when
+   h5explain_check.pk loads on top of this pickle (a later definition wins).
+
+   They exist for the session that did not load it.  The driver skips the policy
+   pickles when a batch session's commands never mention them, because loading
+   them roughly doubles startup; if that guess is wrong, the honest answer is to
+   say which flag fixes it rather than to let poke report an undefined variable
+   and leave the reason to guesswork.  */
+fun h5explain_policy_absent = (string name) void:
+{
+    printf("%s: the h5policy pickles are not loaded in this session, so there is nothing to ask. Rerun with --policy (they are skipped only when a scripted session's commands never mention them).\n",
+           name);
+}
+
+fun check = void: { h5explain_policy_absent("check"); }
+fun check_all = void: { h5explain_policy_absent("check_all"); }
+fun profile = (string name = "") void: { h5explain_policy_absent("profile"); }
 
 fun help = void:
 {
@@ -2245,23 +2478,27 @@ fun help = void:
 
 fun back = void:
 {
-    if (!h5explain_has_prev) {
+    if (h5explain_hist_off'length == 0) {
         printf("no previous location\n");
         return;
     }
-    var off = h5explain_prev_off;
-    var kind = h5explain_prev_kind;
-    var label = h5explain_prev_label;
-    h5explain_has_prev = 0;
-    h5explain_set_current(kind, off, label);
+    var off = apop (h5explain_hist_off);
+    var kind = apop (h5explain_hist_kind);
+    var label = apop (h5explain_hist_label);
+    var heuristic = apop (h5explain_hist_heuristic);
+    h5explain_set_current(kind, off, label, heuristic);
 }
 
 fun go = (offset<uint<64>,B> off, string label = "") void:
 {
+    if (!h5explain_off_in_file(off)) {
+        printf("go: offset %v is past the end of the file (%v)\n", off, iosize());
+        return;
+    }
     h5explain_push_cur;
     var kind = h5explain_detect_kind(off);
     if (kind == H5EX_KIND_SUPER) h5explain_super_off = off;
-    h5explain_set_current(kind, off, label);
+    h5explain_set_current(kind, off, label, h5explain_detect_heuristic);
 }
 
 fun gos = (string off_text, string label = "") void:
@@ -2284,15 +2521,34 @@ fun h5super = void:
 fun h5explain_start = (string offset_text = "") void:
 {
     h5explain_super_off = h5explain_find_super;
-    h5explain_prime_superblock;
-    h5explain_banner;
+
+    /* A file whose superblock does not decode is precisely the file worth
+       exploring, so priming must not take the session down with it.  Report the
+       failure and open anyway: the cursor still lands on the superblock, and
+       dump, check, and manual navigation all still work from there.  */
+    try
+        {
+            h5explain_prime_superblock;
+        }
+    catch (Exception e)
+        {
+            printf("warning: the superblock at %v did not decode (%s); B-tree constants are unset and decoding below it may be wrong\n",
+                   h5explain_super_off, e.name);
+        }
+
+    if (!h5explain_quiet) h5explain_banner;
 
     if (offset_text == "")
         h5explain_set_current(H5EX_KIND_SUPER, h5explain_super_off, "superblock");
     else {
         var off = h5explain_parse_addr(offset_text);
+        if (!h5explain_off_in_file(off)) {
+            printf("h5explain: offset %v is past the end of the file (%v)\n",
+                   off, iosize());
+            raise E_inval;
+        }
         var kind = h5explain_detect_kind(off);
         if (kind == H5EX_KIND_SUPER) h5explain_super_off = off;
-        h5explain_set_current(kind, off, "");
+        h5explain_set_current(kind, off, "", h5explain_detect_heuristic);
     }
 }

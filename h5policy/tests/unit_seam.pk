@@ -1,0 +1,139 @@
+/* unit_seam.pk - Cover h5policy_analyze, the execution seam for pickle
+   consumers that already hold the file open.
+
+   h5policy_run opens its own IOS by name.  GNU poke refuses a second IOS on an
+   already-open file, so an in-process consumer such as h5explain cannot call
+   it; h5policy_analyze takes the caller's IOS instead and leaves reporting to
+   the caller.  These cases pin the properties that consumer depends on: it
+   accepts a caller-owned IOS, it reports through the finding globals, it
+   prints nothing, and it resets state so each call stands alone.
+
+   Prints one "PASS <name>" / "FAIL <name>" line per case and exits 0 only if
+   every case passed.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+load h5_policy;
+
+/* run.sh injects seam_tests_dir with -c before loading this file, so the cases
+   can reach the generated corpus without assuming a working directory.  */
+
+var seam_failures = 0;
+
+fun expect_seam = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else
+        {
+            printf("FAIL %s\n", name);
+            seam_failures = seam_failures + 1;
+        }
+}
+
+fun seam_has_code = (string code) int:
+{
+    for (var i = 0UL; i < h5policy_finding_codes'length as uint<64>; i = i + 1UL)
+        if (h5policy_finding_codes[i] == code) return 1;
+    return 0;
+}
+
+var SEAM_VALID = seam_tests_dir + "/valid/simple_dataset.h5";
+var SEAM_BAD = seam_tests_dir + "/malformed/bad_btree_key.h5";
+
+/* A caller-owned IOS is accepted, and the verdict matches what the CLI reports
+   for the same file.  */
+var valid_ios = open(SEAM_VALID, IOS_M_RDONLY);
+var valid_ctx = h5policy_analyze(valid_ios, h5policy_profile);
+expect_seam("analyze_accepts_a_caller_owned_ios",
+            h5policy_decision == "accept");
+expect_seam("analyze_reports_walk_context_to_the_caller",
+            valid_ctx.object_count > 0UL);
+expect_seam("analyze_leaves_a_clean_file_without_findings",
+            h5policy_finding_codes'length == 0);
+expect_seam("analyze_reports_a_completed_walk",
+            h5policy_result_walk_started
+            && h5policy_result_walk_completed
+            && h5policy_result_walk_stop_reason == "");
+
+/* The seam must not hold the IOS: the caller owns it and closes it.  */
+close (valid_ios);
+
+/* A corrupt file rejects through the same globals the CLI reports from, and
+   the finding keeps the offset an explorer needs to anchor it.  */
+var bad_ios = open(SEAM_BAD, IOS_M_RDONLY);
+var bad_ctx = h5policy_analyze(bad_ios, h5policy_profile);
+expect_seam("analyze_rejects_a_corrupt_file",
+            h5policy_decision == "reject_corrupt");
+expect_seam("analyze_sets_the_corrupt_exit_code",
+            h5policy_exit_code == H5POLICY_EXIT_CORRUPT);
+expect_seam("analyze_reports_the_expected_finding",
+            seam_has_code("H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS"));
+expect_seam("analyze_reports_a_rejection_stopped_walk",
+            h5policy_result_walk_started
+            && !h5policy_result_walk_completed
+            && h5policy_result_walk_stop_reason == "rejection");
+expect_seam("analyze_anchors_findings_to_a_file_offset",
+            h5policy_finding_codes'length > 0
+            && h5policy_finding_offsets[0] > 0UL);
+
+/* Repeating the same analysis reports the same verdict rather than compounding
+   it.  Note this case alone cannot prove the reset: without it, the stale
+   reject_corrupt exit code makes the second walk short-circuit (untrusted
+   strict does not continue after corruption), which also leaves the count
+   unchanged.  The valid-after-corrupt case below is what pins the reset.  */
+var repeat_count = h5policy_finding_codes'length;
+var bad_ctx2 = h5policy_analyze(bad_ios, h5policy_profile);
+expect_seam("analyze_is_repeatable_on_the_same_ios",
+            h5policy_decision == "reject_corrupt"
+            && h5policy_finding_codes'length == repeat_count);
+close (bad_ios);
+
+/* Analyzing a clean file after a corrupt one must report the clean file, not
+   the wreckage of the previous call: verdict, exit code, and findings all come
+   from this analysis only.  This is the case an in-process consumer relies on,
+   since it reuses one session across many checks.  */
+var valid_ios2 = open(SEAM_VALID, IOS_M_RDONLY);
+var valid_ctx2 = h5policy_analyze(valid_ios2, h5policy_profile);
+expect_seam("analyze_does_not_inherit_a_previous_rejection",
+            h5policy_decision == "accept"
+            && h5policy_exit_code == H5POLICY_EXIT_ACCEPT);
+expect_seam("analyze_does_not_inherit_previous_findings",
+            h5policy_finding_codes'length == 0);
+close (valid_ios2);
+
+/* An unvalidated profile has unusable limits: refuse rather than walk with
+   them.  h5policy_run screens this before opening, but a direct caller can
+   pass anything.  */
+var bad_profile = h5policy_clone_profile(H5_UNTRUSTED_STRICT);
+bad_profile.resources.max_walk_operations = 0UL;
+var probe_ios = open(SEAM_VALID, IOS_M_RDONLY);
+var bad_profile_ctx = h5policy_analyze(probe_ios, bad_profile);
+expect_seam("analyze_refuses_an_invalid_profile",
+            seam_has_code("H5_INTERNAL_INVALID_PROFILE"));
+expect_seam("invalid_profile_reports_that_the_walk_never_started",
+            !h5policy_result_walk_started
+            && !h5policy_result_walk_completed
+            && h5policy_result_walk_stop_reason == "invalid_profile");
+close (probe_ios);
+
+if (seam_failures != 0)
+    {
+        printf("UNIT SEAM: %i32d failure(s)\n", seam_failures);
+        exit(1);
+    }
+printf("UNIT SEAM: all passed\n");
