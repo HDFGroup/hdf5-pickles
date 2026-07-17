@@ -72,6 +72,9 @@ repairs:
 - recompute v2/v3 superblock Jenkins checksums;
 - recompute reachable v2 object-header Jenkins checksums reported by
   `h5policy`;
+- rewrite a mismatched stored element size in a reachable v4 chunk-layout
+  message from its unique inline datatype message, then reseal the v2 object
+  header;
 - rewrite flagged v1 object-header message counts to the counted message total;
 - rewrite symbol-table node (`SNOD`) symbol counts to the contiguous valid entry
   count;

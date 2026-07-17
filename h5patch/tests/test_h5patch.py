@@ -20,6 +20,8 @@ import shutil
 import subprocess
 import tempfile
 
+import h5py
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 H5PATCH = os.path.join(REPO, "h5patch", "tools", "h5patch")
@@ -95,6 +97,115 @@ def corrupt_depth0_bthd_total_count(path):
                 return
         off = raw.find(b"BTHD", off + 1)
     raise AssertionError("fixture lacks a depth-0 v2 B-tree header")
+
+
+def corrupt_v4_chunk_layout_element_size(path, dataset_name="d"):
+    """Change only a v4 chunk layout's trailing element-size dimension.
+
+    The caller intentionally gets a stale object-header checksum.  Existing
+    h5patch checksum repair is then used to produce the checksum-valid semantic
+    mismatch that exercises the new catalog item.
+    """
+    with h5py.File(path, "r") as h:
+        dataset = h[dataset_name]
+        ohdr = int(h5py.h5o.get_info(dataset.id).addr)
+        datatype_size = int(dataset.dtype.itemsize)
+
+    raw = bytearray(open(path, "rb").read())
+    if raw[ohdr:ohdr + 4] != b"OHDR" or raw[ohdr + 4] != 2:
+        raise AssertionError("fixture dataset lacks a v2 object header")
+
+    flags = raw[ohdr + 5]
+    cursor = ohdr + 6
+    if flags & (1 << 5):
+        cursor += 16
+    if flags & (1 << 4):
+        cursor += 4
+    size_width = 1 << (flags & 3)
+    chunk_size = int.from_bytes(raw[cursor:cursor + size_width], "little")
+    chunk_off = cursor + size_width
+    checksum_off = chunk_off + chunk_size
+    prefix_size = 6 if flags & 4 else 4
+
+    dtype_payloads = []
+    layout_payloads = []
+    pos = chunk_off
+    while pos + prefix_size <= checksum_off:
+        msg_type = raw[pos]
+        msg_size = int.from_bytes(raw[pos + 1:pos + 3], "little")
+        payload = pos + prefix_size
+        if payload + msg_size > checksum_off:
+            raise AssertionError("fixture object-header message overruns chunk 0")
+        if msg_type == 0x03:
+            dtype_payloads.append((payload, msg_size, raw[pos + 3]))
+        elif msg_type == 0x08:
+            layout_payloads.append((payload, msg_size, raw[pos + 3]))
+        pos = payload + msg_size
+
+    if len(dtype_payloads) != 1 or len(layout_payloads) != 1:
+        raise AssertionError("fixture needs unique inline datatype and layout messages")
+    dtype_payload, dtype_msg_size, dtype_flags = dtype_payloads[0]
+    layout_payload, layout_msg_size, layout_flags = layout_payloads[0]
+    if dtype_flags & 0x02 or layout_flags & 0x02:
+        raise AssertionError("fixture messages must be inline")
+    if dtype_msg_size < 8:
+        raise AssertionError("fixture datatype message is too small")
+    encoded_datatype_size = int.from_bytes(
+        raw[dtype_payload + 4:dtype_payload + 8], "little"
+    )
+    if encoded_datatype_size != datatype_size:
+        raise AssertionError("valid fixture already has a datatype-size mismatch")
+
+    if raw[layout_payload] != 4 or raw[layout_payload + 1] != 2:
+        raise AssertionError("fixture layout is not v4 chunked")
+    ndims = raw[layout_payload + 3]
+    enc = raw[layout_payload + 4]
+    if not ndims or not 1 <= enc <= 8 or 5 + ndims * enc + 1 > layout_msg_size:
+        raise AssertionError("fixture v4 chunk dimension vector is malformed")
+    element_off = layout_payload + 5 + (ndims - 1) * enc
+    stored_size = int.from_bytes(raw[element_off:element_off + enc], "little")
+    if stored_size != datatype_size:
+        raise AssertionError("valid fixture layout already has the wrong element size")
+
+    wrong_size = datatype_size * 2
+    if wrong_size >= 1 << (8 * enc):
+        wrong_size = datatype_size - 1
+    if wrong_size <= 0 or wrong_size == datatype_size:
+        raise AssertionError("could not choose an encodable mismatched element size")
+    raw[element_off:element_off + enc] = wrong_size.to_bytes(enc, "little")
+    with open(path, "wb") as fh:
+        fh.write(raw)
+
+    return {
+        "ohdr": ohdr,
+        "checksum_off": checksum_off,
+        "element_off": element_off,
+        "element_width": enc,
+        "datatype_size": datatype_size,
+        "wrong_size": wrong_size,
+    }
+
+
+def assert_modern_h5ls_rejects_dataset(path):
+    """HDF5 2.x enforces the redundant chunk element-size field on open.
+
+    HDF5 1.14.x ignores this mismatch, so only assert the reported failure when
+    a 2.x command-line oracle is installed.  The byte-level assertions below
+    still cover the repair on older test hosts.
+    """
+    h5ls = shutil.which("h5ls")
+    if h5ls is None:
+        return
+    version = subprocess.run(
+        [h5ls, "-V"], capture_output=True, text=True, check=False
+    )
+    if "Version 2." not in version.stdout + version.stderr:
+        return
+    proc = subprocess.run(
+        [h5ls, "-r", path], capture_output=True, text=True, check=False
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0 or "*ERROR*" in output, output
 
 
 def test_signature_repair(tmp):
@@ -186,6 +297,92 @@ def test_depth0_btree_total_count_repair(tmp):
     assert_accept(repaired)
 
 
+def test_v4_chunk_layout_element_size_repair(tmp):
+    src = os.path.join(CORPUS, "valid", "chunk_ext_array.h5")
+    valid_plan = os.path.join(tmp, "valid_chunk_layout.plan.json")
+    stale_checksum = os.path.join(tmp, "stale_layout_checksum.h5")
+    checksum_plan = os.path.join(tmp, "layout_checksum.plan.json")
+    mismatched = os.path.join(tmp, "bad_layout_element_size.h5")
+    plan = os.path.join(tmp, "layout_element_size.plan.json")
+    repaired = os.path.join(tmp, "layout_element_size_repaired.h5")
+    final_plan = os.path.join(tmp, "layout_element_size_final.plan.json")
+
+    # A valid v4 chunk layout must remain untouched.
+    run([H5PATCH, "plan", src, "-o", valid_plan])
+    assert json.load(open(valid_plan))["actions"] == []
+
+    shutil.copyfile(src, stale_checksum)
+    info = corrupt_v4_chunk_layout_element_size(stale_checksum)
+
+    # Semantic repair is gated on a valid enclosing checksum.  Reseal the
+    # deliberately stale fixture first, and ensure apply performs no unreviewed
+    # element-size write in that pass.
+    run([H5PATCH, "plan", stale_checksum, "-o", checksum_plan])
+    checksum_spec = json.load(open(checksum_plan))
+    assert [a["target"]["structure"] for a in checksum_spec["actions"]] == [
+        "object_header_v2"
+    ], checksum_spec
+    run([H5PATCH, "apply", stale_checksum, checksum_plan, "--output", mismatched])
+    assert_modern_h5ls_rejects_dataset(mismatched)
+
+    before_plan = open(mismatched, "rb").read()
+    run([H5PATCH, "plan", mismatched, "-o", plan])
+    assert open(mismatched, "rb").read() == before_plan, "plan modified its input"
+    spec = json.load(open(plan))
+    assert [a["target"]["structure"] for a in spec["actions"]] == [
+        "chunk_layout_v4",
+        "object_header_v2",
+    ], spec
+
+    layout_action, checksum_action = spec["actions"]
+    assert layout_action["kind"] == "set_uint_le"
+    assert layout_action["target"]["offset"] == info["ohdr"]
+    assert layout_action["writes"] == [{
+        "offset": info["element_off"],
+        "size": info["element_width"],
+        "old_hex": info["wrong_size"].to_bytes(
+            info["element_width"], "little"
+        ).hex(),
+        "new_hex": info["datatype_size"].to_bytes(
+            info["element_width"], "little"
+        ).hex(),
+    }]
+    assert checksum_action["kind"] == "recompute_checksum"
+    assert checksum_action["writes"][0]["offset"] == info["checksum_off"]
+    assert checksum_action["writes"][0]["size"] == 4
+
+    run([H5PATCH, "apply", mismatched, plan, "--output", repaired])
+    after_apply = open(repaired, "rb").read()
+    assert len(after_apply) == len(before_plan)
+    assert int.from_bytes(
+        after_apply[info["element_off"]:
+                    info["element_off"] + info["element_width"]],
+        "little",
+    ) == info["datatype_size"]
+    changed = {i for i, pair in enumerate(zip(before_plan, after_apply))
+               if pair[0] != pair[1]}
+    allowed = set(range(info["element_off"],
+                        info["element_off"] + info["element_width"]))
+    allowed.update(range(info["checksum_off"], info["checksum_off"] + 4))
+    assert changed and changed <= allowed, (changed, allowed)
+
+    assert_accept(repaired)
+    with h5py.File(repaired, "r") as h:
+        dataset = h["d"]
+        assert dataset.dtype.itemsize == info["datatype_size"]
+        assert dataset.shape == (10, 4)
+        assert int(dataset[0, 0]) == 0
+        assert int(dataset[-1, -1]) == 39
+    h5ls = shutil.which("h5ls")
+    if h5ls is not None:
+        listing = run([h5ls, "-r", repaired])
+        assert "*ERROR*" not in listing.stdout + listing.stderr
+
+    # A repaired header is a fixed point: planning it again is a no-op.
+    run([H5PATCH, "plan", repaired, "-o", final_plan])
+    assert json.load(open(final_plan))["actions"] == []
+
+
 def test_userblock_files_need_no_repairs(tmp):
     for name in ("userblock_latest.h5", "userblock_earliest.h5"):
         src = os.path.join(CORPUS, "valid", name)
@@ -204,6 +401,7 @@ def main():
         test_v1_object_header_message_count_repair(tmp)
         test_snod_symbol_count_repair(tmp)
         test_depth0_btree_total_count_repair(tmp)
+        test_v4_chunk_layout_element_size_repair(tmp)
         test_userblock_files_need_no_repairs(tmp)
     print("h5patch tests passed")
 
