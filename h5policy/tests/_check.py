@@ -16,9 +16,10 @@
 
 """Compare h5policy output against tests/expected/*.yml.
 
-For each spec: run the tool on the fixture and assert the decision, exit code,
-required findings (subset), and forbidden outcomes.  Invoked by run.sh, which
-sets TESTS_DIR and TOOL in the environment.
+For each spec: run the tool on the fixture and assert the report schema,
+geometry invariants, decision, exit code, required findings (subset), and
+forbidden outcomes.  Invoked by run.sh, which sets TESTS_DIR and TOOL in the
+environment.
 """
 import glob
 import json
@@ -223,6 +224,63 @@ def run_case(spec):
     if report.get("decision") != spec["expected_decision"]:
         problems.append(
             f"decision {report.get('decision')!r} != {spec['expected_decision']!r}")
+
+    schema_version = report.get("schema_version")
+    if (isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version != 1):
+        problems.append(f"schema_version {schema_version!r} != 1")
+
+    geometry = report.get("geometry")
+    if not isinstance(geometry, dict):
+        problems.append("missing file geometry")
+        geometry = {}
+    geometry_fields = (
+        "physical_bytes", "declared_eoa", "effective_ceiling",
+        "trailing_bytes",
+    )
+    for field in geometry_fields:
+        if field not in geometry:
+            problems.append(f"geometry.{field} is missing")
+            continue
+        value = geometry[field]
+        if (value is not None
+                and (isinstance(value, bool) or not isinstance(value, int)
+                     or value < 0)):
+            problems.append(
+                f"geometry.{field} is not a non-negative integer or null")
+
+    physical = geometry.get("physical_bytes")
+    declared = geometry.get("declared_eoa")
+    ceiling = geometry.get("effective_ceiling")
+    trailing = geometry.get("trailing_bytes")
+    if isinstance(physical, int) and not isinstance(physical, bool):
+        if declared is None:
+            if ceiling != physical:
+                problems.append(
+                    f"geometry.effective_ceiling={ceiling!r} != physical_bytes {physical}")
+            if trailing is not None:
+                problems.append(
+                    "geometry.trailing_bytes must be null without declared_eoa")
+        elif isinstance(declared, int) and not isinstance(declared, bool):
+            want_ceiling = min(physical, declared)
+            want_trailing = max(physical - declared, 0)
+            if ceiling != want_ceiling:
+                problems.append(
+                    f"geometry.effective_ceiling={ceiling!r} != {want_ceiling}")
+            if trailing != want_trailing:
+                problems.append(
+                    f"geometry.trailing_bytes={trailing!r} != {want_trailing}")
+    elif physical is None:
+        for field in ("declared_eoa", "effective_ceiling", "trailing_bytes"):
+            if geometry.get(field) is not None:
+                problems.append(
+                    f"geometry.{field} must be null without physical_bytes")
+
+    for field, want in spec.get("expected_geometry", {}).items():
+        got = geometry.get(field)
+        if got != want:
+            problems.append(f"geometry {field}={got!r} != {want!r}")
 
     analysis = report.get("analysis")
     if not isinstance(analysis, dict):

@@ -94,6 +94,34 @@ stop reason, the effective continuation setting, and finding truncation. This
 makes a fail-fast rejection distinguishable from an exhaustive diagnostic pass.
 `--continue-after-corruption` is retained as a deprecated CLI alias.
 
+### Report schema and file geometry
+
+Every machine-readable report carries integer `schema_version: 1`, including a
+report synthesized by the shell wrapper after its hard wall timeout. The
+version changes when an incompatible field shape, type, or meaning changes;
+additive fields may retain the current version.
+
+The `geometry` object makes the address boundary used during validation
+explicit:
+
+- `physical_bytes` is the byte length of the available file image;
+- `declared_eoa` is the superblock's declared end-of-address value once that
+  field has been decoded;
+- `effective_ceiling` is `min(physical_bytes, declared_eoa)` when EOA is known,
+  otherwise the physical size used before a superblock is available; and
+- `trailing_bytes` is `max(physical_bytes - declared_eoa, 0)` when both inputs
+  are known.
+
+An unavailable value is JSON `null`, rather than zero. A bad signature therefore
+has known physical bytes and an effective physical ceiling, but `null` EOA and
+trailing-byte values. A profile rejected before file I/O has four `null` values.
+A hard-timeout report retains the physical size when the wrapper can obtain it,
+but reports the three in-pickle bounds as `null` because the killed process
+cannot return its decoded state.
+
+Physical bytes after the declared EOA are outside HDF5's address space. They are
+reported for provenance and triage but do not cause a finding by themselves.
+
 When several findings occur, decision precedence is:
 
 ```text

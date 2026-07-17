@@ -9,13 +9,16 @@ controlled outcome; a change that alters any decision is surfaced for review.
   with its input fixture, profile, expected decision, expected exit code,
   required finding codes, and forbidden outcomes (`crash`, `timeout`,
   `external_open`, `plugin_load`, `write`). A fixture can be reused by several
-  expectations.
+  expectations. Every report is also checked for schema version 1 and internally
+  consistent file geometry; `expected_geometry` can pin individual values.
 - `unit_datatype.pk` — synthetic checks for the bounded, depth-guarded
   datatype validator (recursion cap and truncation handling), run under poke.
 - `unit_limits.pk` — reduced-limit, in-memory characterization checks for the
   current `H5PolicyProfile` boundaries, complete built-in preset values,
   saturation, finding classes, profile validation, deterministic walk budgets,
   compound rules, feature switches, and run-mode defaults.
+- `unit_report_wrapper.sh` — a deterministic hard-timeout simulation that
+  validates the shell-generated partial report and its nullable geometry.
 - `valid/ malformed/ policy/ resource/ coverage/ integration/ cve/` — generated
   fixtures (git-ignored build output; see below).
 
@@ -52,7 +55,8 @@ accept only the four named presets. The harness rejects unknown groups, unknown
 fields, non-integer values, and values outside the declared Poke integer type.
 An expectation can additionally assert `forbidden_findings`, exact subsets of
 `expected_metrics` and `expected_features`, `expected_mapping_mode`, or use
-`allow_missing_file` for a pre-I/O validation case. A compact example is:
+`expected_geometry` and `allow_missing_file` for report-boundary cases. A
+compact example is:
 
 ```yaml
 file: integration/value_sites.h5

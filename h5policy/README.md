@@ -63,7 +63,11 @@ the selected policy.
 
 JSON output includes:
 
+- `schema_version`: the integer report-contract version (currently `1`).
 - `decision`: the final classification.
+- `geometry`: physical file bytes, the superblock's declared EOA, the effective
+  address ceiling used by validation, and bytes physically trailing the EOA.
+  Values that cannot be established are JSON `null`.
 - `analysis`: whether the reachable walk completed, why it stopped, whether
   continuation was enabled, and whether the finding list was truncated.
 - `findings`: stable finding codes and locations. Comparison-based findings can
@@ -77,6 +81,9 @@ JSON output includes:
 Evidence comparisons currently use `equal` and `less_than_or_equal`; the
 finding means the reported `actual` value did not satisfy that comparison
 against `expected`.
+
+Trailing bytes are informational. They are outside the declared HDF5 address
+space and do not produce a finding by themselves.
 
 ## In-process consumer API
 
