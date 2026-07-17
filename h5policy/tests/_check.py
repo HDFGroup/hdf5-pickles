@@ -188,11 +188,18 @@ def run_case(spec):
 
     try:
         if "profile_overrides" in spec:
+            if spec.get("mode_flags"):
+                raise ValueError(
+                    "mode_flags cannot be combined with profile_overrides")
             proc = _run_with_profile_overrides(
                 path, profile, spec["profile_overrides"])
         else:
+            mode_flags = spec.get("mode_flags", [])
+            if (not isinstance(mode_flags, list)
+                    or not all(isinstance(flag, str) for flag in mode_flags)):
+                raise ValueError("mode_flags must be a list of strings")
             proc = subprocess.run(
-                [TOOL, "--profile", profile, "--json", path],
+                [TOOL, "--profile", profile, "--json", *mode_flags, path],
                 capture_output=True, text=True, timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return ["timeout"]
@@ -217,6 +224,26 @@ def run_case(spec):
         problems.append(
             f"decision {report.get('decision')!r} != {spec['expected_decision']!r}")
 
+    analysis = report.get("analysis")
+    if not isinstance(analysis, dict):
+        problems.append("missing analysis completion state")
+        analysis = {}
+    else:
+        bool_fields = (
+            "complete", "walk_started", "walk_completed",
+            "continue_after_rejection", "findings_truncated",
+        )
+        for field in bool_fields:
+            if not isinstance(analysis.get(field), bool):
+                problems.append(f"analysis.{field} is not a boolean")
+        if not isinstance(analysis.get("stop_reason"), str):
+            problems.append("analysis.stop_reason is not a string")
+
+    for field, want in spec.get("expected_analysis", {}).items():
+        got = analysis.get(field)
+        if got != want:
+            problems.append(f"analysis {field}={got!r} != {want!r}")
+
     codes = {f["code"] for f in report.get("findings", [])}
     for want in spec.get("required_findings", []):
         if want not in codes:
@@ -224,6 +251,22 @@ def run_case(spec):
     for forbidden_code in spec.get("forbidden_findings", []):
         if forbidden_code in codes:
             problems.append(f"forbidden finding present {forbidden_code}")
+
+    for code, expected in spec.get("expected_finding_evidence", {}).items():
+        matching = [
+            finding.get("evidence")
+            for finding in report.get("findings", [])
+            if finding.get("code") == code
+            and isinstance(finding.get("evidence"), dict)
+        ]
+        if not matching:
+            problems.append(f"finding {code} has no structured evidence")
+            continue
+        if not any(all(evidence.get(key) == value
+                       for key, value in expected.items())
+                   for evidence in matching):
+            problems.append(
+                f"finding {code} evidence does not include {expected!r}")
 
     if "expected_mapping_mode" in spec:
         got = report.get("mapping_mode")

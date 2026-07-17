@@ -40,6 +40,15 @@ var h5policy_finding_offsets = uint<64>[]();
 var h5policy_finding_has_locations = uint<8>[]();
 var h5policy_finding_objects = string[]();
 var h5policy_finding_messages = string[]();
+/* Optional, typed evidence for findings whose decision comes from comparing an
+   observed integer with a required value or bound.  Keeping this in parallel
+   vectors preserves the simple consumer API while making the JSON useful to
+   tools that should not have to scrape values out of prose.  */
+var h5policy_finding_has_evidence = uint<8>[]();
+var h5policy_finding_evidence_fields = string[]();
+var h5policy_finding_evidence_actuals = uint<64>[]();
+var h5policy_finding_evidence_expecteds = uint<64>[]();
+var h5policy_finding_evidence_comparisons = string[]();
 
 var h5policy_exit_code = H5POLICY_EXIT_ACCEPT;
 var h5policy_exit_rank = 0;
@@ -166,7 +175,7 @@ fun h5policy_decision = string:
 }
 
 /* Update the process result while still allowing every finding to be stored in
-   continue-after-corruption mode.  */
+   continue-after-rejection mode.  */
 fun h5policy_consider_exit = (string klass) void:
 {
     var rank = h5policy_class_rank(klass);
@@ -258,6 +267,11 @@ fun h5policy_reset_findings = void:
     h5policy_finding_has_locations = uint<8>[]();
     h5policy_finding_objects = string[]();
     h5policy_finding_messages = string[]();
+    h5policy_finding_has_evidence = uint<8>[]();
+    h5policy_finding_evidence_fields = string[]();
+    h5policy_finding_evidence_actuals = uint<64>[]();
+    h5policy_finding_evidence_expecteds = uint<64>[]();
+    h5policy_finding_evidence_comparisons = string[]();
     h5policy_exit_code = H5POLICY_EXIT_ACCEPT;
     h5policy_exit_rank = 0;
     h5policy_findings_truncated = 0;
@@ -268,9 +282,13 @@ fun h5policy_reset_findings = void:
 /* Store a finding unless the report cap or dedup rules suppress it.  The final
    decision is updated before suppression so the exit code remains correct even
    if many repeated resource findings are collapsed.  */
-fun h5policy_emit_with_location = (string severity, string code, string klass,
+fun h5policy_emit_with_evidence = (string severity, string code, string klass,
                                    off64 loc, int has_location,
-                                   string object, string message) void:
+                                   string object, string message,
+                                   int has_evidence, string evidence_field,
+                                   uint<64> evidence_actual,
+                                   uint<64> evidence_expected,
+                                   string evidence_comparison) void:
 {
     /* The decision always reflects this finding's severity, even if the
        finding itself is deduplicated or dropped past the storage cap.  */
@@ -292,6 +310,11 @@ fun h5policy_emit_with_location = (string severity, string code, string klass,
     var out_object = object;
     var out_message = message;
     var out_has_location = has_location ? 1UB : 0UB;
+    var out_has_evidence = has_evidence ? 1UB : 0UB;
+    var out_evidence_field = evidence_field;
+    var out_evidence_actual = evidence_actual;
+    var out_evidence_expected = evidence_expected;
+    var out_evidence_comparison = evidence_comparison;
     /* Some corrupt files carry high-bit addresses that GNU poke can represent
        as offsets but not convert back to a JSON-safe byte count without raising
        overflow.  A diagnostic location must not turn a corrupt verdict into an
@@ -320,6 +343,11 @@ fun h5policy_emit_with_location = (string severity, string code, string klass,
             out_message = "finding limit reached; additional findings suppressed";
             out_offset = 0UL;
             out_has_location = 0UB;
+            out_has_evidence = 0UB;
+            out_evidence_field = "";
+            out_evidence_actual = 0UL;
+            out_evidence_expected = 0UL;
+            out_evidence_comparison = "";
         }
     else if (klass == "resource")
         h5policy_emitted_resource_codes += [code];
@@ -331,6 +359,19 @@ fun h5policy_emit_with_location = (string severity, string code, string klass,
     h5policy_finding_has_locations += [out_has_location];
     h5policy_finding_objects += [out_object];
     h5policy_finding_messages += [out_message];
+    h5policy_finding_has_evidence += [out_has_evidence];
+    h5policy_finding_evidence_fields += [out_evidence_field];
+    h5policy_finding_evidence_actuals += [out_evidence_actual];
+    h5policy_finding_evidence_expecteds += [out_evidence_expected];
+    h5policy_finding_evidence_comparisons += [out_evidence_comparison];
+}
+
+fun h5policy_emit_with_location = (string severity, string code, string klass,
+                                   off64 loc, int has_location,
+                                   string object, string message) void:
+{
+    h5policy_emit_with_evidence(severity, code, klass, loc, has_location,
+                                object, message, 0, "", 0UL, 0UL, "");
 }
 
 fun h5policy_emit = (string severity, string code, string klass,
@@ -343,6 +384,17 @@ fun h5policy_emit_error = (string code, string klass,
                            off64 loc, string object, string message) void:
 {
     h5policy_emit("error", code, klass, loc, object, message);
+}
+
+fun h5policy_emit_error_u64_evidence = (string code, string klass,
+                                        off64 loc, string object,
+                                        string message, string field,
+                                        uint<64> actual, uint<64> expected,
+                                        string comparison) void:
+{
+    h5policy_emit_with_evidence("error", code, klass, loc, 1,
+                                object, message, 1, field,
+                                actual, expected, comparison);
 }
 
 fun h5policy_emit_warning = (string code,
@@ -443,7 +495,8 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
                                   uint<64> max_logical_dataset_bytes_seen,
                                   uint<64> visited_object_headers,
                                   uint<64> visited_continuations,
-                                  uint<64> visited_btree_refs) void:
+                                  uint<64> visited_btree_refs,
+                                  int continue_after_rejection) void:
 {
     printf("{\n");
     printf("  \"decision\": ");
@@ -459,6 +512,22 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
     h5policy_print_json_string(mapping_mode);
     printf(",\n");
     printf("  \"phase\": \"0-4\",\n");
+    printf("  \"analysis\": {\n");
+    printf("    \"complete\": %s,\n",
+           h5policy_walk_completed && !h5policy_findings_truncated
+               ? "true" : "false");
+    printf("    \"walk_started\": %s,\n",
+           h5policy_walk_started ? "true" : "false");
+    printf("    \"walk_completed\": %s,\n",
+           h5policy_walk_completed ? "true" : "false");
+    printf("    \"stop_reason\": ");
+    h5policy_print_json_string(h5policy_walk_stop_reason);
+    printf(",\n");
+    printf("    \"continue_after_rejection\": %s,\n",
+           continue_after_rejection ? "true" : "false");
+    printf("    \"findings_truncated\": %s\n",
+           h5policy_findings_truncated ? "true" : "false");
+    printf("  },\n");
     printf("  \"boundary\": {\n");
     printf("    \"libhdf5\": false,\n");
     printf("    \"plugins\": false,\n");
@@ -522,7 +591,25 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
             printf(",\n");
             printf("      \"message\": ");
             h5policy_print_json_string(h5policy_finding_messages[i]);
-            printf("\n");
+            if (h5policy_finding_has_evidence[i] != 0UB)
+                {
+                    printf(",\n");
+                    printf("      \"evidence\": {\n");
+                    printf("        \"field\": ");
+                    h5policy_print_json_string(h5policy_finding_evidence_fields[i]);
+                    printf(",\n");
+                    printf("        \"actual\": %u64d,\n",
+                           h5policy_finding_evidence_actuals[i]);
+                    printf("        \"expected\": %u64d,\n",
+                           h5policy_finding_evidence_expecteds[i]);
+                    printf("        \"comparison\": ");
+                    h5policy_print_json_string(
+                        h5policy_finding_evidence_comparisons[i]);
+                    printf("\n");
+                    printf("      }\n");
+                }
+            else
+                printf("\n");
             printf("    }");
             if (i + 1UL < h5policy_finding_codes'length)
                 printf(",");

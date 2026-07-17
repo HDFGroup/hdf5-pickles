@@ -82,12 +82,17 @@ exception or stop the current validator. Some enforcement sites explicitly
 return or decline to enqueue more work; others continue parsing the current
 structure.
 
-Without `--continue-after-corruption`, the main object-header breadth-first walk
+Without `--continue-after-rejection`, the main object-header breadth-first walk
 stops before dequeuing its next object after any decision other than `accept` or
 `accept_with_warnings`. Work already in progress inside the current object,
 tree, index, pipeline, or continuation chain follows the control flow described
 below. With continuation enabled, that main-walk early exit is disabled, but
 explicit per-validator returns and the walk deadline still apply.
+
+The JSON `analysis` object reports whether this walk started and completed, its
+stop reason, the effective continuation setting, and finding truncation. This
+makes a fail-fast rejection distinguishable from an exhaustive diagnostic pass.
+`--continue-after-corruption` is retained as a deprecated CLI alias.
 
 When several findings occur, decision precedence is:
 
@@ -687,10 +692,12 @@ feature counter in the JSON report.
 `--strict` nor `--non-strict` is supplied. Nonzero selects non-strict Poke
 mappings (`@!`); zero selects strict mappings (`@`).
 
-`analysis_defaults.continue_after_corruption` independently selects whether the main
-walk continues between queued objects after a rejection when
-`--continue-after-corruption` is absent. The CLI flag can enable continuation
-for any profile.
+`analysis_defaults.continue_after_corruption` independently selects whether the
+main walk continues between queued objects after a rejection when
+`--continue-after-rejection` is absent. The field keeps its original name for
+profile and pickle API compatibility; the CLI and JSON use the more accurate
+"after rejection" terminology. The CLI flag can enable continuation for any
+profile.
 
 `analysis_defaults.sweep_unreachable_metadata` independently enables the
 raw-file GCOL signature sweep after the reachable walk. The sweep finds

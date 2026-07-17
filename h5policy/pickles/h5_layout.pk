@@ -96,12 +96,12 @@ fun h5policy_check_contiguous_extent = (int ios, H5PolicyProfile profile,
 }
 
 /* Accumulate a chunk's byte size across its encoded dimensions, guarding the
-   32-bit field libhdf5 stores it in.  H5O_layout_chunk_t.size is a uint32_t
-   computed as the product of *all* encoded chunk dims (the trailing dim is the
-   element size in bytes); on decode libhdf5 multiplies them without an overflow
-   check, so a product >= 2^32 wraps to a small value and the per-chunk buffer is
-   under-allocated -- a heap-overflow primitive on the subsequent chunk read.
-   No valid file reaches here: H5Pset_chunk rejects chunks >= 4 GiB at creation.
+   legacy 32-bit field used for it.  H5O_layout_chunk_t.size is computed as the
+   product of *all* encoded chunk dims (the trailing dim is the element size in
+   bytes).  Vulnerable libhdf5 versions can wrap that product and under-allocate
+   the per-chunk buffer; newer versions reject the oversized legacy chunk.
+   No valid writer-produced file reaches here: H5Pset_chunk rejects chunks
+   >= 4 GiB at creation.
 
    Call once per (nonzero) dimension with the running product, starting at 1.
    Returns the new product, or a poison sentinel once the 32-bit bound is blown;
@@ -115,9 +115,15 @@ fun h5policy_chunk_size32_accum = (uint<64> acc, uint<64> dim,
         return acc;                     /* already flagged; stay poisoned */
     if (dim != 0UL && acc > 0xffffffffUL / dim)
         {
-            h5policy_emit_error("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT",
-                                "corrupt", loc, object,
-                                "chunk byte size exceeds the 32-bit chunk-size field; libhdf5 wraps it and under-allocates the chunk buffer");
+            var observed = 0xffffffffffffffffUL;
+            if (acc <= 0xffffffffffffffffUL / dim)
+                observed = acc * dim;
+            h5policy_emit_error_u64_evidence(
+                "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
+                loc, object,
+                "chunk byte size exceeds the legacy 32-bit chunk-size field",
+                "layout.chunk_size_overflow_product", observed,
+                0xffffffffUL, "less_than_or_equal");
             return 0xffffffffffffffffUL;
         }
     return acc * dim;
@@ -939,9 +945,12 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                         /* Two decode filters on one dataset must agree on the
                            chunk element count; a divergence is already tampering
                            and cannot be reconciled with a single chunk shape.  */
-                        h5policy_emit_error("H5_CORRUPT_FILTER_NELMTS_MISMATCH",
-                                            "corrupt", payload_off + cur#B, object,
-                                            "decode filters disagree on the chunk element count");
+                        h5policy_emit_error_u64_evidence(
+                            "H5_CORRUPT_FILTER_NELMTS_MISMATCH", "corrupt",
+                            payload_off + cur#B, object,
+                            "decode filters disagree on the chunk element count",
+                            "filter.decode_element_count", d_nelmts,
+                            h5policy_pipeline_decode_nelmts, "equal");
                     h5policy_pipeline_decode_nelmts = d_nelmts;
                     h5policy_pipeline_has_decode_nelmts = 1UB;
 

@@ -30,7 +30,7 @@ Run from the repository root:
 ./h5policy/tools/h5policy --profile untrusted-strict file.h5
 ./h5policy/tools/h5policy --profile trusted-fast file.h5
 ./h5policy/tools/h5policy --profile legacy file.h5
-./h5policy/tools/h5policy --profile forensic --continue-after-corruption file.h5
+./h5policy/tools/h5policy --profile forensic --continue-after-rejection file.h5
 ```
 
 Output is JSON (the machine-readable result); it is the only format, so no flag
@@ -39,8 +39,9 @@ is required.  `--json` is still accepted as a no-op for backward compatibility.
 Useful mode flags:
 
 - `--strict` / `--non-strict` force GNU poke strict or non-strict mapping.
-- `--continue-after-corruption` keeps walking after the first corruption finding
-  so diagnostics include every reachable issue.
+- `--continue-after-rejection` keeps walking after policy, resource,
+  unsupported, or corruption findings so diagnostics include every reachable
+  issue. `--continue-after-corruption` remains a deprecated compatibility alias.
 
 ## Decisions
 
@@ -63,20 +64,30 @@ the selected policy.
 JSON output includes:
 
 - `decision`: the final classification.
-- `findings`: stable finding codes and locations.
+- `analysis`: whether the reachable walk completed, why it stopped, whether
+  continuation was enabled, and whether the finding list was truncated.
+- `findings`: stable finding codes and locations. Comparison-based findings can
+  also include typed `evidence` with a field name, actual and expected integer
+  values, and the required comparison.
 - `features`: security-relevant constructs such as external links, external
   storage, VDS, dynamic filters, unknown messages, maximum rank, and maximum
   logical dataset bytes.
 - `metrics`: traversal and accounting counters used by profile budgets.
+
+Evidence comparisons currently use `equal` and `less_than_or_equal`; the
+finding means the reported `actual` value did not satisfy that comparison
+against `expected`.
 
 ## In-process consumer API
 
 Consumers that load `h5_policy.pk` should call `h5policy_analyze` and inspect
 the result through the read-only `h5policy_result_*` functions defined in
 `pickles/h5_consumer.pk`. The API exposes the decision, exit code, findings,
-location validity, truncation state, reachability queries, and explicit walk
-start/completion/stop state as scalars and strings. The parallel finding and
-traversal vectors remain implementation details.
+location validity, typed integer evidence, truncation state, reachability
+queries, and explicit walk start/completion/stop state as scalars and strings.
+The parallel finding and traversal vectors remain implementation details. The
+new `h5policy_result_continue_after_rejection` accessor has the deprecated
+`h5policy_result_continue_after_corruption` spelling as an API alias.
 
 ## Profiles
 
