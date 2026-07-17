@@ -455,6 +455,186 @@ fun h5patch_plan_object_header_checksums = (int ios, int apply) void:
        reachable-object repair path has more corpus mileage.  */
 }
 
+/* Repair the redundant datatype-size field at the end of a version-4 chunk
+   shape.  libhdf5 encodes rank + 1 dimensions in chunked layout messages; the
+   final value is the dataset datatype's storage size, and opening the dataset
+   fails when it disagrees with the datatype message.
+
+   This catalog entry deliberately accepts only the simplest trustworthy case:
+
+     * h5policy reached the owning object header from the root graph;
+     * the header is version 2 and its checksum is currently valid;
+     * datatype and layout are unique, inline messages in chunk 0;
+     * there is no continuation chunk whose messages we have not counted; and
+     * the layout is the self-describing version-4 chunked form.
+
+   The datatype message is authoritative for element storage size.  Both the
+   field rewrite and the resulting object-header checksum are recorded as
+   reviewable actions.  A header whose checksum is already bad is left for the
+   ordinary checksum repair pass; after that repair, a fresh plan can consider
+   this semantic rewrite without plan/apply mode observing different bytes.  */
+fun h5patch_plan_one_chunk_layout_element_size = (int ios, uint<64> off,
+                                                  int apply) void:
+{
+    var root_off = off#B;
+    var checksum_off = h5patch_v2_ohdr_checksum_off(ios, root_off);
+    if (checksum_off == 0UL#B)
+        return;
+
+    var flags = byte @ ios : root_off + 5#B;
+    var cursor = root_off + 6#B;
+    if ((flags & (1U <<. 5)) != 0U)
+        cursor = cursor + 16#B;
+    if ((flags & (1U <<. 4)) != 0U)
+        cursor = cursor + 4#B;
+
+    var size_width = 1UL <<. (flags & 3U);
+    var chunk_off = cursor + size_width#B;
+    if (checksum_off < chunk_off)
+        return;
+    var chunk_size = ((checksum_off - chunk_off)/#B) as uint<64>;
+
+    /* Never derive a semantic repair from an object header whose integrity is
+       already in doubt.  This also keeps plan and apply action lists identical
+       when the generic checksum catalog item runs later.  */
+    var body = byte[(checksum_off - root_off)/#B] @ ios : root_off;
+    var stored_checksum = byte[4] @ ios : checksum_off;
+    var current_checksum =
+        h5patch_u32_le_bytes(lookup3_hashlittle(body, 0));
+    if (stored_checksum != current_checksum)
+        return;
+
+    var prefix_bytes = ((flags & 4U) != 0U) ? 6UL : 4UL;
+    var i = 0UL;
+    var dtype_count = 0UL;
+    var layout_count = 0UL;
+    var has_continuation = 0;
+    var dtype_payload_off = 0UL#B;
+    var dtype_msg_size = 0UL;
+    var dtype_msg_flags = 0UB;
+    var layout_payload_off = 0UL#B;
+    var layout_msg_size = 0UL;
+    var layout_msg_flags = 0UB;
+
+    while (i < chunk_size)
+        {
+            if (chunk_size - i < prefix_bytes)
+                break;
+
+            var prefix_off = chunk_off + i#B;
+            var m_type = byte @ ios : prefix_off;
+            var m_size = bytes_to_u64_le(byte[2] @ ios : prefix_off + 1#B);
+            var m_flags = byte @ ios : prefix_off + 3#B;
+            var remaining = chunk_size - i - prefix_bytes;
+            if (m_size > remaining)
+                return;
+
+            var payload_off = prefix_off + prefix_bytes#B;
+            if (m_type == 0x03UB)
+                {
+                    dtype_count = dtype_count + 1UL;
+                    dtype_payload_off = payload_off;
+                    dtype_msg_size = m_size;
+                    dtype_msg_flags = m_flags;
+                }
+            else if (m_type == 0x08UB)
+                {
+                    layout_count = layout_count + 1UL;
+                    layout_payload_off = payload_off;
+                    layout_msg_size = m_size;
+                    layout_msg_flags = m_flags;
+                }
+            else if (m_type == 0x10UB)
+                has_continuation = 1;
+
+            i = i + prefix_bytes + m_size;
+        }
+
+    if (has_continuation || dtype_count != 1UL || layout_count != 1UL)
+        return;
+    if ((dtype_msg_flags & 0x02UB) != 0UB
+        || (layout_msg_flags & 0x02UB) != 0UB)
+        return;
+    if (dtype_msg_size < 8UL || layout_msg_size < 6UL)
+        return;
+
+    var datatype_size =
+        bytes_to_u64_le(byte[4] @ ios : dtype_payload_off + 4#B);
+    if (datatype_size == 0UL)
+        return;
+
+    var layout_version = byte @ ios : layout_payload_off;
+    var layout_class = byte @ ios : layout_payload_off + 1#B;
+    var ndims = (byte @ ios : layout_payload_off + 3#B) as uint<64>;
+    var enc = (byte @ ios : layout_payload_off + 4#B) as uint<64>;
+    if (layout_version != 4UB || layout_class != CHUNKED
+        || ndims == 0UL || ndims > H5O_LAYOUT_NDIMS
+        || enc == 0UL || enc > 8UL)
+        return;
+
+    var dims_bytes = ndims * enc;
+    /* Require the complete dimension vector and the following index-type byte.
+       That prevents a truncated payload from being mistaken for a repairable
+       layout merely because its last available bytes resemble a dimension.  */
+    if (5UL + dims_bytes + 1UL > layout_msg_size)
+        return;
+
+    /* uint32 datatype sizes always fit encodings four bytes or wider.  Avoid a
+       64-bit shift when enc == 8 and explicitly prove the narrower cases.  */
+    if (enc < 4UL && datatype_size >= (1UL <<. (enc * 8UL)))
+        return;
+
+    var element_off = layout_payload_off
+                      + (5UL + (ndims - 1UL) * enc)#B;
+    var old_element_size = byte[enc] @ ios : element_off;
+    var stored_element_size = bytes_to_u64_le(old_element_size);
+    if (stored_element_size == datatype_size)
+        return;
+
+    var new_element_size = h5patch_u64_le_bytes(datatype_size, enc);
+    h5patch_add_action("set_uint_le", "chunk_layout_v4",
+                       off, element_off, old_element_size, new_element_size,
+                       "set chunk-layout stored element size to the datatype storage size",
+                       "high");
+
+    /* Hash the hypothetical body in plan mode and the same byte image in apply
+       mode, then write both fields only after every guard above has succeeded. */
+    var rel = ((element_off - root_off)/#B) as uint<64>;
+    var repaired_body = byte[]();
+    if (rel + enc < body'length)
+        repaired_body = body[0UL:rel] + new_element_size
+                        + body[rel + enc:body'length];
+    else
+        repaired_body = body[0UL:rel] + new_element_size;
+    var repaired_checksum =
+        h5patch_u32_le_bytes(lookup3_hashlittle(repaired_body, 0));
+
+    h5patch_add_action("recompute_checksum", "object_header_v2",
+                       off, checksum_off, stored_checksum, repaired_checksum,
+                       "recompute v2 object-header checksum after chunk-layout element-size repair",
+                       "high");
+
+    if (apply)
+        {
+            byte[enc] @ ios : element_off = new_element_size;
+            byte[4] @ ios : checksum_off = repaired_checksum;
+        }
+}
+
+/* Examine only object headers that the bounded h5policy walk actually
+   dequeued.  The visited list is unique by construction, unlike the broader
+   append-only reachability report.  */
+fun h5patch_plan_chunk_layout_element_sizes = (int ios, int apply) void:
+{
+    var i = 0UL;
+    while (i < h5policy_visited_ohdrs'length)
+        {
+            h5patch_plan_one_chunk_layout_element_size(
+                ios, h5policy_visited_ohdrs[i], apply);
+            i = i + 1UL;
+        }
+}
+
 /* Collect only the offsets relevant to v1 object-header recounting.  Keeping
    this as a small helper makes the repair loop below about recount mechanics,
    not finding-table plumbing.  */
@@ -772,6 +952,7 @@ fun h5patch_collect_actions = (int ios, int apply) void:
 
     h5patch_plan_signature(ios, apply);
     h5patch_plan_superblock_repairs(ios, apply);
+    h5patch_plan_chunk_layout_element_sizes(ios, apply);
     h5patch_plan_object_header_checksums(ios, apply);
     h5patch_plan_v1_object_header_message_counts(ios, apply);
     h5patch_plan_snod_counts(ios, apply);

@@ -93,6 +93,14 @@ def make_chunked(path):
                          maxshape=(None, None), chunks=(4, 4))
 
 
+def make_filtered(path):
+    """A v2 pipeline whose built-in filters carry client data but no names."""
+    with h5py.File(path, "w", libver="latest") as f:
+        data = np.arange(1280, dtype="<f8").reshape(1, 1280)
+        f.create_dataset("filtered", data=data, chunks=(1, 1280),
+                         shuffle=True, compression="gzip", compression_opts=1)
+
+
 def make_bad_signature(path):
     """A file whose superblock signature is broken.
 
@@ -115,6 +123,7 @@ FIXTURES = {
     "userblock_earliest.h5": lambda path: make_userblock(path, "earliest"),
     "dense.h5": make_dense,
     "chunked.h5": make_chunked,
+    "filtered.h5": make_filtered,
     "bad_signature.h5": make_bad_signature,
 }
 

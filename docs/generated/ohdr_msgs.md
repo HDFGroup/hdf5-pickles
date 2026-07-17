@@ -777,19 +777,20 @@ Object reference count message (type 0x0016). Stores the count of hard links poi
 
 ## `oh_msg_fsinfo`
 
-File space info message (type 0x0017). Describes the file space management strategy and stores addresses of the free-space managers for small and large allocations. Stored in the superblock extension.
+File space info message (type 0x0017). Describes the file space management strategy. Deprecated version 0 uses the legacy strategy layout and optionally stores six manager addresses; version 1 uses the modern strategy layout and optionally stores twelve addresses split between small and large allocations. Stored in the superblock extension.
 
 | Field | Description |
 |-------|-------------|
-| `version` | Format version. Values 0 and 1 use identical layouts. |
-| `strategy` | File space management strategy: 1 = FSM_AGGR (free-space manager with aggregation), 2 = PAGE (paged allocation), 3 = AGGR (aggregation only), 4 = NONE (no tracking). |
-| `persist` | Non-zero if the free-space manager state is persisted across file opens. |
+| `version` | Format version. Version 0 is deprecated and has a distinct legacy layout; version 1 is the current layout. |
+| `strategy` | Version-dependent file-space strategy. In v0: 0 = DEFAULT, 1 = ALL_PERSIST, 2 = ALL, 3 = AGGR_VFD, 4 = VFD. In v1: 0 = FSM_AGGR, 1 = PAGE, 2 = AGGR, 3 = NONE. |
+| `persist` | Version 1 only. Non-zero if free-space-manager state is persisted across file opens. |
 | `threshold` | Minimum free-space section size (`sizeof_lengths` bytes) that is tracked. |
-| `page_size` | File space page size (`sizeof_lengths` bytes). _field position differs from the specification_ |
-| `pgend_meta_thres` | Threshold for storing small metadata at the end of a page. |
-| `eoa` | Stored end-of-address value (`sizeof_offsets` bytes). |
-| `small_fs_addr` | Array of 6 file addresses (`sizeof_offsets` bytes each) for the small-allocation free-space managers, one per allocation type. |
-| `large_fs_addr` | Array of 6 file addresses for the large-allocation free-space managers, one per allocation type. |
+| `fs_addr` | Version 0 only, present when strategy is ALL_PERSIST (1). Array of 6 file addresses (`sizeof_offsets` bytes each), one per legacy allocation type. |
+| `page_size` | Version 1 file-space page size (`sizeof_lengths` bytes). |
+| `pgend_meta_thres` | Version 1 threshold for storing small metadata at the end of a page. |
+| `eoa` | Version 1 end-of-address value from before free-space-manager allocation (`sizeof_offsets` bytes). |
+| `small_fs_addr` | Version 1 only, present when `persist` is non-zero. Array of 6 file addresses (`sizeof_offsets` bytes each) for small-allocation free-space managers, one per allocation type. |
+| `large_fs_addr` | Version 1 only, present when `persist` is non-zero. Array of 6 file addresses for large-allocation free-space managers, one per allocation type. |
 
 
 ## `oh_msg_mdci`

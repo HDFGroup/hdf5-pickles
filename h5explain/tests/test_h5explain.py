@@ -82,6 +82,17 @@ def raw_chunk_btree_offset(name):
     raise AssertionError(f"{name} has no raw-chunk v1 B-tree")
 
 
+def decoded_message_index(output, payload_type):
+    """Return the message index whose typed rendering starts with payload_type."""
+    current = None
+    for line in output.splitlines():
+        if line.startswith("Message ") and line.endswith("..."):
+            current = int(line.split()[1].rstrip("."))
+        elif current is not None and line.startswith(payload_type + " {"):
+            return current
+    raise AssertionError(f"no {payload_type} message in output\n{output}")
+
+
 # -- batch plumbing ---------------------------------------------------------
 
 def test_command_option_runs_and_exits():
@@ -459,6 +470,23 @@ def test_msgs_requires_an_object_header():
 def test_msgs_decodes_dataset_messages():
     out = explain("latest.h5", "root", 'cd ("top")', "msgs")
     assert "oh_msg_layout" in out, out
+
+
+def test_info_decodes_v2_builtin_filters_without_name_fields():
+    out = explain("filtered.h5", "root", 'cd ("filtered")', "info")
+    assert "oh_msg_pline" in out, out
+    assert "cd_nelmts=1UH" in out, out
+    assert "stored_element_size=8" in out, out
+    assert "unhandled EOF exception" not in out, out
+
+
+def test_layout_explainer_labels_the_stored_element_size():
+    listing = explain("filtered.h5", "root", 'cd ("filtered")', "msgs")
+    index = decoded_message_index(listing, "oh_msg_layout")
+    out = explain("filtered.h5", "root", 'cd ("filtered")',
+                  f"explain ({index})")
+    assert "layout_class=2UB (chunked)" in out, out
+    assert "stored_element_size=8" in out, out
 
 
 def test_h5dump_covers_the_primitive_extent():
