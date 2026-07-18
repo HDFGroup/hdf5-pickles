@@ -163,6 +163,71 @@ fun h5policy_scan_nul = (int ios, H5PolicyProfile profile,
     return 0xffffffffffffffffUL;
 }
 
+/* Classify an external link's *target file name* for path-safety hazards from
+   the stored bytes alone.  h5policy never resolves or opens the target, so this
+   is a syntactic best-effort signal, not a resolved-path guarantee: it cannot
+   know the consumer's base directory or whether a plain name is itself a
+   symlink.  Mirrors the external-storage (h5_external.pk) and VDS (h5_vds.pk)
+   source-path advisories and, like them, emits only when the profile permits the
+   feature -- a denied profile already rejects the link with H5_POLICY_EXTERNAL_-
+   LINK, so the advisory would be redundant there.  `off`/`len` cover the
+   NUL-free, in-bounds target file name (the object path is validated
+   separately).  */
+fun h5policy_classify_external_link_target = (int ios, H5PolicyProfile profile,
+                                              off64 off, uint<64> len,
+                                              string object) void:
+{
+    if (profile.features.allow_external_links == 0UB || len == 0UL)
+        return;
+
+    var first = 0UL; var second = 0UL; var third = 0UL;
+    var parent = 0; var component_start = 1;
+    var i = 0UL;
+    while (i < len)
+        {
+            var ch = h5policy_msg_u64_at(ios, profile, off + i#B, 1UL);
+            if (i == 0UL) first = ch;
+            if (i == 1UL) second = ch;
+            if (i == 2UL) third = ch;
+            if (component_start && ch == ('.' as uint<64>) && i + 1UL < len)
+                {
+                    var next = h5policy_msg_u64_at(ios, profile,
+                                                   off + (i + 1UL)#B, 1UL);
+                    if (next == ('.' as uint<64>))
+                        {
+                            var after = 0UL;
+                            if (i + 2UL < len)
+                                after = h5policy_msg_u64_at(ios, profile,
+                                                            off + (i + 2UL)#B, 1UL);
+                            if (after == 0UL
+                                || after == ('/' as uint<64>)
+                                || after == ('\\' as uint<64>))
+                                parent = 1;
+                        }
+                }
+            component_start = ch == ('/' as uint<64>) || ch == ('\\' as uint<64>);
+            i = i + 1UL;
+        }
+
+    var absolute = first == ('/' as uint<64>)
+                   || first == ('\\' as uint<64>)
+                   || (second == (':' as uint<64>)
+                       && (third == ('/' as uint<64>)
+                           || third == ('\\' as uint<64>)));
+    if (parent)
+        h5policy_emit_warning("H5_ADVISORY_EXTERNAL_LINK_PARENT_PATH",
+                              off, object,
+                              "external link target path contains a parent-directory component and can direct a consumer to open a file outside the expected directory");
+    else if (absolute)
+        h5policy_emit_warning("H5_ADVISORY_EXTERNAL_LINK_ABSOLUTE_PATH",
+                              off, object,
+                              "external link uses an absolute target path and can direct a consumer to open that file");
+    else
+        h5policy_emit_warning("H5_ADVISORY_EXTERNAL_LINK_RELATIVE_PATH",
+                              off, object,
+                              "external link uses a relative target path whose resolved file depends on consumer path resolution");
+}
+
 fun h5policy_validate_link_payload = (int ios,
                                       H5PolicyProfile profile,
                                       offset<uint<64>,B> payload_off,
@@ -334,6 +399,8 @@ fun h5policy_validate_link_payload = (int ios,
                                             "external link target file name is not terminated within the link value");
                     else
                         {
+                            h5policy_classify_external_link_target(
+                                ios, profile, val_off + 1#B, fname_nul, object);
                             var obj_rel = fname_nul + 2UL;   /* past fname + its NUL */
                             if (obj_rel >= ext_len
                                 || h5policy_scan_nul(ios, profile,

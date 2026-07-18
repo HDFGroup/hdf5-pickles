@@ -637,9 +637,22 @@ When this field is zero, encountering an external link emits:
 H5_POLICY_EXTERNAL_LINK (policy)
 ```
 
-When it is nonzero, no policy finding is emitted. The current external-link
-validator does not emit the absolute/relative/parent-path advisories used for
-external storage and VDS sources.
+When it is nonzero, no policy finding is emitted, but the external-link validator
+classifies the terminated target file name and can emit one of the relative,
+absolute, or parent-path advisories used for external storage and VDS sources:
+
+```text
+H5_ADVISORY_EXTERNAL_LINK_RELATIVE_PATH (warning)
+H5_ADVISORY_EXTERNAL_LINK_ABSOLUTE_PATH (warning)
+H5_ADVISORY_EXTERNAL_LINK_PARENT_PATH   (warning)
+```
+
+The classification is syntactic and best-effort: h5policy inspects only the
+stored bytes, never resolving the path or opening the target, so it cannot know
+the consumer's base directory or whether a plain name is itself a symlink. These
+advisories are suppressed when the feature is denied, although the message
+envelope (bounds and NUL termination of both the target file name and object
+path) is validated under every profile.
 
 ### `allow_external_storage`
 
