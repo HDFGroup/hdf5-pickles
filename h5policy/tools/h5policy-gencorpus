@@ -27,6 +27,7 @@ specification lives in ``tests/expected/*.yml`` and is checked by ``run.sh``.
 
 Requires: h5py.  Usage: h5policy-gencorpus [TARGET_DIR]
 """
+import base64
 import os
 import subprocess
 import struct
@@ -478,6 +479,8 @@ def _gen_malformed(root):
         f"{root}/malformed/scaleoffset_size_mismatch.h5")
     _make_chunk_size_uint32_wrap(
         f"{root}/malformed/chunk_size_uint32_wrap.h5")
+    _make_multifault_scaleoffset(
+        f"{root}/malformed/multifault_scaleoffset.h5")
     _make_bad_reference_datatype_version(
         f"{root}/malformed/bad_reference_datatype_version.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
@@ -933,6 +936,82 @@ def _make_chunk_size_uint32_wrap(path):
                 return
             p = mbody + msize
     raise RuntimeError("could not locate the v4 chunked layout message")
+
+
+# Three v1 object headers lifted verbatim from the libhdf5 ``invalid_read`` seed,
+# each carrying one hand-crafted fault.  v1 headers are unchecksummed, so they
+# embed as-is; the only edit is the chunked-layout B-tree address, neutralized to
+# the undefined sentinel (0xff..) so the fixture needs no raw data or chunk index.
+_MULTIFAULT_OHDRS = {
+    # layout dimensionality (3) != dataspace rank + 1 -> LAYOUT_RANK_MISMATCH
+    "Scale_offset_float_data_le": (
+        "AQAHAAEAAAAgAQAAAAAAAAEAKAAAAAAAAQMAAAAAAADHAAAAAAAAAAYAAAAAAAAABwAA"
+        "AAAAAAAGAAAAAAAAAAMAGAABAAAAESAfAAQAAAAAACAAFwgAF38AAAAAAAAABQAQAAEA"
+        "AAACAwIBBAAAAM3MDMAAAAAABAAIAAEAAAAEAAAAzcwMwAsAcAABAAAAAQEAAAAAAAAG"
+        "ABAAAQAUAHNjYWxlb2Zmc2V0AAAAAAAAAAAAAwAAAAwAAAABAAAABAAAAAAAAAAAAAAA"
+        "AQAAAM3MDMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAgAGAABAAAAAwID//////////8EAAAAAwAAAAQAAAAAEgAIAAAAAAABAAAAyqDRTQ=="),
+    # object-header message with an unknown type -> H5_POLICY_UNKNOWN_MESSAGE
+    "Scale_offset_double_data_le": (
+        "AQAHAAEAAAAoAQAAAAAAAAEAKAAAAAAAAQIBAAAAAAAHAAAAAAAAAAYAAAAAAAAABwAAAAAA"
+        "AAAGAAAAAAAAAAMAGAABAAAAESA/AAgAAAAAAEAANAsANP8DAAAAAAAABQAQAAEAAAACAwIB"
+        "CAAAAJqZowAAAAAAAA0QAAEAYgAAAAAAAA2ZmZmZAcAAAAAACwBwAAEAAAABAQAAAAAAAAYA"
+        "EAABABQAc2NhbGVvZmZzZXQAAAAAAAAAAAADAAAADAAAAAEAAAAIAAAAAAAAAAAAAAABAAAA"
+        "mpmZmZmZAcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAYAAEA"
+        "AAADAgP//////////wQAAAADAAAACAAAAAASAAgAAAAAAAEAAADKoNFN"),
+    # chunk dim byte-size exceeds 32 bits + scale-offset cd_values[2] disagrees
+    # with the chunk -> CHUNK_SIZE_EXCEEDS_32BIT + FILTER_NELMTS_MISMATCH
+    "Scale_offset_long_long_data_le": (
+        "AQAHAAEAAAAgAQAAAAAAAAEAKAAAAAAAAQIBAAAAAAAHAAAAAAAAAAYAAAAAAAAABwAAAAAA"
+        "AAAGAAAAAAAAAAMAEAABAAAAEAgAAAgAAAAAAEAAAAAAAAUAEAABAAAAAgMCAQgAAAD+////"
+        "/////wQAEAABAAAACAAAAP7/////////AAAAAAsAcAABAAAAAQEAAAAAAAAGABAAAQAUAHNj"
+        "YWxlb2Zmc2V0AAAAAAACAAAAAAAAAAwAAAAAAAAACAAAAAEAAAAAAAAAAQAAAP7/////////"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAGAABAAAAAwID////"
+        "//////8EAAAAdHRvcAgAAAAAEgAIAAAAAAABAAAAyqDRTQ=="),
+}
+
+
+def _make_multifault_scaleoffset(path):
+    """A minimized, multi-fault distillation of the libhdf5 ``invalid_read`` seed.
+
+    The original 950 KB seed held 24 filter/type datasets plus a 900 KB trailer;
+    only three scale-offset ``_le`` datasets carried faults.  This fixture keeps
+    just those three, each fault byte-identical to the seed, in a single ~5 KB
+    old-style file.  Because every fault lives inside an unchecksummed v1 object
+    header (see ``_MULTIFAULT_OHDRS``), the headers are embedded verbatim and
+    dropped into a fresh minimal symbol-table container built by h5py, with each
+    symbol-table entry repointed at its header.  h5policy must reject the file and
+    report all four faults across the three datasets in one pass:
+    LAYOUT_RANK_MISMATCH, UNKNOWN_MESSAGE, CHUNK_SIZE_EXCEEDS_32BIT, and
+    FILTER_NELMTS_MISMATCH."""
+    blobs = {nm: base64.b64decode(b64) for nm, b64 in _MULTIFAULT_OHDRS.items()}
+    raw = _base_bytes(
+        lambda h: [h.create_dataset(nm, data=np.zeros(1, dtype="i1"))
+                   for nm in blobs],
+        libver="earliest")
+
+    u = lambda o, n: int.from_bytes(raw[o:o + n], "little")
+    lh_data = u(0x2a8 + 24, 8)                 # local-heap data-segment address
+    def heapname(off):
+        p = lh_data + off
+        return raw[p:raw.index(b"\0", p)].decode("latin1")
+    snod = raw.index(b"SNOD")
+    entry = {}
+    p = snod + 8
+    for _ in range(u(snod + 6, 2)):            # symbol-table entries are 40 bytes
+        entry[heapname(u(p, 8))] = p
+        p += 40
+
+    align8 = lambda n: (n + 7) & ~7
+    for nm, blk in blobs.items():
+        pos = align8(len(raw))
+        raw += b"\0" * (pos - len(raw))
+        raw += blk
+        e = entry[nm]
+        raw[e + 8:e + 16] = pos.to_bytes(8, "little")   # object header address
+        raw[e + 16:e + 20] = (0).to_bytes(4, "little")  # cache type 0, no scratch
+    raw[40:48] = len(raw).to_bytes(8, "little")         # v0 superblock EOF field
+    _patch(path, bytes(raw))
 
 
 def _make_bad_reference_datatype_version(path):
