@@ -138,174 +138,6 @@ fun h5policy_validate_sohm_v2_records = (
         }
 }
 
-/* Recursively validate one type-7 or huge-object v2 B-tree node.  The entire
-   fixed allocation is range-checked and charged as metadata, while the stored
-   checksum covers the exact used prefix through its checksum field. */
-fun h5policy_walk_sohm_v2_btree_node = (
-    int ios, H5PolicyProfile profile, H5WalkContext ctx,
-    uint<64> node_addr, uint<64> node_depth, uint<64> nrec,
-    uint<64> node_size, uint<64> record_size, uint<64> record_type,
-    uint<64> types, uint<64> nfilters, uint<64> file_size,
-    string object) H5WalkContext:
-{
-    if (ctx.metadata_count_exceeded != 0UB)
-        return ctx;
-    if (node_depth > profile.resources.max_btree_depth)
-        {
-            h5policy_emit_error("H5_RESOURCE_BTREE_DEPTH", "resource",
-                                node_addr#B, object,
-                                "SOHM v2 B-tree depth exceeds the selected profile limit");
-            return ctx;
-        }
-    if (!h5policy_mark_visited_btree(node_addr))
-        {
-            h5policy_emit_error("H5_CORRUPT_SOHM_BTREE_CYCLE", "corrupt",
-                                node_addr#B, object,
-                                "SOHM v2 B-tree repeats a node address");
-            return ctx;
-        }
-    if (!h5policy_checked_addr_range(node_addr, node_size, file_size,
-                                     "SOHM v2 B-tree node outside file",
-                                     node_addr#B, object))
-        return ctx;
-
-    var o = global_sizeof_offsets as uint<64>;
-    var nrec_bytes = h5policy_chunk_bt2_nrec_bytes(node_size, record_size);
-    var subtree_bytes = node_depth > 1UL
-                        ? h5policy_chunk_bt2_subtree_bytes(
-                              node_size, record_size, node_depth - 1UL)
-                        : 0UL;
-    var ptr_size = o + nrec_bytes + subtree_bytes;
-    var capacity = (node_size - 10UL) / record_size;
-    if (node_depth > 0UL)
-        {
-            if (node_size < 10UL + ptr_size)
-                capacity = 0UL;
-            else
-                capacity = (node_size - 10UL - ptr_size)
-                           / (record_size + ptr_size);
-        }
-    if (nrec > capacity)
-        {
-            h5policy_emit_error("H5_CORRUPT_BTREE_NODE_ENTRY_COUNT", "corrupt",
-                                node_addr#B, object,
-                                "SOHM v2 B-tree node record count exceeds its capacity");
-            return ctx;
-        }
-
-    var rec_bytes = h5policy_checked_mul_u64(
-        nrec, record_size, 0xffffffffffffffffUL,
-        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-        "SOHM v2 B-tree node record bytes overflow");
-    var used_size = h5policy_checked_add_u64(
-        6UL, rec_bytes, 0xffffffffffffffffUL,
-        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-        "SOHM v2 B-tree node size overflow");
-    if (node_depth > 0UL)
-        {
-            var ptr_bytes = h5policy_checked_mul_u64(
-                nrec + 1UL, ptr_size, 0xffffffffffffffffUL,
-                "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-                "SOHM v2 B-tree child-pointer bytes overflow");
-            used_size = h5policy_checked_add_u64(
-                used_size, ptr_bytes, 0xffffffffffffffffUL,
-                "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-                "SOHM v2 B-tree node size overflow");
-        }
-    used_size = h5policy_checked_add_u64(
-        used_size, 4UL, 0xffffffffffffffffUL,
-        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-        "SOHM v2 B-tree checksum offset overflow");
-    if (used_size > node_size)
-        {
-            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
-                                node_addr#B, object,
-                                "SOHM v2 B-tree contents exceed the declared node size");
-            return ctx;
-        }
-
-    var expected_sig = node_depth == 0UL
-                       ? H5_FORMAT_BTLF_SIGNATURE : H5_FORMAT_BTIN_SIGNATURE;
-    if (h5policy_msg_bytes(ios, profile, node_addr#B, 4UL) != expected_sig)
-        {
-            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
-                                node_addr#B, object,
-                                node_depth == 0UL
-                                ? "SOHM v2 B-tree leaf signature mismatch"
-                                : "SOHM v2 B-tree internal-node signature mismatch");
-            return ctx;
-        }
-    h5policy_mark_reached(node_addr, node_depth == 0UL ? "BTLF" : "BTIN");
-    var version = h5policy_msg_u64_at(ios, profile, node_addr#B + 4#B, 1UL);
-    var found_type = h5policy_msg_u64_at(ios, profile, node_addr#B + 5#B, 1UL);
-    if (version != 0UL || found_type != record_type)
-        {
-            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_HEADER", "corrupt",
-                                node_addr#B, object,
-                                "SOHM v2 B-tree node version or record type does not match the header");
-            return ctx;
-        }
-
-    var metadata_over = h5policy_chunkindex_metadata_would_exceed(
-        ctx, profile, node_size);
-    ctx = h5policy_account_metadata(ctx, profile, node_size,
-                                    node_addr#B, object);
-    if (metadata_over)
-        return ctx;
-    if (!h5policy_chunkindex_verify_trailing_checksum(
-            ios, profile, node_addr, used_size, file_size, object,
-            node_depth == 0UL
-            ? "SOHM v2 B-tree leaf" : "SOHM v2 B-tree internal node"))
-        return ctx;
-
-    h5policy_validate_sohm_v2_records(
-        ios, profile, node_addr + 6UL, nrec, record_type, record_size,
-        types, nfilters, file_size, object);
-    if (node_depth == 0UL)
-        return ctx;
-
-    var ptr_base = node_addr + 6UL + rec_bytes;
-    var i = 0UL;
-    while (i < nrec + 1UL)
-        {
-            if (ctx.metadata_count_exceeded != 0UB)
-                return ctx;
-            var ptr_addr = ptr_base + i*ptr_size;
-            var child_raw = h5policy_msg_bytes(ios, profile, ptr_addr#B, o);
-            var child_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(child_raw));
-            var child_nrec = h5policy_msg_u64_at(
-                ios, profile, ptr_addr#B + o#B, nrec_bytes);
-            if (subtree_bytes != 0UL)
-                {
-                    var child_total = h5policy_msg_u64_at(
-                        ios, profile, ptr_addr#B + (o + nrec_bytes)#B,
-                        subtree_bytes);
-                    if (child_total < child_nrec)
-                        h5policy_emit_error("H5_CORRUPT_V2_BTREE_SUBTREE_COUNT",
-                                            "corrupt",
-                                            ptr_addr#B + (o + nrec_bytes)#B,
-                                            object,
-                                            "SOHM v2 B-tree subtree count is smaller than its node count");
-                }
-            if (h5policy_msg_addr_is_undef(child_raw))
-                h5policy_emit_error("H5_CORRUPT_SOHM_BTREE_CHILD_ADDRESS",
-                                    "corrupt", ptr_addr#B, object,
-                                    "SOHM v2 B-tree internal node has an undefined child address");
-            else if (child_addr >= file_size)
-                h5policy_emit_error("H5_CORRUPT_SOHM_BTREE_CHILD_ADDRESS",
-                                    "corrupt",
-                                    ptr_addr#B, object,
-                                    "SOHM v2 B-tree child address is outside file");
-            else
-                ctx = h5policy_walk_sohm_v2_btree_node(
-                    ios, profile, ctx, child_addr, node_depth - 1UL,
-                    child_nrec, node_size, record_size, record_type,
-                    types, nfilters, file_size, object);
-            i = i + 1UL;
-        }
-    return ctx;
-}
-
 /* Validate and descend a complete SOHM v2 B-tree.  ENFORCE_TOTAL connects a
    type-7 header's total-record count to the SMTB count; huge-object indexes do
    not carry an independent expected count at the caller. */
@@ -427,9 +259,44 @@ fun h5policy_walk_sohm_v2_btree = (
                                 "leaf-root SOHM v2 B-tree count differs from its root count");
             return ctx;
         }
-    return h5policy_walk_sohm_v2_btree_node(
-        ios, profile, ctx, root_addr, depth, root_nrec, node_size,
-        record_size, record_type, types, nfilters, file_size, object);
+    var spec = H5Bt2NodeSpec {
+        node_size = node_size,
+        record_size = record_size,
+        record_type = record_type,
+        depth_message = "SOHM v2 B-tree depth exceeds the selected profile limit",
+        cycle_code = "H5_CORRUPT_SOHM_BTREE_CYCLE",
+        cycle_message = "SOHM v2 B-tree repeats a node address",
+        range_message = "SOHM v2 B-tree node outside file",
+        capacity_message = "SOHM v2 B-tree node record count exceeds its capacity",
+        overflow_recbytes_message = "SOHM v2 B-tree node record bytes overflow",
+        overflow_size_message = "SOHM v2 B-tree node size overflow",
+        overflow_ptrbytes_message = "SOHM v2 B-tree child-pointer bytes overflow",
+        overflow_checksum_message = "SOHM v2 B-tree checksum offset overflow",
+        nodesize_message = "SOHM v2 B-tree contents exceed the declared node size",
+        leaf_sig_message = "SOHM v2 B-tree leaf signature mismatch",
+        internal_sig_message = "SOHM v2 B-tree internal-node signature mismatch",
+        header_message = "SOHM v2 B-tree node version or record type does not match the header",
+        leaf_what = "SOHM v2 B-tree leaf",
+        internal_what = "SOHM v2 B-tree internal node",
+        check_subtree_count = 1UB,
+        subtree_count_message = "SOHM v2 B-tree subtree count is smaller than its node count",
+        child_undef_code = "H5_CORRUPT_SOHM_BTREE_CHILD_ADDRESS",
+        child_undef_message = "SOHM v2 B-tree internal node has an undefined child address",
+        child_oof_code = "H5_CORRUPT_SOHM_BTREE_CHILD_ADDRESS",
+        child_oof_message = "SOHM v2 B-tree child address is outside file",
+        gate_on_chunk_count = 0UB,
+        validate = lambda (int vios, H5PolicyProfile vprofile,
+                           uint<64> vrecords_addr, uint<64> vnrec,
+                           uint<64> vfile_size, string vobject) void:
+            {
+                h5policy_validate_sohm_v2_records(
+                    vios, vprofile, vrecords_addr, vnrec, record_type,
+                    record_size, types, nfilters, vfile_size, vobject);
+            },
+    };
+    return h5policy_walk_v2_btree_node(
+        ios, profile, ctx, root_addr, depth, root_nrec,
+        file_size, object, spec);
 }
 
 /* Layer 2: validate the fractal heap's huge-object index without touching the

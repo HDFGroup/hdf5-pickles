@@ -201,142 +201,6 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext
     return ctx;
 }
 
-/* All v2 B-tree clients use the same node-capacity initialization.  In
-   libhdf5 that calculation divides the usable node bytes by record_size, so a
-   zero record width is corrupt even for an otherwise empty tree.  Keep this
-   check before every client-specific early return. */
-fun h5policy_validate_v2_btree_geometry = (uint<64> node_size,
-                                           uint<64> record_size,
-                                           off64 loc,
-                                           string object) int:
-{
-    if (record_size == 0UL)
-        {
-            h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_SIZE", "corrupt",
-                                loc, object,
-                                "v2 B-tree record size is zero");
-            return 0;
-        }
-    if (node_size < 10UL || record_size > node_size - 10UL)
-        {
-            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
-                                loc, object,
-                                "v2 B-tree node cannot hold one record");
-            return 0;
-        }
-    return 1;
-}
-
-/* Test whether charging BYTES would cross the selected metadata ceiling.  The
-   ordinary accounting helper still performs the charge and emits/saturates the
-   public metric; this predicate tells recursive walkers not to follow another
-   attacker-controlled edge after that refusal has been established. */
-fun h5policy_chunkindex_metadata_would_exceed = (H5WalkContext ctx,
-                                                 H5PolicyProfile profile,
-                                                 uint<64> bytes) int:
-{
-    var limit = profile.resources.max_accounted_metadata_bytes;
-    if (bytes > limit)
-        return 1;
-    return ctx.metadata_seen > limit - bytes;
-}
-
-/* Verify a chunk-index structure whose checksum is the final four bytes of its
-   used image.  A v2 B-tree node may reserve a larger fixed node_size; callers
-   pass only the used prefix through the checksum field, matching libhdf5. */
-fun h5policy_chunkindex_verify_trailing_checksum = (int ios, H5PolicyProfile profile,
-                                                     uint<64> addr, uint<64> total_size,
-                                                     uint<64> file_size, string object,
-                                                     string what) int:
-{
-    if (total_size < 4UL)
-        {
-            h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM", "corrupt",
-                                addr#B, object, what + " checksum field outside block");
-            return 0;
-        }
-    if (!h5policy_checked_addr_range(addr, total_size, file_size,
-                                     what + " outside file",
-                                     addr#B, object))
-        return 0;
-
-    var body_size = total_size - 4UL;
-    var body = h5policy_msg_bytes(ios, profile, addr#B, body_size);
-    var stored = lookup3_u32_le(h5policy_msg_bytes(ios, profile,
-                                                   addr#B + body_size#B, 4UL));
-    var calculated = lookup3_hashlittle(body, 0);
-    if (calculated != stored)
-        {
-            h5policy_emit_error_u64_evidence_at_sources(
-                "H5_CORRUPT_BAD_CHECKSUM", "corrupt", addr#B, object,
-                what + " checksum mismatch", "metadata.lookup3_checksum",
-                stored as uint<64>, calculated as uint<64>, "equal",
-                "actual", (addr + body_size)#B, 4UL,
-                [addr], [body_size]);
-            return 0;
-        }
-    return 1;
-}
-
-/* Number of bytes used for the records-in-child counter in every v2 B-tree
-   pointer.  libhdf5 derives this from the maximum LEAF capacity, not from the
-   smaller internal-node capacity. */
-fun h5policy_chunk_bt2_nrec_bytes = (uint<64> node_size,
-                                     uint<64> record_size) uint<64>:
-{
-    var max_nrec = (node_size - 10UL) / record_size;
-    var bytes = 1UL;
-    var threshold = 256UL;
-    while (max_nrec >= threshold)
-        {
-            bytes = bytes + 1UL;
-            threshold = threshold * 256UL;
-        }
-    return bytes;
-}
-
-/* Width of the records-in-subtree counter for a child pointer.  LEVEL is the
-   child's depth (zero for a leaf).  This is H5B2's cumulative maximum
-   recurrence, with saturation before any uint64 multiplication can wrap. */
-fun h5policy_chunk_bt2_subtree_bytes = (uint<64> node_size,
-                                        uint<64> record_size,
-                                        uint<64> level) uint<64>:
-{
-    if (level == 0UL)
-        return 0UL;
-
-    var o = global_sizeof_offsets as uint<64>;
-    var nrec_bytes = h5policy_chunk_bt2_nrec_bytes(node_size, record_size);
-    var cum_max = (node_size - 10UL) / record_size;
-    var subtree_bytes = 0UL;
-    var u64_max = 0xffffffffffffffffUL;
-    var current = 1UL;
-    while (current <= level)
-        {
-            var ptr_size = o + nrec_bytes + subtree_bytes;
-            if (node_size < 10UL + ptr_size)
-                return subtree_bytes;
-            var max_internal = (node_size - 10UL - ptr_size)
-                               / (record_size + ptr_size);
-            if (max_internal != 0UL
-                && cum_max > (u64_max - max_internal) / (max_internal + 1UL))
-                return 8UL;
-            cum_max = ((max_internal + 1UL) * cum_max) + max_internal;
-            subtree_bytes = 1UL;
-            var threshold = 256UL;
-            while (cum_max >= threshold)
-                {
-                    if (subtree_bytes >= 8UL
-                        || threshold > u64_max / 256UL)
-                        return 8UL;
-                    subtree_bytes = subtree_bytes + 1UL;
-                    threshold = threshold * 256UL;
-                }
-            current = current + 1UL;
-        }
-    return subtree_bytes;
-}
-
 /* Validate the address-bearing part of each type-10/type-11 chunk record.
    Internal-node records are real chunks too, so this is used for every node,
    not only leaves. */
@@ -406,167 +270,6 @@ fun h5policy_validate_v2_chunk_records = (int ios, H5PolicyProfile profile,
                 }
             i = i + 1UL;
         }
-}
-
-/* Recursively validate one v2 B-tree chunk-index node.  The declared node_size
-   bounds every read and is charged once; the checksum covers only the used
-   prefix.  Depth, a visited set, the metadata ceiling, the chunk ceiling, and
-   the global operation/time budgets independently bound descent. */
-fun h5policy_walk_v2_btree_chunk_node = (
-    int ios, H5PolicyProfile profile, H5WalkContext ctx,
-    uint<64> node_addr, uint<64> node_depth, uint<64> nrec,
-    uint<64> node_size, uint<64> record_size, uint<64> record_type,
-    uint<64> chunk_rank, uint<64> chunk_byte_size,
-    uint<64> file_size, string object) H5WalkContext:
-{
-    if (ctx.metadata_count_exceeded != 0UB)
-        return ctx;
-
-    if (node_depth > profile.resources.max_btree_depth)
-        {
-            h5policy_emit_error("H5_RESOURCE_BTREE_DEPTH", "resource",
-                                node_addr#B, object,
-                                "chunk v2 B-tree depth exceeds the selected profile limit");
-            return ctx;
-        }
-
-    if (!h5policy_mark_visited_btree(node_addr))
-        {
-            h5policy_emit_error("H5_CORRUPT_CHUNK_INDEX_CYCLE", "corrupt",
-                                node_addr#B, object,
-                                "v2 B-tree chunk index repeats a node address");
-            return ctx;
-        }
-
-    if (!h5policy_checked_addr_range(node_addr, node_size, file_size,
-                                     "v2 B-tree node outside file",
-                                     node_addr#B, object))
-        return ctx;
-
-    var o = global_sizeof_offsets as uint<64>;
-    var nrec_bytes = h5policy_chunk_bt2_nrec_bytes(node_size, record_size);
-    var subtree_bytes = node_depth > 1UL
-                        ? h5policy_chunk_bt2_subtree_bytes(
-                              node_size, record_size, node_depth - 1UL)
-                        : 0UL;
-    var ptr_size = o + nrec_bytes + subtree_bytes;
-    var capacity = (node_size - 10UL) / record_size;
-    if (node_depth > 0UL)
-        {
-            if (node_size < 10UL + ptr_size)
-                capacity = 0UL;
-            else
-                capacity = (node_size - 10UL - ptr_size)
-                           / (record_size + ptr_size);
-        }
-    if (nrec > capacity)
-        {
-            h5policy_emit_error("H5_CORRUPT_BTREE_NODE_ENTRY_COUNT", "corrupt",
-                                node_addr#B, object,
-                                "v2 B-tree chunk node record count exceeds its capacity");
-            return ctx;
-        }
-
-    var rec_bytes = h5policy_checked_mul_u64(
-        nrec, record_size, 0xffffffffffffffffUL,
-        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-        "v2 B-tree chunk node record bytes overflow");
-    var used_size = h5policy_checked_add_u64(
-        6UL, rec_bytes, 0xffffffffffffffffUL,
-        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-        "v2 B-tree chunk node size overflow");
-    if (node_depth > 0UL)
-        {
-            var ptr_bytes = h5policy_checked_mul_u64(
-                nrec + 1UL, ptr_size, 0xffffffffffffffffUL,
-                "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-                "v2 B-tree chunk child-pointer bytes overflow");
-            used_size = h5policy_checked_add_u64(
-                used_size, ptr_bytes, 0xffffffffffffffffUL,
-                "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-                "v2 B-tree chunk node size overflow");
-        }
-    used_size = h5policy_checked_add_u64(
-        used_size, 4UL, 0xffffffffffffffffUL,
-        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
-        "v2 B-tree chunk node checksum offset overflow");
-    if (used_size > node_size)
-        {
-            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
-                                node_addr#B, object,
-                                "v2 B-tree chunk node contents exceed the declared node size");
-            return ctx;
-        }
-
-    var expected_sig = node_depth == 0UL
-                       ? H5_FORMAT_BTLF_SIGNATURE : H5_FORMAT_BTIN_SIGNATURE;
-    if (h5policy_msg_bytes(ios, profile, node_addr#B, 4UL) != expected_sig)
-        {
-            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
-                                node_addr#B, object,
-                                node_depth == 0UL
-                                ? "v2 B-tree chunk leaf signature mismatch"
-                                : "v2 B-tree chunk internal-node signature mismatch");
-            return ctx;
-        }
-    h5policy_mark_reached(node_addr, node_depth == 0UL ? "BTLF" : "BTIN");
-    var version = h5policy_msg_u64_at(ios, profile, node_addr#B + 4#B, 1UL);
-    var found_type = h5policy_msg_u64_at(ios, profile, node_addr#B + 5#B, 1UL);
-    if (version != 0UL || found_type != record_type)
-        {
-            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_HEADER", "corrupt",
-                                node_addr#B, object,
-                                "v2 B-tree chunk node version or record type does not match the header");
-            return ctx;
-        }
-
-    var metadata_over = h5policy_chunkindex_metadata_would_exceed(
-        ctx, profile, node_size);
-    ctx = h5policy_account_metadata(ctx, profile, node_size,
-                                    node_addr#B, object);
-    if (metadata_over)
-        return ctx;
-    if (!h5policy_chunkindex_verify_trailing_checksum(
-            ios, profile, node_addr, used_size, file_size, object,
-            node_depth == 0UL
-            ? "v2 B-tree chunk leaf" : "v2 B-tree chunk internal node"))
-        return ctx;
-
-    h5policy_validate_v2_chunk_records(
-        ios, profile, node_addr + 6UL, nrec, record_type, record_size,
-        chunk_rank, chunk_byte_size, file_size, object);
-
-    if (node_depth == 0UL || ctx.chunk_count_exceeded != 0UB)
-        return ctx;
-
-    var ptr_base = node_addr + 6UL + rec_bytes;
-    var i = 0UL;
-    while (i < nrec + 1UL)
-        {
-            if (ctx.metadata_count_exceeded != 0UB)
-                return ctx;
-            var ptr_addr = ptr_base + (i * ptr_size);
-            var child_raw = h5policy_msg_bytes(ios, profile, ptr_addr#B, o);
-            var child_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(child_raw));
-            var child_nrec = h5policy_msg_u64_at(
-                ios, profile, ptr_addr#B + o#B, nrec_bytes);
-            if (h5policy_msg_addr_is_undef(child_raw))
-                h5policy_emit_error("H5_CORRUPT_CHUNK_INDEX_CHILD_ADDRESS",
-                                    "corrupt", ptr_addr#B, object,
-                                    "v2 B-tree chunk internal node has an undefined child address");
-            else if (child_addr >= file_size)
-                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
-                                    ptr_addr#B, object,
-                                    "v2 B-tree chunk child address outside file");
-            else
-                ctx = h5policy_walk_v2_btree_chunk_node(
-                    ios, profile, ctx, child_addr, node_depth - 1UL,
-                    child_nrec, node_size, record_size, record_type,
-                    chunk_rank, chunk_byte_size, file_size, object);
-            i = i + 1UL;
-        }
-
-    return ctx;
 }
 
 /* Validate a version-2 B-tree chunk index (v4 layout index type 5).  The
@@ -708,10 +411,45 @@ fun h5policy_walk_v2_btree_chunks = (int ios, H5PolicyProfile profile,
             return ctx;
         }
 
-    return h5policy_walk_v2_btree_chunk_node(
+    var spec = H5Bt2NodeSpec {
+        node_size = node_size,
+        record_size = record_size,
+        record_type = record_type,
+        depth_message = "chunk v2 B-tree depth exceeds the selected profile limit",
+        cycle_code = "H5_CORRUPT_CHUNK_INDEX_CYCLE",
+        cycle_message = "v2 B-tree chunk index repeats a node address",
+        range_message = "v2 B-tree node outside file",
+        capacity_message = "v2 B-tree chunk node record count exceeds its capacity",
+        overflow_recbytes_message = "v2 B-tree chunk node record bytes overflow",
+        overflow_size_message = "v2 B-tree chunk node size overflow",
+        overflow_ptrbytes_message = "v2 B-tree chunk child-pointer bytes overflow",
+        overflow_checksum_message = "v2 B-tree chunk node checksum offset overflow",
+        nodesize_message = "v2 B-tree chunk node contents exceed the declared node size",
+        leaf_sig_message = "v2 B-tree chunk leaf signature mismatch",
+        internal_sig_message = "v2 B-tree chunk internal-node signature mismatch",
+        header_message = "v2 B-tree chunk node version or record type does not match the header",
+        leaf_what = "v2 B-tree chunk leaf",
+        internal_what = "v2 B-tree chunk internal node",
+        check_subtree_count = 0UB,
+        subtree_count_message = "",
+        child_undef_code = "H5_CORRUPT_CHUNK_INDEX_CHILD_ADDRESS",
+        child_undef_message = "v2 B-tree chunk internal node has an undefined child address",
+        child_oof_code = "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+        child_oof_message = "v2 B-tree chunk child address outside file",
+        gate_on_chunk_count = 1UB,
+        validate = lambda (int vios, H5PolicyProfile vprofile,
+                           uint<64> vrecords_addr, uint<64> vnrec,
+                           uint<64> vfile_size, string vobject) void:
+            {
+                h5policy_validate_v2_chunk_records(
+                    vios, vprofile, vrecords_addr, vnrec, record_type,
+                    record_size, chunk_rank, chunk_byte_size, vfile_size,
+                    vobject);
+            },
+    };
+    return h5policy_walk_v2_btree_node(
         ios, profile, ctx, root_addr, depth, num_root,
-        node_size, record_size, record_type, chunk_rank,
-        chunk_byte_size, file_size, object);
+        file_size, object, spec);
 }
 
 /* Fixed arrays are simple when unpaged: one data block, one element per chunk.
