@@ -152,6 +152,11 @@ Current coverage includes:
   resolution, fractal-heap envelopes, and complete huge-object index trees.
   Every recursive SOHM node is independently bounded by range, checksum,
   visited-node, depth, operation/time, and accounted-metadata limits.
+- File-global free-space managers named by the file-space-info message: each
+  `FSHD` header and its `FSSE` serialized section list are range-checked,
+  checksummed, and metadata-accounted, and every free section's extent and
+  class type is validated.  Fractal-heap (non-file) managers, reached from a
+  heap header rather than the file-space-info message, remain a coverage gap.
 - Logical dataset byte accounting kept separate from raw storage accounting, so
   datatype semantics can be compared against `libhdf5` while layout checks still
   use on-disk storage size.

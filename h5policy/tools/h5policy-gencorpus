@@ -69,6 +69,22 @@ def _write_page_fsinfo(path, persist, fn):
         fn(h)
 
 
+def _write_fsm_persist(path, fn):
+    """Write a file with persistent, non-paged free-space managers.
+
+    The FSM_AGGR strategy with persistence tracks freed file space in on-disk
+    free-space managers (an FSHD header plus an FSSE serialized section list per
+    memory type), referenced from the superblock extension's file-space-info
+    message.  ``fn`` should create and then free objects so genuine sections are
+    serialized on close.  The root group is kept small so it stays compact and
+    no incidental fractal-heap (client 0) manager is created.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with h5py.File(path, "w", libver="latest",
+                   fs_strategy="fsm", fs_persist=True, fs_threshold=1) as h:
+        fn(h)
+
+
 def _base_bytes(build, libver="latest"):
     """Return the raw bytes of a fresh h5py base file.
 
@@ -483,15 +499,28 @@ def _gen_integration(root):
     _write(f"{root}/integration/deep_hard_link_chain.h5",
            _deep_hard_link_chain)
 
+    # Persistent, non-paged free-space managers.  Eight datasets are created and
+    # four freed, so the file-level free space is serialized into FSHD/FSSE
+    # structures referenced from the file-space-info message.  h5policy walks
+    # every manager -- header checksum, section-list checksum, and each free
+    # section's [address, size) extent -- and accepts the fully-covered file.
+    def _fsm_persist(h):
+        for i in range(8):
+            h.create_dataset(f"d{i}", data=np.arange(400 + 40*i, dtype="i8"))
+        for i in (1, 3, 5, 7):
+            del h[f"d{i}"]
+    _write_fsm_persist(f"{root}/valid/fsm_persist.h5", _fsm_persist)
+
+    # A PAGE-strategy file-space-info message with persistence disabled: the
+    # envelope is validated but there are no persisted managers to walk, so the
+    # file is a clean accept rather than a coverage gap.
+    _write_page_fsinfo(
+        f"{root}/valid/fsinfo_page_nonpersistent.h5", False,
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")))
+
 
 def _gen_coverage(root):
     # ---- coverage/ : not yet classified, expected `unsupported_coverage_gap`
-    # PAGE strategy forces a v1 file-space-info message into the superblock
-    # extension.  With persistence disabled it has no manager-address array.
-    _write_page_fsinfo(
-        f"{root}/coverage/fsinfo_page_nonpersistent.h5", False,
-        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")))
-
     # An attribute whose datatype is a committed (shared) datatype; the shared
     # message reference is not resolved yet.
     def _shared_attr(h):
@@ -640,6 +669,18 @@ def _gen_malformed(root):
     _make_bad_sohm_huge_object_extent(
         f"{root}/malformed/bad_sohm_huge_object_extent.h5",
         f"{root}/coverage/sohm_huge_btree.h5")
+    _make_bad_fsm_section_list_checksum(
+        f"{root}/malformed/bad_fsm_section_list_checksum.h5",
+        f"{root}/valid/fsm_persist.h5")
+    _make_bad_fsm_section_extent(
+        f"{root}/malformed/bad_fsm_section_extent.h5",
+        f"{root}/valid/fsm_persist.h5")
+    _make_bad_fsm_section_type(
+        f"{root}/malformed/bad_fsm_section_type.h5",
+        f"{root}/valid/fsm_persist.h5")
+    _make_bad_fsm_section_count(
+        f"{root}/malformed/bad_fsm_section_count.h5",
+        f"{root}/valid/fsm_persist.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
     _make_bad_dataset_missing_layout(
@@ -1724,6 +1765,89 @@ def _make_bad_sohm_huge_object_extent(path, base_path):
     checksum = child + 6 + child_nrec * bt["record_size"]
     struct.pack_into("<I", raw, checksum,
                      _jenkins_lookup3()(bytes(raw[child:checksum])))
+    _patch(path, bytes(raw))
+
+
+def _fsm_file_sinfo(raw):
+    """Locate the first file (client 1) free-space manager that owns a
+    serialized section list, returning the header and section-list geometry a
+    patcher needs to mutate a record and repair the covering checksum.  The
+    encode widths mirror libhdf5's H5FS__sinfo_new / deserialize."""
+    o = raw[9]
+    l = raw[10]
+    undef = (1 << (8 * o)) - 1
+    i = raw.find(b"FSHD")
+    while i >= 0:
+        client = raw[i + 5]
+        serial = int.from_bytes(raw[i + 6 + 2*l:i + 6 + 3*l], "little")
+        nclasses = struct.unpack_from("<H", raw, i + 6 + 4*l)[0]
+        max_bits = struct.unpack_from("<H", raw, i + 12 + 4*l)[0]
+        max_sz = int.from_bytes(raw[i + 14 + 4*l:i + 14 + 5*l], "little")
+        sect_addr = int.from_bytes(
+            raw[i + 14 + 5*l:i + 14 + 5*l + o], "little")
+        used = int.from_bytes(
+            raw[i + 14 + 5*l + o:i + 14 + 6*l + o], "little")
+        hdr_size = 18 + 7*l + o
+        if client == 1 and serial > 0 and sect_addr != undef:
+            cnt_size = (max(serial, 1).bit_length() - 1) // 8 + 1
+            len_size = (max(max_sz, 1).bit_length() - 1) // 8 + 1
+            off_size = (max_bits + 7) // 8
+            return dict(
+                o=o, l=l, hdr=i, hdr_size=hdr_size,
+                hdr_checksum=i + hdr_size - 4, serial=serial,
+                nclasses=nclasses, sect_addr=sect_addr, used=used,
+                sect_checksum=sect_addr + used - 4, cnt_size=cnt_size,
+                len_size=len_size, off_size=off_size,
+                first_section=sect_addr + 5 + o + cnt_size + len_size)
+        i = raw.find(b"FSHD", i + 4)
+    raise RuntimeError("no file free-space manager with a section list")
+
+
+def _make_bad_fsm_section_list_checksum(path, base_path):
+    """Flip a byte in a file FSM's serialized section-list checksum."""
+    raw = bytearray(open(base_path, "rb").read())
+    fsm = _fsm_file_sinfo(raw)
+    raw[fsm["sect_checksum"]] ^= 0x01
+    _patch(path, bytes(raw))
+
+
+def _make_bad_fsm_section_extent(path, base_path):
+    """Move a free section's extent beyond EOA; repair the list checksum so the
+    out-of-file extent is the only surviving fault."""
+    raw = bytearray(open(base_path, "rb").read())
+    fsm = _fsm_file_sinfo(raw)
+    first = fsm["first_section"]
+    outside = len(raw) + 0x1000
+    raw[first:first + fsm["off_size"]] = outside.to_bytes(
+        fsm["off_size"], "little")
+    struct.pack_into("<I", raw, fsm["sect_checksum"],
+                     _jenkins_lookup3()(
+                         bytes(raw[fsm["sect_addr"]:fsm["sect_checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_bad_fsm_section_type(path, base_path):
+    """Give a free section an out-of-range class type; repair the list hash."""
+    raw = bytearray(open(base_path, "rb").read())
+    fsm = _fsm_file_sinfo(raw)
+    raw[fsm["first_section"] + fsm["off_size"]] = 0xff   # >= nclasses
+    struct.pack_into("<I", raw, fsm["sect_checksum"],
+                     _jenkins_lookup3()(
+                         bytes(raw[fsm["sect_addr"]:fsm["sect_checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_bad_fsm_section_count(path, base_path):
+    """Break the FSHD identity serial + ghost == total; repair its checksum."""
+    raw = bytearray(open(base_path, "rb").read())
+    fsm = _fsm_file_sinfo(raw)
+    l = fsm["l"]
+    tot_off = fsm["hdr"] + 6 + l
+    tot = int.from_bytes(raw[tot_off:tot_off + l], "little")
+    raw[tot_off:tot_off + l] = (tot + 1).to_bytes(l, "little")
+    struct.pack_into("<I", raw, fsm["hdr_checksum"],
+                     _jenkins_lookup3()(
+                         bytes(raw[fsm["hdr"]:fsm["hdr_checksum"]])))
     _patch(path, bytes(raw))
 
 
