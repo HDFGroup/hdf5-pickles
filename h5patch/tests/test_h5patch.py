@@ -14,6 +14,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -43,9 +45,26 @@ def run(args, **kwargs):
 
 
 def assert_accept(path):
-    proc = run([H5POLICY, "--profile", "untrusted-strict", "--json", path])
+    proc = subprocess.run(
+        [H5POLICY, "--profile", "untrusted-strict", "--json", path],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode in (0, 1), (proc.returncode, proc.stdout, proc.stderr)
     report = json.loads(proc.stdout)
     assert report["decision"] in ("accept", "accept_with_warnings"), report
+
+
+def jenkins_lookup3(data):
+    """Load the corpus builder's vetted HDF5 lookup3 implementation."""
+    path = os.path.join(
+        REPO, "h5policy", "tests", "cve", "make_cve_2020_10812.py"
+    )
+    loader = importlib.machinery.SourceFileLoader("h5patch_checksum_test", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module.jenkins_lookup3(data)
 
 
 def corrupt_first_ohdr_checksum(path):
@@ -102,9 +121,9 @@ def corrupt_depth0_bthd_total_count(path):
 def corrupt_v4_chunk_layout_element_size(path, dataset_name="d"):
     """Change only a v4 chunk layout's trailing element-size dimension.
 
-    The caller intentionally gets a stale object-header checksum.  Existing
-    h5patch checksum repair is then used to produce the checksum-valid semantic
-    mismatch that exercises the new catalog item.
+    The caller intentionally gets a stale object-header checksum.  The semantic
+    repair must restore the field and reseal the complete hypothetical header
+    in one plan.
     """
     with h5py.File(path, "r") as h:
         dataset = h[dataset_name]
@@ -184,6 +203,16 @@ def corrupt_v4_chunk_layout_element_size(path, dataset_name="d"):
         "datatype_size": datatype_size,
         "wrong_size": wrong_size,
     }
+
+
+def reseal_v2_object_header(path, info):
+    raw = bytearray(open(path, "rb").read())
+    checksum = jenkins_lookup3(bytes(raw[info["ohdr"]:info["checksum_off"]]))
+    raw[info["checksum_off"]:info["checksum_off"] + 4] = checksum.to_bytes(
+        4, "little"
+    )
+    with open(path, "wb") as fh:
+        fh.write(raw)
 
 
 def assert_modern_h5ls_rejects_dataset(path):
@@ -300,9 +329,7 @@ def test_depth0_btree_total_count_repair(tmp):
 def test_v4_chunk_layout_element_size_repair(tmp):
     src = os.path.join(CORPUS, "valid", "chunk_ext_array.h5")
     valid_plan = os.path.join(tmp, "valid_chunk_layout.plan.json")
-    stale_checksum = os.path.join(tmp, "stale_layout_checksum.h5")
-    checksum_plan = os.path.join(tmp, "layout_checksum.plan.json")
-    mismatched = os.path.join(tmp, "bad_layout_element_size.h5")
+    damaged = os.path.join(tmp, "bad_layout_element_size.h5")
     plan = os.path.join(tmp, "layout_element_size.plan.json")
     repaired = os.path.join(tmp, "layout_element_size_repaired.h5")
     final_plan = os.path.join(tmp, "layout_element_size_final.plan.json")
@@ -311,30 +338,20 @@ def test_v4_chunk_layout_element_size_repair(tmp):
     run([H5PATCH, "plan", src, "-o", valid_plan])
     assert json.load(open(valid_plan))["actions"] == []
 
-    shutil.copyfile(src, stale_checksum)
-    info = corrupt_v4_chunk_layout_element_size(stale_checksum)
+    shutil.copyfile(src, damaged)
+    info = corrupt_v4_chunk_layout_element_size(damaged)
 
-    # Semantic repair is gated on a valid enclosing checksum.  Reseal the
-    # deliberately stale fixture first, and ensure apply performs no unreviewed
-    # element-size write in that pass.
-    run([H5PATCH, "plan", stale_checksum, "-o", checksum_plan])
-    checksum_spec = json.load(open(checksum_plan))
-    assert [a["target"]["structure"] for a in checksum_spec["actions"]] == [
-        "object_header_v2"
-    ], checksum_spec
-    run([H5PATCH, "apply", stale_checksum, checksum_plan, "--output", mismatched])
-    assert_modern_h5ls_rejects_dataset(mismatched)
-
-    before_plan = open(mismatched, "rb").read()
-    run([H5PATCH, "plan", mismatched, "-o", plan])
-    assert open(mismatched, "rb").read() == before_plan, "plan modified its input"
+    # The semantic field and enclosing checksum are one atomic plan, avoiding a
+    # checksum-valid but semantically inconsistent intermediate file.
+    before_plan = open(damaged, "rb").read()
+    run([H5PATCH, "plan", damaged, "-o", plan])
+    assert open(damaged, "rb").read() == before_plan, "plan modified its input"
     spec = json.load(open(plan))
     assert [a["target"]["structure"] for a in spec["actions"]] == [
         "chunk_layout_v4",
-        "object_header_v2",
     ], spec
 
-    layout_action, checksum_action = spec["actions"]
+    layout_action = spec["actions"][0]
     assert layout_action["kind"] == "set_uint_le"
     assert layout_action["target"]["offset"] == info["ohdr"]
     assert layout_action["writes"] == [{
@@ -347,11 +364,7 @@ def test_v4_chunk_layout_element_size_repair(tmp):
             info["element_width"], "little"
         ).hex(),
     }]
-    assert checksum_action["kind"] == "recompute_checksum"
-    assert checksum_action["writes"][0]["offset"] == info["checksum_off"]
-    assert checksum_action["writes"][0]["size"] == 4
-
-    run([H5PATCH, "apply", mismatched, plan, "--output", repaired])
+    run([H5PATCH, "apply", damaged, plan, "--output", repaired])
     after_apply = open(repaired, "rb").read()
     assert len(after_apply) == len(before_plan)
     assert int.from_bytes(
@@ -383,6 +396,162 @@ def test_v4_chunk_layout_element_size_repair(tmp):
     assert json.load(open(final_plan))["actions"] == []
 
 
+def test_superblock_base_address_repair(tmp):
+    src = os.path.join(CORPUS, "malformed", "bad_base_address.h5")
+    damaged = os.path.join(tmp, "bad_base_address.h5")
+    repaired = os.path.join(tmp, "base_address_repaired.h5")
+    plan = os.path.join(tmp, "base_address.plan.json")
+    final_plan = os.path.join(tmp, "base_address.final.plan.json")
+    shutil.copyfile(src, damaged)
+
+    run([H5PATCH, "plan", damaged, "-o", plan])
+    spec = json.load(open(plan))
+    assert [a["target"]["structure"] for a in spec["actions"]] == [
+        "superblock_v2_v3",
+        "superblock_v2_v3",
+    ], spec
+    base_action, checksum_action = spec["actions"]
+    assert base_action["kind"] == "set_uint_le"
+    assert base_action["writes"][0]["offset"] == 12
+    assert int.from_bytes(
+        bytes.fromhex(base_action["writes"][0]["new_hex"]), "little"
+    ) == spec["input"]["superblock_offset"]
+    assert checksum_action["kind"] == "recompute_checksum"
+
+    run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+    assert_accept(repaired)
+    run([H5PATCH, "plan", repaired, "-o", final_plan])
+    assert json.load(open(final_plan))["actions"] == []
+
+
+def test_filter_parameter_repairs(tmp):
+    cases = (
+        (
+            "scaleoffset_nelmts_mismatch.h5",
+            "set decode-filter element count to the chunk element count",
+        ),
+        (
+            "scaleoffset_size_mismatch.h5",
+            "set decode-filter element size to the datatype storage size",
+        ),
+    )
+    for name, reason in cases:
+        src = os.path.join(CORPUS, "malformed", name)
+        damaged = os.path.join(tmp, "damaged-" + name)
+        repaired = os.path.join(tmp, "repaired-" + name)
+        plan = os.path.join(tmp, name + ".plan.json")
+        final_plan = os.path.join(tmp, name + ".final.plan.json")
+        shutil.copyfile(src, damaged)
+
+        before = open(damaged, "rb").read()
+        run([H5PATCH, "plan", damaged, "-o", plan])
+        assert open(damaged, "rb").read() == before, "plan modified its input"
+        spec = json.load(open(plan))
+        assert [a["target"]["structure"] for a in spec["actions"]] == [
+            "filter_pipeline",
+            "object_header_v2",
+        ], spec
+        field_action, checksum_action = spec["actions"]
+        assert field_action["kind"] == "set_uint_le"
+        assert field_action["reason"] == reason
+        assert field_action["confidence"] == "high"
+        assert int.from_bytes(
+            bytes.fromhex(field_action["writes"][0]["new_hex"]), "little"
+        ) == 4
+        assert checksum_action["kind"] == "recompute_checksum"
+
+        run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+        assert_accept(repaired)
+        run([H5PATCH, "plan", repaired, "-o", final_plan])
+        assert json.load(open(final_plan))["actions"] == []
+
+
+def test_combined_object_header_semantic_repairs(tmp):
+    src = os.path.join(CORPUS, "malformed", "scaleoffset_nelmts_mismatch.h5")
+    damaged = os.path.join(tmp, "combined_semantic_damage.h5")
+    repaired = os.path.join(tmp, "combined_semantic_repaired.h5")
+    plan = os.path.join(tmp, "combined_semantic.plan.json")
+    final_plan = os.path.join(tmp, "combined_semantic.final.plan.json")
+    shutil.copyfile(src, damaged)
+
+    info = corrupt_v4_chunk_layout_element_size(damaged)
+    reseal_v2_object_header(damaged, info)
+    run([H5PATCH, "plan", damaged, "-o", plan])
+    spec = json.load(open(plan))
+    assert [a["target"]["structure"] for a in spec["actions"]] == [
+        "chunk_layout_v4",
+        "filter_pipeline",
+        "object_header_v2",
+    ], spec
+    checksum_actions = [
+        action for action in spec["actions"]
+        if action["kind"] == "recompute_checksum"
+    ]
+    assert len(checksum_actions) == 1, spec
+
+    run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+    assert_accept(repaired)
+    run([H5PATCH, "plan", repaired, "-o", final_plan])
+    assert json.load(open(final_plan))["actions"] == []
+
+
+def test_fshd_section_count_repair(tmp):
+    src = os.path.join(CORPUS, "malformed", "bad_fsm_section_count.h5")
+    damaged = os.path.join(tmp, "bad_fsm_section_count.h5")
+    repaired = os.path.join(tmp, "fsm_count_repaired.h5")
+    plan = os.path.join(tmp, "fsm_count.plan.json")
+    final_plan = os.path.join(tmp, "fsm_count.final.plan.json")
+    shutil.copyfile(src, damaged)
+
+    run([H5PATCH, "plan", damaged, "-o", plan])
+    spec = json.load(open(plan))
+    assert [a["target"]["structure"] for a in spec["actions"]] == [
+        "free_space_manager_header",
+        "free_space_manager_header",
+    ], spec
+    count_action, checksum_action = spec["actions"]
+    assert count_action["kind"] == "set_uint_le"
+    assert int.from_bytes(
+        bytes.fromhex(count_action["writes"][0]["new_hex"]), "little"
+    ) == 3
+    assert checksum_action["kind"] == "recompute_checksum"
+
+    run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+    assert_accept(repaired)
+    run([H5PATCH, "plan", repaired, "-o", final_plan])
+    assert json.load(open(final_plan))["actions"] == []
+
+
+def test_reached_metadata_checksum_repairs(tmp):
+    cases = (
+        ("bad_fsm_section_list_checksum.h5", "free_space_section_list"),
+        ("bad_sohm_btree_deep_checksum.h5", "v2_btree_leaf"),
+        ("bad_chunk_v2_btree_deep_checksum.h5", "v2_btree_leaf"),
+        ("bad_ext_array_deep_checksum.h5", "extensible_array_data_block"),
+    )
+    for name, structure in cases:
+        src = os.path.join(CORPUS, "malformed", name)
+        damaged = os.path.join(tmp, "damaged-" + name)
+        repaired = os.path.join(tmp, "repaired-" + name)
+        plan = os.path.join(tmp, name + ".plan.json")
+        final_plan = os.path.join(tmp, name + ".final.plan.json")
+        shutil.copyfile(src, damaged)
+
+        run([H5PATCH, "plan", damaged, "-o", plan])
+        spec = json.load(open(plan))
+        assert len(spec["actions"]) == 1, spec
+        action = spec["actions"][0]
+        assert action["kind"] == "recompute_checksum"
+        assert action["target"]["structure"] == structure
+        assert action["confidence"] == "medium"
+        assert action["writes"][0]["size"] == 4
+
+        run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+        assert_accept(repaired)
+        run([H5PATCH, "plan", repaired, "-o", final_plan])
+        assert json.load(open(final_plan))["actions"] == []
+
+
 def test_userblock_files_need_no_repairs(tmp):
     for name in ("userblock_latest.h5", "userblock_earliest.h5"):
         src = os.path.join(CORPUS, "valid", name)
@@ -402,6 +571,11 @@ def main():
         test_snod_symbol_count_repair(tmp)
         test_depth0_btree_total_count_repair(tmp)
         test_v4_chunk_layout_element_size_repair(tmp)
+        test_superblock_base_address_repair(tmp)
+        test_filter_parameter_repairs(tmp)
+        test_combined_object_header_semantic_repairs(tmp)
+        test_fshd_section_count_repair(tmp)
+        test_reached_metadata_checksum_repairs(tmp)
         test_userblock_files_need_no_repairs(tmp)
     print("h5patch tests passed")
 

@@ -55,6 +55,7 @@ var h5patch_action_write_offsets = uint<64>[]();
 var h5patch_action_sizes = uint<64>[]();
 var h5patch_action_old_hex = string[]();
 var h5patch_action_new_hex = string[]();
+var h5patch_action_new_bytes = byte[][]();
 var h5patch_action_reasons = string[]();
 var h5patch_action_confidences = string[]();
 
@@ -69,6 +70,7 @@ fun h5patch_reset_actions = void:
     h5patch_action_sizes = uint<64>[]();
     h5patch_action_old_hex = string[]();
     h5patch_action_new_hex = string[]();
+    h5patch_action_new_bytes = byte[][]();
     h5patch_action_reasons = string[]();
     h5patch_action_confidences = string[]();
 }
@@ -128,6 +130,92 @@ fun h5patch_u64_le_bytes = (uint<64> value, uint<64> width) byte[]:
     return out;
 }
 
+/* Replace one byte range in an in-memory metadata image.  Semantic planners
+   use this to calculate the checksum of the exact hypothetical bytes described
+   by their actions without modifying the input in plan mode. */
+fun h5patch_replace_bytes = (byte[] body, uint<64> rel,
+                             byte[] replacement) byte[]:
+{
+    if (rel > body'length || replacement'length > body'length - rel)
+        return byte[]();
+    if (rel == 0UL && replacement'length == body'length)
+        return replacement;
+    if (rel == 0UL)
+        return replacement + body[replacement'length:body'length];
+    if (rel + replacement'length == body'length)
+        return body[0UL:rel] + replacement;
+    return body[0UL:rel] + replacement
+           + body[rel + replacement'length:body'length];
+}
+
+fun h5patch_has_finding_code = (string code) int:
+{
+    var i = 0UL;
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[i] == code)
+                return 1;
+            i = i + 1UL;
+        }
+    return 0;
+}
+
+/* Field-derived and reached-structure repairs rely on a complete finding and
+   reachability record.  Superblock-only repairs do not use this gate because a
+   bad superblock field can itself prevent a meaningful reachable walk. */
+fun h5patch_policy_evidence_complete = int:
+{
+    return h5policy_result_analysis_complete
+           && h5policy_result_reachability_complete;
+}
+
+fun h5patch_action_write_exists = (uint<64> off, uint<64> size) int:
+{
+    var i = 0UL;
+    while (i < h5patch_action_write_offsets'length)
+        {
+            if (h5patch_action_write_offsets[i] == off
+                && h5patch_action_sizes[i] == size)
+                return 1;
+            i = i + 1UL;
+        }
+    return 0;
+}
+
+fun h5patch_has_semantic_ohdr_action = (uint<64> off) int:
+{
+    var i = 0UL;
+    while (i < h5patch_action_target_offsets'length)
+        {
+            if (h5patch_action_target_offsets[i] == off
+                && (h5patch_action_structures[i] == "chunk_layout_v4"
+                    || h5patch_action_structures[i] == "filter_pipeline"))
+                return 1;
+            i = i + 1UL;
+        }
+    return 0;
+}
+
+fun h5patch_structure_name = (string kind) string:
+{
+    if (kind == "FSHD") return "free_space_manager_header";
+    if (kind == "FSSE") return "free_space_section_list";
+    if (kind == "BTHD") return "v2_btree_header";
+    if (kind == "BTIN") return "v2_btree_internal";
+    if (kind == "BTLF") return "v2_btree_leaf";
+    if (kind == "FAHD") return "fixed_array_header";
+    if (kind == "FADB") return "fixed_array_data_block";
+    if (kind == "EAHD") return "extensible_array_header";
+    if (kind == "EAIB") return "extensible_array_index_block";
+    if (kind == "EASB") return "extensible_array_super_block";
+    if (kind == "EADB") return "extensible_array_data_block";
+    if (kind == "EAPG") return "extensible_array_page";
+    if (kind == "SMTB") return "shared_message_table";
+    if (kind == "SMLI") return "shared_message_list";
+    if (kind == "FRHP") return "fractal_heap_header";
+    return kind;
+}
+
 /* Append a normalized action unless it would be a no-op.  target_off names the
    owning structure for humans, while write_off is the exact byte range to
    patch.  old_bytes are preserved as apply preconditions by the shell wrapper,
@@ -147,6 +235,7 @@ fun h5patch_add_action = (string kind, string structure, uint<64> target_off,
     h5patch_action_sizes += [new_bytes'length];
     h5patch_action_old_hex += [h5patch_bytes_hex(old_bytes)];
     h5patch_action_new_hex += [h5patch_bytes_hex(new_bytes)];
+    h5patch_action_new_bytes += [new_bytes];
     h5patch_action_reasons += [reason];
     h5patch_action_confidences += [confidence];
 }
@@ -237,49 +326,12 @@ fun h5patch_locate_superblock = (int ios) void:
    compute replacement values from the current file image.  */
 fun h5patch_collect_policy_findings = (int ios) void:
 {
-    h5policy_reset_findings;
-    h5policy_reset_traversal_state;
-    h5policy_run_options = h5policy_resolve_run_options(
-        H5_FORENSIC, "non_strict", "yes");
-    h5policy_walk_deadline = 0L;
-    h5policy_walk_operation_limit
-        = H5_FORENSIC.resources.max_walk_operations;
-
-    try
-        {
-            h5policy_locate_superblock(ios);
-            if (!h5policy_super_found)
-                {
-                    h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE",
-                                        "corrupt", 0UL#B, "superblock",
-                                        "HDF5 signature was not found at a valid superblock offset");
-                    return;
-                }
-
-            var profile = H5_FORENSIC;
-            var ctx = h5policy_new_walk_context;
-            var sb = h5policy_map_super(ios, profile, h5policy_super_off);
-            ctx = h5policy_validate_superblock(ios, sb, profile,
-                                               ctx, h5policy_super_off);
-
-            var root_addr = h5policy_root_addr(sb);
-            var ext_addr = h5policy_super_ext_addr(sb);
-            if ((root_addr/#B) < (iosize(ios)/#B))
-                ctx = h5policy_walk_reachable_metadata(ios, profile, ctx,
-                                                       root_addr, ext_addr);
-        }
-    catch (Exception e)
-        {
-            if (e.code == H5POLICY_EC_WALK_OPERATION_BUDGET as int<32>)
-                h5policy_emit_error("H5_UNSUPPORTED_WALK_OPERATION_BUDGET",
-                                    "unsupported", 0UL#B, "metadata",
-                                    "file exceeds the forensic repair-planning operation budget");
-            else if (h5policy_exit_rank < h5policy_class_rank("corrupt"))
-                h5policy_emit_error("H5_CORRUPT_MAPPING_FAILED",
-                                    "corrupt", 0UL#B, "metadata",
-                                    "metadata mapping failed while planning repair ("
-                                    + e.name + ")");
-        }
+    /* Use h5policy's supported in-process seam so findings, completion state,
+       reachability, geometry, SOHM state, and traversal budgets all describe
+       one coherent analysis. */
+    h5policy_mapping_arg = "non_strict";
+    h5policy_continue_arg = "yes";
+    var ignored = h5policy_analyze(ios, H5_FORENSIC);
 }
 
 /* Some file-wide scans can find plausible structures that h5policy did not
@@ -319,13 +371,14 @@ fun h5patch_plan_signature = (int ios, int apply) void:
         }
 }
 
-/* Version 2 and 3 superblocks include one byte of file consistency flags and a
-   Jenkins lookup3 checksum over the superblock body.  Interrupted writers can
-   leave stale flags or an old checksum after nearby bytes are corrected.
+/* Version 2 and 3 superblocks include their base address, one byte of file
+   consistency flags, and a Jenkins lookup3 checksum over the superblock body.
+   The base address is redundant with the discovered superblock location;
+   interrupted writers can also leave stale flags or an old checksum.
 
    If planning only, the checksum is computed over the body as it would look
-   after any planned flag clear.  In apply mode, the flag write happens first,
-   so reading the body from the file already sees the same bytes.  */
+   after any planned base/flag rewrite.  In apply mode, those writes happen
+   first, so reading the body from the file already sees the same bytes.  */
 fun h5patch_plan_superblock_repairs = (int ios, int apply) void:
 {
     if (!h5patch_super_found || !h5policy_signature_at(ios, h5patch_super_off))
@@ -340,6 +393,28 @@ fun h5patch_plan_superblock_repairs = (int ios, int apply) void:
     var off_size = byte @ ios : h5patch_super_off + 9#B;
     if (!h5policy_width_supported(off_size))
         return;
+
+    var width = off_size as uint<64>;
+    var base_off = h5patch_super_off + 12#B;
+    if ((base_off/#B + width) > iosize(ios)/#B)
+        return;
+    var base_old = byte[width] @ ios : base_off;
+    var expected_base = (h5patch_super_off/#B) as uint<64>;
+    if (width < 8UL && expected_base >= (1UL <<. (width * 8UL)))
+        return;
+    var base_new = h5patch_u64_le_bytes(expected_base, width);
+    var repair_base = h5patch_has_finding_code(
+                          "H5_CORRUPT_BASE_ADDRESS_MISMATCH")
+                      && base_old != base_new;
+    if (repair_base)
+        {
+            h5patch_add_action("set_uint_le", "superblock_v2_v3",
+                               expected_base, base_off, base_old, base_new,
+                               "set superblock base address to its discovered file offset",
+                               "high");
+            if (apply)
+                byte[width] @ ios : base_off = base_new;
+        }
 
     var flags_off = h5patch_super_off + 11#B;
     var checksum_off = h5patch_super_off + (12UL + 4UL * (off_size as uint<64>))#B;
@@ -359,8 +434,10 @@ fun h5patch_plan_superblock_repairs = (int ios, int apply) void:
         }
 
     var body = byte[(checksum_off - h5patch_super_off)/#B] @ ios : h5patch_super_off;
+    if (!apply && repair_base)
+        body = h5patch_replace_bytes(body, 12UL, base_new);
     if (!apply && flags != 0UB)
-        body = body[0UL:11UL] + [0UB] + body[12UL:body'length];
+        body = h5patch_replace_bytes(body, 11UL, [0UB]);
 
     var stored = byte[4] @ ios : checksum_off;
     var calc = h5patch_u32_le_bytes(lookup3_hashlittle(body, 0));
@@ -419,6 +496,10 @@ fun h5patch_plan_one_object_header = (int ios, uint<64> off, int apply,
     var checksum_off = h5patch_v2_ohdr_checksum_off(ios, root_off);
     if (checksum_off == 0UL#B)
         return;
+    if (h5patch_has_semantic_ohdr_action(off))
+        return;
+    if (h5patch_action_write_exists((checksum_off/#B) as uint<64>, 4UL))
+        return;
 
     var body = byte[(checksum_off - root_off)/#B] @ ios : root_off;
     var stored = byte[4] @ ios : checksum_off;
@@ -463,16 +544,16 @@ fun h5patch_plan_object_header_checksums = (int ios, int apply) void:
    This catalog entry deliberately accepts only the simplest trustworthy case:
 
      * h5policy reached the owning object header from the root graph;
-     * the header is version 2 and its checksum is currently valid;
+     * the header is version 2 and maps within its declared chunk-0 bounds;
      * datatype and layout are unique, inline messages in chunk 0;
      * there is no continuation chunk whose messages we have not counted; and
      * the layout is the self-describing version-4 chunked form.
 
-   The datatype message is authoritative for element storage size.  Both the
-   field rewrite and the resulting object-header checksum are recorded as
-   reviewable actions.  A header whose checksum is already bad is left for the
-   ordinary checksum repair pass; after that repair, a fresh plan can consider
-   this semantic rewrite without plan/apply mode observing different bytes.  */
+   The datatype message is authoritative for element storage size.  The field
+   rewrite and any needed object-header checksum change are recorded as
+   reviewable actions.  Planning them atomically also avoids an unverifiable
+   checksum-only intermediate now that h5policy walks modern chunk indexes
+   deeply. */
 fun h5patch_plan_one_chunk_layout_element_size = (int ios, uint<64> off,
                                                   int apply) void:
 {
@@ -493,16 +574,6 @@ fun h5patch_plan_one_chunk_layout_element_size = (int ios, uint<64> off,
     if (checksum_off < chunk_off)
         return;
     var chunk_size = ((checksum_off - chunk_off)/#B) as uint<64>;
-
-    /* Never derive a semantic repair from an object header whose integrity is
-       already in doubt.  This also keeps plan and apply action lists identical
-       when the generic checksum catalog item runs later.  */
-    var body = byte[(checksum_off - root_off)/#B] @ ios : root_off;
-    var stored_checksum = byte[4] @ ios : checksum_off;
-    var current_checksum =
-        h5patch_u32_le_bytes(lookup3_hashlittle(body, 0));
-    if (stored_checksum != current_checksum)
-        return;
 
     var prefix_bytes = ((flags & 4U) != 0U) ? 6UL : 4UL;
     var i = 0UL;
@@ -597,28 +668,8 @@ fun h5patch_plan_one_chunk_layout_element_size = (int ios, uint<64> off,
                        "set chunk-layout stored element size to the datatype storage size",
                        "high");
 
-    /* Hash the hypothetical body in plan mode and the same byte image in apply
-       mode, then write both fields only after every guard above has succeeded. */
-    var rel = ((element_off - root_off)/#B) as uint<64>;
-    var repaired_body = byte[]();
-    if (rel + enc < body'length)
-        repaired_body = body[0UL:rel] + new_element_size
-                        + body[rel + enc:body'length];
-    else
-        repaired_body = body[0UL:rel] + new_element_size;
-    var repaired_checksum =
-        h5patch_u32_le_bytes(lookup3_hashlittle(repaired_body, 0));
-
-    h5patch_add_action("recompute_checksum", "object_header_v2",
-                       off, checksum_off, stored_checksum, repaired_checksum,
-                       "recompute v2 object-header checksum after chunk-layout element-size repair",
-                       "high");
-
-    if (apply)
-        {
-            byte[enc] @ ios : element_off = new_element_size;
-            byte[4] @ ios : checksum_off = repaired_checksum;
-        }
+    /* All semantic writes for this header are applied and resealed together by
+       h5patch_finalize_semantic_ohdr_actions. */
 }
 
 /* Examine only object headers that the bounded h5policy walk actually
@@ -631,6 +682,443 @@ fun h5patch_plan_chunk_layout_element_sizes = (int ios, int apply) void:
         {
             h5patch_plan_one_chunk_layout_element_size(
                 ios, h5policy_visited_ohdrs[i], apply);
+            i = i + 1UL;
+        }
+}
+
+/* Repair the two redundant decode-buffer factors stored by n-bit and
+   scale-offset filter descriptors.  h5policy compares cd_values[2] with the
+   chunk element count and cd_values[4] with the datatype size, and records the
+   exact four-byte descriptor field as typed evidence.
+
+   Only fields inside a reachable, checksum-valid v2 object-header chunk 0 are
+   considered.  All candidate writes for one header are preflighted together so
+   a dataset with both mismatches receives one final checksum action. */
+fun h5patch_plan_one_filter_parameters = (int ios, uint<64> off,
+                                          int apply) void:
+{
+    if (!h5patch_policy_evidence_complete)
+        return;
+
+    var root_off = off#B;
+    var checksum_off = h5patch_v2_ohdr_checksum_off(ios, root_off);
+    if (checksum_off == 0UL#B)
+        return;
+    if (h5policy_reached_kind_at(off) != "OHDR")
+        return;
+
+    var body_size = ((checksum_off - root_off)/#B) as uint<64>;
+    var body = byte[body_size] @ ios : root_off;
+    var stored_checksum = byte[4] @ ios : checksum_off;
+    if (stored_checksum
+        != h5patch_u32_le_bytes(lookup3_hashlittle(body, 0)))
+        return;
+
+    var target_offsets = uint<64>[]();
+    var expected_values = uint<64>[]();
+    var target_codes = string[]();
+    var object_name = "";
+    var i = 0UL;
+
+    while (i < h5policy_finding_codes'length)
+        {
+            var code = h5policy_finding_codes[i];
+            var is_nelmts = code == "H5_CORRUPT_FILTER_NELMTS_MISMATCH";
+            var is_size = code == "H5_CORRUPT_FILTER_ELEMENT_SIZE_MISMATCH";
+            if ((is_nelmts || is_size)
+                && h5policy_finding_has_locations[i] != 0UB
+                && h5policy_finding_offsets[i] == off
+                && h5policy_finding_has_evidence[i] != 0UB
+                && h5policy_finding_evidence_comparisons[i] == "equal"
+                && h5policy_finding_evidence_expecteds[i] > 0UL
+                && h5policy_finding_evidence_expecteds[i] <= 0xffffffffUL
+                && ((is_nelmts
+                     && h5policy_finding_evidence_fields[i]
+                        == "filter.decode_element_count")
+                    || (is_size
+                        && h5policy_finding_evidence_fields[i]
+                           == "filter.decode_element_size")))
+                {
+                    var start = h5policy_finding_evidence_location_starts[i];
+                    var count = h5policy_finding_evidence_location_counts[i];
+                    var j = 0UL;
+                    var actual_location_count = 0UL;
+                    var target = 0UL;
+                    var expected_location_ok = 1;
+
+                    while (j < count)
+                        {
+                            var flat = start + j;
+                            var role = h5policy_evidence_location_roles[flat];
+                            var location = h5policy_evidence_location_offsets[flat];
+                            var length = h5policy_evidence_location_lengths[flat];
+                            if (role == "actual")
+                                {
+                                    actual_location_count
+                                        = actual_location_count + 1UL;
+                                    if (length == 4UL)
+                                        target = location;
+                                }
+                            else if (role == "expected")
+                                {
+                                    if (length != 4UL
+                                        || location + length > iosize(ios)/#B
+                                        || bytes_to_u64_le(
+                                               byte[length] @ ios : location#B)
+                                           != h5policy_finding_evidence_expecteds[i])
+                                        expected_location_ok = 0;
+                                }
+                            j = j + 1UL;
+                        }
+
+                    if (actual_location_count == 1UL
+                        && target >= off
+                        && target + 4UL <= (checksum_off/#B)
+                        && expected_location_ok)
+                        {
+                            var actual_bytes = byte[4] @ ios : target#B;
+                            if (bytes_to_u64_le(actual_bytes)
+                                == h5policy_finding_evidence_actuals[i])
+                                {
+                                    var duplicate = 0;
+                                    var d = 0UL;
+                                    while (d < target_offsets'length)
+                                        {
+                                            if (target_offsets[d] == target)
+                                                {
+                                                    if (expected_values[d]
+                                                        != h5policy_finding_evidence_expecteds[i])
+                                                        return;
+                                                    duplicate = 1;
+                                                }
+                                            d = d + 1UL;
+                                        }
+                                    if (!duplicate)
+                                        {
+                                            target_offsets += [target];
+                                            expected_values += [
+                                                h5policy_finding_evidence_expecteds[i]];
+                                            target_codes += [code];
+                                            object_name = h5policy_finding_objects[i];
+                                        }
+                                }
+                        }
+                }
+            i = i + 1UL;
+        }
+
+    if (target_offsets'length == 0UL)
+        return;
+
+    /* Do not derive a semantic rewrite from an object carrying any unrelated
+       structural corruption.  Warnings and the two repairable filter findings
+       are harmless here. */
+    i = 0UL;
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_classes[i] == "corrupt"
+                && h5policy_finding_objects[i] == object_name
+                && h5policy_finding_codes[i]
+                   != "H5_CORRUPT_FILTER_NELMTS_MISMATCH"
+                && h5policy_finding_codes[i]
+                   != "H5_CORRUPT_FILTER_ELEMENT_SIZE_MISMATCH")
+                return;
+            i = i + 1UL;
+        }
+
+    i = 0UL;
+    while (i < target_offsets'length)
+        {
+            var old_bytes = byte[4] @ ios : target_offsets[i]#B;
+            var new_bytes = h5patch_u32_le_bytes(
+                expected_values[i] as uint<32>);
+            h5patch_add_action(
+                "set_uint_le", "filter_pipeline", off,
+                target_offsets[i]#B, old_bytes, new_bytes,
+                target_codes[i] == "H5_CORRUPT_FILTER_NELMTS_MISMATCH"
+                ? "set decode-filter element count to the chunk element count"
+                : "set decode-filter element size to the datatype storage size",
+                "high");
+            i = i + 1UL;
+        }
+}
+
+fun h5patch_plan_filter_parameters = (int ios, int apply) void:
+{
+    var i = 0UL;
+    while (i < h5policy_visited_ohdrs'length)
+        {
+            h5patch_plan_one_filter_parameters(
+                ios, h5policy_visited_ohdrs[i], apply);
+            i = i + 1UL;
+        }
+}
+
+/* Combine every semantic field repair for one v2 object header into one
+   hypothetical byte image and one checksum decision.  Delaying all writes
+   until this pass keeps plan and apply identical even when a header needs both
+   a chunk-layout repair and one or more filter-parameter repairs. */
+fun h5patch_finalize_semantic_ohdr_actions = (int ios, int apply) void:
+{
+    var i = 0UL;
+    while (i < h5policy_visited_ohdrs'length)
+        {
+            var off = h5policy_visited_ohdrs[i];
+            if (!h5patch_has_semantic_ohdr_action(off))
+                {
+                    i = i + 1UL;
+                    continue;
+                }
+
+            var root_off = off#B;
+            var checksum_off = h5patch_v2_ohdr_checksum_off(ios, root_off);
+            if (checksum_off == 0UL#B)
+                return;
+            var checksum_abs = (checksum_off/#B) as uint<64>;
+            var body_size = checksum_abs - off;
+            var body = byte[body_size] @ ios : root_off;
+            var repaired_body = body;
+            var a = 0UL;
+
+            while (a < h5patch_action_target_offsets'length)
+                {
+                    if (h5patch_action_target_offsets[a] == off
+                        && (h5patch_action_structures[a] == "chunk_layout_v4"
+                            || h5patch_action_structures[a] == "filter_pipeline"))
+                        {
+                            var write_off = h5patch_action_write_offsets[a];
+                            var write_size = h5patch_action_sizes[a];
+                            if (write_off < off || write_off > checksum_abs
+                                || write_size > checksum_abs - write_off
+                                || h5patch_action_new_bytes[a]'length != write_size)
+                                return;
+                            repaired_body = h5patch_replace_bytes(
+                                repaired_body, write_off - off,
+                                h5patch_action_new_bytes[a]);
+                            if (repaired_body'length != body_size)
+                                return;
+                        }
+                    a = a + 1UL;
+                }
+
+            var stored_checksum = byte[4] @ ios : checksum_off;
+            var repaired_checksum = h5patch_u32_le_bytes(
+                lookup3_hashlittle(repaired_body, 0));
+            h5patch_add_action(
+                "recompute_checksum", "object_header_v2", off,
+                checksum_off, stored_checksum, repaired_checksum,
+                "recompute v2 object-header checksum after semantic metadata repair",
+                "high");
+
+            if (apply)
+                {
+                    a = 0UL;
+                    while (a < h5patch_action_target_offsets'length)
+                        {
+                            if (h5patch_action_target_offsets[a] == off
+                                && (h5patch_action_structures[a]
+                                    == "chunk_layout_v4"
+                                    || h5patch_action_structures[a]
+                                       == "filter_pipeline"))
+                                byte[h5patch_action_sizes[a]] @ ios
+                                    : h5patch_action_write_offsets[a]#B
+                                    = h5patch_action_new_bytes[a];
+                            a = a + 1UL;
+                        }
+                    byte[4] @ ios : checksum_off = repaired_checksum;
+                }
+            i = i + 1UL;
+        }
+}
+
+/* Confirm that a client-1 FSHD's serialized section list contains exactly the
+   header's serial-section count.  File-client section records have no
+   class-specific tail, so this is a bounded structural recount rather than an
+   inference from slack bytes. */
+fun h5patch_fshd_serial_count_confirmed = (
+    int ios, uint<64> hdr_addr, uint<64> serial_sect,
+    uint<64> nclasses, uint<64> max_addr_bits,
+    uint<64> max_sect_size, byte[] sect_raw,
+    uint<64> used_size, uint<64> alloc_size) int:
+{
+    if (serial_sect == 0UL)
+        return h5policy_msg_addr_is_undef(sect_raw)
+               && used_size == 0UL && alloc_size == 0UL;
+    if (h5policy_msg_addr_is_undef(sect_raw))
+        return 0;
+
+    var o = global_sizeof_offsets as uint<64>;
+    var file_size = iosize(ios)/#B;
+    var sect_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(sect_raw));
+    var prefix = 5UL + o;
+    if (used_size < prefix + 4UL || used_size > alloc_size
+        || sect_addr > file_size || alloc_size > file_size - sect_addr)
+        return 0;
+    if ((byte[4] @ ios : sect_addr#B) != H5_FORMAT_FSSE_SIGNATURE
+        || (byte @ ios : (sect_addr + 4UL)#B) != 0UB)
+        return 0;
+    var back_raw = byte[o] @ ios : (sect_addr + 5UL)#B;
+    if (hdf5_addr_to_file_u64(bytes_to_u64_le(back_raw)) != hdr_addr)
+        return 0;
+
+    var section_body = byte[used_size - 4UL] @ ios : sect_addr#B;
+    var section_stored = byte[4] @ ios : (sect_addr + used_size - 4UL)#B;
+    if (section_stored
+        != h5patch_u32_le_bytes(lookup3_hashlittle(section_body, 0)))
+        return 0;
+
+    var cnt_size = h5policy_bytes_for_limit(serial_sect);
+    var len_size = h5policy_bytes_for_limit(max_sect_size);
+    var off_size = h5policy_bytes_for_bits(max_addr_bits);
+    if (cnt_size == 0UL || len_size == 0UL || off_size == 0UL)
+        return 0;
+    var cur = sect_addr + prefix;
+    var limit = sect_addr + used_size - 4UL;
+    var seen = 0UL;
+
+    while (seen < serial_sect)
+        {
+            if (cur > limit || cnt_size + len_size > limit - cur)
+                return 0;
+            var node_count = bytes_to_u64_le(byte[cnt_size] @ ios : cur#B);
+            var sect_size = bytes_to_u64_le(
+                byte[len_size] @ ios : (cur + cnt_size)#B);
+            cur = cur + cnt_size + len_size;
+            if (node_count == 0UL || sect_size == 0UL
+                || node_count > serial_sect - seen)
+                return 0;
+            var j = 0UL;
+            while (j < node_count)
+                {
+                    if (cur > limit || off_size + 1UL > limit - cur)
+                        return 0;
+                    var section_addr = bytes_to_u64_le(
+                        byte[off_size] @ ios : cur#B);
+                    var section_type = byte @ ios : (cur + off_size)#B;
+                    if ((section_type as uint<64>) >= nclasses
+                        || section_addr > file_size
+                        || sect_size > file_size - section_addr)
+                        return 0;
+                    cur = cur + off_size + 1UL;
+                    seen = seen + 1UL;
+                    j = j + 1UL;
+                }
+        }
+
+    return seen == serial_sect && cur == limit;
+}
+
+/* FSHD redundantly stores total = serial + ghost.  For the high-confidence
+   catalog entry, require no ghost sections and independently recount the
+   checksum-valid FSSE list before replacing total and resealing FSHD. */
+fun h5patch_plan_one_fshd_count = (int ios, uint<64> hdr_addr,
+                                   int apply) void:
+{
+    if (!h5patch_policy_evidence_complete)
+        return;
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var file_size = iosize(ios)/#B;
+    var hdr_size = 18UL + 7UL*el + o;
+    if (hdr_addr > file_size || hdr_size > file_size - hdr_addr)
+        return;
+    if ((byte[4] @ ios : hdr_addr#B) != H5_FORMAT_FSHD_SIGNATURE
+        || (byte @ ios : (hdr_addr + 4UL)#B) != 0UB
+        || (byte @ ios : (hdr_addr + 5UL)#B) != 1UB)
+        return;
+
+    var total_off = hdr_addr + 6UL + el;
+    var has_count_finding = 0;
+    var fi = 0UL;
+    while (fi < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[fi] == "H5_CORRUPT_FSM_SECTION_COUNT"
+                && h5policy_finding_has_locations[fi] != 0UB
+                && h5policy_finding_offsets[fi] == total_off)
+                has_count_finding = 1;
+            fi = fi + 1UL;
+        }
+    if (!has_count_finding)
+        return;
+
+    var body = byte[hdr_size - 4UL] @ ios : hdr_addr#B;
+    var stored_checksum = byte[4] @ ios : (hdr_addr + hdr_size - 4UL)#B;
+    if (stored_checksum
+        != h5patch_u32_le_bytes(lookup3_hashlittle(body, 0)))
+        return;
+
+    var total_bytes = byte[el] @ ios : total_off#B;
+    var total = bytes_to_u64_le(total_bytes);
+    var serial = bytes_to_u64_le(
+        byte[el] @ ios : (hdr_addr + 6UL + 2UL*el)#B);
+    var ghost = bytes_to_u64_le(
+        byte[el] @ ios : (hdr_addr + 6UL + 3UL*el)#B);
+    var nclasses = bytes_to_u64_le(
+        byte[2] @ ios : (hdr_addr + 6UL + 4UL*el)#B);
+    var max_addr_bits = bytes_to_u64_le(
+        byte[2] @ ios : (hdr_addr + 12UL + 4UL*el)#B);
+    var max_sect_size = bytes_to_u64_le(
+        byte[el] @ ios : (hdr_addr + 14UL + 4UL*el)#B);
+    var sect_raw = byte[o] @ ios : (hdr_addr + 14UL + 5UL*el)#B;
+    var used_size = bytes_to_u64_le(
+        byte[el] @ ios : (hdr_addr + 14UL + 5UL*el + o)#B);
+    var alloc_size = bytes_to_u64_le(
+        byte[el] @ ios : (hdr_addr + 14UL + 6UL*el + o)#B);
+
+    if (ghost != 0UL || total == serial || nclasses == 0UL
+        || !h5patch_fshd_serial_count_confirmed(
+               ios, hdr_addr, serial, nclasses, max_addr_bits,
+               max_sect_size, sect_raw, used_size, alloc_size))
+        return;
+
+    var new_total = h5patch_u64_le_bytes(serial, el);
+    var repaired_body = h5patch_replace_bytes(
+        body, total_off - hdr_addr, new_total);
+    if (repaired_body'length != hdr_size - 4UL)
+        return;
+    var repaired_checksum = h5patch_u32_le_bytes(
+        lookup3_hashlittle(repaired_body, 0));
+
+    h5patch_add_action(
+        "set_uint_le", "free_space_manager_header", hdr_addr,
+        total_off#B, total_bytes, new_total,
+        "set free-space manager total section count to the recounted serialized total",
+        "high");
+    h5patch_add_action(
+        "recompute_checksum", "free_space_manager_header", hdr_addr,
+        (hdr_addr + hdr_size - 4UL)#B,
+        stored_checksum, repaired_checksum,
+        "recompute free-space manager header checksum after count repair",
+        "high");
+    if (apply)
+        {
+            byte[el] @ ios : total_off#B = new_total;
+            byte[4] @ ios : (hdr_addr + hdr_size - 4UL)#B
+                = repaired_checksum;
+        }
+}
+
+fun h5patch_plan_fshd_counts = (int ios, int apply) void:
+{
+    var i = 0UL;
+    while (i < h5policy_reached_addrs'length)
+        {
+            if (h5policy_reached_kinds[i] == "FSHD")
+                {
+                    var duplicate = 0;
+                    var j = 0UL;
+                    while (j < i)
+                        {
+                            if (h5policy_reached_kinds[j] == "FSHD"
+                                && h5policy_reached_addrs[j]
+                                   == h5policy_reached_addrs[i])
+                                duplicate = 1;
+                            j = j + 1UL;
+                        }
+                    if (!duplicate)
+                        h5patch_plan_one_fshd_count(
+                            ios, h5policy_reached_addrs[i], apply);
+                }
             i = i + 1UL;
         }
 }
@@ -941,6 +1429,96 @@ fun h5patch_plan_depth0_bthd_counts = (int ios, int apply) void:
         }
 }
 
+/* Reseal a reached metadata structure when h5policy reports byte-precise
+   checksum evidence: one four-byte stored value and one contiguous body range
+   from which the expected lookup3 value was derived.  This covers the newly
+   traversed free-space, SOHM, v2 B-tree, and modern chunk-index blocks without
+   scanning raw data for signatures or scraping diagnostic prose. */
+fun h5patch_plan_reached_metadata_checksums = (int ios, int apply) void:
+{
+    if (!h5patch_policy_evidence_complete)
+        return;
+    var file_size = iosize(ios)/#B;
+    var i = 0UL;
+
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[i] == "H5_CORRUPT_BAD_CHECKSUM"
+                && h5policy_finding_has_locations[i] != 0UB
+                && h5policy_finding_has_evidence[i] != 0UB
+                && h5policy_finding_evidence_fields[i]
+                   == "metadata.lookup3_checksum"
+                && h5policy_finding_evidence_comparisons[i] == "equal"
+                && h5policy_finding_evidence_actuals[i] <= 0xffffffffUL
+                && h5policy_finding_evidence_expecteds[i] <= 0xffffffffUL)
+                {
+                    var target = h5policy_finding_offsets[i];
+                    var kind = h5policy_reached_kind_at(target);
+                    var start = h5policy_finding_evidence_location_starts[i];
+                    var count = h5policy_finding_evidence_location_counts[i];
+                    var actual_off = 0UL;
+                    var actual_len = 0UL;
+                    var actual_count = 0UL;
+                    var source_off = 0UL;
+                    var source_len = 0UL;
+                    var source_count = 0UL;
+                    var j = 0UL;
+
+                    while (j < count)
+                        {
+                            var flat = start + j;
+                            if (h5policy_evidence_location_roles[flat] == "actual")
+                                {
+                                    actual_count = actual_count + 1UL;
+                                    actual_off = h5policy_evidence_location_offsets[flat];
+                                    actual_len = h5policy_evidence_location_lengths[flat];
+                                }
+                            else if (h5policy_evidence_location_roles[flat]
+                                     == "actual_source")
+                                {
+                                    source_count = source_count + 1UL;
+                                    source_off = h5policy_evidence_location_offsets[flat];
+                                    source_len = h5policy_evidence_location_lengths[flat];
+                                }
+                            j = j + 1UL;
+                        }
+
+                    if (kind != "" && kind != "OHDR" && kind != "SUPER"
+                        && actual_count == 1UL && source_count == 1UL
+                        && actual_len == 4UL && source_len > 0UL
+                        && source_off == target
+                        && source_off <= file_size
+                        && source_len <= file_size - source_off
+                        && actual_off == source_off + source_len
+                        && actual_off <= file_size
+                        && 4UL <= file_size - actual_off
+                        && !h5patch_action_write_exists(actual_off, 4UL))
+                        {
+                            var old_bytes = byte[4] @ ios : actual_off#B;
+                            var body = byte[source_len] @ ios : source_off#B;
+                            var calculated = lookup3_hashlittle(body, 0);
+                            if (bytes_to_u64_le(old_bytes)
+                                    == h5policy_finding_evidence_actuals[i]
+                                && (calculated as uint<64>)
+                                   == h5policy_finding_evidence_expecteds[i])
+                                {
+                                    var new_bytes = h5patch_u32_le_bytes(calculated);
+                                    h5patch_add_action(
+                                        "recompute_checksum",
+                                        h5patch_structure_name(kind), target,
+                                        actual_off#B, old_bytes, new_bytes,
+                                        "recompute checksum for reached " + kind
+                                        + " metadata",
+                                        "medium");
+                                    if (apply)
+                                        byte[4] @ ios : actual_off#B = new_bytes;
+                                }
+                        }
+                }
+            i = i + 1UL;
+        }
+}
+
 /* The catalog pipeline is ordered from global structure to localized repairs.
    Some later checksum repairs intentionally see earlier planned writes through
    their apply flag handling, so the order is part of the behavior.  */
@@ -953,10 +1531,14 @@ fun h5patch_collect_actions = (int ios, int apply) void:
     h5patch_plan_signature(ios, apply);
     h5patch_plan_superblock_repairs(ios, apply);
     h5patch_plan_chunk_layout_element_sizes(ios, apply);
+    h5patch_plan_filter_parameters(ios, apply);
+    h5patch_finalize_semantic_ohdr_actions(ios, apply);
     h5patch_plan_object_header_checksums(ios, apply);
+    h5patch_plan_fshd_counts(ios, apply);
     h5patch_plan_v1_object_header_message_counts(ios, apply);
     h5patch_plan_snod_counts(ios, apply);
     h5patch_plan_depth0_bthd_counts(ios, apply);
+    h5patch_plan_reached_metadata_checksums(ios, apply);
 }
 
 /* Emit one action in the stable plan schema.  Preconditions and writes share
