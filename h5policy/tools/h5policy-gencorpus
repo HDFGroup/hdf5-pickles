@@ -166,16 +166,36 @@ def _gen_valid(root):
     # depth.  Assembled rather than patched -- no libhdf5 writes a type this deep.
     _make_dtype_compound_recursion(
         f"{root}/cve/dtype_compound_unbounded_recursion.h5")
-    # h5py does not expose the file-creation SOHM controls.  Repack a normal
-    # file through libhdf5 to force a list-backed shared dataspace index; this
-    # exercises SMTB/SMLI validation plus managed fractal-heap ID resolution.
+    # h5py does not expose the file-creation SOHM controls.  Repack normal
+    # files through libhdf5 to force both list-backed and B-tree-backed shared
+    # dataspace indexes.  Two -s options deliberately work around HDF5 2.2's
+    # off-by-one configuration loop, which otherwise ignores a sole index.
     sohm_src = f"{root}/valid/.sohm_list_source.h5"
-    _write(sohm_src,
-           lambda h: h.create_dataset("a", data=np.arange(6, dtype="i4")))
-    subprocess.run(["h5repack", "-s", "1:dspace", sohm_src,
+    def _sohm_list_source(h):
+        h.create_dataset("a", shape=(6,), dtype="i4", track_times=False)
+        h.create_dataset("b", shape=(6,), dtype="i4", track_times=False)
+    _write(sohm_src, _sohm_list_source)
+    subprocess.run(["h5repack", "-s", "1:dspace", "-s", "999999:dtype",
+                    sohm_src,
                     f"{root}/valid/sohm_list.h5"], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.unlink(sohm_src)
+
+    # The list-to-B-tree phase change occurs at 50 shared messages.  Fifty-one
+    # distinct shapes, each referenced twice, produce a genuine type-7 BTHD
+    # with an internal BTIN root and BTLF children.
+    sohm_btree_src = f"{root}/valid/.sohm_btree_source.h5"
+    def _sohm_btree_source(h):
+        for i in range(51):
+            for copy in range(2):
+                h.create_dataset(f"d_{i:02d}_{copy}", shape=(i + 1,),
+                                 dtype="u1", track_times=False)
+    _write(sohm_btree_src, _sohm_btree_source)
+    subprocess.run(["h5repack", "-s", "1:dspace", "-s", "999999:dtype",
+                    sohm_btree_src, f"{root}/valid/sohm_btree.h5"],
+                   check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
+    os.unlink(sohm_btree_src)
     # A gzip-compressed dataset: structurally valid, so h5policy accepts -- but
     # reading its data requires a consumer to decode/decompress untrusted bytes
     # (the filter-decode CVE surface a metadata-only oracle cannot vet), so the
@@ -481,6 +501,30 @@ def _gen_coverage(root):
         h5py.h5a.create(d.id, b"attr", h["t"].id, sid)
     _write(f"{root}/coverage/shared_attr_datatype.h5", _shared_attr)
 
+    # Twenty-four distinct compound datatype messages, each shared twice and
+    # larger than the SOHM heap's 4096-byte managed-object ceiling, force a
+    # genuine depth-one type-1 huge-object B-tree.  Three options keep the
+    # desired dtype index despite HDF5 2.2's off-by-one configuration loop.
+    # The file remains an explicit coverage refusal because shared wrappers
+    # naming huge heap objects are not decoded yet; its entire index tree is
+    # nevertheless validated before that boundary is reported.
+    sohm_huge_src = f"{root}/coverage/.sohm_huge_source.h5"
+    def _sohm_huge_source(h):
+        for i in range(24):
+            dtype = np.dtype([
+                (f"f{i:02d}_{j:03d}", "<i8") for j in range(280 + i)
+            ])
+            for copy in range(2):
+                h.create_dataset(f"d_{i:02d}_{copy}", shape=(1,),
+                                 dtype=dtype, track_times=False)
+    _write(sohm_huge_src, _sohm_huge_source)
+    subprocess.run([
+        "h5repack", "-s", "1:dtype", "-s", "999999:dspace",
+        "-s", "999999:fill", sohm_huge_src,
+        f"{root}/coverage/sohm_huge_btree.h5"
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.unlink(sohm_huge_src)
+
 
 def _gen_malformed(root):
     # ---- malformed/ : expected `reject_corrupt`, byte-patched from a base --
@@ -569,6 +613,33 @@ def _gen_malformed(root):
     _make_bad_chunk_v2_btree_cycle(
         f"{root}/malformed/bad_chunk_v2_btree_cycle.h5",
         f"{root}/valid/chunk_v2_btree_deep.h5")
+    _make_bad_sohm_list_location(
+        f"{root}/malformed/bad_sohm_list_location.h5",
+        f"{root}/valid/sohm_list.h5")
+    _make_bad_sohm_btree_deep_checksum(
+        f"{root}/malformed/bad_sohm_btree_deep_checksum.h5",
+        f"{root}/valid/sohm_btree.h5")
+    _make_bad_sohm_btree_child_address(
+        f"{root}/malformed/bad_sohm_btree_child_address.h5",
+        f"{root}/valid/sohm_btree.h5")
+    _make_bad_sohm_btree_cycle(
+        f"{root}/malformed/bad_sohm_btree_cycle.h5",
+        f"{root}/valid/sohm_btree.h5")
+    _make_bad_sohm_btree_record_location(
+        f"{root}/malformed/bad_sohm_btree_record_location.h5",
+        f"{root}/valid/sohm_btree.h5")
+    _make_bad_sohm_huge_btree_deep_checksum(
+        f"{root}/malformed/bad_sohm_huge_btree_deep_checksum.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
+    _make_bad_sohm_huge_btree_child_address(
+        f"{root}/malformed/bad_sohm_huge_btree_child_address.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
+    _make_bad_sohm_huge_btree_cycle(
+        f"{root}/malformed/bad_sohm_huge_btree_cycle.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
+    _make_bad_sohm_huge_object_extent(
+        f"{root}/malformed/bad_sohm_huge_object_extent.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
     _make_bad_dataset_missing_layout(
@@ -1370,6 +1441,102 @@ def _dense_bthd_info(raw):
                 checksum=bthd + 22 + off_size + len_size - 4)
 
 
+def _bthd_info_for_type(raw, wanted_type):
+    """Locate a v2 B-tree header by client record type."""
+    off_size = raw[9]
+    len_size = raw[10]
+    bthd = raw.find(b"BTHD")
+    while bthd >= 0:
+        if bthd + 22 + off_size + len_size <= len(raw) \
+                and raw[bthd + 5] == wanted_type:
+            node_size = struct.unpack_from("<I", raw, bthd + 6)[0]
+            record_size = struct.unpack_from("<H", raw, bthd + 10)[0]
+            depth = struct.unpack_from("<H", raw, bthd + 12)[0]
+            root = int.from_bytes(
+                raw[bthd + 16:bthd + 16 + off_size], "little")
+            nroot = struct.unpack_from("<H", raw,
+                                       bthd + 16 + off_size)[0]
+            total = int.from_bytes(
+                raw[bthd + 18 + off_size:
+                    bthd + 18 + off_size + len_size], "little")
+            return dict(off_size=off_size, len_size=len_size, bthd=bthd,
+                        record_type=wanted_type, node_size=node_size,
+                        record_size=record_size, depth=depth, root=root,
+                        nroot=nroot, total=total,
+                        checksum=bthd + 22 + off_size + len_size - 4)
+        bthd = raw.find(b"BTHD", bthd + 4)
+    raise RuntimeError(f"could not locate v2 B-tree record type {wanted_type}")
+
+
+def _sohm_bt2_root_info(raw):
+    """Return exact used geometry for an internal type-7 SOHM root."""
+    bt = _bthd_info_for_type(raw, 7)
+    root = bt["root"]
+    if bt["depth"] == 0 or raw[root:root + 4] != b"BTIN":
+        raise RuntimeError("SOHM type-7 fixture has no internal root")
+    nrec_bytes = _bt2_nrec_bytes(bt["node_size"], bt["record_size"],
+                                  bt["off_size"])
+    subtree_bytes = _bt2_subtree_bytes(
+        bt["node_size"], bt["record_size"], bt["depth"] - 1,
+        bt["off_size"]) if bt["depth"] > 1 else 0
+    ptr_size = bt["off_size"] + nrec_bytes + subtree_bytes
+    ptr_base = root + 6 + bt["nroot"] * bt["record_size"]
+    root_checksum = ptr_base + (bt["nroot"] + 1) * ptr_size
+    if root_checksum + 4 > root + bt["node_size"]:
+        raise RuntimeError("SOHM type-7 root contents exceed node size")
+    bt.update(nrec_bytes=nrec_bytes, subtree_bytes=subtree_bytes,
+              ptr_size=ptr_size, ptr_base=ptr_base,
+              root_checksum=root_checksum)
+    return bt
+
+
+def _sohm_bt2_first_child(raw):
+    bt = _sohm_bt2_root_info(raw)
+    ptr = bt["ptr_base"]
+    child = int.from_bytes(raw[ptr:ptr + bt["off_size"]], "little")
+    child_nrec = int.from_bytes(
+        raw[ptr + bt["off_size"]:
+            ptr + bt["off_size"] + bt["nrec_bytes"]], "little")
+    if child >= len(raw):
+        raise RuntimeError("SOHM type-7 base has an invalid first child")
+    return bt, ptr, child, child_nrec
+
+
+def _sohm_huge_bt2_first_child(raw):
+    """Return the first child of a depth-one unfiltered huge-object tree."""
+    bt = _bthd_info_for_type(raw, 1)
+    root = bt["root"]
+    if bt["depth"] == 0 or raw[root:root + 4] != b"BTIN":
+        raise RuntimeError("SOHM huge-object fixture has no internal root")
+    nrec_bytes = _bt2_nrec_bytes(bt["node_size"], bt["record_size"],
+                                  bt["off_size"])
+    subtree_bytes = _bt2_subtree_bytes(
+        bt["node_size"], bt["record_size"], bt["depth"] - 1,
+        bt["off_size"]) if bt["depth"] > 1 else 0
+    ptr_size = bt["off_size"] + nrec_bytes + subtree_bytes
+    ptr_base = root + 6 + bt["nroot"] * bt["record_size"]
+    root_checksum = ptr_base + (bt["nroot"] + 1) * ptr_size
+    if root_checksum + 4 > root + bt["node_size"]:
+        raise RuntimeError("SOHM huge-object root contents exceed node size")
+    ptr = ptr_base
+    child = int.from_bytes(raw[ptr:ptr + bt["off_size"]], "little")
+    child_nrec = int.from_bytes(
+        raw[ptr + bt["off_size"]:
+            ptr + bt["off_size"] + nrec_bytes], "little")
+    if child >= len(raw):
+        raise RuntimeError("SOHM huge-object base has an invalid first child")
+    bt.update(nrec_bytes=nrec_bytes, subtree_bytes=subtree_bytes,
+              ptr_size=ptr_size, ptr_base=ptr_base,
+              root_checksum=root_checksum)
+    return bt, ptr, child, child_nrec
+
+
+def _repair_sohm_bt2_root_checksum(raw, bt):
+    checksum = _jenkins_lookup3()(
+        bytes(raw[bt["root"]:bt["root_checksum"]]))
+    struct.pack_into("<I", raw, bt["root_checksum"], checksum)
+
+
 def _chunk_bt2_root_info(raw):
     """Return the exact used geometry of a raw-data v2 B-tree root."""
     bt = _dense_bthd_info(raw)
@@ -1444,6 +1611,119 @@ def _make_bad_chunk_v2_btree_cycle(path, base_path):
     raw[ptr:ptr + bt["off_size"]] = bt["root"].to_bytes(bt["off_size"],
                                                          "little")
     _repair_chunk_bt2_root_checksum(raw, bt)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_sohm_list_location(path, base_path):
+    """Give a checksummed SMLI record an invalid storage-location tag."""
+    raw = bytearray(open(base_path, "rb").read())
+    smli = raw.find(b"SMLI")
+    if smli < 0:
+        raise RuntimeError("could not locate the SOHM list")
+    entry_size = 5 + max(12, 4 + raw[9])
+    checksum = smli + 4 + entry_size       # fixture has exactly one record
+    if checksum + 4 > len(raw):
+        raise RuntimeError("SOHM list checksum is outside file")
+    raw[smli + 4] = 2
+    struct.pack_into("<I", raw, checksum,
+                     _jenkins_lookup3()(bytes(raw[smli:checksum])))
+    _patch(path, bytes(raw))
+
+
+def _make_bad_sohm_btree_deep_checksum(path, base_path):
+    """Flip the first type-7 child leaf checksum."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, _, child, child_nrec = _sohm_bt2_first_child(raw)
+    if bt["depth"] != 1 or raw[child:child + 4] != b"BTLF":
+        raise RuntimeError("expected a depth-one SOHM type-7 B-tree")
+    checksum = child + 6 + child_nrec * bt["record_size"]
+    if checksum + 4 > child + bt["node_size"]:
+        raise RuntimeError("SOHM type-7 leaf contents exceed node size")
+    raw[checksum] ^= 0x01
+    _patch(path, bytes(raw))
+
+
+def _make_bad_sohm_btree_child_address(path, base_path):
+    """Point a checksummed type-7 BTIN child beyond EOA."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, ptr, _, _ = _sohm_bt2_first_child(raw)
+    outside = len(raw) + 0x1000
+    raw[ptr:ptr + bt["off_size"]] = outside.to_bytes(bt["off_size"],
+                                                      "little")
+    _repair_sohm_bt2_root_checksum(raw, bt)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_sohm_btree_cycle(path, base_path):
+    """Make a checksum-valid type-7 root child point back to its root."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, ptr, _, _ = _sohm_bt2_first_child(raw)
+    raw[ptr:ptr + bt["off_size"]] = bt["root"].to_bytes(bt["off_size"],
+                                                         "little")
+    _repair_sohm_bt2_root_checksum(raw, bt)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_sohm_btree_record_location(path, base_path):
+    """Give a type-7 child record an invalid location and repair its hash."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, _, child, child_nrec = _sohm_bt2_first_child(raw)
+    if child_nrec == 0 or raw[child:child + 4] != b"BTLF":
+        raise RuntimeError("SOHM type-7 first child has no records")
+    raw[child + 6] = 2
+    checksum = child + 6 + child_nrec * bt["record_size"]
+    struct.pack_into("<I", raw, checksum,
+                     _jenkins_lookup3()(bytes(raw[child:checksum])))
+    _patch(path, bytes(raw))
+
+
+def _make_bad_sohm_huge_btree_deep_checksum(path, base_path):
+    """Flip the first huge-object child leaf checksum."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, _, child, child_nrec = _sohm_huge_bt2_first_child(raw)
+    if bt["depth"] != 1 or raw[child:child + 4] != b"BTLF":
+        raise RuntimeError("expected a depth-one SOHM huge-object B-tree")
+    checksum = child + 6 + child_nrec * bt["record_size"]
+    if checksum + 4 > child + bt["node_size"]:
+        raise RuntimeError("SOHM huge-object leaf contents exceed node size")
+    raw[checksum] ^= 0x01
+    _patch(path, bytes(raw))
+
+
+def _make_bad_sohm_huge_btree_child_address(path, base_path):
+    """Point a checksummed huge-object BTIN child beyond EOA."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, ptr, _, _ = _sohm_huge_bt2_first_child(raw)
+    outside = len(raw) + 0x1000
+    raw[ptr:ptr + bt["off_size"]] = outside.to_bytes(bt["off_size"],
+                                                      "little")
+    _repair_sohm_bt2_root_checksum(raw, bt)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_sohm_huge_btree_cycle(path, base_path):
+    """Make a checksum-valid huge-object child refer back to its root."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, ptr, _, _ = _sohm_huge_bt2_first_child(raw)
+    raw[ptr:ptr + bt["off_size"]] = bt["root"].to_bytes(bt["off_size"],
+                                                         "little")
+    _repair_sohm_bt2_root_checksum(raw, bt)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_sohm_huge_object_extent(path, base_path):
+    """Move a huge-object record body beyond EOA and repair its leaf hash."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, _, child, child_nrec = _sohm_huge_bt2_first_child(raw)
+    if child_nrec == 0 or raw[child:child + 4] != b"BTLF":
+        raise RuntimeError("SOHM huge-object first child has no records")
+    record = child + 6
+    outside = len(raw) + 0x1000
+    raw[record:record + bt["off_size"]] = outside.to_bytes(
+        bt["off_size"], "little")
+    checksum = child + 6 + child_nrec * bt["record_size"]
+    struct.pack_into("<I", raw, checksum,
+                     _jenkins_lookup3()(bytes(raw[child:checksum])))
     _patch(path, bytes(raw))
 
 

@@ -93,6 +93,18 @@ metadata-byte saturation. A 300-chunk one-unlimited-dimension dataset reaches
 `EAIB`, direct `EADB`s, an `EASB`, and nested `EADB`s, with a child-checksum
 mutation proving the walk goes beyond the header and inline records.
 
+SOHM has matching end-to-end coverage. A two-dataset repack produces a genuine
+`SMLI`, while 51 distinct shared dataspaces force a type-7 `BTIN` root and
+`BTLF` children. Repaired mutations cover list and B-tree record locations, a
+deep checksum, an out-of-file child, and a cycle; reduced overrides prove the
+same tree stops at its depth ceiling and saturates metadata bytes while charging
+the first child allocation. Another boundary case pins the SMLI distinction:
+its checksum covers one used record while metadata accounting charges all 50
+configured record slots. A separate set of 24 oversized shared compound
+datatypes forces a depth-one type-1 huge-object tree; its own checksum, child
+range, cycle, object-extent, depth, and metadata-ceiling cases cover the heap's
+second recursive index independently of wrapper-body decoding.
+
 Legacy chunk-index cases cover the subtler finite-ceiling boundary directly.
 A four-chunk v1 B-tree distinguishes equality from overflow within one leaf;
 a generated 130-chunk, multi-level v1 tree proves that an internal-node walk
@@ -118,7 +130,11 @@ libhdf5 rejects is safe but retained as a classification warning. A
 `reject_corrupt` on a file that h5py can structurally traverse is downgraded to
 an `A+` warning when a bounded, out-of-process `libhdf5` probe also errors while
 inspecting attributes, reading small datasets, or running optional `libhdf5`
-tools; those eager catches are security-useful, not hard false positives.
+tools; those eager catches are security-useful, not hard false positives. The
+similarly narrow `A~` warning covers only file-global SOHM search-index
+findings: shared wrappers carry direct heap IDs, so libhdf5's read path never
+opens the active SMLI/type-7 index that h5policy intentionally validates at the
+superblock extension.
 
 The logical-**bytes** comparison is warning-level rather than a hard failure:
 h5policy now tracks logical dataset bytes separately from raw storage bytes, so

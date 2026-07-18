@@ -197,16 +197,19 @@ complete unique-extent measure. Current accounting calls cover:
 - old-style group v1 B-tree nodes and SNOD nodes;
 - v1 chunk B-tree nodes;
 - raw-data v2 B-tree headers and each fixed-size internal or leaf node;
+- SOHM master tables, full configured record-list allocations, fractal-heap
+  headers, and each type-7 or huge-object v2 B-tree header/internal/leaf
+  allocation (list/node checksums still cover only their exact used prefixes);
 - fixed-array chunk-index headers; and
 - extensible-array headers, index blocks, secondary blocks, and complete data
   block allocations (including their page-checksum storage).
 
 In particular, general byte mappings do not charge this counter automatically.
-Dense fractal-heap/B-tree blocks, SOHM structures, VDS global-heap objects,
-metadata-cache image bodies, and fixed-array chunk-index data blocks are not
-uniformly included. Reaching the same explicitly accounted structure through
-distinct paths is not guaranteed to be globally deduplicated by the accounting
-helper.
+Dense fractal-heap/B-tree blocks, SOHM heap data blocks and encoded message
+bodies, VDS global-heap objects, metadata-cache image bodies, and fixed-array
+chunk-index data blocks are not uniformly included. Reaching the same
+explicitly accounted structure through distinct paths is not guaranteed to be
+globally deduplicated by the accounting helper.
 
 Zero is an active zero-byte limit. The built-in unlimited preset uses
 `UINT64_MAX`.
@@ -372,7 +375,9 @@ This is checked on recursive paths for:
 - v2 raw-data chunk B-trees;
 - old-style group v1 B-trees;
 - dense-link v2 B-trees; and
-- dense-attribute v2 B-trees.
+- dense-attribute v2 B-trees;
+- SOHM type-7 shared-message v2 B-trees; and
+- SOHM fractal-heap huge-object v2 B-trees.
 
 The check is `depth > max_btree_depth`, so depth equal to the limit is allowed.
 Exceeding it emits:
@@ -782,14 +787,14 @@ CLI.
 | Field or rule | Current direct coverage |
 | --- | --- |
 | Built-in profile values | Every field in all four presets is compared with its documented value. The production clone helper reconstructs every nested group; unit mutation checks verify that clones cannot alias a shipped preset. |
-| `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. Reduced full-file cases saturate `metadata_bytes_seen` at the exact ceiling, including a deep raw-data v2 B-tree case that permits its root but refuses and stops at a child-node charge. |
+| `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. Reduced full-file cases saturate `metadata_bytes_seen` at the exact ceiling, including deep raw-data, SOHM type-7, and SOHM huge-object v2 B-tree cases that permit their roots but refuse and stop at a child-node charge. |
 | `max_attribute_count` | A valid synthetic attribute is parsed at and above a reduced cumulative limit. |
 | `max_object_header_chunks` | A synthetic continuation message covers equality, over-limit saturation, and the fact that its later structural finding is independent. A valid continuation-heavy object header crosses a reduced full-walk ceiling and saturates the reported counter without becoming corrupt. |
 | `max_chunk_count` | Defined chunk-index references cover equality, over-limit saturation, and the internal exact-versus-exceeded state. A valid four-chunk fixed-array dataset rejects as resource policy under a reduced ceiling. Separate legacy v1 cases cover exact equality and overflow within one leaf, plus a 130-chunk multi-level tree whose parent must continue at equality into a later child to prove overflow. In every rejecting case, `chunk_index_refs` saturates exactly at the selected limit. |
 | `max_single_value_bytes` | Fill values cover equality, over-limit resource classification, and zero-as-disabled; separate valid datatype and attribute blobs cross the other two enforcement sites. A compact valid file isolates the attribute-value enforcement site during a full walk. |
 | `max_logical_dataset_bytes` | Synthetic dataset facts cover equality and saturation. `resource/huge_logical_dataset.h5` requires the resource finding, and the same file is accepted under legacy. |
 | Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, zero-byte disabling, and validation of the disabled pair. `resource/tiny_chunks.h5` supplies end-to-end coverage. |
-| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. Valid multi-level dense-link and raw-data chunk v2 B-trees also reject as resource policy under reduced full-walk ceilings. |
+| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. Valid multi-level dense-link, raw-data chunk, SOHM type-7, and SOHM huge-object v2 B-trees also reject as resource policy under reduced full-walk ceilings. |
 | `max_link_traversal_depth` | Synthetic queue operations cover equality, the resource over-limit finding, and declining to enqueue the child. A real depth-66 hierarchy rejects under the built-in strict profile and accepts under the built-in forensic profile. |
 | `max_datatype_recursion_depth` | `unit_datatype.pk` covers deep VLen and compound nesting as resource rejection; the CVE fixture requires the same finding under legacy. A valid compound-with-array datatype crosses a reduced full-walk depth ceiling as a resource rejection. |
 | `max_filter_parameter_recursion_depth` | A direct recursive call above a zero limit covers the resource finding and poison return; malformed n-bit parameter bounds and classes retain their synthetic coverage. A valid n-bit-filtered dataset reaches the same resource path end to end under a reduced ceiling. |

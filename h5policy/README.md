@@ -147,6 +147,11 @@ Current coverage includes:
 - Compact hard links, dense link storage, dense attribute storage, old-style
   group metadata, and chunk-index metadata, including recursive raw-data v2
   B-trees and complete extensible-array block graphs.
+- File-global Shared Object Header Message metadata: `SMTB` directories,
+  `SMLI` record lists, recursive type-7 v2 B-trees, managed-message heap-ID
+  resolution, fractal-heap envelopes, and complete huge-object index trees.
+  Every recursive SOHM node is independently bounded by range, checksum,
+  visited-node, depth, operation/time, and accounted-metadata limits.
 - Logical dataset byte accounting kept separate from raw storage accounting, so
   datatype semantics can be compared against `libhdf5` while layout checks still
   use on-disk storage size.
@@ -159,12 +164,22 @@ Checksum coverage includes the HDF5 Jenkins checksums used by:
   index/secondary/data blocks and initialized pages
 - dense metadata fractal heaps: `FRHP`, `FHDB`, `FHIB`
 - dense metadata v2 B-trees: `BTHD`, `BTLF`, `BTIN`
+- SOHM master tables/lists (`SMTB`, `SMLI`), fractal-heap headers (`FRHP`),
+  and type-7/huge-object v2 B-tree headers and internal/leaf nodes
 
 ### Known blind spots
 
 Some defects live strictly beyond a metadata-only boundary and are reported as
 `unsupported_coverage_gap` rather than `reject_corrupt`, even when `libhdf5`
 crashes on them:
+
+- **Encoded SOHM message bodies.** h5policy completely walks the type-7 shared
+  index and the heap's huge-object index, validating record layouts, object
+  extents, filter masks, checksums, and traversal budgets. Shared wrappers are
+  currently resolved only when their eight-byte ID names an unfiltered managed
+  heap object. A wrapper naming a huge, tiny, or filter-encoded heap object is
+  refused as unsupported because validating its message payload would require
+  an additional body decoder (and, for filtered objects, decompression).
 
 - **Filtered dense link/attribute fractal heaps.** When a dense group's or
   object's fractal heap declares an I/O filter pipeline, the link/attribute
