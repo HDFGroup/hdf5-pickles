@@ -18,7 +18,8 @@
 # h5policy regression runner.
 #
 #   1. (re)generates the corpus fixtures with h5policy-gencorpus,
-#   2. runs synthetic datatype, file-space-info, and profile-limit checks,
+#   2. runs synthetic datatype, assigned-message, file-space-info, and
+#      profile-limit checks,
 #   3. runs the reachability-record checks, including its walk-budget neutrality,
 #   4. checks the stable, read-only API exposed to in-process consumers,
 #   5. runs the h5policy_analyze seam checks that in-process consumers rely on,
@@ -40,6 +41,10 @@ echo "== generating corpus =="
 echo "== datatype validator unit checks =="
 poke --quiet -L "$tests_dir/unit_datatype.pk"
 unit_status=$?
+
+echo "== metadata message validator unit checks =="
+poke --quiet -L "$tests_dir/unit_messages.pk"
+message_status=$?
 
 echo "== file-space-info validator unit checks =="
 poke --quiet -L "$tests_dir/unit_fsinfo.pk"
@@ -77,7 +82,8 @@ echo "== differential vs libhdf5 (h5py / h5dump / h5debug) =="
     grep -E '\[(PASS|FAIL|WARN)\]|FAIL |differential:'
 diff_status=${PIPESTATUS[0]}
 
-if [[ $unit_status -eq 0 && $fsinfo_status -eq 0 \
+if [[ $unit_status -eq 0 && $message_status -eq 0 \
+      && $fsinfo_status -eq 0 \
       && $limits_status -eq 0 && $reached_status -eq 0 \
       && $consumer_status -eq 0 \
       && $seam_status -eq 0 && $report_status -eq 0 \
@@ -85,5 +91,5 @@ if [[ $unit_status -eq 0 && $fsinfo_status -eq 0 \
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status)"
 exit 1

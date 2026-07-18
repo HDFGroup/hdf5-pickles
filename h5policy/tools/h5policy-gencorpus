@@ -401,6 +401,16 @@ def _gen_resource(root):
         for i in range(30):
             d.attrs.create("attribute_number_%02d" % i, np.arange(3, dtype="i8"))
     _write(f"{root}/valid/dense_attribute.h5", _dense_attrs)
+    # The same storage graph with creation-order tracking and indexing enabled.
+    # This adds an independent type-9 v2 B-tree which h5policy must traverse,
+    # checksum, and reconcile with the type-8 name index.
+    def _dense_attrs_corder(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_order=True, track_times=False)
+        for i in range(40):
+            d.attrs.create("attribute_number_%03d" % i,
+                           np.arange(3, dtype="i8"))
+    _write(f"{root}/valid/dense_attribute_corder.h5", _dense_attrs_corder)
     _make_adjacent_null_messages(
         f"{root}/valid/adjacent_null_messages.h5",
         f"{root}/valid/dense_attribute.h5")
@@ -413,6 +423,15 @@ def _gen_resource(root):
                      + [h["group"].create_dataset("child_dataset_%03d" % i,
                                                    data=np.arange(2, dtype="i4"))
                         for i in range(40)])
+
+    # Creation-order tracking adds a type-6 secondary B-tree beside the type-5
+    # name index.  Forty links force an internal root and child leaves.
+    def _dense_links_corder(h):
+        g = h.create_group("group", track_order=True)
+        for i in range(40):
+            g.create_dataset("child_dataset_%03d" % i,
+                             data=np.arange(2, dtype="i4"))
+    _write(f"{root}/valid/dense_links_corder.h5", _dense_links_corder)
 
     # Fixed-array chunk index (v4 index type 3): fixed-shape dataset with
     # several chunks.  h5policy validates the checksummed FAHD header and the
@@ -727,6 +746,12 @@ def _gen_malformed(root):
     _make_bad_dense_attr_btree_deep(
         f"{root}/malformed/bad_dense_attr_btree_deep.h5",
         f"{root}/valid/dense_attribute.h5")
+    _make_bad_dense_corder_leaf_checksum(
+        f"{root}/malformed/bad_dense_link_corder_leaf_checksum.h5",
+        f"{root}/valid/dense_links_corder.h5", 6)
+    _make_bad_dense_corder_leaf_checksum(
+        f"{root}/malformed/bad_dense_attr_corder_leaf_checksum.h5",
+        f"{root}/valid/dense_attribute_corder.h5", 9)
     _make_zero_v2_btree_record_size(
         f"{root}/malformed/zero_v2_btree_record_size.h5",
         f"{root}/valid/dense_links.h5")
@@ -1943,6 +1968,33 @@ def _make_bad_dense_attr_btree_deep(path, base_path):
     struct.pack_into("<H", raw, bt["bthd"] + 12, 120)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_bad_dense_corder_leaf_checksum(path, base_path, record_type):
+    """Flip a child-leaf checksum in a type-6/type-9 creation-order tree."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt = _bthd_info_for_type(raw, record_type)
+    root = bt["root"]
+    if bt["depth"] < 1 or raw[root:root + 4] != b"BTIN":
+        raise RuntimeError("creation-order fixture has no internal root")
+    nrec_bytes = _bt2_nrec_bytes(bt["node_size"], bt["record_size"],
+                                  bt["off_size"])
+    subtree_bytes = _bt2_subtree_bytes(
+        bt["node_size"], bt["record_size"], bt["depth"] - 1,
+        bt["off_size"]) if bt["depth"] > 1 else 0
+    ptr_size = bt["off_size"] + nrec_bytes + subtree_bytes
+    ptr = root + 6 + bt["nroot"] * bt["record_size"]
+    child = int.from_bytes(raw[ptr:ptr + bt["off_size"]], "little")
+    child_nrec = int.from_bytes(
+        raw[ptr + bt["off_size"]:
+            ptr + bt["off_size"] + nrec_bytes], "little")
+    if child >= len(raw) or raw[child:child + 4] != b"BTLF":
+        raise RuntimeError("creation-order root has no valid first leaf")
+    checksum = child + 6 + child_nrec * bt["record_size"]
+    if checksum + 4 > child + bt["node_size"]:
+        raise RuntimeError("creation-order leaf contents exceed node size")
+    raw[checksum] ^= 0x01
     _patch(path, bytes(raw))
 
 

@@ -297,6 +297,203 @@ fun h5policy_validate_ginfo_payload = (int ios,
                             "group-info message has trailing bytes");
 }
 
+/* The two modification-time messages are fixed-size scalar envelopes.  The
+   legacy form predates versioned messages and stores YYYYMMDDhhmmss as ASCII,
+   followed by two zero bytes.  Validate the text in place instead of mapping
+   it through the historical (and incorrect) broken-out integer pickle. */
+fun h5policy_validate_old_mtime_payload = (int ios,
+                                           H5PolicyProfile profile,
+                                           offset<uint<64>,B> payload_off,
+                                           uint<64> msg_size,
+                                           string object) void:
+{
+    if (msg_size != 16UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_OLD_MTIME_MESSAGE_SIZE", "corrupt",
+                                payload_off, object,
+                                "old modification-time message must be 16 bytes");
+            return;
+        }
+
+    var raw = h5policy_msg_bytes(ios, profile, payload_off, 16UL);
+    var i = 0UL;
+    while (i < 14UL)
+        {
+            if (raw[i] < 0x30UB || raw[i] > 0x39UB)
+                {
+                    h5policy_emit_error("H5_CORRUPT_OLD_MTIME_FORMAT", "corrupt",
+                                        payload_off + i#B, object,
+                                        "old modification-time message contains a non-decimal timestamp byte");
+                    return;
+                }
+            i = i + 1UL;
+        }
+    if (raw[14] != 0UB || raw[15] != 0UB)
+        h5policy_emit_error("H5_CORRUPT_OLD_MTIME_RESERVED", "corrupt",
+                            payload_off + 14#B, object,
+                            "old modification-time reserved bytes are nonzero");
+
+    /* Reject values that cannot be calendar fields.  The day check is kept at
+       1..31, matching the serialized format without imposing a timezone- or
+       calendar-library-dependent normalization policy. */
+    var month = ((raw[4] as uint<64>) - 48UL) * 10UL
+                + (raw[5] as uint<64>) - 48UL;
+    var day = ((raw[6] as uint<64>) - 48UL) * 10UL
+              + (raw[7] as uint<64>) - 48UL;
+    var hour = ((raw[8] as uint<64>) - 48UL) * 10UL
+               + (raw[9] as uint<64>) - 48UL;
+    var minute = ((raw[10] as uint<64>) - 48UL) * 10UL
+                 + (raw[11] as uint<64>) - 48UL;
+    var second = ((raw[12] as uint<64>) - 48UL) * 10UL
+                 + (raw[13] as uint<64>) - 48UL;
+    if (month < 1UL || month > 12UL || day < 1UL || day > 31UL
+        || hour > 23UL || minute > 59UL || second > 60UL)
+        h5policy_emit_error("H5_CORRUPT_OLD_MTIME_RANGE", "corrupt",
+                            payload_off, object,
+                            "old modification-time message contains an invalid calendar field");
+}
+
+fun h5policy_validate_mtime_payload = (int ios,
+                                       H5PolicyProfile profile,
+                                       offset<uint<64>,B> payload_off,
+                                       uint<64> msg_size,
+                                       string object) void:
+{
+    if (msg_size != 8UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_MTIME_MESSAGE_SIZE", "corrupt",
+                                payload_off, object,
+                                "modification-time message must be 8 bytes");
+            return;
+        }
+    var raw = h5policy_msg_bytes(ios, profile, payload_off, 4UL);
+    if (raw[0] != 1UB)
+        h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_MTIME_VERSION", "corrupt",
+                            payload_off, object,
+                            "modification-time message has an unsupported version");
+    if (raw[1] != 0UB || raw[2] != 0UB || raw[3] != 0UB)
+        h5policy_emit_error("H5_CORRUPT_MTIME_RESERVED", "corrupt",
+                            payload_off + 1#B, object,
+                            "modification-time reserved bytes are nonzero");
+}
+
+/* The superblock-extension K message replaces the defaults used by every
+   legacy group and indexed-storage B-tree reached later in the file. */
+fun h5policy_validate_btreek_payload = (int ios,
+                                        H5PolicyProfile profile,
+                                        offset<uint<64>,B> payload_off,
+                                        uint<64> msg_size,
+                                        string object) void:
+{
+    if (msg_size != 7UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_BTREEK_MESSAGE_SIZE", "corrupt",
+                                payload_off, object,
+                                "v1 B-tree K-values message must be 7 bytes");
+            return;
+        }
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
+    var chunk_k = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 2UL);
+    var snode_k = h5policy_msg_u64_at(ios, profile, payload_off + 3#B, 2UL);
+    var leaf_k = h5policy_msg_u64_at(ios, profile, payload_off + 5#B, 2UL);
+    if (version != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_BTREEK_VERSION", "corrupt",
+                                payload_off, object,
+                                "v1 B-tree K-values message has an unsupported version");
+            return;
+        }
+    if (chunk_k == 0UL || snode_k == 0UL || leaf_k == 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_BTREEK_VALUE", "corrupt",
+                                payload_off + 1#B, object,
+                                "v1 B-tree K-values message contains a zero K value");
+            return;
+        }
+    if (object != "/<superblock-extension>")
+        {
+            h5policy_emit_error("H5_CORRUPT_BTREEK_PLACEMENT", "corrupt",
+                                payload_off, object,
+                                "v1 B-tree K-values message is outside the superblock extension");
+            return;
+        }
+
+    h5policy_super_indexed_internal_k = chunk_k;
+    h5policy_super_stab_internal_k = snode_k;
+    h5policy_super_stab_leaf_k = leaf_k;
+}
+
+/* Driver-specific bytes are consumed by a VFD and can name other files.  The
+   common envelope can be validated safely here; accepting the opaque body as
+   understood would be unsound, so a well-formed message remains an explicit
+   coverage refusal until member-file validation exists. */
+fun h5policy_validate_drvinfo_payload = (int ios,
+                                         H5PolicyProfile profile,
+                                         offset<uint<64>,B> payload_off,
+                                         uint<64> msg_size,
+                                         string object) void:
+{
+    if (msg_size < 11UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_DRVINFO_MESSAGE_TOO_SMALL", "corrupt",
+                                payload_off, object,
+                                "driver-info message is too small");
+            return;
+        }
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
+    var body_size = h5policy_msg_u64_at(ios, profile, payload_off + 9#B, 2UL);
+    if (version != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_DRVINFO_VERSION", "corrupt",
+                                payload_off, object,
+                                "driver-info message has an unsupported version");
+            return;
+        }
+    if (body_size == 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_DRVINFO_LENGTH", "corrupt",
+                                payload_off + 9#B, object,
+                                "driver-info body length is zero");
+            return;
+        }
+    if (body_size != msg_size - 11UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_DRVINFO_LENGTH", "corrupt",
+                                payload_off + 9#B, object,
+                                "driver-info body length does not match the message size");
+            return;
+        }
+    if (object != "/<superblock-extension>")
+        {
+            h5policy_emit_error("H5_CORRUPT_DRVINFO_PLACEMENT", "corrupt",
+                                payload_off, object,
+                                "driver-info message is outside the superblock extension");
+            return;
+        }
+    h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP", "unsupported",
+                        payload_off, object,
+                        "driver-specific member files are not validated");
+}
+
+fun h5policy_validate_refcount_payload = (int ios,
+                                          H5PolicyProfile profile,
+                                          offset<uint<64>,B> payload_off,
+                                          uint<64> msg_size,
+                                          string object) void:
+{
+    if (msg_size != 5UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_REFCOUNT_MESSAGE_SIZE", "corrupt",
+                                payload_off, object,
+                                "reference-count message must be 5 bytes");
+            return;
+        }
+    if (h5policy_msg_u64_at(ios, profile, payload_off, 1UL) != 0UL)
+        h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_REFCOUNT_VERSION", "corrupt",
+                            payload_off, object,
+                            "reference-count message has an unsupported version");
+}
+
 /* Walk a client-1 (file) free-space section list.  Every file-level section
    class carries a zero-byte serialized tail, so the entire section list is a
    flat, self-describing record stream that can be bounded and range-checked

@@ -13,6 +13,8 @@ controlled outcome; a change that alters any decision is surfaced for review.
   consistent file geometry; `expected_geometry` can pin individual values.
 - `unit_datatype.pk` — synthetic checks for the bounded, depth-guarded
   datatype validator (recursion cap and truncation handling), run under poke.
+- `unit_messages.pk` — fixed-envelope and dispatch checks for old/new mtime,
+  B-tree K override, driver-info, reference-count, LINFO, and AINFO messages.
 - `unit_limits.pk` — reduced-limit, in-memory characterization checks for the
   current `H5PolicyProfile` boundaries, complete built-in preset values,
   saturation, finding classes, profile validation, deterministic walk budgets,
@@ -93,6 +95,11 @@ metadata-byte saturation. A 300-chunk one-unlimited-dimension dataset reaches
 `EAIB`, direct `EADB`s, an `EASB`, and nested `EADB`s, with a child-checksum
 mutation proving the walk goes beyond the header and inline records.
 
+Dense links and attributes each have creation-order-indexed fixtures. Their
+type-6/type-9 trees have internal roots and child leaves; paired leaf-checksum
+mutations prove h5policy follows the secondary graph independently of the name
+index, while valid cases exercise heap-ID and creation-order reconciliation.
+
 SOHM has matching end-to-end coverage. A two-dataset repack produces a genuine
 `SMLI`, while 51 distinct shared dataspaces force a type-7 `BTIN` root and
 `BTLF` children. Repaired mutations cover list and B-tree record locations, a
@@ -131,10 +138,11 @@ libhdf5 rejects is safe but retained as a classification warning. A
 an `A+` warning when a bounded, out-of-process `libhdf5` probe also errors while
 inspecting attributes, reading small datasets, or running optional `libhdf5`
 tools; those eager catches are security-useful, not hard false positives. The
-similarly narrow `A~` warning covers only file-global SOHM search-index
-findings: shared wrappers carry direct heap IDs, so libhdf5's read path never
-opens the active SMLI/type-7 index that h5policy intentionally validates at the
-superblock extension.
+similarly narrow `A~` warning covers file-global SOHM/free-space metadata that
+read-only libhdf5 paths leave unopened, and findings confined to dense
+secondary creation-order indexes. Current libhdf5 can enumerate the primary
+name index without authenticating every type-6/type-9 block; h5policy
+intentionally validates both active indexes.
 
 The logical-**bytes** comparison is warning-level rather than a hard failure:
 h5policy now tracks logical dataset bytes separately from raw storage bytes, so

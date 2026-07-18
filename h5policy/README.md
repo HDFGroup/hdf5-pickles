@@ -143,10 +143,16 @@ Current coverage includes:
 - Object headers, continuation chunks, object-header checksums, message prefix
   bounds, and reachable object traversal with visited sets.
 - Dataspace, datatype, layout, filter pipeline, fill value, link, attribute,
-  free-space info, and metadata cache image messages.
+  both modification-time forms, B-tree K override, reference-count,
+  free-space info, and metadata cache image messages. Driver-info envelopes are
+  validated and then explicitly refused because their VFD bodies can name
+  member files outside the single-file validation boundary.
 - Compact hard links, dense link storage, dense attribute storage, old-style
-  group metadata, and chunk-index metadata, including recursive raw-data v2
-  B-trees and complete extensible-array block graphs.
+  group metadata, and chunk-index metadata. Dense storage covers both the name
+  indexes and recursive type-6/type-9 creation-order B-trees, including
+  checksums, subtree totals, heap-ID resolution, and cross-index identity;
+  chunk coverage includes recursive raw-data v2 B-trees and complete
+  extensible-array block graphs.
 - File-global Shared Object Header Message metadata: `SMTB` directories,
   `SMLI` record lists, recursive type-7 v2 B-trees, managed-message heap-ID
   resolution, fractal-heap envelopes, and complete huge-object index trees.

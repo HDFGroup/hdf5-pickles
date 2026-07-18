@@ -643,16 +643,11 @@ Object comment message (type 0x000d). Stores a short human-readable comment stri
 
 ## `oh_msg_old_mtime`
 
-Modification time message, old form (type 0x000e). Stores an object modification time as broken-out calendar fields rather than a UNIX timestamp. Present only in legacy files; new files use `oh_msg_mtime`.
+Modification time message, old form (type 0x000e). Stores an object modification time as the fixed-width ASCII string YYYYMMDDhhmmss. Present only in legacy files; new files use `oh_msg_mtime`.
 
 | Field | Description |
 |-------|-------------|
-| `year` | Calendar year as a signed 32-bit integer. |
-| `month` | Month of the year (1–12). |
-| `mday` | Day of the month (1–31). |
-| `hour` | Hour of the day (0–23). |
-| `minute` | Minute of the hour (0–59). |
-| `second` | Second of the minute (0–60, allowing for a leap second). |
+| `timestamp` | Fourteen ASCII decimal bytes in YYYYMMDDhhmmss order. |
 | `res` | Reserved. Must be zero (2 bytes). |
 
 
@@ -887,4 +882,3 @@ Version 1 object header layout. Identified by a version byte of 1 at the start o
 | `obj_ref_cnt` | Reference count: the number of hard links pointing to this object. An object is eligible for deletion when this count reaches zero. |
 | `obj_hdr_size` | Size in bytes of the message data in the first object header chunk. The message bytes immediately follow the 16-byte fixed prefix and are accessed via the internal `_msg_chunk` wrapper. |
 | `res2` | Reserved. Must be zero (4 bytes). |
-
