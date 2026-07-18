@@ -64,7 +64,8 @@ move.  `go` and `gos` refuse an offset at or past the end of the file.
 `check` runs the [`h5policy`](../h5policy/) oracle over the open file and reports
 what bears on the cursor; `check_all` reports every finding. `profile` shows or
 sets the profile they use (`untrusted_strict`, `forensic`, `trusted_fast`,
-`legacy`).
+`legacy`). Comparison findings include their typed actual/expected evidence and
+the exact byte ranges that directly encode or contribute to those values.
 
 ```text
 check

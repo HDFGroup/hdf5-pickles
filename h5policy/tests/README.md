@@ -71,6 +71,12 @@ expected_metrics:
   attribute_count: 1
 ```
 
+Every structured-evidence location is checked for its role, integer bounds, and
+containment in the physical file. `expected_finding_evidence_locations` can
+also match role/length and decode the cited fixture bytes as a little-endian
+integer, so tests verify the reported range rather than pinning generator-
+version-dependent absolute offsets.
+
 The reduced-boundary layer also reuses valid nested datatypes, multi-level
 dense-link B-trees, and continuation-heavy object headers to distinguish
 resource ceilings from structural corruption. A focused

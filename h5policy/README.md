@@ -72,7 +72,7 @@ JSON output includes:
   continuation was enabled, and whether the finding list was truncated.
 - `findings`: stable finding codes and locations. Comparison-based findings can
   also include typed `evidence` with a field name, actual and expected integer
-  values, and the required comparison.
+  values, the required comparison, and byte-precise supporting locations.
 - `features`: security-relevant constructs such as external links, external
   storage, VDS, dynamic filters, unknown messages, maximum rank, and maximum
   logical dataset bytes.
@@ -80,7 +80,10 @@ JSON output includes:
 
 Evidence comparisons currently use `equal` and `less_than_or_equal`; the
 finding means the reported `actual` value did not satisfy that comparison
-against `expected`.
+against `expected`. Each evidence location has a `role`, byte `offset`, and
+byte `length`. `actual` and `expected` mean the bytes directly encode that
+value; `actual_source` and `expected_source` identify fields contributing to a
+derived value such as a product.
 
 Trailing bytes are informational. They are outside the declared HDF5 address
 space and do not produce a finding by themselves.
@@ -90,8 +93,9 @@ space and do not produce a finding by themselves.
 Consumers that load `h5_policy.pk` should call `h5policy_analyze` and inspect
 the result through the read-only `h5policy_result_*` functions defined in
 `pickles/h5_consumer.pk`. The API exposes the decision, exit code, findings,
-location validity, typed integer evidence, truncation state, reachability
-queries, and explicit walk start/completion/stop state as scalars and strings.
+location validity, typed integer evidence and its supporting byte ranges,
+truncation state, reachability queries, and explicit walk
+start/completion/stop state as scalars and strings.
 The parallel finding and traversal vectors remain implementation details. The
 new `h5policy_result_continue_after_rejection` accessor has the deprecated
 `h5policy_result_continue_after_corruption` spelling as an API alias.
@@ -175,6 +179,19 @@ crashes on them:
   not process the file. The differential harness accepts that explicit refusal
   under invariant A' while retaining a classification warning when libhdf5
   rejects the same file as corrupt.
+
+- **Vlen and reference data global heaps.** A dataset's variable-length or
+  reference elements point into a global heap collection (`GCOL`) through heap
+  IDs stored in the dataset's *raw data*, which h5policy never reads. It
+  validates a `GCOL` only when the reference lives in metadata (the VDS layout
+  message; see `h5_vds.pk`) or when the collection is *orphaned* and caught by
+  the forensic sweep (`H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP`). A malformed but
+  data-reachable collection is otherwise invisible, so unlike the filtered-heap
+  gap above this one surfaces as an *accept*, not a coverage-gap refusal. That
+  is still sound under invariant A': the differential oracle (`introspect` in
+  `h5policy-diff`) also reads only metadata and reports such a file as opened, so
+  a consumer that goes on to read the data gets libhdf5's own error or
+  denial-of-service behavior, which a metadata-only preflight does not model.
 
 ## Embedding h5policy
 

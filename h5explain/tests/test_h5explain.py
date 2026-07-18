@@ -575,6 +575,15 @@ def test_check_all_lists_every_finding():
     assert "H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS" in out, out
 
 
+def test_check_all_prints_structured_evidence_locations():
+    out = explain_path(
+        corpus("malformed/scaleoffset_size_mismatch.h5"), "check_all")
+    assert "evidence: filter.decode_element_size actual=131073" in out, out
+    assert "expected=4 comparison=equal" in out, out
+    assert "actual bytes @0x" in out, out
+    assert "expected bytes @0x" in out, out
+
+
 def test_check_all_on_a_clean_file_says_no_findings():
     out = explain("latest.h5", "check_all")
     assert "No findings." in out, out

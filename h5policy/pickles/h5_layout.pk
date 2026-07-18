@@ -108,8 +108,10 @@ fun h5policy_check_contiguous_extent = (int ios, H5PolicyProfile profile,
    the sentinel emits the finding exactly once and is carried through the rest of
    the loop.  The `dim != 0` division guard is safe because zero dims are rejected
    separately by the caller before this runs.  */
-fun h5policy_chunk_size32_accum = (uint<64> acc, uint<64> dim,
-                                   off64 loc, string object) uint<64>:
+fun h5policy_chunk_size32_accum_with_sources = (
+    uint<64> acc, uint<64> dim, off64 loc, uint<64> field_width,
+    uint<64>[] source_offsets, uint<64>[] source_lengths,
+    string object) uint<64>:
 {
     if (acc == 0xffffffffffffffffUL)
         return acc;                     /* already flagged; stay poisoned */
@@ -118,15 +120,49 @@ fun h5policy_chunk_size32_accum = (uint<64> acc, uint<64> dim,
             var observed = 0xffffffffffffffffUL;
             if (acc <= 0xffffffffffffffffUL / dim)
                 observed = acc * dim;
-            h5policy_emit_error_u64_evidence(
-                "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
-                loc, object,
-                "chunk byte size exceeds the legacy 32-bit chunk-size field",
-                "layout.chunk_size_overflow_product", observed,
-                0xffffffffUL, "less_than_or_equal");
+            if (source_offsets'length != 0UL
+                && source_offsets'length == source_lengths'length)
+                h5policy_emit_error_u64_evidence_sources(
+                    "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
+                    loc, object,
+                    "chunk byte size exceeds the legacy 32-bit chunk-size field",
+                    "layout.chunk_size_overflow_product", observed,
+                    0xffffffffUL, "less_than_or_equal",
+                    source_offsets, source_lengths);
+            else if (field_width != 0UL)
+                h5policy_emit_error_u64_evidence_at(
+                    "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
+                    loc, object,
+                    "chunk byte size exceeds the legacy 32-bit chunk-size field",
+                    "layout.chunk_size_overflow_product", observed,
+                    0xffffffffUL, "less_than_or_equal",
+                    "actual_source", loc, field_width);
+            else
+                h5policy_emit_error_u64_evidence(
+                    "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
+                    loc, object,
+                    "chunk byte size exceeds the legacy 32-bit chunk-size field",
+                    "layout.chunk_size_overflow_product", observed,
+                    0xffffffffUL, "less_than_or_equal");
             return 0xffffffffffffffffUL;
         }
     return acc * dim;
+}
+
+fun h5policy_chunk_size32_accum_at = (uint<64> acc, uint<64> dim,
+                                      off64 loc, uint<64> field_width,
+                                      string object) uint<64>:
+{
+    return h5policy_chunk_size32_accum_with_sources(
+        acc, dim, loc, field_width, uint<64>[](), uint<64>[](), object);
+}
+
+/* Compatibility seam for arithmetic unit tests that have a value but no
+   corresponding encoded field width.  */
+fun h5policy_chunk_size32_accum = (uint<64> acc, uint<64> dim,
+                                   off64 loc, string object) uint<64>:
+{
+    return h5policy_chunk_size32_accum_at(acc, dim, loc, 0UL, object);
 }
 
 /* v4 chunked layout: validate the chunk dimensions and dispatch on the
@@ -169,12 +205,13 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyProfile profile,
                That count is used only for budget estimates and the filter
                chunk-consistency check; raw chunk data is still not read.  */
             var k = 0UL;
+            var chunk_source_offsets4 = uint<64>[]();
+            var chunk_source_lengths4 = uint<64>[]();
             while (k < ndims4)
                 {
-                    var dim4 = h5policy_msg_u64_at(ios, profile,
-                                                  payload_off
-                                                  + (dims_rel4 + k * enc)#B,
-                                                  enc);
+                    var dim4_off = payload_off
+                        + (dims_rel4 + k * enc)#B;
+                    var dim4 = h5policy_msg_u64_at(ios, profile, dim4_off, enc);
                     if (dim4 == 0UL)
                         {
                             chunk_dims_ok = 0UB;
@@ -185,6 +222,8 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyProfile profile,
                         }
                     else
                         {
+                            chunk_source_offsets4 += [dim4_off/#B];
+                            chunk_source_lengths4 += [enc];
                             if (k + 1UL < ndims4)
                                 chunk_elem_count =
                                     h5policy_checked_mul_u64(chunk_elem_count, dim4,
@@ -195,8 +234,10 @@ fun h5policy_layout_chunked_v4 = (int ios, H5PolicyProfile profile,
                             /* All dims (incl. the trailing element-size dim)
                                multiply into libhdf5's 32-bit chunk.size. */
                             chunk_byte_size =
-                                h5policy_chunk_size32_accum(chunk_byte_size, dim4,
-                                                            payload_off, object);
+                                h5policy_chunk_size32_accum_with_sources(
+                                    chunk_byte_size, dim4, dim4_off, enc,
+                                    chunk_source_offsets4, chunk_source_lengths4,
+                                    object);
                         }
                     k = k + 1UL;
                 }
@@ -385,6 +426,8 @@ fun h5policy_validate_layout_payload = (int ios,
                        rank updater compares it with the dataspace when known. */
                     ctx.has_legacy_chunked_layout = 1UB;
                     ctx.legacy_chunked_layout_ndims = ndims;
+                    ctx.legacy_chunked_layout_ndims_offset =
+                        (payload_off + 1#B)/#B;
                     ctx = h5policy_update_legacy_chunked_layout_rank(ctx,
                                                                      payload_off + 1#B,
                                                                      object);
@@ -419,12 +462,14 @@ fun h5policy_validate_layout_payload = (int ios,
                             var chunk_dims_ok = 1UB;
                             var chunk_elem_count = 1UL;
                             var chunk_byte_size = 1UL;
+                            var chunk_source_offsets = uint<64>[]();
+                            var chunk_source_lengths = uint<64>[]();
                             while (i < ndims)
                                 {
+                                    var dim_off = payload_off
+                                        + (dims_rel + i * 4UL)#B;
                                     var dim = h5policy_msg_u64_at(ios, profile,
-                                                                  payload_off
-                                                                  + (dims_rel + i * 4UL)#B,
-                                                                  4UL);
+                                                                  dim_off, 4UL);
                                     if (dim == 0UL)
                                         {
                                             chunk_dims_ok = 0UB;
@@ -435,6 +480,8 @@ fun h5policy_validate_layout_payload = (int ios,
                                         }
                                     else
                                         {
+                                            chunk_source_offsets += [dim_off/#B];
+                                            chunk_source_lengths += [4UL];
                                             if (i + 1UL < ndims)
                                                 chunk_elem_count =
                                                     h5policy_checked_mul_u64(chunk_elem_count, dim,
@@ -447,8 +494,12 @@ fun h5policy_validate_layout_payload = (int ios,
                                                dim) multiply into libhdf5's 32-bit
                                                chunk.size. */
                                             chunk_byte_size =
-                                                h5policy_chunk_size32_accum(chunk_byte_size, dim,
-                                                                            payload_off, object);
+                                                h5policy_chunk_size32_accum_with_sources(
+                                                    chunk_byte_size, dim,
+                                                    dim_off, 4UL,
+                                                    chunk_source_offsets,
+                                                    chunk_source_lengths,
+                                                    object);
                                         }
                                     i = i + 1UL;
                                 }
@@ -529,6 +580,8 @@ fun h5policy_validate_layout_payload = (int ios,
                                                     "layout dimensionality is out of range");
                             ctx.has_legacy_chunked_layout = 1UB;
                             ctx.legacy_chunked_layout_ndims = ndims3;
+                            ctx.legacy_chunked_layout_ndims_offset =
+                                (payload_off + 2#B)/#B;
                             ctx = h5policy_update_legacy_chunked_layout_rank(ctx,
                                                                              payload_off + 2#B,
                                                                              object);
@@ -566,12 +619,14 @@ fun h5policy_validate_layout_payload = (int ios,
                                     var chunk_dims3_ok = 1UB;
                                     var chunk_elem3_count = 1UL;
                                     var chunk_byte3_size = 1UL;
+                                    var chunk_source_offsets3 = uint<64>[]();
+                                    var chunk_source_lengths3 = uint<64>[]();
                                     while (j < ndims3)
                                         {
-                                            var dim3 = h5policy_msg_u64_at(ios, profile,
-                                                                          payload_off
-                                                                          + (dims_rel3 + j * 4UL)#B,
-                                                                          4UL);
+                                            var dim3_off = payload_off
+                                                + (dims_rel3 + j * 4UL)#B;
+                                            var dim3 = h5policy_msg_u64_at(
+                                                ios, profile, dim3_off, 4UL);
                                             if (dim3 == 0UL)
                                                 {
                                                     chunk_dims3_ok = 0UB;
@@ -582,6 +637,9 @@ fun h5policy_validate_layout_payload = (int ios,
                                                 }
                                             else
                                                 {
+                                                    chunk_source_offsets3 +=
+                                                        [dim3_off/#B];
+                                                    chunk_source_lengths3 += [4UL];
                                                     if (j + 1UL < ndims3)
                                                         chunk_elem3_count =
                                                             h5policy_checked_mul_u64(chunk_elem3_count, dim3,
@@ -594,8 +652,12 @@ fun h5policy_validate_layout_payload = (int ios,
                                                        element-size dim) multiply into
                                                        libhdf5's 32-bit chunk.size. */
                                                     chunk_byte3_size =
-                                                        h5policy_chunk_size32_accum(chunk_byte3_size, dim3,
-                                                                                    payload_off, object);
+                                                        h5policy_chunk_size32_accum_with_sources(
+                                                            chunk_byte3_size, dim3,
+                                                            dim3_off, 4UL,
+                                                            chunk_source_offsets3,
+                                                            chunk_source_lengths3,
+                                                            object);
                                                 }
                                             j = j + 1UL;
                                         }
@@ -935,24 +997,26 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
             if (record_decode_nelmts != 0
                 && (filter_id == 5UL || filter_id == 6UL) && cd_nelmts >= 3UL)
                 {
+                    var d_nelmts_off = payload_off
+                        + (cur + desc_header + name_len + 8UL)#B;
                     var d_nelmts =
-                        h5policy_msg_u64_at(ios, profile,
-                                            payload_off
-                                            + (cur + desc_header + name_len + 8UL)#B,
-                                            4UL);
+                        h5policy_msg_u64_at(ios, profile, d_nelmts_off, 4UL);
                     if (h5policy_pipeline_has_decode_nelmts != 0UB
                         && h5policy_pipeline_decode_nelmts != d_nelmts)
                         /* Two decode filters on one dataset must agree on the
                            chunk element count; a divergence is already tampering
                            and cannot be reconciled with a single chunk shape.  */
-                        h5policy_emit_error_u64_evidence(
+                        h5policy_emit_error_u64_evidence_between(
                             "H5_CORRUPT_FILTER_NELMTS_MISMATCH", "corrupt",
                             payload_off + cur#B, object,
                             "decode filters disagree on the chunk element count",
                             "filter.decode_element_count", d_nelmts,
-                            h5policy_pipeline_decode_nelmts, "equal");
+                            h5policy_pipeline_decode_nelmts, "equal",
+                            d_nelmts_off, 4UL,
+                            h5policy_pipeline_decode_nelmts_offset#B, 4UL);
                     h5policy_pipeline_decode_nelmts = d_nelmts;
                     h5policy_pipeline_has_decode_nelmts = 1UB;
+                    h5policy_pipeline_decode_nelmts_offset = d_nelmts_off/#B;
 
                     /* Scale-offset also stores the per-element size in
                        cd_values[4] (H5Z_SCALEOFFSET_PARM_SIZE); it multiplies
@@ -963,12 +1027,14 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                        only.  */
                     if (filter_id == 6UL && cd_nelmts >= 5UL)
                         {
+                            var decode_size_off = payload_off
+                                + (cur + desc_header + name_len + 16UL)#B;
                             h5policy_pipeline_decode_size =
                                 h5policy_msg_u64_at(ios, profile,
-                                                    payload_off
-                                                    + (cur + desc_header + name_len + 16UL)#B,
-                                                    4UL);
+                                                    decode_size_off, 4UL);
                             h5policy_pipeline_has_decode_size = 1UB;
+                            h5policy_pipeline_decode_size_offset =
+                                decode_size_off/#B;
                         }
                 }
 

@@ -88,6 +88,26 @@ PROFILE_OVERRIDE_FIELDS = {
 }
 
 
+def _location_matches(location, expected, fixture_bytes):
+    """Match a location subset and, optionally, its little-endian bytes."""
+    for key, value in expected.items():
+        if key == "little_endian_value":
+            continue
+        if location.get(key) != value:
+            return False
+    if "little_endian_value" not in expected:
+        return True
+    offset = location.get("offset")
+    length = location.get("length")
+    if (fixture_bytes is None or isinstance(offset, bool)
+            or not isinstance(offset, int) or isinstance(length, bool)
+            or not isinstance(length, int) or offset < 0 or length <= 0
+            or offset + length > len(fixture_bytes)):
+        return False
+    encoded = int.from_bytes(fixture_bytes[offset:offset + length], "little")
+    return encoded == expected["little_endian_value"]
+
+
 def _poke_string(value):
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
@@ -310,6 +330,42 @@ def run_case(spec):
         if forbidden_code in codes:
             problems.append(f"forbidden finding present {forbidden_code}")
 
+    for finding in report.get("findings", []):
+        evidence = finding.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        locations = evidence.get("locations")
+        if not isinstance(locations, list) or not locations:
+            problems.append(
+                f"finding {finding.get('code')} evidence has no byte locations")
+            continue
+        for index, location in enumerate(locations):
+            if not isinstance(location, dict):
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} is not an object")
+                continue
+            role = location.get("role")
+            offset = location.get("offset")
+            length = location.get("length")
+            if role not in {"actual", "expected", "actual_source",
+                            "expected_source"}:
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} has invalid role {role!r}")
+            if (isinstance(offset, bool) or not isinstance(offset, int)
+                    or offset < 0):
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} has invalid offset")
+            if (isinstance(length, bool) or not isinstance(length, int)
+                    or length <= 0):
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} has invalid length")
+            if (isinstance(physical, int) and not isinstance(physical, bool)
+                    and isinstance(offset, int) and not isinstance(offset, bool)
+                    and isinstance(length, int) and not isinstance(length, bool)
+                    and length > 0 and offset + length > physical):
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} exceeds physical file size")
+
     for code, expected in spec.get("expected_finding_evidence", {}).items():
         matching = [
             finding.get("evidence")
@@ -325,6 +381,43 @@ def run_case(spec):
                    for evidence in matching):
             problems.append(
                 f"finding {code} evidence does not include {expected!r}")
+
+    expected_location_sets = spec.get(
+        "expected_finding_evidence_locations", {})
+    fixture_bytes = None
+    if expected_location_sets and os.path.exists(path):
+        with open(path, "rb") as fixture_file:
+            fixture_bytes = fixture_file.read()
+    for code, expected_locations in expected_location_sets.items():
+        candidates = [
+            finding.get("evidence")
+            for finding in report.get("findings", [])
+            if finding.get("code") == code
+            and isinstance(finding.get("evidence"), dict)
+        ]
+        matched = False
+        for evidence in candidates:
+            locations = evidence.get("locations", [])
+            used = set()
+            all_matched = True
+            for expected_location in expected_locations:
+                found_index = None
+                for index, location in enumerate(locations):
+                    if (index not in used and isinstance(location, dict)
+                            and _location_matches(location, expected_location,
+                                                  fixture_bytes)):
+                        found_index = index
+                        break
+                if found_index is None:
+                    all_matched = False
+                    break
+                used.add(found_index)
+            if all_matched:
+                matched = True
+                break
+        if not matched:
+            problems.append(
+                f"finding {code} evidence locations do not include {expected_locations!r}")
 
     if "expected_mapping_mode" in spec:
         got = report.get("mapping_mode")

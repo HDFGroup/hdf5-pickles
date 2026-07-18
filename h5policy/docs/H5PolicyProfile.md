@@ -122,6 +122,15 @@ cannot return its decoded state.
 Physical bytes after the declared EOA are outside HDF5's address space. They are
 reported for provenance and triage but do not cause a finding by themselves.
 
+Comparison-based findings carry an `evidence.locations` array. Every entry has
+a semantic `role`, absolute byte `offset`, and byte `length`. Roles `actual` and
+`expected` mean the range directly encodes the corresponding integer. Roles
+`actual_source` and `expected_source` identify encoded inputs to a derived value;
+for example, a chunk-size overflow cites every dimension field multiplied into
+the reported product. Constants and other values with no encoded byte range do
+not receive a fabricated location. These locations are additive report fields
+under schema version 1.
+
 When several findings occur, decision precedence is:
 
 ```text
