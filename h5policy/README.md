@@ -145,7 +145,8 @@ Current coverage includes:
 - Dataspace, datatype, layout, filter pipeline, fill value, link, attribute,
   free-space info, and metadata cache image messages.
 - Compact hard links, dense link storage, dense attribute storage, old-style
-  group metadata, and chunk-index metadata.
+  group metadata, and chunk-index metadata, including recursive raw-data v2
+  B-trees and complete extensible-array block graphs.
 - Logical dataset byte accounting kept separate from raw storage accounting, so
   datatype semantics can be compared against `libhdf5` while layout checks still
   use on-disk storage size.
@@ -154,7 +155,8 @@ Checksum coverage includes the HDF5 Jenkins checksums used by:
 
 - v2/v3 superblocks
 - v2 object headers and continuation chunks
-- chunk-index metadata
+- chunk-index headers, v2 B-tree internal/leaf nodes, and extensible-array
+  index/secondary/data blocks and initialized pages
 - dense metadata fractal heaps: `FRHP`, `FHDB`, `FHIB`
 - dense metadata v2 B-trees: `BTHD`, `BTLF`, `BTIN`
 

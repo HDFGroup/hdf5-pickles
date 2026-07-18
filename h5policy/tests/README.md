@@ -85,6 +85,14 @@ fixed-array index and a two-filter shuffle+gzip pipeline: its baseline case is
 valid with the normal gzip advisory, while separate overrides reduce only the
 chunk or filter count ceiling.
 
+Modern chunk indexes have dedicated deep fixtures as well. A 400-chunk
+two-unlimited-dimension dataset forces a raw-data `BTIN` root with `BTLF`
+children; paired mutations cover a child checksum, an out-of-file child, and a
+checksum-valid cycle, while integration overrides cover depth and exact
+metadata-byte saturation. A 300-chunk one-unlimited-dimension dataset reaches
+`EAIB`, direct `EADB`s, an `EASB`, and nested `EADB`s, with a child-checksum
+mutation proving the walk goes beyond the header and inline records.
+
 Legacy chunk-index cases cover the subtler finite-ceiling boundary directly.
 A four-chunk v1 B-tree distinguishes equality from overflow within one leaf;
 a generated 130-chunk, multi-level v1 tree proves that an internal-node walk

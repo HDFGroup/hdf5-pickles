@@ -183,8 +183,10 @@ the counter becomes the limit and h5policy emits:
 H5_RESOURCE_ACCOUNTED_METADATA_BYTES (resource)
 ```
 
-An accounting failure does not immediately stop the validator that made the
-call.
+An accounting failure does not globally abort unrelated validation. Recursive
+modern chunk-index walkers do stop following additional child edges once the
+ceiling has been crossed, so an attacker cannot use an already-refused charge
+to drive an unbounded graph walk.
 
 The accumulator is not a count of all bytes read or mapped, and it is not a
 complete unique-extent measure. Current accounting calls cover:
@@ -193,14 +195,18 @@ complete unique-extent measure. Current accounting calls cover:
 - v1 and v2 root object-header extents;
 - declared object-header continuation extents;
 - old-style group v1 B-tree nodes and SNOD nodes;
-- v1 chunk B-tree nodes; and
-- v2 B-tree, fixed-array, and extensible-array chunk-index headers.
+- v1 chunk B-tree nodes;
+- raw-data v2 B-tree headers and each fixed-size internal or leaf node;
+- fixed-array chunk-index headers; and
+- extensible-array headers, index blocks, secondary blocks, and complete data
+  block allocations (including their page-checksum storage).
 
 In particular, general byte mappings do not charge this counter automatically.
 Dense fractal-heap/B-tree blocks, SOHM structures, VDS global-heap objects,
-metadata-cache image bodies, and chunk-index data blocks are not uniformly
-included. Reaching the same explicitly accounted structure through distinct
-paths is not guaranteed to be globally deduplicated by the accounting helper.
+metadata-cache image bodies, and fixed-array chunk-index data blocks are not
+uniformly included. Reaching the same explicitly accounted structure through
+distinct paths is not guaranteed to be globally deduplicated by the accounting
+helper.
 
 Zero is an active zero-byte limit. The built-in unlimited preset uses
 `UINT64_MAX`.
@@ -328,7 +334,7 @@ the layout/index type, the counter is increased by:
 - each leaf chunk reached in a v1 chunk B-tree;
 - a v2 chunk B-tree header's total record count;
 - a fixed-array header's element count; or
-- an extensible-array header's element count.
+- an extensible-array header's realized-element count.
 
 Consequently, the JSON metric named `chunk_index_refs` is a mixed
 chunk/index-accounting value, not strictly a number of index references.
@@ -341,8 +347,9 @@ H5_RESOURCE_CHUNK_COUNT (resource)
 
 and saturates the counter. An internal overflow flag preserves the distinction
 between exact equality and proven overflow after saturation, and suppresses
-duplicate chunk-count findings. Header-counted index validators may continue
-validating their root or inline records after the finding.
+duplicate chunk-count findings. Header-counted index validators may validate
+their root or inline records after the finding, but recursive modern
+chunk-index walkers do not follow further child edges after proven overflow.
 
 For a validated v1 chunk-B-tree leaf, the declared leaf entry count is claimed
 atomically. If it crosses the remaining allowance, only entries within that
@@ -362,6 +369,7 @@ is used by the unlimited presets.
 This is checked on recursive paths for:
 
 - v1 raw-data chunk B-trees;
+- v2 raw-data chunk B-trees;
 - old-style group v1 B-trees;
 - dense-link v2 B-trees; and
 - dense-attribute v2 B-trees.
@@ -375,10 +383,8 @@ H5_RESOURCE_BTREE_DEPTH (resource)
 
 and returns from that tree branch. A tree can be valid HDF5 while exceeding the
 selected profile's analysis budget, so this finding does not claim corruption.
-The field does not constrain every structure
-that contains an on-disk B-tree depth. For example, the partial v2 chunk-index
-B-tree validator validates a header and root but does not recursively descend
-arbitrary internal nodes through this field.
+The field does not constrain every structure that merely contains a field
+named “depth”; it applies at the recursive B-tree walkers listed above.
 
 Zero allows a depth-zero leaf/root and rejects a recursive depth of one.
 `UINT64_MAX` is effectively unlimited.
@@ -776,14 +782,14 @@ CLI.
 | Field or rule | Current direct coverage |
 | --- | --- |
 | Built-in profile values | Every field in all four presets is compared with its documented value. The production clone helper reconstructs every nested group; unit mutation checks verify that clones cannot alias a shipped preset. |
-| `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. A reduced full-file case also saturates `metadata_bytes_seen` at its exact ceiling. |
+| `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. Reduced full-file cases saturate `metadata_bytes_seen` at the exact ceiling, including a deep raw-data v2 B-tree case that permits its root but refuses and stops at a child-node charge. |
 | `max_attribute_count` | A valid synthetic attribute is parsed at and above a reduced cumulative limit. |
 | `max_object_header_chunks` | A synthetic continuation message covers equality, over-limit saturation, and the fact that its later structural finding is independent. A valid continuation-heavy object header crosses a reduced full-walk ceiling and saturates the reported counter without becoming corrupt. |
 | `max_chunk_count` | Defined chunk-index references cover equality, over-limit saturation, and the internal exact-versus-exceeded state. A valid four-chunk fixed-array dataset rejects as resource policy under a reduced ceiling. Separate legacy v1 cases cover exact equality and overflow within one leaf, plus a 130-chunk multi-level tree whose parent must continue at equality into a later child to prove overflow. In every rejecting case, `chunk_index_refs` saturates exactly at the selected limit. |
 | `max_single_value_bytes` | Fill values cover equality, over-limit resource classification, and zero-as-disabled; separate valid datatype and attribute blobs cross the other two enforcement sites. A compact valid file isolates the attribute-value enforcement site during a full walk. |
 | `max_logical_dataset_bytes` | Synthetic dataset facts cover equality and saturation. `resource/huge_logical_dataset.h5` requires the resource finding, and the same file is accepted under legacy. |
 | Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, zero-byte disabling, and validation of the disabled pair. `resource/tiny_chunks.h5` supplies end-to-end coverage. |
-| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. A valid multi-level dense-link v2 B-tree also rejects as resource policy under a reduced full-walk ceiling. |
+| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. Valid multi-level dense-link and raw-data chunk v2 B-trees also reject as resource policy under reduced full-walk ceilings. |
 | `max_link_traversal_depth` | Synthetic queue operations cover equality, the resource over-limit finding, and declining to enqueue the child. A real depth-66 hierarchy rejects under the built-in strict profile and accepts under the built-in forensic profile. |
 | `max_datatype_recursion_depth` | `unit_datatype.pk` covers deep VLen and compound nesting as resource rejection; the CVE fixture requires the same finding under legacy. A valid compound-with-array datatype crosses a reduced full-walk depth ceiling as a resource rejection. |
 | `max_filter_parameter_recursion_depth` | A direct recursive call above a zero limit covers the resource finding and poison return; malformed n-bit parameter bounds and classes retain their synthetic coverage. A valid n-bit-filtered dataset reaches the same resource path end to end under a reduced ceiling. |

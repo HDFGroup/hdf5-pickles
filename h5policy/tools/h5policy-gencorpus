@@ -347,6 +347,16 @@ def _gen_resource(root):
         d[:] = np.arange(400).reshape(20, 20)
     _write(f"{root}/valid/chunk_v2_btree.h5", _v2btree_chunks)
 
+    # A v2 raw-data B-tree whose 400 one-byte chunks force a BTIN root and
+    # several BTLF children.  This pins recursive node geometry, checksums,
+    # address validation, cycle detection, and depth/metadata budgets.
+    def _v2btree_chunks_deep(h):
+        d = h.create_dataset("d", shape=(20, 20), maxshape=(None, None),
+                             chunks=(1, 1), dtype="u1", track_times=False)
+        d[:] = (np.arange(400) % 251).astype("u1").reshape(20, 20)
+    _write(f"{root}/valid/chunk_v2_btree_deep.h5",
+           _v2btree_chunks_deep)
+
     # Dense attribute storage: a fractal heap + name-indexed v2 B-tree.  Many
     # attributes force dense storage; h5policy resolves each heap object and
     # validates it as an attribute message.
@@ -387,6 +397,15 @@ def _gen_resource(root):
                              chunks=(5, 4), dtype="i4")
         d[:] = np.arange(40).reshape(10, 4)
     _write(f"{root}/valid/chunk_ext_array.h5", _ext_array)
+
+    # Enough single-element chunks to leave EAIB's inline entries, fill its
+    # direct EADB table, and allocate an EASB with nested EADBs.
+    def _ext_array_deep(h):
+        d = h.create_dataset("d", shape=(0,), maxshape=(None,), chunks=(1,),
+                             dtype="u1", track_times=False)
+        d.resize((300,))
+        d[:] = (np.arange(300) % 251).astype("u1")
+    _write(f"{root}/valid/chunk_ext_array_deep.h5", _ext_array_deep)
 
     # Paged fixed-array chunk index: enough chunks that the data block is split
     # into pages (each with its own checksum and a page-init bitmap).
@@ -538,6 +557,18 @@ def _gen_malformed(root):
     _make_bad_ext_array_without_unlimited_dim(
         f"{root}/malformed/bad_ext_array_without_unlimited_dim.h5",
         f"{root}/valid/chunk_ext_array.h5")
+    _make_bad_ext_array_deep_checksum(
+        f"{root}/malformed/bad_ext_array_deep_checksum.h5",
+        f"{root}/valid/chunk_ext_array_deep.h5")
+    _make_bad_chunk_v2_btree_deep_checksum(
+        f"{root}/malformed/bad_chunk_v2_btree_deep_checksum.h5",
+        f"{root}/valid/chunk_v2_btree_deep.h5")
+    _make_bad_chunk_v2_btree_child_address(
+        f"{root}/malformed/bad_chunk_v2_btree_child_address.h5",
+        f"{root}/valid/chunk_v2_btree_deep.h5")
+    _make_bad_chunk_v2_btree_cycle(
+        f"{root}/malformed/bad_chunk_v2_btree_cycle.h5",
+        f"{root}/valid/chunk_v2_btree_deep.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
     _make_bad_dataset_missing_layout(
@@ -1242,19 +1273,15 @@ def _floor_log2(value):
 
 
 def _bt2_nrec_bytes(node_size, record_size, offset_size):
+    del offset_size  # The width is derived from leaf capacity, not pointers.
+    if record_size == 0 or node_size < 10:
+        return 1
+    max_nrec = (node_size - 10) // record_size
     nbytes = 1
-    prev = 0
-    while nbytes != prev:
-        prev = nbytes
-        ptr_size = offset_size + nbytes
-        if node_size < 10 + ptr_size or record_size + ptr_size == 0:
-            return nbytes
-        max_nrec = (node_size - 10 - ptr_size) // (record_size + ptr_size)
-        nbytes = 1
-        thresh = 256
-        while max_nrec >= thresh:
-            nbytes += 1
-            thresh *= 256
+    thresh = 256
+    while max_nrec >= thresh:
+        nbytes += 1
+        thresh *= 256
     return nbytes
 
 
@@ -1341,6 +1368,116 @@ def _dense_bthd_info(raw):
                 node_size=node_size, record_size=record_size, depth=depth,
                 root=root, nroot=nroot,
                 checksum=bthd + 22 + off_size + len_size - 4)
+
+
+def _chunk_bt2_root_info(raw):
+    """Return the exact used geometry of a raw-data v2 B-tree root."""
+    bt = _dense_bthd_info(raw)
+    record_type = raw[bt["bthd"] + 5]
+    if record_type not in (10, 11):
+        raise RuntimeError("BTHD is not a raw-data chunk index")
+    root = bt["root"]
+    if raw[root:root + 4] != b"BTIN" or bt["depth"] == 0:
+        raise RuntimeError("chunk v2 B-tree fixture has no internal root")
+    nrec_bytes = _bt2_nrec_bytes(bt["node_size"], bt["record_size"],
+                                  bt["off_size"])
+    subtree_bytes = _bt2_subtree_bytes(
+        bt["node_size"], bt["record_size"], bt["depth"] - 1,
+        bt["off_size"]) if bt["depth"] > 1 else 0
+    ptr_size = bt["off_size"] + nrec_bytes + subtree_bytes
+    ptr_base = root + 6 + bt["nroot"] * bt["record_size"]
+    checksum = ptr_base + (bt["nroot"] + 1) * ptr_size
+    if checksum + 4 > root + bt["node_size"]:
+        raise RuntimeError("chunk v2 B-tree root contents exceed node size")
+    bt.update(record_type=record_type, nrec_bytes=nrec_bytes,
+              subtree_bytes=subtree_bytes, ptr_size=ptr_size,
+              ptr_base=ptr_base, root_checksum=checksum)
+    return bt
+
+
+def _chunk_bt2_first_child(raw):
+    bt = _chunk_bt2_root_info(raw)
+    ptr = bt["ptr_base"]
+    child = int.from_bytes(raw[ptr:ptr + bt["off_size"]], "little")
+    child_nrec = int.from_bytes(
+        raw[ptr + bt["off_size"]:
+            ptr + bt["off_size"] + bt["nrec_bytes"]], "little")
+    if child >= len(raw):
+        raise RuntimeError("chunk v2 B-tree base has an invalid first child")
+    return bt, ptr, child, child_nrec
+
+
+def _repair_chunk_bt2_root_checksum(raw, bt):
+    checksum = _jenkins_lookup3()(
+        bytes(raw[bt["root"]:bt["root_checksum"]]))
+    struct.pack_into("<I", raw, bt["root_checksum"], checksum)
+
+
+def _make_bad_chunk_v2_btree_deep_checksum(path, base_path):
+    """Flip a child BTLF checksum that shallow root-only walking missed."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, _, child, child_nrec = _chunk_bt2_first_child(raw)
+    if bt["depth"] != 1 or raw[child:child + 4] != b"BTLF":
+        raise RuntimeError("expected a depth-one chunk v2 B-tree")
+    checksum = child + 6 + child_nrec * bt["record_size"]
+    if checksum + 4 > child + bt["node_size"]:
+        raise RuntimeError("chunk v2 B-tree leaf contents exceed node size")
+    raw[checksum] ^= 0x01
+    _patch(path, bytes(raw))
+
+
+def _make_bad_chunk_v2_btree_child_address(path, base_path):
+    """Point a checksummed BTIN child beyond EOA and repair the root hash."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, ptr, _, _ = _chunk_bt2_first_child(raw)
+    outside = len(raw) + 0x1000
+    raw[ptr:ptr + bt["off_size"]] = outside.to_bytes(bt["off_size"],
+                                                      "little")
+    _repair_chunk_bt2_root_checksum(raw, bt)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_chunk_v2_btree_cycle(path, base_path):
+    """Make a checksum-valid root child pointer refer back to the root."""
+    raw = bytearray(open(base_path, "rb").read())
+    bt, ptr, _, _ = _chunk_bt2_first_child(raw)
+    raw[ptr:ptr + bt["off_size"]] = bt["root"].to_bytes(bt["off_size"],
+                                                         "little")
+    _repair_chunk_bt2_root_checksum(raw, bt)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_ext_array_deep_checksum(path, base_path):
+    """Flip the checksum of the first non-inline EADB in a deep EA index."""
+    raw = bytearray(open(base_path, "rb").read())
+    eahd = raw.find(b"EAHD")
+    if eahd < 0:
+        raise RuntimeError("could not locate extensible-array header")
+    off_size = raw[9]
+    raw_elmt_size = raw[eahd + 6]
+    max_nelmts_bits = raw[eahd + 7]
+    data_blk_min_elmts = raw[eahd + 9]
+    arr_off_size = _bytes_for_bits(max_nelmts_bits)
+    prefix_body = 6 + off_size + arr_off_size
+
+    # Select the group-zero EADB: its block offset is zero and it is always
+    # unpaged because the page capacity must cover the first data-block group.
+    eadb = raw.find(b"EADB")
+    while eadb >= 0:
+        owner = int.from_bytes(raw[eadb + 6:eadb + 6 + off_size], "little")
+        block_off = int.from_bytes(
+            raw[eadb + 6 + off_size:eadb + prefix_body], "little")
+        if owner == eahd and block_off == 0:
+            break
+        eadb = raw.find(b"EADB", eadb + 4)
+    if eadb < 0:
+        raise RuntimeError("could not locate first extensible-array data block")
+
+    checksum = eadb + prefix_body + data_blk_min_elmts * raw_elmt_size
+    if checksum + 4 > len(raw):
+        raise RuntimeError("extensible-array data-block checksum is outside file")
+    raw[checksum] ^= 0x01
+    _patch(path, bytes(raw))
 
 
 def _dense_checksum_offset(raw, block):
