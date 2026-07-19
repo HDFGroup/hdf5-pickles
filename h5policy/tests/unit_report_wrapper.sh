@@ -25,7 +25,7 @@ printf 'abc' >"$input_file"
 
 report=$(PATH="$case_dir:$PATH" \
     "$tool" --profile untrusted-strict --non-strict \
-    --continue-after-rejection "$input_file")
+    --continue-after-rejection --max-walk-seconds 45 "$input_file")
 tool_status=$?
 
 if [[ $tool_status -ne 5 ]]; then
@@ -70,7 +70,8 @@ if not boundary or any(boundary.values()):
 findings = report.get("findings", [])
 if (len(findings) != 1
         or findings[0].get("code") != "H5_UNSUPPORTED_WALK_TIMEOUT"
-        or findings[0].get("has_location") is not False):
+        or findings[0].get("has_location") is not False
+        or "75s wall-clock limit" not in findings[0].get("message", "")):
     problems.append("findings")
 
 if problems:
@@ -78,3 +79,17 @@ if problems:
     sys.exit(1)
 print("PASS wrapper_timeout_report")
 PY
+
+if "$tool" --max-walk-seconds 0 "$input_file" >/dev/null 2>&1; then
+    printf 'FAIL max_walk_seconds_rejects_zero\n'
+    exit 1
+fi
+if "$tool" --max-walk-seconds nope "$input_file" >/dev/null 2>&1; then
+    printf 'FAIL max_walk_seconds_rejects_text\n'
+    exit 1
+fi
+if "$tool" --max-walk-seconds 99999999999999999999 "$input_file" >/dev/null 2>&1; then
+    printf 'FAIL max_walk_seconds_rejects_overflow\n'
+    exit 1
+fi
+printf 'PASS max_walk_seconds_argument_validation\n'

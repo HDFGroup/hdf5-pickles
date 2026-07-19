@@ -31,6 +31,7 @@ Run from the repository root:
 ./h5policy/tools/h5policy --profile trusted-fast file.h5
 ./h5policy/tools/h5policy --profile legacy file.h5
 ./h5policy/tools/h5policy --profile forensic --continue-after-rejection file.h5
+./h5policy/tools/h5policy --profile trusted-fast --max-walk-seconds 60 file.h5
 ```
 
 Output is JSON (the machine-readable result); it is the only format, so no flag
@@ -42,6 +43,8 @@ Useful mode flags:
 - `--continue-after-rejection` keeps walking after policy, resource,
   unsupported, or corruption findings so diagnostics include every reachable
   issue. `--continue-after-corruption` remains a deprecated compatibility alias.
+- `--max-walk-seconds N` overrides the selected profile's internal wall-clock
+  walk budget. The wrapper hard timeout is set to `N + 30` seconds.
 
 ## Decisions
 

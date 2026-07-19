@@ -619,7 +619,9 @@ The shell wrapper has a second, independent hard timeout: 20 seconds for the
 default/untrusted profile, 35 for trusted-fast, 50 for forensic, and 90 for
 legacy. If that timeout kills poke, the wrapper produces
 `H5_UNSUPPORTED_WALK_TIMEOUT`. Those wrapper values are not derived from
-`max_walk_seconds`.
+`max_walk_seconds`. The command-line `--max-walk-seconds N` option overrides
+the selected preset's internal limit and sets this hard timeout to `N + 30`
+seconds.
 
 ## Built-in feature and analysis-default presets
 
