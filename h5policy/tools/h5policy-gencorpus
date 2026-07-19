@@ -103,6 +103,16 @@ def _base_bytes(build, libver="latest"):
         os.unlink(base)
 
 
+def _build_shared_attr(h):
+    """A dataset `d` carrying an attribute whose datatype is the committed
+    (shared) datatype `t`.  Shared by the valid fixture and the NUL-link-name
+    malformed fixture (which byte-patches this same layout)."""
+    h["t"] = np.dtype("i8")
+    d = h.create_dataset("d", data=np.arange(3, dtype="i4"))
+    sid = h5py.h5s.create_simple((2,))
+    h5py.h5a.create(d.id, b"attr", h["t"].id, sid)
+
+
 def _gen_valid(root):
     # ---- valid/ : fully covered metadata, expected `accept` -------------
     _write(f"{root}/valid/empty.h5", lambda h: None)
@@ -415,6 +425,13 @@ def _gen_resource(root):
         f"{root}/valid/adjacent_null_messages.h5",
         f"{root}/valid/dense_attribute.h5")
 
+    # An attribute whose datatype is a committed (shared) datatype.  The
+    # attribute's datatype field holds a shared-message wrapper pointing at the
+    # committed datatype's object header; h5policy resolves that wrapper -- and
+    # follows the OCHK continuation chunk the datatype message lands in -- and
+    # validates the recovered datatype, so the file is a clean accept.
+    _write(f"{root}/valid/shared_attr_datatype.h5", _build_shared_attr)
+
     # Dense link storage: a group with enough members that its links live in a
     # fractal heap + name-indexed v2 B-tree.  h5policy enumerates them and
     # enqueues each child object header.
@@ -540,15 +557,6 @@ def _gen_integration(root):
 
 def _gen_coverage(root):
     # ---- coverage/ : not yet classified, expected `unsupported_coverage_gap`
-    # An attribute whose datatype is a committed (shared) datatype; the shared
-    # message reference is not resolved yet.
-    def _shared_attr(h):
-        h["t"] = np.dtype("i8")
-        d = h.create_dataset("d", data=np.arange(3, dtype="i4"))
-        sid = h5py.h5s.create_simple((2,))
-        h5py.h5a.create(d.id, b"attr", h["t"].id, sid)
-    _write(f"{root}/coverage/shared_attr_datatype.h5", _shared_attr)
-
     # Twenty-four distinct compound datatype messages, each shared twice and
     # larger than the SOHM heap's 4096-byte managed-object ceiling, force a
     # genuine depth-one type-1 huge-object B-tree.  Three options keep the
@@ -574,6 +582,48 @@ def _gen_coverage(root):
     os.unlink(sohm_huge_src)
 
 
+def _make_nul_compact_link_name(path):
+    """A group whose compact link message stores a single-NUL name.
+
+    The on-disk compact link name is exactly `name_len` bytes with no NUL
+    terminator, so overwriting the one-byte name of `d` with 0x00 makes libhdf5
+    decode an empty link name and reject the file.  The enclosing v2
+    object-header checksum is re-sealed so the empty name -- not a checksum
+    mismatch -- is the defect under test.  Derived from h5policy-fuzz
+    false_accept_shared_attr_datatype (struct/00367).
+    """
+    raw = _base_bytes(_build_shared_attr)
+
+    # The root group's object header is the first v2 OHDR in the file.  Parse its
+    # optional time/phase-change fields and chunk-0 size to bound the checksummed
+    # region [ohdr, body_end) and the 4-byte checksum that follows it.
+    ohdr = raw.find(b"OHDR")
+    if ohdr < 0:
+        raise RuntimeError("root object header not found")
+    flags = raw[ohdr + 5]
+    cursor = ohdr + 6
+    if flags & 0x20:            # access/modification/change/birth times
+        cursor += 16
+    if flags & 0x10:            # attribute storage phase-change values
+        cursor += 4
+    size_len = 1 << (flags & 0x03)
+    chunk0_size = int.from_bytes(raw[cursor:cursor + size_len], "little")
+    cursor += size_len
+    body_end = cursor + chunk0_size
+
+    # /d's compact link message stores name_len=1, the name byte 'd', then the
+    # 8-byte hard-link target address.  NUL the name byte in place.
+    name_len_off = raw.find(b"\x01d", cursor, body_end)
+    if name_len_off < 0:
+        raise RuntimeError("compact link name 'd' not found in root header")
+    raw[name_len_off + 1] = 0x00
+
+    jenkins = _jenkins_lookup3()
+    raw[body_end:body_end + 4] = jenkins(bytes(raw[ohdr:body_end])).to_bytes(
+        4, "little")
+    _patch(path, bytes(raw))
+
+
 def _gen_malformed(root):
     # ---- malformed/ : expected `reject_corrupt`, byte-patched from a base --
     base = f"{root}/valid/empty.h5"
@@ -584,6 +634,8 @@ def _gen_malformed(root):
     _patch(f"{root}/malformed/bad_superblock_version.h5",
            raw[:8] + b"\xff" + raw[9:])
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
+    _make_nul_compact_link_name(
+        f"{root}/malformed/nul_compact_link_name.h5")
     _make_compound_member_array_nelem_overflow(
         f"{root}/malformed/compound_member_array_nelem_overflow.h5")
     _make_compound_member_array_bounds(
