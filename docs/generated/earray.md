@@ -44,6 +44,27 @@ file.  All pages within one data block hold the same number of elements.
 Use `print_ea(addr#B)` to map the header, print it and the index block,
 and recursively walk all reachable data blocks and secondary blocks.
 
+**Layout: Extensible Array Header**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Version</td><td>Client ID</td><td>Element Size</td><td>Max. Elements Bits</td></tr>
+    <tr><td>Index Block Elements</td><td>Min. Data Block Elements</td><td>Min. Secondary Block Pointers</td><td>Max. Page Elements Bits</td></tr>
+    <tr><td colspan="4">Number of Secondary Blocks<sup>L</sup></td></tr>
+    <tr><td colspan="4">Secondary Block Size<sup>L</sup></td></tr>
+    <tr><td colspan="4">Number of Data Blocks<sup>L</sup></td></tr>
+    <tr><td colspan="4">Data Block Size<sup>L</sup></td></tr>
+    <tr><td colspan="4">Maximum Index Set<sup>L</sup></td></tr>
+    <tr><td colspan="4">Number of Elements<sup>L</sup></td></tr>
+    <tr><td colspan="4">Index Block Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Checksum</td></tr>
+  </tbody>
+</table>
+
+`O` is the size of offsets; `L` is the size of lengths.
+
 ## `eadb_chunk_elem`
 
 One element for a non-filtered chunk (client ID 0). Contains only the chunk's file address.
@@ -188,5 +209,3 @@ Extensible Array data block page. No on-disk signature; pages are appended conse
 |-------|-------------|
 | `elements` | Array of `global_ea_dblk_page_nelmts` elements (type `eadb_element`). |
 | `chksum` | Jenkins lookup3 checksum of all preceding page bytes. |
-
-

@@ -30,6 +30,21 @@ enough, all elements are stored directly in the data block (`fadb_nopaged`).
 Use `print_fa(addr#B)` to map the header, print it, and recursively
 print the data block and all pages.
 
+**Layout: Fixed Array Header**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Version</td><td>Client ID</td><td>Element Size</td><td>Max. Page Elements Bits</td></tr>
+    <tr><td colspan="4">Number of Elements<sup>L</sup></td></tr>
+    <tr><td colspan="4">Data Block Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Checksum</td></tr>
+  </tbody>
+</table>
+
+`O` is the size of offsets; `L` is the size of lengths.
+
 ## `fadb_chunk_elem`
 
 One element for a non-filtered chunk (client ID 0). Contains only the chunk's file address.
@@ -128,5 +143,3 @@ Paged prefix layout. Active when `global_fa_npages > 0`.
 ### `nopaged`
 
 Inline element layout. Active when `global_fa_npages == 0`.
-
-

@@ -22,6 +22,27 @@ managed object requires the doubling-table geometry exposed by
 `frhp_dtable`, which drives the offset arithmetic in
 `frhp_managed_id_to_addr`.
 
+**Layout: Fractal Heap Header**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Version</td><td colspan="2">Heap ID Length</td><td>Filter Length (low byte)</td></tr>
+    <tr><td>Filter Length (high byte)</td><td>Flags</td><td colspan="2">Maximum Managed Object Size</td></tr>
+    <tr><td colspan="2">Maximum Managed Object Size (continued)</td><td colspan="2">Next Huge Object ID<sup>L</sup></td></tr>
+    <tr><td colspan="4">Next Huge Object ID (continued)<sup>L</sup></td></tr>
+    <tr><td colspan="4">Huge Object B-tree Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Free Managed Space<sup>L</sup></td></tr>
+    <tr><td colspan="4">Free-space Manager Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Managed-space Statistics and Doubling Table</td></tr>
+    <tr><td colspan="4">Optional Filter Information</td></tr>
+    <tr><td colspan="4">Checksum</td></tr>
+  </tbody>
+</table>
+
+Rows containing variable-width fields are schematic. `O` is the size of offsets; `L` is the size of lengths.
+
 ## `frhp_dtable`
 
 Doubling-table geometry embedded in every fractal heap header. It describes how logical heap offsets are mapped onto root direct or indirect blocks, and how indirect block rows grow.
@@ -137,5 +158,3 @@ Fractal Heap ID (`heap_id_length` bytes). The first byte's type bits select one 
 | Field | Description |
 |-------|-------------|
 | `raw` | The raw ID bytes (`heap_id_length` long). The `_print` method decodes the flags byte and the form-specific fields. |
-
-

@@ -14,6 +14,44 @@ replaces the symbol-table root group entry with a plain object header
 address and adds a checksum. Version 3 additionally restricts which
 bits of the consistency flags field may be set.
 
+**Layout: Superblock (Versions 0 and 1)**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Format Signature (8 bytes)</td></tr>
+    <tr><td colspan="4">Format Signature (continued)</td></tr>
+    <tr><td>Superblock Version</td><td>Free-space Version</td><td>Root Group Symbol Table Version</td><td>Reserved</td></tr>
+    <tr><td>Shared Header Version</td><td>Size of Offsets</td><td>Size of Lengths</td><td>Reserved</td></tr>
+    <tr><td colspan="2">Group Leaf Node K</td><td colspan="2">Group Internal Node K</td></tr>
+    <tr><td colspan="4">File Consistency Flags</td></tr>
+    <tr><td colspan="4">Version 1 B-tree K and Reserved (version 1 only)</td></tr>
+    <tr><td colspan="4">Base Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Free-space Info Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">End-of-file Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Driver Information Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Root Group Symbol Table Entry</td></tr>
+  </tbody>
+</table>
+
+**Layout: Superblock (Versions 2 and 3)**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Format Signature (8 bytes)</td></tr>
+    <tr><td colspan="4">Format Signature (continued)</td></tr>
+    <tr><td>Superblock Version</td><td>Size of Offsets</td><td>Size of Lengths</td><td>File Consistency Flags</td></tr>
+    <tr><td colspan="4">Base Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Superblock Extension Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">End-of-file Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Root Group Object Header Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Checksum</td></tr>
+  </tbody>
+</table>
+
+`O` is the size of offsets. Fields whose width is `L` elsewhere in the format use the Size of Lengths declared here.
+
 ## `superblock`
 
 The root on-disk metadata structure of every HDF5 file.
@@ -61,5 +99,3 @@ Compact layout introduced in superblock version 2. Replaces the symbol-table roo
 | `eof_addr_raw` | File address of the first byte beyond all HDF5 data. |
 | `root_obj_addr_raw` | File address of the root group object header. |
 | `chksum` | Jenkins lookup3 checksum computed over all preceding superblock bytes (from the signature through `root_obj_addr_raw`). |
-
-

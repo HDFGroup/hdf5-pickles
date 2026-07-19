@@ -28,6 +28,34 @@ form is retained for reading legacy files.
 
 All fields are stored in little-endian byte order.
 
+**Layout: Version 1 Object Header Prefix**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td>Version</td><td>Reserved</td><td colspan="2">Number of Messages</td></tr>
+    <tr><td colspan="4">Reference Count</td></tr>
+    <tr><td colspan="4">Object Header Size</td></tr>
+    <tr><td colspan="4">Reserved</td></tr>
+  </tbody>
+</table>
+
+**Layout: Version 2 Object Header Prefix**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Version</td><td>Flags</td><td colspan="2">Optional Fields</td></tr>
+    <tr><td colspan="4">Optional Fields (continued)</td></tr>
+    <tr><td colspan="4">Chunk 0 Size</td></tr>
+    <tr><td colspan="4">Messages (variable size)</td></tr>
+    <tr><td colspan="4">Checksum</td></tr>
+  </tbody>
+</table>
+
+The flags select the optional timestamp, phase-change, and creation-order fields and the width of Chunk 0 Size.
+
 ## `dtype_hdr`
 
 8-byte common header present at the start of every Datatype message and embedded recursively in compound, enumerated, variable-length, and array types. Encodes the datatype class, format version, and class-specific flags.

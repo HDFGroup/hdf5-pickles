@@ -26,6 +26,31 @@ Serialized dataspace selections use the same wire format as `dspace_enc`
 
 All fields are stored in little-endian byte order.
 
+**Layout: Revised Reference Element**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td>Reference Type</td><td>Flags</td><td colspan="2">Token or Blob Descriptor</td></tr>
+    <tr><td colspan="4">Token or Blob Descriptor (continued)</td></tr>
+    <tr><td colspan="4">Padding to Fixed Element Size</td></tr>
+  </tbody>
+</table>
+
+An internal object reference contains a token of width `O`; other references contain a 4-byte blob size, a global heap address of width `O`, and a 4-byte heap index. `O` is the size of offsets.
+
+**Layout: Backward-compatible Dataset-region Reference**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Global Heap Collection Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Global Heap Object Index</td></tr>
+  </tbody>
+</table>
+
+`O` is the size of offsets.
+
 ## `ref_enc_hdr`
 
 2-byte common header at the start of every revised (`H5T_STD_REF`) reference element. Shared by the direct and blob sub-formats.
@@ -67,5 +92,3 @@ Backward-compatible dataset-region reference element (`H5R_DATASET_REGION1`, Sec
 |-------|-------------|
 | `heap_addr_raw` | File address of the global heap collection holding the region data (`sizeof_offsets` bytes). |
 | `heap_idx_raw` | Object index of the region data within that collection (4-byte unsigned integer). |
-
-
