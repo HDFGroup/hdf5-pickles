@@ -422,7 +422,12 @@ fun h5policy_validate_message_flags = (uint<64> m_type,
 /* Validate one object-header message chunk.  The chunk may be the root chunk or
    a continuation chunk.  The loop stops cleanly on the permitted trailing gap,
    validates each prefix/payload pair, and follows continuation messages under
-   chunk-count and visited-continuation budgets.  */
+   chunk-count and interval-overlap budgets.
+
+   [src_lo, src_hi) is the physical byte extent of THIS chunk (signature/prefix
+   through checksum, not just its message region).  It lets a continuation
+   message reject a target that overlaps the very chunk being parsed, which the
+   message-region offset alone cannot express.  */
 fun h5policy_validate_msg_chunk = (int ios,
                                    H5PolicyProfile profile,
                                    H5WalkContext ctx,
@@ -431,6 +436,8 @@ fun h5policy_validate_msg_chunk = (int ios,
                                    int is_root_chunk,
                                    offset<uint<64>,B> chunk_off,
                                    uint<64> chunk_size,
+                                   uint<64> src_lo,
+                                   uint<64> src_hi,
                                    string object) H5WalkContext:
 {
     var i = 0UL;
@@ -524,15 +531,6 @@ fun h5policy_validate_msg_chunk = (int ios,
                                                             + (global_sizeof_offsets as uint<64>)#B,
                                                             object);
 
-                    ctx.object_header_chunk_count =
-                        h5policy_checked_add_u64(ctx.object_header_chunk_count,
-                                                 1UL,
-                                                 profile.resources.max_object_header_chunks,
-                                                 "H5_RESOURCE_OBJECT_HEADER_CHUNKS",
-                                                 "resource",
-                                                 payload_off, object,
-                                                 "object-header continuation chunk budget exceeded");
-
                     if (cont_size == 0UL)
                         h5policy_emit_error("H5_CORRUPT_ZERO_CONTINUATION_CHUNK",
                                             "corrupt",
@@ -541,33 +539,54 @@ fun h5policy_validate_msg_chunk = (int ios,
                     else
                         {
                             /* Continuations are ordinary object-header chunks
-                               living elsewhere in the file.  They get their
-                               own bounds, cycle, metadata-budget, signature,
-                               and checksum checks before recursive parsing.  */
+                               living elsewhere in the file.  A target becomes a
+                               real, followable chunk only once it is in-bounds
+                               AND occupies a byte interval disjoint from its
+                               source chunk and from every chunk already decoded
+                               on this walk.  Bounds, overlap, the chunk budget,
+                               the signature, and the checksum are all checked
+                               before recursion -- and the chunk is counted only
+                               after it clears the overlap gate, so a rejected,
+                               self-referential, or aliased target never inflates
+                               the object-header chunk budget or gets followed. */
                             var ok = h5policy_checked_addr_range(cont_addr,
                                                                  cont_size,
                                                                  file_size,
                                                                  "object-header continuation chunk outside file",
                                                                  payload_off,
                                                                  object);
-                            if (ok && cont_addr == (chunk_off/#B))
+                            var cls = ok
+                                      ? h5policy_claim_cont_interval(src_lo, src_hi,
+                                                                     cont_addr,
+                                                                     cont_addr + cont_size)
+                                      : -1;
+
+                            if (cls == 1)
                                 h5policy_emit_error("H5_CORRUPT_SELF_REFERENTIAL_CONTINUATION",
                                                     "corrupt",
                                                     payload_off, object,
-                                                    "object-header continuation chunk points to its own chunk");
-                            else if (ok)
+                                                    "object-header continuation chunk overlaps its own source chunk");
+                            else if (cls == 2)
+                                h5policy_emit_error("H5_CORRUPT_NON_PROGRESS_LOOP",
+                                                    "corrupt",
+                                                    payload_off, object,
+                                                    "object-header continuation chunk overlaps an already-decoded chunk");
+                            else if (cls == 0)
                                 {
-                                    if (!h5policy_mark_visited_cont(cont_addr))
-                                        h5policy_emit_error("H5_CORRUPT_NON_PROGRESS_LOOP",
-                                                            "corrupt",
-                                                            payload_off, object,
-                                                            "object-header continuation chunk was already visited");
-                                    else
-                                        {
-                                            ctx = h5policy_account_metadata(ctx, profile,
-                                                                            cont_size,
-                                                                            cont_addr#B,
-                                                                            object);
+                                    ctx.object_header_chunk_count =
+                                        h5policy_checked_add_u64(ctx.object_header_chunk_count,
+                                                                 1UL,
+                                                                 profile.resources.max_object_header_chunks,
+                                                                 "H5_RESOURCE_OBJECT_HEADER_CHUNKS",
+                                                                 "resource",
+                                                                 payload_off, object,
+                                                                 "object-header continuation chunk budget exceeded");
+
+                                    ctx = h5policy_account_metadata(ctx, profile,
+                                                                    cont_size,
+                                                                    cont_addr#B,
+                                                                    object);
+                                    {
                                             var cont_msg_off = cont_addr#B;
                                             var cont_msg_size = cont_size;
 
@@ -632,6 +651,8 @@ fun h5policy_validate_msg_chunk = (int ios,
                                                                                   0,
                                                                                   cont_msg_off,
                                                                                   cont_msg_size,
+                                                                                  cont_addr,
+                                                                                  cont_addr + cont_size,
                                                                                   object);
                                         }
                                 }

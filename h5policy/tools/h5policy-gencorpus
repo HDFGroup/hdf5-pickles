@@ -684,6 +684,9 @@ def _gen_malformed(root):
     _make_bad_link_name_charset(
         f"{root}/malformed/bad_link_name_charset.h5",
         f"{root}/valid/continuation_chunks.h5")
+    _make_continuation_overlaps_source(
+        f"{root}/malformed/continuation_overlaps_source.h5",
+        f"{root}/valid/continuation_chunks.h5")
     _make_bad_object_header_checksum_preparse(
         f"{root}/malformed/bad_object_header_checksum_preparse.h5",
         f"{root}/valid/dense_attribute.h5")
@@ -2578,6 +2581,50 @@ def _make_bad_link_name_charset(path, base_path):
         raise RuntimeError("could not locate containing object header")
     _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
+
+
+def _make_continuation_overlaps_source(path, base_path):
+    """Repoint the root header's continuation message a few bytes INTO its own
+    source chunk rather than to a separate object-header continuation block.
+
+    This is the object-header continuation family's evasion case.  The old walk
+    rejected a continuation only when its target address exactly equaled the
+    source chunk's message-region start; a target landing just past the leading
+    bytes (here root_off + 4, immediately after the OHDR signature) has a start
+    address nobody claimed, so it passed the exact self-reference test, the
+    file-bounds test, and the start-address visited set -- and was then followed
+    and counted.  The interval model rejects any target that shares a byte with
+    an already-decoded chunk, so h5policy must now flag the self-overlap before
+    counting or recursing."""
+    raw = bytearray(open(base_path, "rb").read())
+    soff = raw[9]
+    root_off = int.from_bytes(raw[12 + 3 * soff:12 + 3 * soff + soff], "little")
+    if raw[root_off:root_off + 4] != b"OHDR" or raw[root_off + 4] != 2:
+        raise RuntimeError("expected a v2 root object header")
+
+    flags = raw[root_off + 5]
+    cursor = root_off + 6 + (16 if flags & (1 << 5) else 0) \
+        + (4 if flags & (1 << 4) else 0)
+    size_width = 1 << (flags & 3)
+    chunk_size = int.from_bytes(raw[cursor:cursor + size_width], "little")
+    i = cursor + size_width
+    end = i + chunk_size
+    prefix = 4 + (2 if flags & 0x04 else 0)   # v2 msg: type(1) size(2) flags(1) [+corder]
+
+    while i + prefix <= end:
+        mtype = raw[i]
+        msize = struct.unpack_from("<H", raw, i + 1)[0]
+        payload = i + prefix
+        if mtype == 0x10:                     # object-header continuation message
+            # Target [root_off + 4, root_off + 4 + size) overlaps the live root
+            # chunk but starts past its OHDR signature, so it is neither the
+            # chunk's message-region start nor a byte the old visited set held.
+            struct.pack_into("<Q", raw, payload, root_off + 4)
+            _fix_v2_ohdr_checksum(raw, root_off)
+            _patch(path, bytes(raw))
+            return
+        i = payload + msize
+    raise RuntimeError("could not locate the root continuation message")
 
 
 def _make_bad_object_header_checksum_preparse(path, base_path):
