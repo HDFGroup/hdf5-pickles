@@ -260,6 +260,9 @@ consumer holding the file open — `h5explain`, for instance — cannot call
 
 ## Companion Tools
 
+See the [h5policy tool guide](docs/README.md) for command usage, fuzzing
+workflows, and a detailed explanation of the differential cross-invariants.
+
 - [`tools/h5policy`](tools/h5policy): the policy oracle.
 - [`tools/h5policy-diff`](tools/h5policy-diff): compares h5policy decisions and
   extracted features with `libhdf5` via `h5py` and optional HDF5 command-line
