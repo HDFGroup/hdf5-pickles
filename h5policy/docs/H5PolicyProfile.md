@@ -92,7 +92,6 @@ explicit per-validator returns and the walk deadline still apply.
 The JSON `analysis` object reports whether this walk started and completed, its
 stop reason, the effective continuation setting, and finding truncation. This
 makes a fail-fast rejection distinguishable from an exhaustive diagnostic pass.
-`--continue-after-corruption` is retained as a deprecated CLI alias.
 
 ### Report schema and file geometry
 

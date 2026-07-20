@@ -42,7 +42,7 @@ Useful mode flags:
 - `--strict` / `--non-strict` force GNU poke strict or non-strict mapping.
 - `--continue-after-rejection` keeps walking after policy, resource,
   unsupported, or corruption findings so diagnostics include every reachable
-  issue. `--continue-after-corruption` remains a deprecated compatibility alias.
+  issue.
 - `--max-walk-seconds N` overrides the selected profile's internal wall-clock
   walk budget. The wrapper hard timeout is set to `N + 30` seconds.
 
@@ -259,6 +259,9 @@ consumer holding the file open — `h5explain`, for instance — cannot call
 `tests/unit_seam.pk` pins these properties.
 
 ## Companion Tools
+
+See the [h5policy tool guide](docs/README.md) for command usage, fuzzing
+workflows, and a detailed explanation of the differential cross-invariants.
 
 - [`tools/h5policy`](tools/h5policy): the policy oracle.
 - [`tools/h5policy-diff`](tools/h5policy-diff): compares h5policy decisions and
