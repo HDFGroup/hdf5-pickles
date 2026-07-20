@@ -21,6 +21,28 @@ groups; only the fixed header exposes typed fields.
 
 All fields are stored in little-endian byte order.
 
+**Layout: Free-space Manager Header**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Version</td><td>Client ID</td><td colspan="2">Total Free Space<sup>L</sup></td></tr>
+    <tr><td colspan="4">Total Free Space (continued)<sup>L</sup></td></tr>
+    <tr><td colspan="4">Total Section Count<sup>L</sup></td></tr>
+    <tr><td colspan="4">Serializable Section Count<sup>L</sup></td></tr>
+    <tr><td colspan="4">Ghost Section Count<sup>L</sup></td></tr>
+    <tr><td colspan="4">Section Class and Threshold Fields</td></tr>
+    <tr><td colspan="4">Maximum Section Size<sup>L</sup></td></tr>
+    <tr><td colspan="4">Section Info Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Section Info Size<sup>L</sup></td></tr>
+    <tr><td colspan="4">Allocated Section Info Size<sup>L</sup></td></tr>
+    <tr><td colspan="4">Checksum</td></tr>
+  </tbody>
+</table>
+
+Rows containing variable-width fields are schematic. `O` is the size of offsets; `L` is the size of lengths.
+
 ## `fs_hdr`
 
 Free-space Manager header (signature 'FSHD'). Records total tracked space, section counts, the section classes' shrink/expand thresholds, and the address and size of the section-info block. Mapping it sets the derived section offset/length/count widths used by `fs_sinfo`.
@@ -52,5 +74,3 @@ Free-space Manager section-info block (signature 'FSSE'). Holds the serialized f
 | Field | Description |
 |-------|-------------|
 | `data` | The entire section-info allocation, `sect_size` bytes long. It begins with a 'FSSE' signature, a version byte, and the owning header's file address, followed by variable-width section-group records and a trailing checksum. |
-
-

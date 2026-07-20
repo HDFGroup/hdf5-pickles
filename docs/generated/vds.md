@@ -22,6 +22,20 @@ has no per-entry flags byte; version 1 adds one.
 
 All fields are stored in little-endian byte order.
 
+**Layout: Virtual Dataset Global Heap Block**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td>Version</td><td colspan="3">Number of Mappings<sup>L</sup></td></tr>
+    <tr><td colspan="4">Number of Mappings (continued)<sup>L</sup></td></tr>
+    <tr><td colspan="4">Mapping Entries (variable size)</td></tr>
+    <tr><td colspan="4">Checksum</td></tr>
+  </tbody>
+</table>
+
+The first row is schematic because `L` may exceed three bytes. `L` is the size of lengths.
+
 ## `vds_block`
 
 Virtual Dataset global heap block. Only the fixed prefix is mapped as typed fields; the per-mapping entries and trailing checksum are decoded on the fly by `_print` because each entry's length depends on its name-sharing flags and its serialized dataspace selections.
@@ -30,5 +44,3 @@ Virtual Dataset global heap block. Only the fixed prefix is mapped as typed fiel
 |-------|-------------|
 | `version` | Block encoding version. 0 has no per-entry flags byte; 1 adds a flags byte to each mapping entry (source-file-shared, source-dataset-shared, source-same-file). |
 | `num_mappings_raw` | Number of source→virtual mapping entries that follow (`sizeof_lengths` bytes). |
-
-

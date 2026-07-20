@@ -82,12 +82,54 @@ exception or stop the current validator. Some enforcement sites explicitly
 return or decline to enqueue more work; others continue parsing the current
 structure.
 
-Without `--continue-after-corruption`, the main object-header breadth-first walk
+Without `--continue-after-rejection`, the main object-header breadth-first walk
 stops before dequeuing its next object after any decision other than `accept` or
 `accept_with_warnings`. Work already in progress inside the current object,
 tree, index, pipeline, or continuation chain follows the control flow described
 below. With continuation enabled, that main-walk early exit is disabled, but
 explicit per-validator returns and the walk deadline still apply.
+
+The JSON `analysis` object reports whether this walk started and completed, its
+stop reason, the effective continuation setting, and finding truncation. This
+makes a fail-fast rejection distinguishable from an exhaustive diagnostic pass.
+`--continue-after-corruption` is retained as a deprecated CLI alias.
+
+### Report schema and file geometry
+
+Every machine-readable report carries integer `schema_version: 1`, including a
+report synthesized by the shell wrapper after its hard wall timeout. The
+version changes when an incompatible field shape, type, or meaning changes;
+additive fields may retain the current version.
+
+The `geometry` object makes the address boundary used during validation
+explicit:
+
+- `physical_bytes` is the byte length of the available file image;
+- `declared_eoa` is the superblock's declared end-of-address value once that
+  field has been decoded;
+- `effective_ceiling` is `min(physical_bytes, declared_eoa)` when EOA is known,
+  otherwise the physical size used before a superblock is available; and
+- `trailing_bytes` is `max(physical_bytes - declared_eoa, 0)` when both inputs
+  are known.
+
+An unavailable value is JSON `null`, rather than zero. A bad signature therefore
+has known physical bytes and an effective physical ceiling, but `null` EOA and
+trailing-byte values. A profile rejected before file I/O has four `null` values.
+A hard-timeout report retains the physical size when the wrapper can obtain it,
+but reports the three in-pickle bounds as `null` because the killed process
+cannot return its decoded state.
+
+Physical bytes after the declared EOA are outside HDF5's address space. They are
+reported for provenance and triage but do not cause a finding by themselves.
+
+Comparison-based findings carry an `evidence.locations` array. Every entry has
+a semantic `role`, absolute byte `offset`, and byte `length`. Roles `actual` and
+`expected` mean the range directly encodes the corresponding integer. Roles
+`actual_source` and `expected_source` identify encoded inputs to a derived value;
+for example, a chunk-size overflow cites every dimension field multiplied into
+the reported product. Constants and other values with no encoded byte range do
+not receive a fabricated location. These locations are additive report fields
+under schema version 1.
 
 When several findings occur, decision precedence is:
 
@@ -141,8 +183,10 @@ the counter becomes the limit and h5policy emits:
 H5_RESOURCE_ACCOUNTED_METADATA_BYTES (resource)
 ```
 
-An accounting failure does not immediately stop the validator that made the
-call.
+An accounting failure does not globally abort unrelated validation. Recursive
+modern chunk-index walkers do stop following additional child edges once the
+ceiling has been crossed, so an attacker cannot use an already-refused charge
+to drive an unbounded graph walk.
 
 The accumulator is not a count of all bytes read or mapped, and it is not a
 complete unique-extent measure. Current accounting calls cover:
@@ -151,14 +195,23 @@ complete unique-extent measure. Current accounting calls cover:
 - v1 and v2 root object-header extents;
 - declared object-header continuation extents;
 - old-style group v1 B-tree nodes and SNOD nodes;
-- v1 chunk B-tree nodes; and
-- v2 B-tree, fixed-array, and extensible-array chunk-index headers.
+- v1 chunk B-tree nodes;
+- raw-data v2 B-tree headers and each fixed-size internal or leaf node;
+- SOHM master tables, full configured record-list allocations, fractal-heap
+  headers, and each type-7 or huge-object v2 B-tree header/internal/leaf
+  allocation (list/node checksums still cover only their exact used prefixes);
+- free-space manager `FSHD` headers and their full `FSSE` section-list
+  allocations (the section-list checksum still covers only its used prefix);
+- fixed-array chunk-index headers; and
+- extensible-array headers, index blocks, secondary blocks, and complete data
+  block allocations (including their page-checksum storage).
 
 In particular, general byte mappings do not charge this counter automatically.
-Dense fractal-heap/B-tree blocks, SOHM structures, VDS global-heap objects,
-metadata-cache image bodies, and chunk-index data blocks are not uniformly
-included. Reaching the same explicitly accounted structure through distinct
-paths is not guaranteed to be globally deduplicated by the accounting helper.
+Dense fractal-heap/B-tree blocks, SOHM heap data blocks and encoded message
+bodies, VDS global-heap objects, metadata-cache image bodies, and fixed-array
+chunk-index data blocks are not uniformly included. Reaching the same
+explicitly accounted structure through distinct paths is not guaranteed to be
+globally deduplicated by the accounting helper.
 
 Zero is an active zero-byte limit. The built-in unlimited preset uses
 `UINT64_MAX`.
@@ -286,7 +339,7 @@ the layout/index type, the counter is increased by:
 - each leaf chunk reached in a v1 chunk B-tree;
 - a v2 chunk B-tree header's total record count;
 - a fixed-array header's element count; or
-- an extensible-array header's element count.
+- an extensible-array header's realized-element count.
 
 Consequently, the JSON metric named `chunk_index_refs` is a mixed
 chunk/index-accounting value, not strictly a number of index references.
@@ -299,8 +352,9 @@ H5_RESOURCE_CHUNK_COUNT (resource)
 
 and saturates the counter. An internal overflow flag preserves the distinction
 between exact equality and proven overflow after saturation, and suppresses
-duplicate chunk-count findings. Header-counted index validators may continue
-validating their root or inline records after the finding.
+duplicate chunk-count findings. Header-counted index validators may validate
+their root or inline records after the finding, but recursive modern
+chunk-index walkers do not follow further child edges after proven overflow.
 
 For a validated v1 chunk-B-tree leaf, the declared leaf entry count is claimed
 atomically. If it crosses the remaining allowance, only entries within that
@@ -320,9 +374,12 @@ is used by the unlimited presets.
 This is checked on recursive paths for:
 
 - v1 raw-data chunk B-trees;
+- v2 raw-data chunk B-trees;
 - old-style group v1 B-trees;
 - dense-link v2 B-trees; and
-- dense-attribute v2 B-trees.
+- dense-attribute v2 B-trees;
+- SOHM type-7 shared-message v2 B-trees; and
+- SOHM fractal-heap huge-object v2 B-trees.
 
 The check is `depth > max_btree_depth`, so depth equal to the limit is allowed.
 Exceeding it emits:
@@ -333,10 +390,8 @@ H5_RESOURCE_BTREE_DEPTH (resource)
 
 and returns from that tree branch. A tree can be valid HDF5 while exceeding the
 selected profile's analysis budget, so this finding does not claim corruption.
-The field does not constrain every structure
-that contains an on-disk B-tree depth. For example, the partial v2 chunk-index
-B-tree validator validates a header and root but does not recursively descend
-arbitrary internal nodes through this field.
+The field does not constrain every structure that merely contains a field
+named “depth”; it applies at the recursive B-tree walkers listed above.
 
 Zero allows a depth-zero leaf/root and rejects a recursive depth of one.
 `UINT64_MAX` is effectively unlimited.
@@ -564,7 +619,9 @@ The shell wrapper has a second, independent hard timeout: 20 seconds for the
 default/untrusted profile, 35 for trusted-fast, 50 for forensic, and 90 for
 legacy. If that timeout kills poke, the wrapper produces
 `H5_UNSUPPORTED_WALK_TIMEOUT`. Those wrapper values are not derived from
-`max_walk_seconds`.
+`max_walk_seconds`. The command-line `--max-walk-seconds N` option overrides
+the selected preset's internal limit and sets this hard timeout to `N + 30`
+seconds.
 
 ## Built-in feature and analysis-default presets
 
@@ -595,9 +652,22 @@ When this field is zero, encountering an external link emits:
 H5_POLICY_EXTERNAL_LINK (policy)
 ```
 
-When it is nonzero, no policy finding is emitted. The current external-link
-validator does not emit the absolute/relative/parent-path advisories used for
-external storage and VDS sources.
+When it is nonzero, no policy finding is emitted, but the external-link validator
+classifies the terminated target file name and can emit one of the relative,
+absolute, or parent-path advisories used for external storage and VDS sources:
+
+```text
+H5_ADVISORY_EXTERNAL_LINK_RELATIVE_PATH (warning)
+H5_ADVISORY_EXTERNAL_LINK_ABSOLUTE_PATH (warning)
+H5_ADVISORY_EXTERNAL_LINK_PARENT_PATH   (warning)
+```
+
+The classification is syntactic and best-effort: h5policy inspects only the
+stored bytes, never resolving the path or opening the target, so it cannot know
+the consumer's base directory or whether a plain name is itself a symlink. These
+advisories are suppressed when the feature is denied, although the message
+envelope (bounds and NUL termination of both the target file name and object
+path) is validated under every profile.
 
 ### `allow_external_storage`
 
@@ -687,10 +757,12 @@ feature counter in the JSON report.
 `--strict` nor `--non-strict` is supplied. Nonzero selects non-strict Poke
 mappings (`@!`); zero selects strict mappings (`@`).
 
-`analysis_defaults.continue_after_corruption` independently selects whether the main
-walk continues between queued objects after a rejection when
-`--continue-after-corruption` is absent. The CLI flag can enable continuation
-for any profile.
+`analysis_defaults.continue_after_corruption` independently selects whether the
+main walk continues between queued objects after a rejection when
+`--continue-after-rejection` is absent. The field keeps its original name for
+profile and pickle API compatibility; the CLI and JSON use the more accurate
+"after rejection" terminology. The CLI flag can enable continuation for any
+profile.
 
 `analysis_defaults.sweep_unreachable_metadata` independently enables the
 raw-file GCOL signature sweep after the reachable walk. The sweep finds
@@ -719,14 +791,14 @@ CLI.
 | Field or rule | Current direct coverage |
 | --- | --- |
 | Built-in profile values | Every field in all four presets is compared with its documented value. The production clone helper reconstructs every nested group; unit mutation checks verify that clones cannot alias a shipped preset. |
-| `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. A reduced full-file case also saturates `metadata_bytes_seen` at its exact ceiling. |
+| `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. Reduced full-file cases saturate `metadata_bytes_seen` at the exact ceiling, including deep raw-data, SOHM type-7, and SOHM huge-object v2 B-tree cases that permit their roots but refuse and stop at a child-node charge. |
 | `max_attribute_count` | A valid synthetic attribute is parsed at and above a reduced cumulative limit. |
 | `max_object_header_chunks` | A synthetic continuation message covers equality, over-limit saturation, and the fact that its later structural finding is independent. A valid continuation-heavy object header crosses a reduced full-walk ceiling and saturates the reported counter without becoming corrupt. |
 | `max_chunk_count` | Defined chunk-index references cover equality, over-limit saturation, and the internal exact-versus-exceeded state. A valid four-chunk fixed-array dataset rejects as resource policy under a reduced ceiling. Separate legacy v1 cases cover exact equality and overflow within one leaf, plus a 130-chunk multi-level tree whose parent must continue at equality into a later child to prove overflow. In every rejecting case, `chunk_index_refs` saturates exactly at the selected limit. |
 | `max_single_value_bytes` | Fill values cover equality, over-limit resource classification, and zero-as-disabled; separate valid datatype and attribute blobs cross the other two enforcement sites. A compact valid file isolates the attribute-value enforcement site during a full walk. |
 | `max_logical_dataset_bytes` | Synthetic dataset facts cover equality and saturation. `resource/huge_logical_dataset.h5` requires the resource finding, and the same file is accepted under legacy. |
 | Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, zero-byte disabling, and validation of the disabled pair. `resource/tiny_chunks.h5` supplies end-to-end coverage. |
-| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. A valid multi-level dense-link v2 B-tree also rejects as resource policy under a reduced full-walk ceiling. |
+| `max_btree_depth` | A recursive chunk-tree entry above a zero limit characterizes the resource finding and early branch return. Valid multi-level dense-link, raw-data chunk, SOHM type-7, and SOHM huge-object v2 B-trees also reject as resource policy under reduced full-walk ceilings. |
 | `max_link_traversal_depth` | Synthetic queue operations cover equality, the resource over-limit finding, and declining to enqueue the child. A real depth-66 hierarchy rejects under the built-in strict profile and accepts under the built-in forensic profile. |
 | `max_datatype_recursion_depth` | `unit_datatype.pk` covers deep VLen and compound nesting as resource rejection; the CVE fixture requires the same finding under legacy. A valid compound-with-array datatype crosses a reduced full-walk depth ceiling as a resource rejection. |
 | `max_filter_parameter_recursion_depth` | A direct recursive call above a zero limit covers the resource finding and poison return; malformed n-bit parameter bounds and classes retain their synthetic coverage. A valid n-bit-filtered dataset reaches the same resource path end to end under a reduced ceiling. |

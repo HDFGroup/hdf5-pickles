@@ -21,6 +21,18 @@ selection walking is done by helper functions (`dspace_enc_sel_size`,
 
 All fields are stored in little-endian byte order.
 
+**Layout: Encoded Dataspace Prefix**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td>Dataspace Message ID</td><td>Encoding Version</td><td>Size of Sizes</td><td>Extent Size</td></tr>
+    <tr><td colspan="3">Extent Size (continued)</td><td>…</td></tr>
+    <tr><td colspan="4">Dataspace Extent Message (variable size)</td></tr>
+    <tr><td colspan="4">Serialized Selection (variable size)</td></tr>
+  </tbody>
+</table>
+
 ## `dspace_enc_hdr`
 
 Fixed 7-byte prefix of an `H5Sencode` buffer. The dataspace extent message and the serialized selection follow and are decoded by `oh_msg_sdspace` and the selection helpers respectively.
@@ -31,5 +43,3 @@ Fixed 7-byte prefix of an `H5Sencode` buffer. The dataspace extent message and t
 | `encode_version` | Encode version (`H5S_ENCODE_VERSION`). Must be 0. |
 | `size_of_size` | `sizeof(hsize_t)` on the encoding platform (typically 8). Each extent dimension value occupies this many bytes; it must match `global_sizeof_lengths`. |
 | `extent_size` | Byte count of the dataspace extent message that follows the prefix (4-byte unsigned integer). |
-
-

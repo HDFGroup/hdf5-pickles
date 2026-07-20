@@ -113,6 +113,25 @@ fun has_code = (string code) int:
     return 0;
 }
 
+fun has_u64_evidence = (string code, string field,
+                        uint<64> actual, uint<64> expected,
+                        string comparison) int:
+{
+    var i = 0UL;
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[i] == code
+                && h5policy_finding_has_evidence[i] != 0UB
+                && h5policy_finding_evidence_fields[i] == field
+                && h5policy_finding_evidence_actuals[i] == actual
+                && h5policy_finding_evidence_expecteds[i] == expected
+                && h5policy_finding_evidence_comparisons[i] == comparison)
+                return 1;
+            i = i + 1UL;
+        }
+    return 0;
+}
+
 /* 1. simple fixed-point: 8B header + 4B props = 12 consumed, no findings.  */
 var simple = dt_hdr(1UL, 0UL, 0UL, 4UL) + [0UB, 0UB, 32UB, 0UB];
 var c1 = run_blob(simple);
@@ -282,17 +301,21 @@ run_layout_blob([1UB, 0UB, 1UB, 0UB, 0UB, 0UB, 0UB, 0UB]);
 expect("layout_zero_dimensionality_rejected",
        has_code("H5_CORRUPT_LAYOUT_DIMENSIONALITY"));
 
-/* 10a. Chunk byte-size 32-bit wrap guard.  libhdf5's H5O_layout_chunk_t.size is
-   a uint32 formed by multiplying every encoded chunk dim (the trailing dim is
-   the element size); a product >= 2^32 wraps and under-allocates the chunk
-   buffer.  h5policy_chunk_size32_accum must flag exactly at the 2^32 boundary,
-   poison the running product, and pass anything representable in 32 bits.  */
+/* 10a. Chunk byte-size 32-bit wrap guard.  Legacy H5O_layout_chunk_t.size is a
+   uint32 formed by multiplying every encoded chunk dim (the trailing dim is
+   the element size); vulnerable readers can wrap and under-allocate while
+   newer readers reject the oversized chunk. h5policy_chunk_size32_accum must
+   flag exactly at the 2^32 boundary, poison the running product, and pass
+   anything representable in 32 bits.  */
 h5policy_reset_findings;
 var acc_a = h5policy_chunk_size32_accum(1UL, 0x40000040UL, 0#B, "/u");
 var acc_b = h5policy_chunk_size32_accum(acc_a, 4UL, 0#B, "/u");   /* -> 2^32 + 256 */
 expect("chunk_size32_wrap_flagged",
        acc_a == 0x40000040UL && acc_b == 0xffffffffffffffffUL
-       && has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT"));
+       && has_u64_evidence("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT",
+                           "layout.chunk_size_overflow_product",
+                           0x100000100UL, 0xffffffffUL,
+                           "less_than_or_equal"));
 
 h5policy_reset_findings;
 var acc_max = h5policy_chunk_size32_accum(1UL, 0xffffffffUL, 0#B, "/u");
@@ -304,7 +327,10 @@ h5policy_reset_findings;
 var acc_p = h5policy_chunk_size32_accum(0x80000000UL, 2UL, 0#B, "/u"); /* exactly 2^32 */
 expect("chunk_size32_exact_pow2_flagged",
        acc_p == 0xffffffffffffffffUL
-       && has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT"));
+       && has_u64_evidence("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT",
+                           "layout.chunk_size_overflow_product",
+                           0x100000000UL, 0xffffffffUL,
+                           "less_than_or_equal"));
 
 /* 10b. End-to-end through the v4 chunked layout validator: dims [0x40000040, 4]
    (data dim x element size) multiply to 2^32 + 256 -> rejected; the same shape
@@ -400,7 +426,9 @@ so_ctx.has_datatype = 1UB;
 so_ctx.datatype_size = 4UL;                 /* i4: SIZE=4 is consistent, must not fire */
 h5policy_finalize_ohdr_dataset(so_ctx, 0#B, "/u");
 expect("scaleoffset_nelmts_1M_rejected",
-       has_code("H5_CORRUPT_FILTER_NELMTS_MISMATCH")
+       has_u64_evidence("H5_CORRUPT_FILTER_NELMTS_MISMATCH",
+                        "filter.decode_element_count",
+                        1000000UL, 4UL, "equal")
        && !has_code("H5_CORRUPT_FILTER_ELEMENT_SIZE_MISMATCH"));
 
 /* 11e. The n-bit twin (filter id 5), same shared cd_values[2]=d_nelmts guard.
@@ -430,8 +458,75 @@ nb_ctx.has_datatype = 1UB;
 nb_ctx.datatype_size = 4UL;
 h5policy_finalize_ohdr_dataset(nb_ctx, 0#B, "/u");
 expect("nbit_nelmts_1M_rejected",
-       has_code("H5_CORRUPT_FILTER_NELMTS_MISMATCH")
+       has_u64_evidence("H5_CORRUPT_FILTER_NELMTS_MISMATCH",
+                        "filter.decode_element_count",
+                        1000000UL, 4UL, "equal")
        && !has_code("H5_CORRUPT_NBIT_PARAMS_OVERRUN"));
+
+/* 11f. n-bit SIZE-factor overflow: the *second* multiplicand.  Here the element
+   count is left consistent with the chunk (65537 == 65537, so no NELMTS mismatch),
+   but the atomic type's cd_values[4] size is inflated to 65537 while the real
+   datatype is 4 bytes.  H5Z__nbit_decompress sizes the output buffer as
+   d_nelmts * size, so 65537 * 65537 = 0x100020001 wraps a 32-bit size_t to
+   0x20001 and under-allocates.  The size is a flat element size only because the
+   root type is atomic, so h5policy records cd_values[4] for n-bit here and the
+   datatype cross-check rejects it.  Reset the per-object globals first. */
+h5policy_pipeline_has_decode_nelmts = 0UB;
+h5policy_pipeline_has_decode_size = 0UB;
+var nbit_size = [2UB, 1UB, 5UB, 0UB, 0UB, 0UB, 8UB, 0UB,   /* v2, 1 filter, id 5, cd_nelmts 8 */
+                 8UB, 0UB, 0UB, 0UB,                       /* [0] total */
+                 1UB, 0UB, 0UB, 0UB,                       /* [1] flag */
+                 1UB, 0UB, 1UB, 0UB,                       /* [2] d_nelmts = 65537 */
+                 1UB, 0UB, 0UB, 0UB,                       /* [3] ATOMIC */
+                 1UB, 0UB, 1UB, 0UB,                       /* [4] size = 65537 */
+                 0UB, 0UB, 0UB, 0UB,                       /* [5] order */
+                 32UB, 0UB, 0UB, 0UB,                      /* [6] precision */
+                 0UB, 0UB, 0UB, 0UB];                      /* [7] offset */
+run_pipeline_blob(nbit_size);            /* records decode_nelmts=65537, decode_size=65537 */
+var ns_ctx = h5policy_new_walk_context;
+ns_ctx.has_chunked_layout = 1UB;
+ns_ctx.chunk_dataset_element_count = 65537UL;   /* count left consistent -> no NELMTS mismatch */
+ns_ctx.has_datatype = 1UB;
+ns_ctx.datatype_size = 4UL;                     /* real element size, not 65537 */
+h5policy_finalize_ohdr_dataset(ns_ctx, 0#B, "/u");
+expect("nbit_size_inflated_rejected",
+       has_u64_evidence("H5_CORRUPT_FILTER_ELEMENT_SIZE_MISMATCH",
+                        "filter.decode_element_size",
+                        65537UL, 4UL, "equal")
+       && !has_code("H5_CORRUPT_FILTER_NELMTS_MISMATCH")
+       && !has_code("H5_CORRUPT_NBIT_PARAMS_OVERRUN"));
+
+/* 11g. Guard against a false positive: a *compound*-root n-bit type must NOT have
+   its cd_values[4] (the compound's structural size, not a flat element size)
+   checked against the datatype size, or every valid compound n-bit file would be
+   rejected.  Root class 3 (COMPOUND) with one atomic member; cd_values[4] = 8 is
+   left inconsistent with datatype_size to prove the size check does not run. */
+h5policy_pipeline_has_decode_nelmts = 0UB;
+h5policy_pipeline_has_decode_size = 0UB;
+var nbit_compound = [2UB, 1UB, 5UB, 0UB, 0UB, 0UB, 12UB, 0UB, /* cd_nelmts 12 */
+                     12UB, 0UB, 0UB, 0UB,                    /* [0] total */
+                     1UB, 0UB, 0UB, 0UB,                     /* [1] flag */
+                     4UB, 0UB, 0UB, 0UB,                     /* [2] d_nelmts = 4 */
+                     3UB, 0UB, 0UB, 0UB,                     /* [3] COMPOUND */
+                     8UB, 0UB, 0UB, 0UB,                     /* [4] size = 8 (structural) */
+                     1UB, 0UB, 0UB, 0UB,                     /* [5] nmembers = 1 */
+                     0UB, 0UB, 0UB, 0UB,                     /* [6] member byte offset */
+                     1UB, 0UB, 0UB, 0UB,                     /* [7] ATOMIC */
+                     4UB, 0UB, 0UB, 0UB,                     /* [8] size */
+                     0UB, 0UB, 0UB, 0UB,                     /* [9] order */
+                     32UB, 0UB, 0UB, 0UB,                    /* [10] precision */
+                     0UB, 0UB, 0UB, 0UB];                    /* [11] offset */
+run_pipeline_blob(nbit_compound);
+var nc_ctx = h5policy_new_walk_context;
+nc_ctx.has_chunked_layout = 1UB;
+nc_ctx.chunk_dataset_element_count = 4UL;
+nc_ctx.has_datatype = 1UB;
+nc_ctx.datatype_size = 8UL;
+h5policy_finalize_ohdr_dataset(nc_ctx, 0#B, "/u");
+expect("nbit_compound_size_not_checked",
+       !has_code("H5_CORRUPT_FILTER_ELEMENT_SIZE_MISMATCH")
+       && !has_code("H5_CORRUPT_NBIT_PARAMS_OVERRUN")
+       && !has_code("H5_CORRUPT_NBIT_PARAMS_CLASS"));
 
 /* 12. Object name/comment message (0x0D) of zero length is rejected: libhdf5's
    H5O__name_decode does H5MM_strndup(p, p_size - 1), so p_size == 0 underflows to

@@ -16,9 +16,10 @@
 
 """Compare h5policy output against tests/expected/*.yml.
 
-For each spec: run the tool on the fixture and assert the decision, exit code,
-required findings (subset), and forbidden outcomes.  Invoked by run.sh, which
-sets TESTS_DIR and TOOL in the environment.
+For each spec: run the tool on the fixture and assert the report schema,
+geometry invariants, decision, exit code, required findings (subset), and
+forbidden outcomes.  Invoked by run.sh, which sets TESTS_DIR and TOOL in the
+environment.
 """
 import glob
 import json
@@ -85,6 +86,26 @@ PROFILE_OVERRIDE_FIELDS = {
         "sweep_unreachable_metadata": "UB",
     },
 }
+
+
+def _location_matches(location, expected, fixture_bytes):
+    """Match a location subset and, optionally, its little-endian bytes."""
+    for key, value in expected.items():
+        if key == "little_endian_value":
+            continue
+        if location.get(key) != value:
+            return False
+    if "little_endian_value" not in expected:
+        return True
+    offset = location.get("offset")
+    length = location.get("length")
+    if (fixture_bytes is None or isinstance(offset, bool)
+            or not isinstance(offset, int) or isinstance(length, bool)
+            or not isinstance(length, int) or offset < 0 or length <= 0
+            or offset + length > len(fixture_bytes)):
+        return False
+    encoded = int.from_bytes(fixture_bytes[offset:offset + length], "little")
+    return encoded == expected["little_endian_value"]
 
 
 def _poke_string(value):
@@ -188,11 +209,18 @@ def run_case(spec):
 
     try:
         if "profile_overrides" in spec:
+            if spec.get("mode_flags"):
+                raise ValueError(
+                    "mode_flags cannot be combined with profile_overrides")
             proc = _run_with_profile_overrides(
                 path, profile, spec["profile_overrides"])
         else:
+            mode_flags = spec.get("mode_flags", [])
+            if (not isinstance(mode_flags, list)
+                    or not all(isinstance(flag, str) for flag in mode_flags)):
+                raise ValueError("mode_flags must be a list of strings")
             proc = subprocess.run(
-                [TOOL, "--profile", profile, "--json", path],
+                [TOOL, "--profile", profile, "--json", *mode_flags, path],
                 capture_output=True, text=True, timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return ["timeout"]
@@ -217,6 +245,83 @@ def run_case(spec):
         problems.append(
             f"decision {report.get('decision')!r} != {spec['expected_decision']!r}")
 
+    schema_version = report.get("schema_version")
+    if (isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version != 1):
+        problems.append(f"schema_version {schema_version!r} != 1")
+
+    geometry = report.get("geometry")
+    if not isinstance(geometry, dict):
+        problems.append("missing file geometry")
+        geometry = {}
+    geometry_fields = (
+        "physical_bytes", "declared_eoa", "effective_ceiling",
+        "trailing_bytes",
+    )
+    for field in geometry_fields:
+        if field not in geometry:
+            problems.append(f"geometry.{field} is missing")
+            continue
+        value = geometry[field]
+        if (value is not None
+                and (isinstance(value, bool) or not isinstance(value, int)
+                     or value < 0)):
+            problems.append(
+                f"geometry.{field} is not a non-negative integer or null")
+
+    physical = geometry.get("physical_bytes")
+    declared = geometry.get("declared_eoa")
+    ceiling = geometry.get("effective_ceiling")
+    trailing = geometry.get("trailing_bytes")
+    if isinstance(physical, int) and not isinstance(physical, bool):
+        if declared is None:
+            if ceiling != physical:
+                problems.append(
+                    f"geometry.effective_ceiling={ceiling!r} != physical_bytes {physical}")
+            if trailing is not None:
+                problems.append(
+                    "geometry.trailing_bytes must be null without declared_eoa")
+        elif isinstance(declared, int) and not isinstance(declared, bool):
+            want_ceiling = min(physical, declared)
+            want_trailing = max(physical - declared, 0)
+            if ceiling != want_ceiling:
+                problems.append(
+                    f"geometry.effective_ceiling={ceiling!r} != {want_ceiling}")
+            if trailing != want_trailing:
+                problems.append(
+                    f"geometry.trailing_bytes={trailing!r} != {want_trailing}")
+    elif physical is None:
+        for field in ("declared_eoa", "effective_ceiling", "trailing_bytes"):
+            if geometry.get(field) is not None:
+                problems.append(
+                    f"geometry.{field} must be null without physical_bytes")
+
+    for field, want in spec.get("expected_geometry", {}).items():
+        got = geometry.get(field)
+        if got != want:
+            problems.append(f"geometry {field}={got!r} != {want!r}")
+
+    analysis = report.get("analysis")
+    if not isinstance(analysis, dict):
+        problems.append("missing analysis completion state")
+        analysis = {}
+    else:
+        bool_fields = (
+            "complete", "walk_started", "walk_completed",
+            "continue_after_rejection", "findings_truncated",
+        )
+        for field in bool_fields:
+            if not isinstance(analysis.get(field), bool):
+                problems.append(f"analysis.{field} is not a boolean")
+        if not isinstance(analysis.get("stop_reason"), str):
+            problems.append("analysis.stop_reason is not a string")
+
+    for field, want in spec.get("expected_analysis", {}).items():
+        got = analysis.get(field)
+        if got != want:
+            problems.append(f"analysis {field}={got!r} != {want!r}")
+
     codes = {f["code"] for f in report.get("findings", [])}
     for want in spec.get("required_findings", []):
         if want not in codes:
@@ -224,6 +329,95 @@ def run_case(spec):
     for forbidden_code in spec.get("forbidden_findings", []):
         if forbidden_code in codes:
             problems.append(f"forbidden finding present {forbidden_code}")
+
+    for finding in report.get("findings", []):
+        evidence = finding.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        locations = evidence.get("locations")
+        if not isinstance(locations, list) or not locations:
+            problems.append(
+                f"finding {finding.get('code')} evidence has no byte locations")
+            continue
+        for index, location in enumerate(locations):
+            if not isinstance(location, dict):
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} is not an object")
+                continue
+            role = location.get("role")
+            offset = location.get("offset")
+            length = location.get("length")
+            if role not in {"actual", "expected", "actual_source",
+                            "expected_source"}:
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} has invalid role {role!r}")
+            if (isinstance(offset, bool) or not isinstance(offset, int)
+                    or offset < 0):
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} has invalid offset")
+            if (isinstance(length, bool) or not isinstance(length, int)
+                    or length <= 0):
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} has invalid length")
+            if (isinstance(physical, int) and not isinstance(physical, bool)
+                    and isinstance(offset, int) and not isinstance(offset, bool)
+                    and isinstance(length, int) and not isinstance(length, bool)
+                    and length > 0 and offset + length > physical):
+                problems.append(
+                    f"finding {finding.get('code')} evidence location {index} exceeds physical file size")
+
+    for code, expected in spec.get("expected_finding_evidence", {}).items():
+        matching = [
+            finding.get("evidence")
+            for finding in report.get("findings", [])
+            if finding.get("code") == code
+            and isinstance(finding.get("evidence"), dict)
+        ]
+        if not matching:
+            problems.append(f"finding {code} has no structured evidence")
+            continue
+        if not any(all(evidence.get(key) == value
+                       for key, value in expected.items())
+                   for evidence in matching):
+            problems.append(
+                f"finding {code} evidence does not include {expected!r}")
+
+    expected_location_sets = spec.get(
+        "expected_finding_evidence_locations", {})
+    fixture_bytes = None
+    if expected_location_sets and os.path.exists(path):
+        with open(path, "rb") as fixture_file:
+            fixture_bytes = fixture_file.read()
+    for code, expected_locations in expected_location_sets.items():
+        candidates = [
+            finding.get("evidence")
+            for finding in report.get("findings", [])
+            if finding.get("code") == code
+            and isinstance(finding.get("evidence"), dict)
+        ]
+        matched = False
+        for evidence in candidates:
+            locations = evidence.get("locations", [])
+            used = set()
+            all_matched = True
+            for expected_location in expected_locations:
+                found_index = None
+                for index, location in enumerate(locations):
+                    if (index not in used and isinstance(location, dict)
+                            and _location_matches(location, expected_location,
+                                                  fixture_bytes)):
+                        found_index = index
+                        break
+                if found_index is None:
+                    all_matched = False
+                    break
+                used.add(found_index)
+            if all_matched:
+                matched = True
+                break
+        if not matched:
+            problems.append(
+                f"finding {code} evidence locations do not include {expected_locations!r}")
 
     if "expected_mapping_mode" in spec:
         got = report.get("mapping_mode")

@@ -45,6 +45,9 @@ fun h5policy_dense_attr_records = (int ios, H5PolicyProfile profile, H5WalkConte
         {
             var id_off = rec_base + (i * record_size);   /* type-8: heap id at rec+0 */
             var id_flags = h5policy_msg_u64_at(ios, profile, id_off#B, 1UL);
+            h5policy_validate_dense_attr_record_flags(
+                h5policy_msg_u64_at(ios, profile, id_off#B + 8#B, 1UL),
+                id_off#B + 8#B, object);
             if (((id_flags .>> 4) & 3UL) == 0UL)
                 {
                     /* Managed heap IDs are the covered form: flags byte,
@@ -56,8 +59,17 @@ fun h5policy_dense_attr_records = (int ios, H5PolicyProfile profile, H5WalkConte
                     var heap_obj_len = h5policy_msg_u64_at(ios, profile,
                                                            id_off#B + (1UL + off_size)#B,
                                                            len_size);
-                    if (heap_obj_len != 0UL)
+                    var creation_order = h5policy_msg_u64_at(
+                        ios, profile, id_off#B + 9#B, 4UL);
+                    if (heap_obj_len == 0UL)
+                        h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID", "corrupt",
+                                            id_off#B, object,
+                                            "dense attribute name index has a zero-length heap object ID");
+                    else
                         {
+                            h5policy_record_dense_name_heap_id(
+                                heap_obj_off, heap_obj_len, creation_order,
+                                id_off#B, object);
                             var obj_off = h5policy_frhp_locate(ios, profile,
                                                                fheap_root, curr_root_rows,
                                                                start_size, max_direct_size,
@@ -71,7 +83,18 @@ fun h5policy_dense_attr_records = (int ios, H5PolicyProfile profile, H5WalkConte
                                 ctx = h5policy_validate_attribute_payload(ios, profile, ctx,
                                                                           obj_off#B, heap_obj_len,
                                                                           object);
+                            else
+                                h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID",
+                                                    "corrupt", id_off#B, object,
+                                                    "dense attribute name-index heap ID cannot be resolved in file bounds");
                         }
+                }
+            else if (!h5policy_dense_name_nonmanaged_reported)
+                {
+                    h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                        "unsupported", id_off#B, object,
+                                        "dense attribute name index uses a non-managed fractal-heap ID");
+                    h5policy_dense_name_nonmanaged_reported = 1;
                 }
             i = i + 1UL;
         }
@@ -265,6 +288,7 @@ fun h5policy_dense_attrs_node = (int ios, H5PolicyProfile profile, H5WalkContext
    any depth.  Sets h5policy_dense_handled.  */
 fun h5policy_walk_dense_attrs = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                  uint<64> fheap_addr, uint<64> btree_addr,
+                                 uint<64> corder_btree_addr,
                                  off64 loc, string object) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
@@ -358,10 +382,17 @@ fun h5policy_walk_dense_attrs = (int ios, H5PolicyProfile profile, H5WalkContext
         len_size = off_size;
     if (h5policy_msg_addr_is_undef(root_raw) || start_size == 0UL || table_width == 0UL)
         return ctx;
+    if (1UL + off_size + len_size > 8UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID_WIDTH", "corrupt",
+                                fheap_addr#B, object,
+                                "dense attribute heap ID widths exceed the eight-byte record field");
+            h5policy_dense_handled = 1;
+            return ctx;
+        }
 
-    /* Then validate the name-indexed v2 B-tree root.  Attribute creation-order
-       indexes are intentionally ignored here; the name index is enough to
-       enumerate every dense attribute payload.  */
+    /* Validate the name index first so every attribute payload is checked, then
+       validate the independent creation-order index against the same heap. */
     var bt_hdr = 22UL + o + el;
     if (!h5policy_checked_addr_range(btree_addr, bt_hdr, file_size,
                                      "dense attribute v2 B-tree header outside file", loc, object))
@@ -408,7 +439,18 @@ fun h5policy_walk_dense_attrs = (int ios, H5PolicyProfile profile, H5WalkContext
 
     if (record_type != 8UL || h5policy_msg_addr_is_undef(bt_root_raw))
         return ctx;
+    if (record_size != 17UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_LAYOUT", "corrupt",
+                                btree_addr#B + 10#B, object,
+                                "dense attribute name-index record size is invalid");
+            h5policy_dense_handled = 1;
+            return ctx;
+        }
 
+    var name_total = h5policy_msg_u64_at(ios, profile,
+                                         btree_addr#B + (18UL + o)#B, el);
+    h5policy_reset_dense_name_index;
     if (bt_root >= file_size)
         h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
                             btree_addr#B + 16#B, object,
@@ -420,6 +462,12 @@ fun h5policy_walk_dense_attrs = (int ios, H5PolicyProfile profile, H5WalkContext
                                         max_direct_size, table_width, off_size,
                                         checksum_dblocks, len_size, file_size,
                                         object);
+    if (corder_btree_addr != 0xffffffffffffffffUL)
+        h5policy_walk_dense_corder_btree(
+            ios, profile, corder_btree_addr, 9UL, name_total,
+            root_addr, curr_root_rows, start_size, max_direct_size,
+            table_width, off_size, checksum_dblocks, len_size,
+            file_size, loc, object);
     h5policy_dense_handled = 1;
     return ctx;
 }
@@ -438,27 +486,89 @@ fun h5policy_validate_ainfo_payload = (int ios, H5PolicyProfile profile, H5WalkC
                                    "attribute-info message is too small"))
         return ctx;
 
+    var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
     var flags = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
+    if (version != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_ATTRIBUTE_INFO_VERSION",
+                                "corrupt", payload_off, object,
+                                "attribute-info message has an unsupported version");
+            return ctx;
+        }
+    if ((flags & ~3UL) != 0UL)
+        h5policy_emit_error("H5_CORRUPT_ATTRIBUTE_INFO_FLAGS", "corrupt",
+                            payload_off + 1#B, object,
+                            "attribute-info message has invalid flag bits");
+    if ((flags & 2UL) != 0UL && (flags & 1UL) == 0UL)
+        h5policy_emit_error("H5_CORRUPT_ATTRIBUTE_INFO_FLAGS", "corrupt",
+                            payload_off + 1#B, object,
+                            "attribute-info creation-order index requires creation-order tracking");
+
     var cur = 2UL;
     if ((flags & 1UL) != 0UL)
         cur = cur + 2UL;                /* max creation index */
 
-    if (!h5policy_payload_range_ok(msg_size, 0UL, cur + (2UL * o),
+    var expected = cur + (2UL * o);
+    if ((flags & 2UL) != 0UL)
+        expected = expected + o;
+    if (!h5policy_payload_range_ok(msg_size, 0UL, expected,
                                    "H5_CORRUPT_ATTRIBUTE_INFO_MESSAGE_TOO_SMALL",
                                    payload_off, object,
                                    "attribute-info addresses overrun the message"))
         return ctx;
+    if (!h5policy_message_size_matches(msg_size, expected))
+        h5policy_emit_error("H5_CORRUPT_ATTRIBUTE_INFO_TRAILING_BYTES", "corrupt",
+                            payload_off + expected#B, object,
+                            "attribute-info message has trailing bytes");
 
     var fheap_raw = h5policy_msg_bytes(ios, profile, payload_off + cur#B, o);
     var fheap_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(fheap_raw));
     var btree_raw = h5policy_msg_bytes(ios, profile, payload_off + (cur + o)#B, o);
     var btree_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(btree_raw));
+    cur = cur + (2UL * o);
 
-    if (h5policy_msg_addr_is_undef(fheap_raw) || h5policy_msg_addr_is_undef(btree_raw))
+    var corder_btree_addr = 0xffffffffffffffffUL;
+    var corder_is_undef = 1;
+    if ((flags & 2UL) != 0UL)
+        {
+            var corder_raw = h5policy_msg_bytes(ios, profile,
+                                                payload_off + cur#B, o);
+            corder_is_undef = h5policy_msg_addr_is_undef(corder_raw);
+            if (!corder_is_undef)
+                corder_btree_addr = hdf5_addr_to_file_u64(
+                    bytes_to_u64_le(corder_raw));
+        }
+
+    var fheap_is_undef = h5policy_msg_addr_is_undef(fheap_raw);
+    var name_is_undef = h5policy_msg_addr_is_undef(btree_raw);
+    if (fheap_is_undef != name_is_undef)
+        {
+            h5policy_emit_error("H5_CORRUPT_ATTRIBUTE_INFO_ADDRESS_PAIR",
+                                "corrupt", payload_off, object,
+                                "attribute-info fractal-heap and name-index addresses are not both defined or both undefined");
+            return ctx;
+        }
+    if ((flags & 2UL) != 0UL && !fheap_is_undef && corder_is_undef)
+        {
+            h5policy_emit_error("H5_CORRUPT_ATTRIBUTE_INFO_CORDER_ADDRESS",
+                                "corrupt", payload_off, object,
+                                "dense attribute-info message has an undefined creation-order index address");
+            return ctx;
+        }
+    if (fheap_is_undef)
+        {
+            if ((flags & 2UL) != 0UL && !corder_is_undef)
+                h5policy_emit_error("H5_CORRUPT_ATTRIBUTE_INFO_CORDER_ADDRESS",
+                                    "corrupt", payload_off, object,
+                                    "attribute-info creation-order index is defined without dense storage");
+            return ctx;
+        }
+
+    if (name_is_undef)
         return ctx;
 
     ctx = h5policy_walk_dense_attrs(ios, profile, ctx, fheap_addr, btree_addr,
-                                    payload_off, object);
+                                    corder_btree_addr, payload_off, object);
     if (!h5policy_dense_handled)
         h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP", "unsupported",
                             payload_off, object,

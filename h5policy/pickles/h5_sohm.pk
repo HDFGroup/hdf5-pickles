@@ -33,31 +33,135 @@ fun h5policy_reset_sohm = void:
     h5policy_sohm_ready = 0;
 }
 
-/* Layer 2: validate the fractal heap's huge-object index without touching the
-   encoded object bytes.  SOHM commonly puts messages larger than max_man_size
-   here, including filter-encoded messages.  The first slice covers root-leaf
-   trees; deeper trees retain the surrounding SOHM B-tree coverage finding. */
-fun h5policy_validate_sohm_huge_objects = (int ios, H5PolicyProfile profile,
-                                           uint<64> btree_addr,
-                                           uint<64> expected_type,
-                                           uint<64> nfilters,
-                                           off64 loc, string object) void:
+/* Validate the client-specific records stored in a SOHM v2 B-tree.  Type 7 is
+   the shared-message index itself.  Types 1..4 are the fractal heap's four
+   huge-object index layouts.  Internal-node records are real records too, so
+   every level passes through the same validator. */
+fun h5policy_validate_sohm_v2_records = (
+    int ios, H5PolicyProfile profile, uint<64> records_addr, uint<64> nrec,
+    uint<64> record_type, uint<64> record_size, uint<64> types,
+    uint<64> nfilters, uint<64> file_size, string object) void:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var i = 0UL;
+    while (i < nrec)
+        {
+            h5policy_walk_tick(1UL);
+            var r = records_addr + i*record_size;
+            if (record_type == 7UL)
+                {
+                    var storage = h5policy_msg_u64_at(ios, profile, r#B, 1UL);
+                    if (storage > 1UL)
+                        h5policy_emit_error("H5_CORRUPT_SOHM_LOCATION", "corrupt",
+                                            r#B, object,
+                                            "SOHM index record has an invalid message location");
+                    else if (storage == 0UL)
+                        {
+                            var ref_count = h5policy_msg_u64_at(
+                                ios, profile, r#B + 5#B, 4UL);
+                            var heap_flags = h5policy_msg_u64_at(
+                                ios, profile, r#B + 9#B, 1UL);
+                            if (ref_count == 0UL)
+                                h5policy_emit_error("H5_CORRUPT_SOHM_REFERENCE_COUNT",
+                                                    "corrupt", r#B + 5#B, object,
+                                                    "SOHM heap record has a zero reference count");
+                            if ((heap_flags & 0xc0UL) != 0UL
+                                || (heap_flags & 0x30UL) == 0x30UL)
+                                h5policy_emit_error("H5_CORRUPT_SOHM_HEAP_ID",
+                                                    "corrupt", r#B + 9#B, object,
+                                                    "SOHM record has an invalid fractal-heap ID");
+                        }
+                    else
+                        {
+                            var reserved = h5policy_msg_u64_at(
+                                ios, profile, r#B + 5#B, 1UL);
+                            var msg_type = h5policy_msg_u64_at(
+                                ios, profile, r#B + 6#B, 1UL);
+                            var oh_raw = h5policy_msg_bytes(
+                                ios, profile, r#B + 9#B, o);
+                            var oh_addr = hdf5_addr_to_file_u64(
+                                bytes_to_u64_le(oh_raw));
+                            if (reserved != 0UL)
+                                h5policy_emit_error("H5_CORRUPT_RESERVED_FIELD",
+                                                    "corrupt", r#B + 5#B, object,
+                                                    "SOHM object-header record reserved byte is nonzero");
+                            if (msg_type >= 16UL
+                                || (types & (1UL <<. msg_type)) == 0UL)
+                                h5policy_emit_error("H5_CORRUPT_SOHM_MESSAGE_TYPES",
+                                                    "corrupt", r#B + 6#B, object,
+                                                    "SOHM object-header record is outside its index type mask");
+                            if (h5policy_msg_addr_is_undef(oh_raw))
+                                h5policy_emit_error("H5_CORRUPT_SOHM_OBJECT_HEADER_ADDRESS",
+                                                    "corrupt", r#B + 9#B, object,
+                                                    "SOHM record has an undefined object-header address");
+                            else if (oh_addr >= file_size)
+                                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                    "corrupt", r#B + 9#B, object,
+                                                    "SOHM object-header record address is outside file");
+                        }
+                }
+            else
+                {
+                    var addr_raw = h5policy_msg_bytes(ios, profile, r#B, o);
+                    var addr = hdf5_addr_to_file_u64(bytes_to_u64_le(addr_raw));
+                    var disk_size = h5policy_msg_u64_at(
+                        ios, profile, r#B + o#B, el);
+                    if (h5policy_msg_addr_is_undef(addr_raw) || disk_size == 0UL)
+                        h5policy_emit_error("H5_CORRUPT_SOHM_HUGE_OBJECT", "corrupt",
+                                            r#B, object,
+                                            "SOHM huge-object record has an undefined address or zero size");
+                    else
+                        {
+                            var ok = h5policy_checked_addr_range(
+                                addr, disk_size, file_size,
+                                "SOHM huge object outside file", r#B, object);
+                        }
+                    if (record_type == 2UL || record_type == 4UL)
+                        {
+                            var mask = h5policy_msg_u64_at(
+                                ios, profile, r#B + (o + el)#B, 4UL);
+                            var mem_size = h5policy_msg_u64_at(
+                                ios, profile, r#B + (o + el + 4UL)#B, el);
+                            if (mem_size == 0UL)
+                                h5policy_emit_error("H5_CORRUPT_SOHM_HUGE_OBJECT",
+                                                    "corrupt", r#B, object,
+                                                    "filtered SOHM huge object has zero decoded size");
+                            if (nfilters < 32UL && (mask .>> nfilters) != 0UL)
+                                h5policy_emit_error("H5_CORRUPT_FILTER_MASK",
+                                                    "corrupt", r#B + (o + el)#B,
+                                                    object,
+                                                    "SOHM huge-object filter mask names absent filters");
+                        }
+                }
+            i = i + 1UL;
+        }
+}
+
+/* Validate and descend a complete SOHM v2 B-tree.  ENFORCE_TOTAL connects a
+   type-7 header's total-record count to the SMTB count; huge-object indexes do
+   not carry an independent expected count at the caller. */
+fun h5policy_walk_sohm_v2_btree = (
+    int ios, H5PolicyProfile profile, H5WalkContext ctx,
+    uint<64> btree_addr, uint<64> expected_type, uint<64> types,
+    uint<64> nfilters, uint<64> expected_total, uint<8> enforce_total,
+    off64 loc, string object) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
     var el = global_sizeof_lengths as uint<64>;
     var file_size = h5policy_ceiling(ios);
     var hdr_size = 22UL + o + el;
     if (!h5policy_checked_addr_range(btree_addr, hdr_size, file_size,
-                                     "SOHM huge-object B-tree header outside file",
+                                     "SOHM v2 B-tree header outside file",
                                      loc, object))
-        return;
+        return ctx;
     if (h5policy_msg_bytes(ios, profile, btree_addr#B, 4UL)
         != H5_FORMAT_BTHD_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
                                 btree_addr#B, object,
-                                "SOHM huge-object B-tree header signature mismatch");
-            return;
+                                "SOHM v2 B-tree header signature mismatch");
+            return ctx;
         }
     h5policy_mark_reached(btree_addr, "BTHD");
     var version = h5policy_msg_u64_at(ios, profile, btree_addr#B + 4#B, 1UL);
@@ -65,124 +169,154 @@ fun h5policy_validate_sohm_huge_objects = (int ios, H5PolicyProfile profile,
     var node_size = h5policy_msg_u64_at(ios, profile, btree_addr#B + 6#B, 4UL);
     var record_size = h5policy_msg_u64_at(ios, profile, btree_addr#B + 10#B, 2UL);
     var depth = h5policy_msg_u64_at(ios, profile, btree_addr#B + 12#B, 2UL);
+    var split_percent = h5policy_msg_u64_at(
+        ios, profile, btree_addr#B + 14#B, 1UL);
+    var merge_percent = h5policy_msg_u64_at(
+        ios, profile, btree_addr#B + 15#B, 1UL);
     var root_raw = h5policy_msg_bytes(ios, profile, btree_addr#B + 16#B, o);
     var root_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(root_raw));
-    var root_nrec = h5policy_msg_u64_at(ios, profile,
-                                        btree_addr#B + (16UL + o)#B, 2UL);
+    var root_nrec = h5policy_msg_u64_at(
+        ios, profile, btree_addr#B + (16UL + o)#B, 2UL);
+    var total_nrec = h5policy_msg_u64_at(
+        ios, profile, btree_addr#B + (18UL + o)#B, el);
     if (version != 0UL || record_type != expected_type)
         {
             h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_HEADER", "corrupt",
                                 btree_addr#B, object,
-                                "SOHM huge-object B-tree version or record type is invalid");
-            return;
+                                "SOHM v2 B-tree version or record type is invalid");
+            return ctx;
         }
     if (!h5policy_validate_v2_btree_geometry(node_size, record_size,
                                               btree_addr#B, object))
-        return;
-    h5policy_dense_verify_trailing_checksum(ios, profile, btree_addr, hdr_size,
-                                             file_size, object,
-                                             "SOHM huge-object B-tree header");
-    if (h5policy_msg_addr_is_undef(root_raw))
+        return ctx;
+    var expected_size = 0UL;
+    if (record_type == 7UL)
         {
-            if (root_nrec != 0UL)
-                h5policy_emit_error("H5_CORRUPT_SOHM_HUGE_BTREE_ROOT", "corrupt",
-                                    btree_addr#B + 16#B, object,
-                                    "nonempty SOHM huge-object B-tree has an undefined root");
-            return;
+            var oh_loc_size = 4UL + o;
+            var loc_size = oh_loc_size > 12UL ? oh_loc_size : 12UL;
+            expected_size = 5UL + loc_size;
         }
-    if (depth != 0UL)
-        return;
-
-    var rec_bytes = h5policy_checked_mul_u64(root_nrec, record_size,
-                                              0xffffffffffffffffUL,
-                                              "H5_CORRUPT_LENGTH_OVERFLOW",
-                                              "corrupt", root_addr#B, object,
-                                              "SOHM huge-object B-tree leaf size overflow");
-    var leaf_size = h5policy_checked_add_u64(rec_bytes, 10UL,
-                                              0xffffffffffffffffUL,
-                                              "H5_CORRUPT_LENGTH_OVERFLOW",
-                                              "corrupt", root_addr#B, object,
-                                              "SOHM huge-object B-tree leaf size overflow");
-    if (!h5policy_checked_addr_range(root_addr, leaf_size, file_size,
-                                     "SOHM huge-object B-tree leaf outside file",
-                                     root_addr#B, object))
-        return;
-    if (h5policy_msg_bytes(ios, profile, root_addr#B, 4UL)
-        != H5_FORMAT_BTLF_SIGNATURE)
-        {
-            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
-                                root_addr#B, object,
-                                "SOHM huge-object B-tree leaf signature mismatch");
-            return;
-        }
-    h5policy_mark_reached(root_addr, "BTLF");
-    var leaf_version = h5policy_msg_u64_at(ios, profile, root_addr#B + 4#B, 1UL);
-    var leaf_type = h5policy_msg_u64_at(ios, profile, root_addr#B + 5#B, 1UL);
-    if (leaf_version != 0UL || leaf_type != record_type)
-        {
-            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_HEADER", "corrupt",
-                                root_addr#B, object,
-                                "SOHM huge-object B-tree leaf header is invalid");
-            return;
-        }
-    h5policy_dense_verify_trailing_checksum(ios, profile, root_addr, leaf_size,
-                                             file_size, object,
-                                             "SOHM huge-object B-tree leaf");
-    var expected_size = (record_type == 1UL) ? (o + 2UL*el)
-                      : (record_type == 2UL) ? (o + 3UL*el + 4UL)
-                      : (record_type == 3UL) ? (o + el)
-                      : (o + 2UL*el + 4UL);
+    else if (record_type == 1UL)
+        expected_size = o + 2UL*el;
+    else if (record_type == 2UL)
+        expected_size = o + 3UL*el + 4UL;
+    else if (record_type == 3UL)
+        expected_size = o + el;
+    else if (record_type == 4UL)
+        expected_size = o + 2UL*el + 4UL;
     if (record_size != expected_size)
         {
             h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_SIZE", "corrupt",
                                 btree_addr#B + 10#B, object,
-                                "SOHM huge-object B-tree record size is inconsistent with its type");
-            return;
+                                "SOHM v2 B-tree record size is inconsistent with its type");
+            return ctx;
         }
-    var i = 0UL;
-    while (i < root_nrec)
+    if (split_percent == 0UL || split_percent > 100UL
+        || merge_percent == 0UL || merge_percent >= split_percent / 2UL)
         {
-            h5policy_walk_tick(1UL);
-            var r = root_addr + 6UL + i*record_size;
-            var addr_raw = h5policy_msg_bytes(ios, profile, r#B, o);
-            var addr = hdf5_addr_to_file_u64(bytes_to_u64_le(addr_raw));
-            var disk_size = h5policy_msg_u64_at(ios, profile, r#B + o#B, el);
-            if (h5policy_msg_addr_is_undef(addr_raw) || disk_size == 0UL)
-                h5policy_emit_error("H5_CORRUPT_SOHM_HUGE_OBJECT", "corrupt",
-                                    r#B, object,
-                                    "SOHM huge-object record has an undefined address or zero size");
-            else
-                {
-                    var ok = h5policy_checked_addr_range(addr, disk_size, file_size,
-                                                         "SOHM huge object outside file",
-                                                         r#B, object);
-                }
-            if (record_type == 2UL || record_type == 4UL)
-                {
-                    var mask = h5policy_msg_u64_at(ios, profile,
-                                                   r#B + (o + el)#B, 4UL);
-                    var mem_size = h5policy_msg_u64_at(ios, profile,
-                                                       r#B + (o + el + 4UL)#B,
-                                                       el);
-                    if (mem_size == 0UL)
-                        h5policy_emit_error("H5_CORRUPT_SOHM_HUGE_OBJECT", "corrupt",
-                                            r#B, object,
-                                            "filtered SOHM huge object has zero decoded size");
-                    if (nfilters < 32UL && (mask .>> nfilters) != 0UL)
-                        h5policy_emit_error("H5_CORRUPT_FILTER_MASK", "corrupt",
-                                            r#B + (o + el)#B, object,
-                                            "SOHM huge-object filter mask names absent filters");
-                }
-            i = i + 1UL;
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_SPLIT_MERGE", "corrupt",
+                                btree_addr#B + 14#B, object,
+                                "SOHM v2 B-tree split/merge percentages are inconsistent");
+            return ctx;
         }
+    if (!h5policy_chunkindex_verify_trailing_checksum(
+            ios, profile, btree_addr, hdr_size, file_size, object,
+            "SOHM v2 B-tree header"))
+        return ctx;
+
+    var metadata_over = h5policy_chunkindex_metadata_would_exceed(
+        ctx, profile, hdr_size);
+    ctx = h5policy_account_metadata(ctx, profile, hdr_size,
+                                    btree_addr#B, object);
+    if (metadata_over)
+        return ctx;
+    if (enforce_total != 0UB && total_nrec != expected_total)
+        {
+            h5policy_emit_error("H5_CORRUPT_SOHM_MESSAGE_COUNT", "corrupt",
+                                btree_addr#B + (18UL + o)#B, object,
+                                "SOHM B-tree total record count differs from the SMTB count");
+            return ctx;
+        }
+    if (h5policy_msg_addr_is_undef(root_raw))
+        {
+            if (root_nrec != 0UL || total_nrec != 0UL)
+                h5policy_emit_error("H5_CORRUPT_V2_BTREE_ROOT_COUNT", "corrupt",
+                                    btree_addr#B + 16#B, object,
+                                    "nonempty SOHM v2 B-tree has an undefined root");
+            return ctx;
+        }
+    if (root_addr >= file_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                btree_addr#B + 16#B, object,
+                                "SOHM v2 B-tree root is outside file");
+            return ctx;
+        }
+    if (depth == 0UL && total_nrec != root_nrec)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_ROOT_COUNT", "corrupt",
+                                btree_addr#B + (18UL + o)#B, object,
+                                "leaf-root SOHM v2 B-tree count differs from its root count");
+            return ctx;
+        }
+    var spec = H5Bt2NodeSpec {
+        node_size = node_size,
+        record_size = record_size,
+        record_type = record_type,
+        depth_message = "SOHM v2 B-tree depth exceeds the selected profile limit",
+        cycle_code = "H5_CORRUPT_SOHM_BTREE_CYCLE",
+        cycle_message = "SOHM v2 B-tree repeats a node address",
+        range_message = "SOHM v2 B-tree node outside file",
+        capacity_message = "SOHM v2 B-tree node record count exceeds its capacity",
+        overflow_recbytes_message = "SOHM v2 B-tree node record bytes overflow",
+        overflow_size_message = "SOHM v2 B-tree node size overflow",
+        overflow_ptrbytes_message = "SOHM v2 B-tree child-pointer bytes overflow",
+        overflow_checksum_message = "SOHM v2 B-tree checksum offset overflow",
+        nodesize_message = "SOHM v2 B-tree contents exceed the declared node size",
+        leaf_sig_message = "SOHM v2 B-tree leaf signature mismatch",
+        internal_sig_message = "SOHM v2 B-tree internal-node signature mismatch",
+        header_message = "SOHM v2 B-tree node version or record type does not match the header",
+        leaf_what = "SOHM v2 B-tree leaf",
+        internal_what = "SOHM v2 B-tree internal node",
+        check_subtree_count = 1UB,
+        subtree_count_message = "SOHM v2 B-tree subtree count is smaller than its node count",
+        child_undef_code = "H5_CORRUPT_SOHM_BTREE_CHILD_ADDRESS",
+        child_undef_message = "SOHM v2 B-tree internal node has an undefined child address",
+        child_oof_code = "H5_CORRUPT_SOHM_BTREE_CHILD_ADDRESS",
+        child_oof_message = "SOHM v2 B-tree child address is outside file",
+        gate_on_chunk_count = 0UB,
+        validate = lambda (int vios, H5PolicyProfile vprofile,
+                           uint<64> vrecords_addr, uint<64> vnrec,
+                           uint<64> vfile_size, string vobject) void:
+            {
+                h5policy_validate_sohm_v2_records(
+                    vios, vprofile, vrecords_addr, vnrec, record_type,
+                    record_size, types, nfilters, vfile_size, vobject);
+            },
+    };
+    return h5policy_walk_v2_btree_node(
+        ios, profile, ctx, root_addr, depth, root_nrec,
+        file_size, object, spec);
+}
+
+/* Layer 2: validate the fractal heap's huge-object index without touching the
+   encoded object bytes. */
+fun h5policy_validate_sohm_huge_objects = (
+    int ios, H5PolicyProfile profile, H5WalkContext ctx,
+    uint<64> btree_addr, uint<64> expected_type, uint<64> nfilters,
+    off64 loc, string object) H5WalkContext:
+{
+    return h5policy_walk_sohm_v2_btree(
+        ios, profile, ctx, btree_addr, expected_type, 0UL, nfilters,
+        0UL, 0UB, loc, object);
 }
 
 /* Layer 1: validate a SOHM fractal-heap envelope independently of whether the
    SOHM index itself is an SMLI or a type-7 B-tree.  This parses filter metadata
    but never executes a filter or reads the encoded huge-object body. */
-fun h5policy_validate_sohm_heap_envelope = (int ios, H5PolicyProfile profile,
-                                            uint<64> heap_addr,
-                                            off64 loc, string object) void:
+fun h5policy_validate_sohm_heap_envelope = (
+    int ios, H5PolicyProfile profile, H5WalkContext ctx,
+    uint<64> heap_addr, off64 loc, string object) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
     var el = global_sizeof_lengths as uint<64>;
@@ -190,14 +324,14 @@ fun h5policy_validate_sohm_heap_envelope = (int ios, H5PolicyProfile profile,
     if (!h5policy_checked_addr_range(heap_addr, 10UL, file_size,
                                      "SOHM fractal heap header outside file",
                                      loc, object))
-        return;
+        return ctx;
     if (h5policy_msg_bytes(ios, profile, heap_addr#B, 4UL)
         != H5_FORMAT_FRHP_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
                                 heap_addr#B, object,
                                 "SOHM fractal heap header signature mismatch");
-            return;
+            return ctx;
         }
     h5policy_mark_reached(heap_addr, "FRHP");
     var version = h5policy_msg_u64_at(ios, profile, heap_addr#B + 4#B, 1UL);
@@ -209,13 +343,19 @@ fun h5policy_validate_sohm_heap_envelope = (int ios, H5PolicyProfile profile,
             h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_FRACTAL_HEAP_VERSION",
                                 "corrupt", heap_addr#B, object,
                                 "SOHM fractal heap has an unsupported version");
-            return;
+            return ctx;
         }
     var heap_size = h5policy_frhp_header_size(filter_len, heap_addr#B, object);
-    if (!h5policy_dense_verify_trailing_checksum(ios, profile, heap_addr,
-                                                 heap_size, file_size, object,
-                                                 "SOHM fractal heap header"))
-        return;
+    if (!h5policy_chunkindex_verify_trailing_checksum(
+            ios, profile, heap_addr, heap_size, file_size, object,
+            "SOHM fractal heap header"))
+        return ctx;
+    var metadata_over = h5policy_chunkindex_metadata_would_exceed(
+        ctx, profile, heap_size);
+    ctx = h5policy_account_metadata(ctx, profile, heap_size,
+                                    heap_addr#B, object);
+    if (metadata_over)
+        return ctx;
     var nfilters = 0UL;
     if (filter_len != 0UL)
         {
@@ -239,86 +379,80 @@ fun h5policy_validate_sohm_heap_envelope = (int ios, H5PolicyProfile profile,
             var expected_type = filter_len != 0UL
                                 ? (direct ? 4UL : 2UL)
                                 : (direct ? 3UL : 1UL);
-            h5policy_validate_sohm_huge_objects(ios, profile,
-                                                hdf5_addr_to_file_u64(bytes_to_u64_le(huge_raw)),
-                                                expected_type, nfilters,
-                                                heap_addr#B, object);
+            ctx = h5policy_validate_sohm_huge_objects(
+                ios, profile, ctx,
+                hdf5_addr_to_file_u64(bytes_to_u64_le(huge_raw)),
+                expected_type, nfilters, heap_addr#B, object);
         }
+    return ctx;
 }
 
-fun h5policy_validate_sohm_list = (int ios, H5PolicyProfile profile,
-                                   uint<64> addr, uint<64> nmessages,
-                                   off64 loc, string object) void:
+fun h5policy_validate_sohm_list = (
+    int ios, H5PolicyProfile profile, H5WalkContext ctx,
+    uint<64> addr, uint<64> nmessages, uint<64> list_max, uint<64> types,
+    off64 loc, string object) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
     var oh_loc_size = 4UL + o;
     var loc_size = oh_loc_size > 12UL ? oh_loc_size : 12UL;
     var entry_size = 5UL + loc_size;
     var file_size = h5policy_ceiling(ios);
-    var entries_size = h5policy_checked_mul_u64(nmessages, entry_size,
-                                                 0xffffffffffffffffUL,
-                                                 "H5_CORRUPT_LENGTH_OVERFLOW",
-                                                 "corrupt", loc, object,
-                                                 "SOHM list size overflow");
-    var list_size = h5policy_checked_add_u64(entries_size, 8UL,
-                                              0xffffffffffffffffUL,
-                                              "H5_CORRUPT_LENGTH_OVERFLOW",
-                                              "corrupt", loc, object,
-                                              "SOHM list size overflow");
-    if (!h5policy_checked_addr_range(addr, list_size, file_size,
-                                     "SOHM list outside file", loc, object))
-        return;
+    if (nmessages > list_max)
+        {
+            h5policy_emit_error("H5_CORRUPT_SOHM_MESSAGE_COUNT", "corrupt",
+                                loc, object,
+                                "SOHM list contains more messages than its allocated capacity");
+            return ctx;
+        }
+    var used_entries = h5policy_checked_mul_u64(
+        nmessages, entry_size, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", loc, object,
+        "SOHM list used size overflow");
+    var used_size = h5policy_checked_add_u64(
+        used_entries, 8UL, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", loc, object,
+        "SOHM list checksum size overflow");
+    var allocated_entries = h5policy_checked_mul_u64(
+        list_max, entry_size, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", loc, object,
+        "SOHM list allocation size overflow");
+    var allocated_size = h5policy_checked_add_u64(
+        allocated_entries, 8UL, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", loc, object,
+        "SOHM list allocation size overflow");
+    if (!h5policy_checked_addr_range(addr, allocated_size, file_size,
+                                     "SOHM list allocation outside file",
+                                     loc, object))
+        return ctx;
     if (h5policy_msg_bytes(ios, profile, addr#B, 4UL)
         != H5_FORMAT_SMLI_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", addr#B,
                                 object, "SOHM list signature mismatch");
-            return;
+            return ctx;
         }
     h5policy_mark_reached(addr, "SMLI");
-    h5policy_dense_verify_trailing_checksum(ios, profile, addr, list_size,
-                                             file_size, object, "SOHM list");
-
-    var i = 0UL;
-    while (i < nmessages)
-        {
-            h5policy_walk_tick(1UL);
-            var entry = addr + 4UL + (i * entry_size);
-            var storage = h5policy_msg_u64_at(ios, profile, entry#B, 1UL);
-            if (storage > 1UL)
-                h5policy_emit_error("H5_CORRUPT_SOHM_LOCATION", "corrupt",
-                                    entry#B, object,
-                                    "SOHM list entry has an invalid message location");
-            if (storage == 1UL)
-                {
-                    var reserved = h5policy_msg_u64_at(ios, profile,
-                                                       entry#B + 5#B, 1UL);
-                    if (reserved != 0UL)
-                        h5policy_emit_error("H5_CORRUPT_RESERVED_FIELD", "corrupt",
-                                            entry#B + 5#B, object,
-                                            "SOHM object-header entry reserved byte is nonzero");
-                    var oh_raw = h5policy_msg_bytes(ios, profile,
-                                                    entry#B + 9#B, o);
-                    if (!h5policy_msg_addr_is_undef(oh_raw))
-                        {
-                            var oh_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(oh_raw));
-                            if (oh_addr >= file_size)
-                                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
-                                                    "corrupt", entry#B + 9#B,
-                                                    object,
-                                                    "SOHM object-header entry address is outside file");
-                        }
-                }
-            i = i + 1UL;
-        }
+    if (!h5policy_chunkindex_verify_trailing_checksum(
+            ios, profile, addr, used_size, file_size, object, "SOHM list"))
+        return ctx;
+    var metadata_over = h5policy_chunkindex_metadata_would_exceed(
+        ctx, profile, allocated_size);
+    ctx = h5policy_account_metadata(ctx, profile, allocated_size,
+                                    addr#B, object);
+    if (metadata_over)
+        return ctx;
+    h5policy_validate_sohm_v2_records(
+        ios, profile, addr + 4UL, nmessages, 7UL, entry_size,
+        types, 0UL, file_size, object);
+    return ctx;
 }
 
-/* Validate the 0x0f extension message, its SMTB, and every list-backed index.
-   Type-7 B-tree indexes remain the deliberately bounded next implementation
-   slice.  */
-fun h5policy_validate_sohm_payload = (int ios, H5PolicyProfile profile,
-                                      offset<uint<64>,B> payload_off,
-                                      uint<64> msg_size, string object) void:
+/* Validate the 0x0f extension message, its SMTB, every list/type-7 index, and
+   the fractal-heap envelope (including a complete huge-object index). */
+fun h5policy_validate_sohm_payload = (
+    int ios, H5PolicyProfile profile, H5WalkContext ctx,
+    offset<uint<64>,B> payload_off, uint<64> msg_size,
+    string object) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
     var file_size = h5policy_ceiling(ios);
@@ -326,14 +460,14 @@ fun h5policy_validate_sohm_payload = (int ios, H5PolicyProfile profile,
                                    "H5_CORRUPT_SOHM_MESSAGE_TOO_SMALL",
                                    payload_off, object,
                                    "shared-message table message is too small"))
-        return;
+        return ctx;
     var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
     if (version != 0UL)
         {
             h5policy_emit_error("H5_CORRUPT_SOHM_VERSION", "corrupt",
                                 payload_off, object,
                                 "shared-message table message has an unsupported version");
-            return;
+            return ctx;
         }
     var table_raw = h5policy_msg_bytes(ios, profile, payload_off + 1#B, o);
     var table_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(table_raw));
@@ -344,26 +478,40 @@ fun h5policy_validate_sohm_payload = (int ios, H5PolicyProfile profile,
             h5policy_emit_error("H5_CORRUPT_SOHM_INDEX_COUNT", "corrupt",
                                 payload_off + (1UL + o)#B, object,
                                 "shared-message table index count is outside 1..8");
-            return;
+            return ctx;
         }
     var stride = 14UL + (2UL * o);
     var table_size = 8UL + (nindexes * stride);
-    if (h5policy_msg_addr_is_undef(table_raw)
-        || !h5policy_checked_addr_range(table_addr, table_size, file_size,
-                                        "SOHM table outside file", payload_off,
-                                        object))
-        return;
+    if (h5policy_msg_addr_is_undef(table_raw))
+        {
+            h5policy_emit_error("H5_CORRUPT_SOHM_STORAGE_ADDRESS", "corrupt",
+                                payload_off + 1#B, object,
+                                "shared-message table has an undefined address");
+            return ctx;
+        }
+    if (!h5policy_checked_addr_range(table_addr, table_size, file_size,
+                                     "SOHM table outside file", payload_off,
+                                     object))
+        return ctx;
     if (h5policy_msg_bytes(ios, profile, table_addr#B, 4UL)
         != H5_FORMAT_SMTB_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
                                 table_addr#B, object,
                                 "SOHM table signature mismatch");
-            return;
+            return ctx;
         }
     h5policy_mark_reached(table_addr, "SMTB");
-    h5policy_dense_verify_trailing_checksum(ios, profile, table_addr, table_size,
-                                             file_size, object, "SOHM table");
+    if (!h5policy_chunkindex_verify_trailing_checksum(
+            ios, profile, table_addr, table_size, file_size, object,
+            "SOHM table"))
+        return ctx;
+    var metadata_over = h5policy_chunkindex_metadata_would_exceed(
+        ctx, profile, table_size);
+    ctx = h5policy_account_metadata(ctx, profile, table_size,
+                                    table_addr#B, object);
+    if (metadata_over)
+        return ctx;
     h5policy_reset_sohm;
     var i = 0UL;
     var seen_types = 0UL;
@@ -374,6 +522,10 @@ fun h5policy_validate_sohm_payload = (int ios, H5PolicyProfile profile,
             var iv = h5policy_msg_u64_at(ios, profile, p#B, 1UL);
             var it = h5policy_msg_u64_at(ios, profile, p#B + 1#B, 1UL);
             var types = h5policy_msg_u64_at(ios, profile, p#B + 2#B, 2UL);
+            var list_max = h5policy_msg_u64_at(
+                ios, profile, p#B + 8#B, 2UL);
+            var btree_min = h5policy_msg_u64_at(
+                ios, profile, p#B + 10#B, 2UL);
             var nmessages = h5policy_msg_u64_at(ios, profile, p#B + 12#B, 2UL);
             var index_raw = h5policy_msg_bytes(ios, profile, p#B + 14#B, o);
             var heap_raw = h5policy_msg_bytes(ios, profile, p#B + (14UL + o)#B, o);
@@ -386,9 +538,16 @@ fun h5policy_validate_sohm_payload = (int ios, H5PolicyProfile profile,
                 h5policy_emit_error("H5_CORRUPT_SOHM_INDEX_TYPE", "corrupt",
                                     p#B + 1#B, object,
                                     "SOHM index has an invalid index type");
+            if (list_max > 5000UL || btree_min > 5000UL
+                || btree_min > list_max + 1UL
+                || (list_max == 0UL && btree_min != 0UL))
+                h5policy_emit_error("H5_CORRUPT_SOHM_PHASE_CHANGE", "corrupt",
+                                    p#B + 8#B, object,
+                                    "SOHM list/B-tree phase-change thresholds are inconsistent");
             /* libhdf5 preserves unused configured slots as zero-mask indexes
                with no messages and undefined storage addresses. */
             if ((types & seen_types) != 0UL
+                || (types & 0xffffffffffffe7d5UL) != 0UL
                 || (types == 0UL && nmessages != 0UL))
                 h5policy_emit_error("H5_CORRUPT_SOHM_MESSAGE_TYPES", "corrupt",
                                     p#B + 2#B, object,
@@ -399,19 +558,31 @@ fun h5policy_validate_sohm_payload = (int ios, H5PolicyProfile profile,
             h5policy_sohm_index_addrs += [index_addr];
             h5policy_sohm_heap_addrs += [heap_addr];
             h5policy_sohm_num_messages += [nmessages];
+            if (nmessages != 0UL
+                && (h5policy_msg_addr_is_undef(index_raw)
+                    || h5policy_msg_addr_is_undef(heap_raw)))
+                h5policy_emit_error("H5_CORRUPT_SOHM_STORAGE_ADDRESS", "corrupt",
+                                    p#B + 14#B, object,
+                                    "nonempty SOHM index has undefined index or heap storage");
             if (!h5policy_msg_addr_is_undef(heap_raw))
-                h5policy_validate_sohm_heap_envelope(ios, profile, heap_addr,
-                                                      p#B, object);
+                ctx = h5policy_validate_sohm_heap_envelope(
+                    ios, profile, ctx, heap_addr, p#B, object);
+            if (ctx.metadata_count_exceeded != 0UB)
+                return ctx;
             if (it == 0UL && !h5policy_msg_addr_is_undef(index_raw))
-                h5policy_validate_sohm_list(ios, profile, index_addr, nmessages,
-                                            p#B, object);
-            else if (it == 1UL)
-                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
-                                    "unsupported", p#B, object,
-                                    "SOHM type-7 v2 B-tree traversal is not covered yet");
+                ctx = h5policy_validate_sohm_list(
+                    ios, profile, ctx, index_addr, nmessages, list_max, types,
+                    p#B, object);
+            else if (it == 1UL && !h5policy_msg_addr_is_undef(index_raw))
+                ctx = h5policy_walk_sohm_v2_btree(
+                    ios, profile, ctx, index_addr, 7UL, types, 0UL,
+                    nmessages, 1UB, p#B, object);
+            if (ctx.metadata_count_exceeded != 0UB)
+                return ctx;
             i = i + 1UL;
         }
     h5policy_sohm_ready = 1;
+    return ctx;
 }
 
 /* Resolve a managed SOHM heap ID.  The heap geometry is the same one used by
@@ -427,8 +598,7 @@ fun h5policy_resolve_sohm_heap = (int ios, H5PolicyProfile profile,
     while (idx < h5policy_sohm_types'length
            && (h5policy_sohm_types[idx] & bit) == 0UL)
         idx = idx + 1UL;
-    if (idx == h5policy_sohm_types'length
-        || h5policy_sohm_index_types[idx] != 0UL)
+    if (idx == h5policy_sohm_types'length)
         return h5policy_sohm_ref_none;
 
     var heap_addr = h5policy_sohm_heap_addrs[idx];
@@ -460,9 +630,9 @@ fun h5policy_resolve_sohm_heap = (int ios, H5PolicyProfile profile,
     var filter_len = h5policy_msg_u64_at(ios, profile, heap_addr#B + 7#B, 2UL);
     var flags = h5policy_msg_u64_at(ios, profile, heap_addr#B + 9#B, 1UL);
     var heap_size = h5policy_frhp_header_size(filter_len, heap_addr#B, object);
-    if (!h5policy_dense_verify_trailing_checksum(ios, profile, heap_addr,
-                                                 heap_size, file_size, object,
-                                                 "SOHM fractal heap header"))
+    if (!h5policy_chunkindex_verify_trailing_checksum(
+            ios, profile, heap_addr, heap_size, file_size, object,
+            "SOHM fractal heap header"))
         return h5policy_sohm_ref_none;
     if (filter_len != 0UL)
         return h5policy_sohm_ref_none;

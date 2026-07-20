@@ -16,6 +16,21 @@ end of the list: an all-ones (undefined) value and the value 1
 
 All fields are stored in little-endian byte order.
 
+**Layout: Local Heap Header**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Version</td><td colspan="3">Reserved</td></tr>
+    <tr><td colspan="4">Data Segment Size<sup>L</sup></td></tr>
+    <tr><td colspan="4">Free-list Head Offset<sup>L</sup></td></tr>
+    <tr><td colspan="4">Data Segment Address<sup>O</sup></td></tr>
+  </tbody>
+</table>
+
+`O` is the size of offsets; `L` is the size of lengths.
+
 ## `lh_free_blk`
 
 One free block in the local heap's data segment. Free blocks form a singly-linked list sorted by ascending data-segment offset. The minimum free block size is `2 × sizeof_lengths` bytes.
@@ -38,5 +53,3 @@ Local heap header (signature 'HEAP'). Records the size and file address of the d
 | `data_seg_size_raw` | Total number of bytes allocated for the data segment (`sizeof_lengths` bytes). |
 | `free_list_head_raw` | Data-segment byte offset of the first free block (`sizeof_lengths` bytes). An all-ones (undefined) value or 1 indicates that the heap has no free blocks. |
 | `data_seg_addr_raw` | File address of the data segment's first byte (`sizeof_offsets` bytes). |
-
-

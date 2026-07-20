@@ -12,6 +12,32 @@ scratch-pad area whose meaning depends on the cache type.
 
 All fields are stored in little-endian byte order.
 
+**Layout: Symbol Table Node**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Version</td><td>Reserved</td><td colspan="2">Number of Symbols</td></tr>
+    <tr><td colspan="4">Symbol Table Entries (variable count)</td></tr>
+  </tbody>
+</table>
+
+**Layout: Symbol Table Entry**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Link Name Offset<sup>O</sup></td></tr>
+    <tr><td colspan="4">Object Header Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Cache Type</td></tr>
+    <tr><td colspan="4">Reserved</td></tr>
+    <tr><td colspan="4">Scratch-pad Space (16 bytes)</td></tr>
+  </tbody>
+</table>
+
+`O` is the size of offsets.
+
 ## `stab_ent`
 
 Symbol table entry. Appears in the version 0/1 superblock root group entry and in every SNOD leaf node. Each entry records the object header address, a cache type, and a scratch-pad area whose meaning depends on the cache type.
@@ -53,5 +79,3 @@ Symbol Table Node (signature 'SNOD'). Leaf node pointed to by the child pointers
 | `res` | Reserved. Must be zero. |
 | `num_symbols` | Number of valid `stab_ent` entries in `entries`. |
 | `entries` | Array of `num_symbols` symbol table entries of type `stab_ent`. Each entry records a link name offset, an object header address, a cache type, and a scratch-pad area. |
-
-

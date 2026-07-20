@@ -30,7 +30,8 @@ Run from the repository root:
 ./h5policy/tools/h5policy --profile untrusted-strict file.h5
 ./h5policy/tools/h5policy --profile trusted-fast file.h5
 ./h5policy/tools/h5policy --profile legacy file.h5
-./h5policy/tools/h5policy --profile forensic --continue-after-corruption file.h5
+./h5policy/tools/h5policy --profile forensic --continue-after-rejection file.h5
+./h5policy/tools/h5policy --profile trusted-fast --max-walk-seconds 60 file.h5
 ```
 
 Output is JSON (the machine-readable result); it is the only format, so no flag
@@ -39,8 +40,11 @@ is required.  `--json` is still accepted as a no-op for backward compatibility.
 Useful mode flags:
 
 - `--strict` / `--non-strict` force GNU poke strict or non-strict mapping.
-- `--continue-after-corruption` keeps walking after the first corruption finding
-  so diagnostics include every reachable issue.
+- `--continue-after-rejection` keeps walking after policy, resource,
+  unsupported, or corruption findings so diagnostics include every reachable
+  issue. `--continue-after-corruption` remains a deprecated compatibility alias.
+- `--max-walk-seconds N` overrides the selected profile's internal wall-clock
+  walk budget. The wrapper hard timeout is set to `N + 30` seconds.
 
 ## Decisions
 
@@ -62,21 +66,42 @@ the selected policy.
 
 JSON output includes:
 
+- `schema_version`: the integer report-contract version (currently `1`).
 - `decision`: the final classification.
-- `findings`: stable finding codes and locations.
+- `geometry`: physical file bytes, the superblock's declared EOA, the effective
+  address ceiling used by validation, and bytes physically trailing the EOA.
+  Values that cannot be established are JSON `null`.
+- `analysis`: whether the reachable walk completed, why it stopped, whether
+  continuation was enabled, and whether the finding list was truncated.
+- `findings`: stable finding codes and locations. Comparison-based findings can
+  also include typed `evidence` with a field name, actual and expected integer
+  values, the required comparison, and byte-precise supporting locations.
 - `features`: security-relevant constructs such as external links, external
   storage, VDS, dynamic filters, unknown messages, maximum rank, and maximum
   logical dataset bytes.
 - `metrics`: traversal and accounting counters used by profile budgets.
+
+Evidence comparisons currently use `equal` and `less_than_or_equal`; the
+finding means the reported `actual` value did not satisfy that comparison
+against `expected`. Each evidence location has a `role`, byte `offset`, and
+byte `length`. `actual` and `expected` mean the bytes directly encode that
+value; `actual_source` and `expected_source` identify fields contributing to a
+derived value such as a product.
+
+Trailing bytes are informational. They are outside the declared HDF5 address
+space and do not produce a finding by themselves.
 
 ## In-process consumer API
 
 Consumers that load `h5_policy.pk` should call `h5policy_analyze` and inspect
 the result through the read-only `h5policy_result_*` functions defined in
 `pickles/h5_consumer.pk`. The API exposes the decision, exit code, findings,
-location validity, truncation state, reachability queries, and explicit walk
-start/completion/stop state as scalars and strings. The parallel finding and
-traversal vectors remain implementation details.
+location validity, typed integer evidence and its supporting byte ranges,
+truncation state, reachability queries, and explicit walk
+start/completion/stop state as scalars and strings.
+The parallel finding and traversal vectors remain implementation details. The
+new `h5policy_result_continue_after_rejection` accessor has the deprecated
+`h5policy_result_continue_after_corruption` spelling as an API alias.
 
 ## Profiles
 
@@ -121,9 +146,26 @@ Current coverage includes:
 - Object headers, continuation chunks, object-header checksums, message prefix
   bounds, and reachable object traversal with visited sets.
 - Dataspace, datatype, layout, filter pipeline, fill value, link, attribute,
-  free-space info, and metadata cache image messages.
+  both modification-time forms, B-tree K override, reference-count,
+  free-space info, and metadata cache image messages. Driver-info envelopes are
+  validated and then explicitly refused because their VFD bodies can name
+  member files outside the single-file validation boundary.
 - Compact hard links, dense link storage, dense attribute storage, old-style
-  group metadata, and chunk-index metadata.
+  group metadata, and chunk-index metadata. Dense storage covers both the name
+  indexes and recursive type-6/type-9 creation-order B-trees, including
+  checksums, subtree totals, heap-ID resolution, and cross-index identity;
+  chunk coverage includes recursive raw-data v2 B-trees and complete
+  extensible-array block graphs.
+- File-global Shared Object Header Message metadata: `SMTB` directories,
+  `SMLI` record lists, recursive type-7 v2 B-trees, managed-message heap-ID
+  resolution, fractal-heap envelopes, and complete huge-object index trees.
+  Every recursive SOHM node is independently bounded by range, checksum,
+  visited-node, depth, operation/time, and accounted-metadata limits.
+- File-global free-space managers named by the file-space-info message: each
+  `FSHD` header and its `FSSE` serialized section list are range-checked,
+  checksummed, and metadata-accounted, and every free section's extent and
+  class type is validated.  Fractal-heap (non-file) managers, reached from a
+  heap header rather than the file-space-info message, remain a coverage gap.
 - Logical dataset byte accounting kept separate from raw storage accounting, so
   datatype semantics can be compared against `libhdf5` while layout checks still
   use on-disk storage size.
@@ -132,15 +174,26 @@ Checksum coverage includes the HDF5 Jenkins checksums used by:
 
 - v2/v3 superblocks
 - v2 object headers and continuation chunks
-- chunk-index metadata
+- chunk-index headers, v2 B-tree internal/leaf nodes, and extensible-array
+  index/secondary/data blocks and initialized pages
 - dense metadata fractal heaps: `FRHP`, `FHDB`, `FHIB`
 - dense metadata v2 B-trees: `BTHD`, `BTLF`, `BTIN`
+- SOHM master tables/lists (`SMTB`, `SMLI`), fractal-heap headers (`FRHP`),
+  and type-7/huge-object v2 B-tree headers and internal/leaf nodes
 
 ### Known blind spots
 
 Some defects live strictly beyond a metadata-only boundary and are reported as
 `unsupported_coverage_gap` rather than `reject_corrupt`, even when `libhdf5`
 crashes on them:
+
+- **Encoded SOHM message bodies.** h5policy completely walks the type-7 shared
+  index and the heap's huge-object index, validating record layouts, object
+  extents, filter masks, checksums, and traversal budgets. Shared wrappers are
+  currently resolved only when their eight-byte ID names an unfiltered managed
+  heap object. A wrapper naming a huge, tiny, or filter-encoded heap object is
+  refused as unsupported because validating its message payload would require
+  an additional body decoder (and, for filtered objects, decompression).
 
 - **Filtered dense link/attribute fractal heaps.** When a dense group's or
   object's fractal heap declares an I/O filter pipeline, the link/attribute
@@ -157,6 +210,19 @@ crashes on them:
   not process the file. The differential harness accepts that explicit refusal
   under invariant A' while retaining a classification warning when libhdf5
   rejects the same file as corrupt.
+
+- **Vlen and reference data global heaps.** A dataset's variable-length or
+  reference elements point into a global heap collection (`GCOL`) through heap
+  IDs stored in the dataset's *raw data*, which h5policy never reads. It
+  validates a `GCOL` only when the reference lives in metadata (the VDS layout
+  message; see `h5_vds.pk`) or when the collection is *orphaned* and caught by
+  the forensic sweep (`H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP`). A malformed but
+  data-reachable collection is otherwise invisible, so unlike the filtered-heap
+  gap above this one surfaces as an *accept*, not a coverage-gap refusal. That
+  is still sound under invariant A': the differential oracle (`introspect` in
+  `h5policy-diff`) also reads only metadata and reports such a file as opened, so
+  a consumer that goes on to read the data gets libhdf5's own error or
+  denial-of-service behavior, which a metadata-only preflight does not model.
 
 ## Embedding h5policy
 

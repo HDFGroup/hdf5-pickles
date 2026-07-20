@@ -22,6 +22,33 @@ entries are padded to that width.
 
 All fields are stored in little-endian byte order.
 
+**Layout: Shared Message Master Table**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td colspan="4">Index Entries (variable count)</td></tr>
+    <tr><td colspan="4">Checksum</td></tr>
+  </tbody>
+</table>
+
+**Layout: Shared Message Index Entry**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td>Version</td><td>Index Type</td><td colspan="2">Message Types</td></tr>
+    <tr><td colspan="4">Minimum Message Size</td></tr>
+    <tr><td colspan="2">List Maximum</td><td colspan="2">B-tree Minimum</td></tr>
+    <tr><td colspan="2">Number of Messages</td><td colspan="2">Index Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Index Address (continued)<sup>O</sup></td></tr>
+    <tr><td colspan="4">Fractal Heap Address<sup>O</sup></td></tr>
+  </tbody>
+</table>
+
+Rows containing variable-width fields are schematic. `O` is the size of offsets.
+
 ## `sohm_index_entry`
 
 One index descriptor within the master table. Describes a single shared-message index: which message types it covers, its list-to-B-tree conversion thresholds, its current message count, and the addresses of its index structure and backing fractal heap.
@@ -105,5 +132,3 @@ Shared Message Record List (signature 'SMLI'). Holds exactly `num_messages` `soh
 | `signature` | 4-byte signature: 'S' 'M' 'L' 'I'. Must match exactly. |
 | `entries` | Array of `sohm_entry` records, one per shared message in this index (`global_sohm_num_mesg` entries). |
 | `chksum` | Jenkins lookup3 checksum over the list, immediately after the last entry. |
-
-

@@ -9,13 +9,18 @@ controlled outcome; a change that alters any decision is surfaced for review.
   with its input fixture, profile, expected decision, expected exit code,
   required finding codes, and forbidden outcomes (`crash`, `timeout`,
   `external_open`, `plugin_load`, `write`). A fixture can be reused by several
-  expectations.
+  expectations. Every report is also checked for schema version 1 and internally
+  consistent file geometry; `expected_geometry` can pin individual values.
 - `unit_datatype.pk` — synthetic checks for the bounded, depth-guarded
   datatype validator (recursion cap and truncation handling), run under poke.
+- `unit_messages.pk` — fixed-envelope and dispatch checks for old/new mtime,
+  B-tree K override, driver-info, reference-count, LINFO, and AINFO messages.
 - `unit_limits.pk` — reduced-limit, in-memory characterization checks for the
   current `H5PolicyProfile` boundaries, complete built-in preset values,
   saturation, finding classes, profile validation, deterministic walk budgets,
   compound rules, feature switches, and run-mode defaults.
+- `unit_report_wrapper.sh` — a deterministic hard-timeout simulation that
+  validates the shell-generated partial report and its nullable geometry.
 - `valid/ malformed/ policy/ resource/ coverage/ integration/ cve/` — generated
   fixtures (git-ignored build output; see below).
 
@@ -52,7 +57,8 @@ accept only the four named presets. The harness rejects unknown groups, unknown
 fields, non-integer values, and values outside the declared Poke integer type.
 An expectation can additionally assert `forbidden_findings`, exact subsets of
 `expected_metrics` and `expected_features`, `expected_mapping_mode`, or use
-`allow_missing_file` for a pre-I/O validation case. A compact example is:
+`expected_geometry` and `allow_missing_file` for report-boundary cases. A
+compact example is:
 
 ```yaml
 file: integration/value_sites.h5
@@ -67,6 +73,12 @@ expected_metrics:
   attribute_count: 1
 ```
 
+Every structured-evidence location is checked for its role, integer bounds, and
+containment in the physical file. `expected_finding_evidence_locations` can
+also match role/length and decode the cited fixture bytes as a little-endian
+integer, so tests verify the reported range rather than pinning generator-
+version-dependent absolute offsets.
+
 The reduced-boundary layer also reuses valid nested datatypes, multi-level
 dense-link B-trees, and continuation-heavy object headers to distinguish
 resource ceilings from structural corruption. A focused
@@ -74,6 +86,31 @@ resource ceilings from structural corruption. A focused
 fixed-array index and a two-filter shuffle+gzip pipeline: its baseline case is
 valid with the normal gzip advisory, while separate overrides reduce only the
 chunk or filter count ceiling.
+
+Modern chunk indexes have dedicated deep fixtures as well. A 400-chunk
+two-unlimited-dimension dataset forces a raw-data `BTIN` root with `BTLF`
+children; paired mutations cover a child checksum, an out-of-file child, and a
+checksum-valid cycle, while integration overrides cover depth and exact
+metadata-byte saturation. A 300-chunk one-unlimited-dimension dataset reaches
+`EAIB`, direct `EADB`s, an `EASB`, and nested `EADB`s, with a child-checksum
+mutation proving the walk goes beyond the header and inline records.
+
+Dense links and attributes each have creation-order-indexed fixtures. Their
+type-6/type-9 trees have internal roots and child leaves; paired leaf-checksum
+mutations prove h5policy follows the secondary graph independently of the name
+index, while valid cases exercise heap-ID and creation-order reconciliation.
+
+SOHM has matching end-to-end coverage. A two-dataset repack produces a genuine
+`SMLI`, while 51 distinct shared dataspaces force a type-7 `BTIN` root and
+`BTLF` children. Repaired mutations cover list and B-tree record locations, a
+deep checksum, an out-of-file child, and a cycle; reduced overrides prove the
+same tree stops at its depth ceiling and saturates metadata bytes while charging
+the first child allocation. Another boundary case pins the SMLI distinction:
+its checksum covers one used record while metadata accounting charges all 50
+configured record slots. A separate set of 24 oversized shared compound
+datatypes forces a depth-one type-1 huge-object tree; its own checksum, child
+range, cycle, object-extent, depth, and metadata-ceiling cases cover the heap's
+second recursive index independently of wrapper-body decoding.
 
 Legacy chunk-index cases cover the subtler finite-ceiling boundary directly.
 A four-chunk v1 B-tree distinguishes equality from overflow within one leaf;
@@ -100,7 +137,12 @@ libhdf5 rejects is safe but retained as a classification warning. A
 `reject_corrupt` on a file that h5py can structurally traverse is downgraded to
 an `A+` warning when a bounded, out-of-process `libhdf5` probe also errors while
 inspecting attributes, reading small datasets, or running optional `libhdf5`
-tools; those eager catches are security-useful, not hard false positives.
+tools; those eager catches are security-useful, not hard false positives. The
+similarly narrow `A~` warning covers file-global SOHM/free-space metadata that
+read-only libhdf5 paths leave unopened, and findings confined to dense
+secondary creation-order indexes. Current libhdf5 can enumerate the primary
+name index without authenticating every type-6/type-9 block; h5policy
+intentionally validates both active indexes.
 
 The logical-**bytes** comparison is warning-level rather than a hard failure:
 h5policy now tracks logical dataset bytes separately from raw storage bytes, so

@@ -1,0 +1,196 @@
+/* unit_messages.pk - Assigned object-header and dense-info envelope checks. */
+
+/* Copyright (C) 2026 The HDF Group. */
+
+load h5_policy;
+
+var message_failures = 0;
+
+fun expect_message = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else
+        {
+            printf("FAIL %s\n", name);
+            message_failures = message_failures + 1;
+        }
+}
+
+fun message_has_code = (string code) int:
+{
+    var i = 0UL;
+    while (i < h5policy_finding_codes'length as uint<64>)
+        {
+            if (h5policy_finding_codes[i] == code)
+                return 1;
+            i = i + 1UL;
+        }
+    return 0;
+}
+
+fun run_message_blob = (uint<64> message_type, byte[] blob,
+                        string object) void:
+{
+    var ios = open("*unit-message*");
+    byte[blob'length] @ ios : 0#B = blob;
+    h5policy_reset_findings;
+    var ctx = h5policy_new_walk_context;
+    ctx = h5policy_validate_message_payload(
+        ios, H5_UNTRUSTED_STRICT, ctx, message_type, 0UB,
+        0#B, blob'length as uint<64>, object);
+    close(ios);
+}
+
+fun run_linfo_blob = (byte[] blob) void:
+{
+    var ios = open("*unit-linfo*");
+    byte[blob'length] @ ios : 0#B = blob;
+    h5policy_reset_findings;
+    h5policy_validate_linfo_payload(
+        ios, H5_UNTRUSTED_STRICT, 0#B,
+        blob'length as uint<64>, "/g");
+    close(ios);
+}
+
+fun run_ainfo_blob = (byte[] blob) void:
+{
+    var ios = open("*unit-ainfo*");
+    byte[blob'length] @ ios : 0#B = blob;
+    h5policy_reset_findings;
+    var ctx = h5policy_new_walk_context;
+    ctx = h5policy_validate_ainfo_payload(
+        ios, H5_UNTRUSTED_STRICT, ctx, 0#B,
+        blob'length as uint<64>, "/d");
+    close(ios);
+}
+
+set_global_sizeof_offsets(4UB);
+set_global_sizeof_lengths(4UB);
+
+/* Old mtime is ASCII YYYYMMDDhhmmss plus two reserved bytes. */
+var OLD_MTIME = [0x32UB, 0x30UB, 0x32UB, 0x36UB,
+                 0x30UB, 0x37UB, 0x31UB, 0x38UB,
+                 0x31UB, 0x36UB, 0x30UB, 0x35UB,
+                 0x30UB, 0x39UB, 0UB, 0UB];
+run_message_blob(0x0eUL, OLD_MTIME, "/u");
+expect_message("old_mtime_ascii_envelope_is_accepted",
+               h5policy_finding_codes'length == 0);
+
+var OLD_MTIME_BAD = OLD_MTIME;
+OLD_MTIME_BAD[8] = 0x78UB;
+run_message_blob(0x0eUL, OLD_MTIME_BAD, "/u");
+expect_message("old_mtime_rejects_non_decimal_timestamp",
+               message_has_code("H5_CORRUPT_OLD_MTIME_FORMAT"));
+
+run_message_blob(0x12UL,
+                 [1UB, 0UB, 0UB, 0UB, 0x78UB, 0x56UB, 0x34UB, 0x12UB],
+                 "/u");
+expect_message("new_mtime_envelope_is_accepted",
+               h5policy_finding_codes'length == 0);
+run_message_blob(0x12UL,
+                 [1UB, 1UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB], "/u");
+expect_message("new_mtime_rejects_reserved_bytes",
+               message_has_code("H5_CORRUPT_MTIME_RESERVED"));
+
+h5policy_super_indexed_internal_k = 32UL;
+h5policy_super_stab_internal_k = 16UL;
+h5policy_super_stab_leaf_k = 4UL;
+run_message_blob(0x13UL,
+                 [0UB, 9UB, 0UB, 7UB, 0UB, 5UB, 0UB],
+                 "/<superblock-extension>");
+expect_message("btreek_updates_all_three_file_defaults",
+               h5policy_finding_codes'length == 0
+               && h5policy_super_indexed_internal_k == 9UL
+               && h5policy_super_stab_internal_k == 7UL
+               && h5policy_super_stab_leaf_k == 5UL);
+run_message_blob(0x13UL,
+                 [0UB, 0UB, 0UB, 7UB, 0UB, 5UB, 0UB],
+                 "/<superblock-extension>");
+expect_message("btreek_rejects_zero_k",
+               message_has_code("H5_CORRUPT_BTREEK_VALUE"));
+
+/* version, 8-byte VFD name, u16 body size, one opaque body byte */
+run_message_blob(0x14UL,
+                 [0UB, 0x54UB, 0x45UB, 0x53UB, 0x54UB,
+                  0x44UB, 0x52UB, 0x56UB, 0x52UB,
+                  1UB, 0UB, 0UB],
+                 "/<superblock-extension>");
+expect_message("driver_info_is_explicit_coverage_refusal",
+               message_has_code("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP")
+               && !message_has_code("H5_CORRUPT_DRVINFO_LENGTH"));
+run_message_blob(0x14UL,
+                 [0UB, 0x54UB, 0x45UB, 0x53UB, 0x54UB,
+                  0x44UB, 0x52UB, 0x56UB, 0x52UB,
+                  2UB, 0UB, 0UB],
+                 "/<superblock-extension>");
+expect_message("driver_info_rejects_body_length_mismatch",
+               message_has_code("H5_CORRUPT_DRVINFO_LENGTH")
+               && !message_has_code("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP"));
+
+run_message_blob(0x16UL, [0UB, 2UB, 0UB, 0UB, 0UB], "/u");
+expect_message("reference_count_envelope_is_accepted",
+               h5policy_finding_codes'length == 0);
+run_message_blob(0x16UL, [1UB, 2UB, 0UB, 0UB, 0UB], "/u");
+expect_message("reference_count_rejects_unknown_version",
+               message_has_code("H5_CORRUPT_UNSUPPORTED_REFCOUNT_VERSION"));
+
+/* LINFO/AINFO share the version/flags and paired dense-storage addresses. */
+var DENSE_INFO_EMPTY = [0UB, 0UB,
+                        0xffUB, 0xffUB, 0xffUB, 0xffUB,
+                        0xffUB, 0xffUB, 0xffUB, 0xffUB];
+run_linfo_blob(DENSE_INFO_EMPTY);
+expect_message("link_info_empty_envelope_is_accepted",
+               h5policy_finding_codes'length == 0);
+run_ainfo_blob(DENSE_INFO_EMPTY);
+expect_message("attribute_info_empty_envelope_is_accepted",
+               h5policy_finding_codes'length == 0);
+
+var DENSE_INFO_INDEX_WITHOUT_TRACK =
+    [0UB, 2UB,
+     0xffUB, 0xffUB, 0xffUB, 0xffUB,
+     0xffUB, 0xffUB, 0xffUB, 0xffUB,
+     0xffUB, 0xffUB, 0xffUB, 0xffUB];
+run_linfo_blob(DENSE_INFO_INDEX_WITHOUT_TRACK);
+expect_message("link_info_index_requires_tracking",
+               message_has_code("H5_CORRUPT_LINK_INFO_FLAGS"));
+run_ainfo_blob(DENSE_INFO_INDEX_WITHOUT_TRACK);
+expect_message("attribute_info_index_requires_tracking",
+               message_has_code("H5_CORRUPT_ATTRIBUTE_INFO_FLAGS"));
+
+var DENSE_INFO_UNPAIRED = [0UB, 0UB,
+                           0UB, 0UB, 0UB, 0UB,
+                           0xffUB, 0xffUB, 0xffUB, 0xffUB];
+run_linfo_blob(DENSE_INFO_UNPAIRED);
+expect_message("link_info_requires_paired_dense_addresses",
+               message_has_code("H5_CORRUPT_LINK_INFO_ADDRESS_PAIR"));
+run_ainfo_blob(DENSE_INFO_UNPAIRED);
+expect_message("attribute_info_requires_paired_dense_addresses",
+               message_has_code("H5_CORRUPT_ATTRIBUTE_INFO_ADDRESS_PAIR"));
+
+run_ainfo_blob(DENSE_INFO_EMPTY + [0UB]);
+expect_message("attribute_info_rejects_trailing_bytes",
+               message_has_code("H5_CORRUPT_ATTRIBUTE_INFO_TRAILING_BYTES"));
+
+/* Version-1 object headers include 8-byte slot padding in msg_size. */
+global_version = 1;
+run_message_blob(0x0aUL,
+                 [0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB], "/g");
+expect_message("v1_group_info_accepts_slot_padding",
+               h5policy_finding_codes'length == 0);
+run_linfo_blob(DENSE_INFO_EMPTY +
+               [0UB, 0UB, 0UB, 0UB, 0UB, 0UB]);
+expect_message("v1_link_info_accepts_slot_padding",
+               h5policy_finding_codes'length == 0);
+run_ainfo_blob(DENSE_INFO_EMPTY +
+               [0UB, 0UB, 0UB, 0UB, 0UB, 0UB]);
+expect_message("v1_attribute_info_accepts_slot_padding",
+               h5policy_finding_codes'length == 0);
+global_version = 0;
+
+if (message_failures != 0)
+    {
+        printf("UNIT MESSAGES: %i32d failure(s)\n", message_failures);
+        exit(1);
+    }
+printf("UNIT MESSAGES: all passed\n");

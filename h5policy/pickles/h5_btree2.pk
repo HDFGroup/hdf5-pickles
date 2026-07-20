@@ -1,0 +1,382 @@
+/* h5_btree2.pk - Shared version-2 B-tree node engine.  Loaded after h5_walk.pk
+   and before its clients (h5_chunkindex.pk, h5_sohm.pk).  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* The chunk-index and SOHM v2 B-trees share one node envelope: identical
+   geometry, overflow-checked sizing, signature/header checks, metadata
+   accounting, trailing checksum, and child-pointer descent.  They differ only
+   in the record decoder they run per node and in the finding codes/messages
+   they emit.  This file owns the shared geometry helpers (kept under their
+   original names so existing call sites resolve) and the single recursive node
+   engine; each client supplies an H5Bt2NodeSpec describing its record decoder,
+   its codes/messages, and two small behavioural switches.  */
+
+/* All v2 B-tree clients use the same node-capacity initialization.  In
+   libhdf5 that calculation divides the usable node bytes by record_size, so a
+   zero record width is corrupt even for an otherwise empty tree.  Keep this
+   check before every client-specific early return. */
+fun h5policy_validate_v2_btree_geometry = (uint<64> node_size,
+                                           uint<64> record_size,
+                                           off64 loc,
+                                           string object) int:
+{
+    if (record_size == 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_SIZE", "corrupt",
+                                loc, object,
+                                "v2 B-tree record size is zero");
+            return 0;
+        }
+    if (node_size < 10UL || record_size > node_size - 10UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
+                                loc, object,
+                                "v2 B-tree node cannot hold one record");
+            return 0;
+        }
+    return 1;
+}
+
+/* Test whether charging BYTES would cross the selected metadata ceiling.  The
+   ordinary accounting helper still performs the charge and emits/saturates the
+   public metric; this predicate tells recursive walkers not to follow another
+   attacker-controlled edge after that refusal has been established. */
+fun h5policy_chunkindex_metadata_would_exceed = (H5WalkContext ctx,
+                                                 H5PolicyProfile profile,
+                                                 uint<64> bytes) int:
+{
+    var limit = profile.resources.max_accounted_metadata_bytes;
+    if (bytes > limit)
+        return 1;
+    return ctx.metadata_seen > limit - bytes;
+}
+
+/* Verify a chunk-index structure whose checksum is the final four bytes of its
+   used image.  A v2 B-tree node may reserve a larger fixed node_size; callers
+   pass only the used prefix through the checksum field, matching libhdf5. */
+fun h5policy_chunkindex_verify_trailing_checksum = (int ios, H5PolicyProfile profile,
+                                                     uint<64> addr, uint<64> total_size,
+                                                     uint<64> file_size, string object,
+                                                     string what) int:
+{
+    if (total_size < 4UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM", "corrupt",
+                                addr#B, object, what + " checksum field outside block");
+            return 0;
+        }
+    if (!h5policy_checked_addr_range(addr, total_size, file_size,
+                                     what + " outside file",
+                                     addr#B, object))
+        return 0;
+
+    var body_size = total_size - 4UL;
+    var body = h5policy_msg_bytes(ios, profile, addr#B, body_size);
+    var stored = lookup3_u32_le(h5policy_msg_bytes(ios, profile,
+                                                   addr#B + body_size#B, 4UL));
+    var calculated = lookup3_hashlittle(body, 0);
+    if (calculated != stored)
+        {
+            h5policy_emit_error_ev(
+                "H5_CORRUPT_BAD_CHECKSUM", "corrupt", addr#B, object,
+                what + " checksum mismatch",
+                H5Evidence {
+                    field = "metadata.lookup3_checksum",
+                    actual = stored as uint<64>,
+                    expected = calculated as uint<64>,
+                    comparison = "equal",
+                    has_loc1 = 1, loc1_role = "actual",
+                    loc1 = (addr + body_size)#B, loc1_len = 4UL,
+                    source_offsets = [addr], source_lengths = [body_size],
+                });
+            return 0;
+        }
+    return 1;
+}
+
+/* Number of bytes used for the records-in-child counter in every v2 B-tree
+   pointer.  libhdf5 derives this from the maximum LEAF capacity, not from the
+   smaller internal-node capacity. */
+fun h5policy_chunk_bt2_nrec_bytes = (uint<64> node_size,
+                                     uint<64> record_size) uint<64>:
+{
+    var max_nrec = (node_size - 10UL) / record_size;
+    var bytes = 1UL;
+    var threshold = 256UL;
+    while (max_nrec >= threshold)
+        {
+            bytes = bytes + 1UL;
+            threshold = threshold * 256UL;
+        }
+    return bytes;
+}
+
+/* Width of the records-in-subtree counter for a child pointer.  LEVEL is the
+   child's depth (zero for a leaf).  This is H5B2's cumulative maximum
+   recurrence, with saturation before any uint64 multiplication can wrap. */
+fun h5policy_chunk_bt2_subtree_bytes = (uint<64> node_size,
+                                        uint<64> record_size,
+                                        uint<64> level) uint<64>:
+{
+    if (level == 0UL)
+        return 0UL;
+
+    var o = global_sizeof_offsets as uint<64>;
+    var nrec_bytes = h5policy_chunk_bt2_nrec_bytes(node_size, record_size);
+    var cum_max = (node_size - 10UL) / record_size;
+    var subtree_bytes = 0UL;
+    var u64_max = 0xffffffffffffffffUL;
+    var current = 1UL;
+    while (current <= level)
+        {
+            var ptr_size = o + nrec_bytes + subtree_bytes;
+            if (node_size < 10UL + ptr_size)
+                return subtree_bytes;
+            var max_internal = (node_size - 10UL - ptr_size)
+                               / (record_size + ptr_size);
+            if (max_internal != 0UL
+                && cum_max > (u64_max - max_internal) / (max_internal + 1UL))
+                return 8UL;
+            cum_max = ((max_internal + 1UL) * cum_max) + max_internal;
+            subtree_bytes = 1UL;
+            var threshold = 256UL;
+            while (cum_max >= threshold)
+                {
+                    if (subtree_bytes >= 8UL
+                        || threshold > u64_max / 256UL)
+                        return 8UL;
+                    subtree_bytes = subtree_bytes + 1UL;
+                    threshold = threshold * 256UL;
+                }
+            current = current + 1UL;
+        }
+    return subtree_bytes;
+}
+
+/* Per-node record decoder.  The engine calls this once for every reached node
+   with (ios, profile, records_addr, nrec, file_size, object); a client wraps
+   its own decoder in a closure that captures record_type, record_size, and any
+   client-specific parameters (chunk rank/size, SOHM type mask/filter count). */
+type H5Bt2Validator = (int, H5PolicyProfile, uint<64>, uint<64>, uint<64>,
+                       string) void;
+
+/* Everything a client varies in the shared node envelope.  The message and
+   code fields are stored explicitly rather than templated so each client's
+   output stays byte-identical to its former hand-written walker. */
+type H5Bt2NodeSpec = struct
+  {
+    uint<64> node_size;
+    uint<64> record_size;
+    uint<64> record_type;
+
+    string depth_message;
+    string cycle_code;
+    string cycle_message;
+    string range_message;
+    string capacity_message;
+    string overflow_recbytes_message;
+    string overflow_size_message;
+    string overflow_ptrbytes_message;
+    string overflow_checksum_message;
+    string nodesize_message;
+    string leaf_sig_message;
+    string internal_sig_message;
+    string header_message;
+    string leaf_what;
+    string internal_what;
+
+    /* SOHM validates that each child pointer's records-in-subtree count is at
+       least the child's own record count; chunk indexes do not. */
+    uint<8> check_subtree_count;
+    string subtree_count_message;
+
+    string child_undef_code;
+    string child_undef_message;
+    string child_oof_code;
+    string child_oof_message;
+
+    /* Chunk descent also stops once the chunk-count budget is exhausted. */
+    uint<8> gate_on_chunk_count;
+
+    H5Bt2Validator validate;
+  };
+
+/* Recursively validate one v2 B-tree node under SPEC.  The declared node_size
+   bounds every read and is charged once; the checksum covers only the used
+   prefix.  Depth, a visited set, the metadata ceiling, and (for chunk indexes)
+   the chunk ceiling independently bound descent. */
+fun h5policy_walk_v2_btree_node = (
+    int ios, H5PolicyProfile profile, H5WalkContext ctx,
+    uint<64> node_addr, uint<64> node_depth, uint<64> nrec,
+    uint<64> file_size, string object, H5Bt2NodeSpec spec) H5WalkContext:
+{
+    var node_size = spec.node_size;
+    var record_size = spec.record_size;
+    var record_type = spec.record_type;
+
+    if (ctx.metadata_count_exceeded != 0UB)
+        return ctx;
+
+    if (node_depth > profile.resources.max_btree_depth)
+        {
+            h5policy_emit_error("H5_RESOURCE_BTREE_DEPTH", "resource",
+                                node_addr#B, object, spec.depth_message);
+            return ctx;
+        }
+
+    if (!h5policy_mark_visited_btree(node_addr))
+        {
+            h5policy_emit_error(spec.cycle_code, "corrupt",
+                                node_addr#B, object, spec.cycle_message);
+            return ctx;
+        }
+
+    if (!h5policy_checked_addr_range(node_addr, node_size, file_size,
+                                     spec.range_message,
+                                     node_addr#B, object))
+        return ctx;
+
+    var o = global_sizeof_offsets as uint<64>;
+    var nrec_bytes = h5policy_chunk_bt2_nrec_bytes(node_size, record_size);
+    var subtree_bytes = node_depth > 1UL
+                        ? h5policy_chunk_bt2_subtree_bytes(
+                              node_size, record_size, node_depth - 1UL)
+                        : 0UL;
+    var ptr_size = o + nrec_bytes + subtree_bytes;
+    var capacity = (node_size - 10UL) / record_size;
+    if (node_depth > 0UL)
+        {
+            if (node_size < 10UL + ptr_size)
+                capacity = 0UL;
+            else
+                capacity = (node_size - 10UL - ptr_size)
+                           / (record_size + ptr_size);
+        }
+    if (nrec > capacity)
+        {
+            h5policy_emit_error("H5_CORRUPT_BTREE_NODE_ENTRY_COUNT", "corrupt",
+                                node_addr#B, object, spec.capacity_message);
+            return ctx;
+        }
+
+    var rec_bytes = h5policy_checked_mul_u64(
+        nrec, record_size, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        spec.overflow_recbytes_message);
+    var used_size = h5policy_checked_add_u64(
+        6UL, rec_bytes, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        spec.overflow_size_message);
+    if (node_depth > 0UL)
+        {
+            var ptr_bytes = h5policy_checked_mul_u64(
+                nrec + 1UL, ptr_size, 0xffffffffffffffffUL,
+                "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+                spec.overflow_ptrbytes_message);
+            used_size = h5policy_checked_add_u64(
+                used_size, ptr_bytes, 0xffffffffffffffffUL,
+                "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+                spec.overflow_size_message);
+        }
+    used_size = h5policy_checked_add_u64(
+        used_size, 4UL, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        spec.overflow_checksum_message);
+    if (used_size > node_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
+                                node_addr#B, object, spec.nodesize_message);
+            return ctx;
+        }
+
+    var expected_sig = node_depth == 0UL
+                       ? H5_FORMAT_BTLF_SIGNATURE : H5_FORMAT_BTIN_SIGNATURE;
+    if (h5policy_msg_bytes(ios, profile, node_addr#B, 4UL) != expected_sig)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                node_addr#B, object,
+                                node_depth == 0UL
+                                ? spec.leaf_sig_message
+                                : spec.internal_sig_message);
+            return ctx;
+        }
+    h5policy_mark_reached(node_addr, node_depth == 0UL ? "BTLF" : "BTIN");
+    var version = h5policy_msg_u64_at(ios, profile, node_addr#B + 4#B, 1UL);
+    var found_type = h5policy_msg_u64_at(ios, profile, node_addr#B + 5#B, 1UL);
+    if (version != 0UL || found_type != record_type)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_HEADER", "corrupt",
+                                node_addr#B, object, spec.header_message);
+            return ctx;
+        }
+
+    var metadata_over = h5policy_chunkindex_metadata_would_exceed(
+        ctx, profile, node_size);
+    ctx = h5policy_account_metadata(ctx, profile, node_size,
+                                    node_addr#B, object);
+    if (metadata_over)
+        return ctx;
+    if (!h5policy_chunkindex_verify_trailing_checksum(
+            ios, profile, node_addr, used_size, file_size, object,
+            node_depth == 0UL ? spec.leaf_what : spec.internal_what))
+        return ctx;
+
+    spec.validate(ios, profile, node_addr + 6UL, nrec, file_size, object);
+
+    if (node_depth == 0UL)
+        return ctx;
+    if (spec.gate_on_chunk_count != 0UB && ctx.chunk_count_exceeded != 0UB)
+        return ctx;
+
+    var ptr_base = node_addr + 6UL + rec_bytes;
+    var i = 0UL;
+    while (i < nrec + 1UL)
+        {
+            if (ctx.metadata_count_exceeded != 0UB)
+                return ctx;
+            var ptr_addr = ptr_base + (i * ptr_size);
+            var child_raw = h5policy_msg_bytes(ios, profile, ptr_addr#B, o);
+            var child_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(child_raw));
+            var child_nrec = h5policy_msg_u64_at(
+                ios, profile, ptr_addr#B + o#B, nrec_bytes);
+            if (spec.check_subtree_count != 0UB && subtree_bytes != 0UL)
+                {
+                    var child_total = h5policy_msg_u64_at(
+                        ios, profile, ptr_addr#B + (o + nrec_bytes)#B,
+                        subtree_bytes);
+                    if (child_total < child_nrec)
+                        h5policy_emit_error("H5_CORRUPT_V2_BTREE_SUBTREE_COUNT",
+                                            "corrupt",
+                                            ptr_addr#B + (o + nrec_bytes)#B,
+                                            object, spec.subtree_count_message);
+                }
+            if (h5policy_msg_addr_is_undef(child_raw))
+                h5policy_emit_error(spec.child_undef_code, "corrupt",
+                                    ptr_addr#B, object, spec.child_undef_message);
+            else if (child_addr >= file_size)
+                h5policy_emit_error(spec.child_oof_code, "corrupt",
+                                    ptr_addr#B, object, spec.child_oof_message);
+            else
+                ctx = h5policy_walk_v2_btree_node(
+                    ios, profile, ctx, child_addr, node_depth - 1UL,
+                    child_nrec, file_size, object, spec);
+            i = i + 1UL;
+        }
+
+    return ctx;
+}

@@ -23,6 +23,24 @@ The global variables `global_bt2_*` must be set correctly before
 mapping any node. `print_v2_btree(addr#B)` handles this automatically
 by reading the header first.
 
+**Layout: Version 2 B-tree Header**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Version</td><td>Record Type</td><td colspan="2">Node Size</td></tr>
+    <tr><td colspan="2">Node Size (continued)</td><td colspan="2">Record Size</td></tr>
+    <tr><td colspan="2">Depth</td><td>Split Percent</td><td>Merge Percent</td></tr>
+    <tr><td colspan="4">Root Node Address<sup>O</sup></td></tr>
+    <tr><td colspan="2">Root Record Count</td><td colspan="2">Total Record Count<sup>L</sup></td></tr>
+    <tr><td colspan="4">Total Record Count (continued)<sup>L</sup></td></tr>
+    <tr><td colspan="4">Checksum</td></tr>
+  </tbody>
+</table>
+
+Rows containing variable-width fields are schematic. `O` is the size of offsets; `L` is the size of lengths.
+
 ## `bt2_hdr`
 
 Version 2 B-tree header (signature 'BTHD'). Describes the geometry of the entire B-tree. Mapping this struct sets the global parameters `global_bt2_type`, `global_bt2_record_size`, `global_bt2_node_size`, and `global_bt2_depth` via constraint side-effects, so subsequent node mappings require no additional setter calls.
@@ -243,5 +261,3 @@ Child-pointer array for a depth-1 internal node (children are leaves). Each poin
 ### `dn`
 
 Child-pointer array for a depth > 1 internal node (children are internal nodes). Each pointer is a `child_ptr_dn` carrying the child address, node record count, and subtree record count.
-
-

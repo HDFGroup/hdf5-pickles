@@ -38,16 +38,22 @@ type H5WalkContext = struct
     uint<64> dataspace_rank;
     uint<64> dataset_element_count;
     uint<64> datatype_size;
+    uint<64> datatype_size_offset;
     uint<64> datatype_logical_size;
     uint<64> fill_value_size;
     uint<64> compact_layout_size;
     uint<64> contiguous_layout_size;
     uint<64> legacy_chunked_layout_ndims;
+    uint<64> legacy_chunked_layout_ndims_offset;
     uint<64> chunk_dataset_element_count;
     uint<64> chunk_logical_bytes;
     uint<64> logical_dataset_bytes;
     uint<64> max_logical_dataset_bytes_seen;
     uint<64> accounted_chunk_count;
+    /* Like chunk_count_exceeded below, preserve the proof hidden by the
+       saturating public metadata counter so recursive validators can stop
+       following new metadata edges once the byte refusal is established. */
+    uint<8> metadata_count_exceeded;
     /* The public count saturates at the selected ceiling, so equality alone
        cannot say whether the walk observed exactly the limit or proved an
        additional chunk.  Keep that proof as internal traversal state. */
@@ -151,7 +157,7 @@ fun h5policy_reset_reached = void:
 
 /* Object headers are walked breadth-first.  Link messages enqueue child object
    headers here; h5policy_walk_reachable_metadata drains the queue while
-   enforcing max link depth and continue-after-corruption policy.  */
+   enforcing max link depth and continue-after-rejection policy.  */
 var h5policy_pending_ohdrs = uint<64>[]();
 var h5policy_pending_depths = uint<64>[]();
 var h5policy_pending_paths = string[]();
@@ -172,12 +178,14 @@ var h5policy_dense_handled = 0;
    filtered dense-storage heap cannot pollute a dataset's chunk-consistency check.  */
 var h5policy_pipeline_decode_nelmts = 0UL;
 var h5policy_pipeline_has_decode_nelmts = 0UB;
+var h5policy_pipeline_decode_nelmts_offset = 0UL;
 /* Scale-offset's per-element size (cd_values[4]), the other factor libhdf5
    multiplies into the decompressed chunk buffer.  Checked against the real
    datatype size at finalization so an inflated size can't overflow the product
    even when the element count is left consistent.  */
 var h5policy_pipeline_decode_size = 0UL;
 var h5policy_pipeline_has_decode_size = 0UB;
+var h5policy_pipeline_decode_size_offset = 0UL;
 var h5policy_super_stab_leaf_k = 4UL;
 var h5policy_super_stab_internal_k = 16UL;
 var h5policy_super_indexed_internal_k = 32UL;
@@ -297,16 +305,19 @@ fun h5policy_new_walk_context = H5WalkContext:
         dataspace_rank = 0UL,
         dataset_element_count = 0UL,
         datatype_size = 0UL,
+        datatype_size_offset = 0UL,
         datatype_logical_size = 0UL,
         fill_value_size = 0UL,
         compact_layout_size = 0UL,
         contiguous_layout_size = 0UL,
         legacy_chunked_layout_ndims = 0UL,
+        legacy_chunked_layout_ndims_offset = 0UL,
         chunk_dataset_element_count = 0UL,
         chunk_logical_bytes = 0UL,
         logical_dataset_bytes = 0UL,
         max_logical_dataset_bytes_seen = 0UL,
         accounted_chunk_count = 0UL,
+        metadata_count_exceeded = 0UB,
         chunk_count_exceeded = 0UB,
         has_dataspace = 0UB,
         has_datatype = 0UB,
@@ -346,13 +357,19 @@ fun h5policy_account_metadata = (H5WalkContext ctx,
                                  off64 loc,
                                  string object) H5WalkContext:
 {
+    var limit = profile.resources.max_accounted_metadata_bytes;
+    var exceeds = bytes > limit;
+    if (!exceeds && ctx.metadata_seen > limit - bytes)
+        exceeds = 1;
     var next = h5policy_checked_add_u64(ctx.metadata_seen, bytes,
-                                        profile.resources.max_accounted_metadata_bytes,
+                                        limit,
                                         "H5_RESOURCE_ACCOUNTED_METADATA_BYTES",
                                         "resource",
                                         loc, object,
                                         "accounted metadata byte budget exceeded");
     ctx.metadata_seen = next;
+    if (exceeds)
+        ctx.metadata_count_exceeded = 1UB;
     return ctx;
 }
 
@@ -490,6 +507,18 @@ fun h5policy_payload_range_ok = (uint<64> msg_size,
         }
 
     return 1;
+}
+
+/* Version-1 object headers store message data in 8-byte-aligned slots and
+   include that padding in msg_size.  Version-2 headers store the exact payload
+   length.  Validators for fixed-size messages use this helper so valid v1
+   padding is not mistaken for an extension or swallowed following message. */
+fun h5policy_message_size_matches = (uint<64> msg_size,
+                                     uint<64> payload_size) int:
+{
+    if (global_version == 1)
+        return msg_size == ((payload_size + 7UL) / 8UL) * 8UL;
+    return msg_size == payload_size;
 }
 
 /* HDF5 undefined addresses are all-ones at the file's configured offset width.
@@ -751,9 +780,16 @@ fun h5policy_update_legacy_chunked_layout_rank = (H5WalkContext ctx,
 {
     if (ctx.has_dataspace != 0UB && ctx.has_legacy_chunked_layout != 0UB
         && ctx.legacy_chunked_layout_ndims != ctx.dataspace_rank + 1UL)
-        h5policy_emit_error("H5_CORRUPT_LAYOUT_RANK_MISMATCH",
-                            "corrupt", loc, object,
-                            "legacy chunked layout dimensionality does not match dataspace rank");
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_LAYOUT_RANK_MISMATCH", "corrupt", loc, object,
+            "legacy chunked layout dimensionality does not match dataspace rank",
+            H5Evidence {
+                field = "layout.legacy_chunk_dimensions",
+                actual = ctx.legacy_chunked_layout_ndims,
+                expected = ctx.dataspace_rank + 1UL,
+                comparison = "equal",
+                has_loc1 = 1, loc1_role = "actual", loc1 = loc, loc1_len = 1UL,
+            });
 
     return ctx;
 }

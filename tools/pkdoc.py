@@ -109,12 +109,56 @@ def field_table(fields: dict) -> str:
     return "\n".join(rows)
 
 
+def layout_table(layout: dict) -> str:
+    """Render a four-byte-wide format diagram from a sidecar layout."""
+    title = (layout.get("title") or "Layout").strip()
+    rows = layout.get("rows") or []
+    out = [f"**Layout: {title}**", "", '<table class="format-layout">',
+           "  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>",
+           "  <tbody>"]
+
+    for row_num, row in enumerate(rows, 1):
+        cells = row if isinstance(row, list) else [row]
+        used = 0
+        rendered: list[str] = []
+        for cell in cells:
+            if isinstance(cell, dict):
+                label = str(cell.get("label") or "")
+                span = int(cell.get("span", 1))
+                width = str(cell.get("width") or "").strip()
+            else:
+                label = str(cell)
+                span = 1
+                width = ""
+            if span < 1 or used + span > 4:
+                raise ValueError(
+                    f"layout '{title}' row {row_num} exceeds four byte columns"
+                )
+            suffix = f"<sup>{width}</sup>" if width else ""
+            colspan = f' colspan="{span}"' if span > 1 else ""
+            rendered.append(f"<td{colspan}>{label}{suffix}</td>")
+            used += span
+        if used != 4:
+            raise ValueError(
+                f"layout '{title}' row {row_num} uses {used} byte columns, expected 4"
+            )
+        out.append("    <tr>" + "".join(rendered) + "</tr>")
+
+    out.extend(["  </tbody>", "</table>", ""])
+    note = (layout.get("note") or "").strip()
+    if note:
+        out.extend([note, ""])
+    return "\n".join(out)
+
+
 def render_type(name: str, type_yaml: dict, heading: str = "##") -> list[str]:
     out: list[str] = []
     out.append(f"{heading} `{name}`\n")
     desc = (type_yaml.get("desc") or "").strip()
     if desc:
         out.append(f"{desc}\n")
+    for layout in (type_yaml.get("layouts") or []):
+        out.append(layout_table(layout))
     fields = type_yaml.get("fields")
     if fields:
         out.append(field_table(fields))
@@ -138,6 +182,9 @@ def render(doc: dict, out_path: Path) -> None:
         lines.append(intro)
         lines.append("")
 
+    for layout in (doc.get("layouts") or []):
+        lines.append(layout_table(layout))
+
     for type_name, type_info in (doc.get("types") or {}).items():
         lines.extend(render_type(type_name, type_info))
         lines.append("")
@@ -148,7 +195,7 @@ def render(doc: dict, out_path: Path) -> None:
         lines.append("")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines) + "\n")
+    out_path.write_text("\n".join(lines).rstrip() + "\n")
     print(f"Written: {out_path}")
 
 
@@ -161,6 +208,17 @@ def check(doc: dict, pk_path: Path) -> bool:
 
     issues: list[str] = []
     warnings: list[str] = []
+
+    # Layouts are specification data too. Render them during checks so a
+    # row that is not exactly four byte columns wide is caught immediately.
+    try:
+        for layout in (doc.get("layouts") or []):
+            layout_table(layout)
+        for type_info in yaml_types.values():
+            for layout in (type_info.get("layouts") or []):
+                layout_table(layout)
+    except (TypeError, ValueError) as exc:
+        issues.append(str(exc))
 
     # Types in YAML but not in pickle (stale)
     for tname in yaml_types:

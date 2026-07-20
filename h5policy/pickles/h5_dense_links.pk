@@ -163,6 +163,71 @@ fun h5policy_scan_nul = (int ios, H5PolicyProfile profile,
     return 0xffffffffffffffffUL;
 }
 
+/* Classify an external link's *target file name* for path-safety hazards from
+   the stored bytes alone.  h5policy never resolves or opens the target, so this
+   is a syntactic best-effort signal, not a resolved-path guarantee: it cannot
+   know the consumer's base directory or whether a plain name is itself a
+   symlink.  Mirrors the external-storage (h5_external.pk) and VDS (h5_vds.pk)
+   source-path advisories and, like them, emits only when the profile permits the
+   feature -- a denied profile already rejects the link with H5_POLICY_EXTERNAL_-
+   LINK, so the advisory would be redundant there.  `off`/`len` cover the
+   NUL-free, in-bounds target file name (the object path is validated
+   separately).  */
+fun h5policy_classify_external_link_target = (int ios, H5PolicyProfile profile,
+                                              off64 off, uint<64> len,
+                                              string object) void:
+{
+    if (profile.features.allow_external_links == 0UB || len == 0UL)
+        return;
+
+    var first = 0UL; var second = 0UL; var third = 0UL;
+    var parent = 0; var component_start = 1;
+    var i = 0UL;
+    while (i < len)
+        {
+            var ch = h5policy_msg_u64_at(ios, profile, off + i#B, 1UL);
+            if (i == 0UL) first = ch;
+            if (i == 1UL) second = ch;
+            if (i == 2UL) third = ch;
+            if (component_start && ch == ('.' as uint<64>) && i + 1UL < len)
+                {
+                    var next = h5policy_msg_u64_at(ios, profile,
+                                                   off + (i + 1UL)#B, 1UL);
+                    if (next == ('.' as uint<64>))
+                        {
+                            var after = 0UL;
+                            if (i + 2UL < len)
+                                after = h5policy_msg_u64_at(ios, profile,
+                                                            off + (i + 2UL)#B, 1UL);
+                            if (after == 0UL
+                                || after == ('/' as uint<64>)
+                                || after == ('\\' as uint<64>))
+                                parent = 1;
+                        }
+                }
+            component_start = ch == ('/' as uint<64>) || ch == ('\\' as uint<64>);
+            i = i + 1UL;
+        }
+
+    var absolute = first == ('/' as uint<64>)
+                   || first == ('\\' as uint<64>)
+                   || (second == (':' as uint<64>)
+                       && (third == ('/' as uint<64>)
+                           || third == ('\\' as uint<64>)));
+    if (parent)
+        h5policy_emit_warning("H5_ADVISORY_EXTERNAL_LINK_PARENT_PATH",
+                              off, object,
+                              "external link target path contains a parent-directory component and can direct a consumer to open a file outside the expected directory");
+    else if (absolute)
+        h5policy_emit_warning("H5_ADVISORY_EXTERNAL_LINK_ABSOLUTE_PATH",
+                              off, object,
+                              "external link uses an absolute target path and can direct a consumer to open that file");
+    else
+        h5policy_emit_warning("H5_ADVISORY_EXTERNAL_LINK_RELATIVE_PATH",
+                              off, object,
+                              "external link uses a relative target path whose resolved file depends on consumer path resolution");
+}
+
 fun h5policy_validate_link_payload = (int ios,
                                       H5PolicyProfile profile,
                                       offset<uint<64>,B> payload_off,
@@ -236,6 +301,26 @@ fun h5policy_validate_link_payload = (int ios,
                                    payload_off + cur#B, object,
                                    "link name overruns the link message"))
         return;
+
+    /* The compact link name is stored as exactly `name_len` bytes with no NUL
+       terminator, so an embedded NUL truncates the C-string libhdf5 decodes --
+       a leading NUL yields an empty name, which libhdf5 rejects outright.  No
+       valid file stores a NUL inside a link name, so flagging one here closes a
+       soundness gap (h5policy would otherwise accept a file libhdf5 refuses)
+       without risking an over-strict rejection of a legitimate name.  */
+    var name_nul = 0UL;
+    while (name_nul < name_len)
+        {
+            if (h5policy_msg_u64_at(ios, profile,
+                                    name_off + name_nul#B, 1UL) == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_LINK_NAME_EMPTY",
+                                        "corrupt", name_off + name_nul#B, object,
+                                        "link name contains a NUL byte");
+                    break;
+                }
+            name_nul = name_nul + 1UL;
+        }
 
     cur = cur + name_len;
     var link_name = h5policy_string_from_payload(ios, profile,
@@ -334,6 +419,8 @@ fun h5policy_validate_link_payload = (int ios,
                                             "external link target file name is not terminated within the link value");
                     else
                         {
+                            h5policy_classify_external_link_target(
+                                ios, profile, val_off + 1#B, fname_nul, object);
                             var obj_rel = fname_nul + 2UL;   /* past fname + its NUL */
                             if (obj_rel >= ext_len
                                 || h5policy_scan_nul(ios, profile,
@@ -729,9 +816,102 @@ fun h5policy_bt2_nrec_bytes = (uint<64> node_sz, uint<64> rec_sz) uint<64>:
     return bytes;
 }
 
-/* Dense link B-tree records carry a fractal-heap ID.  Only managed heap IDs are
-   decoded here; other ID classes are outside the supported dense-storage
-   subset and are ignored by this record pass.  */
+/* The name and creation-order indexes must describe exactly the same heap
+   objects.  Record managed-ID identities while walking the name tree, then
+   consume them once from the secondary tree. */
+var h5policy_dense_name_heap_offsets = uint<64>[]();
+var h5policy_dense_name_heap_lengths = uint<64>[]();
+var h5policy_dense_name_corders = uint<64>[]();
+var h5policy_dense_name_matched = uint<8>[]();
+var h5policy_dense_name_nonmanaged_reported = 0;
+
+fun h5policy_reset_dense_name_index = void:
+{
+    h5policy_dense_name_heap_offsets = uint<64>[]();
+    h5policy_dense_name_heap_lengths = uint<64>[]();
+    h5policy_dense_name_corders = uint<64>[]();
+    h5policy_dense_name_matched = uint<8>[]();
+    h5policy_dense_name_nonmanaged_reported = 0;
+}
+
+fun h5policy_record_dense_name_heap_id = (uint<64> heap_off,
+                                           uint<64> heap_len,
+                                           uint<64> corder,
+                                           off64 loc,
+                                           string object) void:
+{
+    var i = 0UL;
+    while (i < h5policy_dense_name_heap_offsets'length as uint<64>)
+        {
+            h5policy_walk_tick(1UL);
+            if (h5policy_dense_name_heap_offsets[i] == heap_off
+                && h5policy_dense_name_heap_lengths[i] == heap_len)
+                {
+                    h5policy_emit_error("H5_CORRUPT_DENSE_NAME_INDEX_DUPLICATE_ID",
+                                        "corrupt", loc, object,
+                                        "dense name index references one heap object more than once");
+                    return;
+                }
+            i = i + 1UL;
+        }
+    h5policy_dense_name_heap_offsets += [heap_off];
+    h5policy_dense_name_heap_lengths += [heap_len];
+    h5policy_dense_name_corders += [corder];
+    h5policy_dense_name_matched += [0UB];
+}
+
+fun h5policy_match_dense_corder_heap_id = (uint<64> heap_off,
+                                            uint<64> heap_len,
+                                            uint<64> corder,
+                                            off64 loc,
+                                            string object) void:
+{
+    var i = 0UL;
+    while (i < h5policy_dense_name_heap_offsets'length as uint<64>)
+        {
+            h5policy_walk_tick(1UL);
+            if (h5policy_dense_name_heap_offsets[i] == heap_off
+                && h5policy_dense_name_heap_lengths[i] == heap_len)
+                {
+                    if (h5policy_dense_name_matched[i] != 0UB)
+                        h5policy_emit_error("H5_CORRUPT_DENSE_CORDER_INDEX_DUPLICATE_ID",
+                                            "corrupt", loc, object,
+                                            "dense creation-order index references one heap object more than once");
+                    else
+                        h5policy_dense_name_matched[i] = 1UB;
+                    if (h5policy_dense_name_corders[i] != corder)
+                        h5policy_emit_error("H5_CORRUPT_DENSE_CORDER_MISMATCH",
+                                            "corrupt", loc, object,
+                                            "dense creation-order key disagrees with the name-indexed record");
+                    return;
+                }
+            i = i + 1UL;
+        }
+    h5policy_emit_error("H5_CORRUPT_DENSE_CORDER_INDEX_UNKNOWN_ID", "corrupt",
+                        loc, object,
+                        "dense creation-order index references a heap object absent from the name index");
+}
+
+fun h5policy_finish_dense_corder_matches = (off64 loc, string object) void:
+{
+    var i = 0UL;
+    while (i < h5policy_dense_name_matched'length as uint<64>)
+        {
+            h5policy_walk_tick(1UL);
+            if (h5policy_dense_name_matched[i] == 0UB)
+                {
+                    h5policy_emit_error("H5_CORRUPT_DENSE_CORDER_INDEX_MISSING_ID",
+                                        "corrupt", loc, object,
+                                        "dense creation-order index omits an object present in the name index");
+                    return;
+                }
+            i = i + 1UL;
+        }
+}
+
+/* Dense link B-tree records carry a fractal-heap ID.  Managed IDs are decoded
+   and recorded for cross-index consistency; other classes are an explicit
+   coverage refusal rather than a silent skip. */
 /* Process one v2 B-tree leaf of dense-link (type-5) records: resolve each
    fractal-heap object and validate/enqueue it as a link message.  */
 /* Process nrec dense-link (type-5) records starting at rec_base (node prefix +
@@ -764,7 +944,11 @@ fun h5policy_dense_link_records = (int ios, H5PolicyProfile profile,
                     var heap_obj_len = h5policy_msg_u64_at(ios, profile,
                                                            id_off#B + (1UL + off_size)#B,
                                                            len_size);
-                    if (heap_obj_len != 0UL)
+                    if (heap_obj_len == 0UL)
+                        h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID", "corrupt",
+                                            id_off#B, object,
+                                            "dense link name index has a zero-length heap object ID");
+                    else
                         {
                             var obj_off = h5policy_frhp_locate(ios, profile,
                                                                fheap_root, curr_root_rows,
@@ -773,13 +957,47 @@ fun h5policy_dense_link_records = (int ios, H5PolicyProfile profile,
                                                                checksum_dblocks,
                                                                heap_obj_off, file_size,
                                                                object);
+                            var link_corder = 0xffffffffffffffffUL;
                             if (obj_off != 0xffffffffffffffffUL
                                 && obj_off < file_size
                                 && heap_obj_len <= file_size - obj_off)
-                                h5policy_validate_link_payload(ios, profile,
-                                                               obj_off#B, heap_obj_len,
-                                                               object);
+                                {
+                                    if (heap_obj_len >= 2UL)
+                                        {
+                                            var link_flags = h5policy_msg_u64_at(
+                                                ios, profile, obj_off#B + 1#B, 1UL);
+                                            var link_cur = 2UL;
+                                            if ((link_flags & 8UL) != 0UL)
+                                                link_cur = link_cur + 1UL;
+                                            if ((link_flags & 4UL) != 0UL
+                                                && h5policy_payload_range_ok(
+                                                    heap_obj_len, link_cur, 8UL,
+                                                    "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                                    obj_off#B + link_cur#B, object,
+                                                    "dense link creation order overruns the link message"))
+                                                link_corder = h5policy_msg_u64_at(
+                                                    ios, profile,
+                                                    obj_off#B + link_cur#B, 8UL);
+                                        }
+                                    h5policy_validate_link_payload(
+                                        ios, profile, obj_off#B, heap_obj_len,
+                                        object);
+                                }
+                            else
+                                h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID",
+                                                    "corrupt", id_off#B, object,
+                                                    "dense link name-index heap ID cannot be resolved in file bounds");
+                            h5policy_record_dense_name_heap_id(
+                                heap_obj_off, heap_obj_len, link_corder,
+                                id_off#B, object);
                         }
+                }
+            else if (!h5policy_dense_name_nonmanaged_reported)
+                {
+                    h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                        "unsupported", id_off#B, object,
+                                        "dense link name index uses a non-managed fractal-heap ID");
+                    h5policy_dense_name_nonmanaged_reported = 1;
                 }
             i = i + 1UL;
         }
@@ -842,11 +1060,9 @@ fun h5policy_dense_leaf_links = (int ios, H5PolicyProfile profile,
                                 len_size, file_size, object);
 }
 
-/* Enumerate dense-link records from the name-indexed v2 B-tree (root leaf, or a
-   depth-1 root internal node's leaves), resolve each fractal-heap object, and
-   validate/enqueue it as a link message.  Returns 1 when handled; 0 when the
-   structure is outside the supported subset (filtered heap, v2 B-tree depth>1,
-   non-managed ids), so the caller falls back to a coverage gap.  */
+/* Enumerate dense-link records from every node of the name-indexed v2 B-tree,
+   resolve each fractal-heap object, and validate/enqueue it as a link message.
+   Recursive geometry is shared with the creation-order walker below. */
 /* v2 B-tree internal child pointers include a variable-width count for records
    in the child and, for deeper trees, records in the whole child subtree.  This
    helper mirrors the H5B2 cumulative maximum recurrence to determine that
@@ -887,6 +1103,445 @@ fun h5policy_bt2_subtree_bytes = (uint<64> node_sz, uint<64> rec_sz, uint<64> le
             lv = lv + 1UL;
         }
     return subtree_bytes;
+}
+
+/* Creation-order indexes are independent v2 B-trees, not alternate views of
+   the already-validated name tree.  Keep a per-index key set so duplicate
+   creation orders are rejected even when they occur in different nodes. */
+var h5policy_dense_corder_values = uint<64>[]();
+var h5policy_dense_corder_nonmanaged_reported = 0;
+
+fun h5policy_validate_dense_attr_record_flags = (uint<64> flags, off64 loc,
+                                                  string object) void:
+{
+    if ((flags & 0x02UL) != 0UL && (flags & 0x04UL) != 0UL)
+        h5policy_emit_error("H5_CORRUPT_MESSAGE_FLAG_COMBINATION", "corrupt",
+                            loc, object,
+                            "dense attribute record is both shared and marked do-not-share");
+    if ((flags & 0x20UL) != 0UL && (flags & 0x08UL) != 0UL)
+        h5policy_emit_error("H5_CORRUPT_MESSAGE_FLAG_COMBINATION", "corrupt",
+                            loc, object,
+                            "dense attribute record has incompatible unknown-message flags");
+    if ((flags & 0x20UL) != 0UL && (flags & 0x10UL) == 0UL)
+        h5policy_emit_error("H5_CORRUPT_MESSAGE_FLAG_COMBINATION", "corrupt",
+                            loc, object,
+                            "dense attribute record was-unknown flag requires mark-if-unknown");
+}
+
+/* Validate the records held directly by one creation-order node.  Type 6 is
+   creation-ordered links (u64 key + 7-byte heap ID); type 9 is creation-ordered
+   attributes (8-byte heap ID + flags + u32 key).  Resolving every managed ID
+   proves that the secondary index cannot hide an out-of-file heap reference. */
+fun h5policy_dense_corder_records = (int ios, H5PolicyProfile profile,
+                                      uint<64> rec_base, uint<64> nrec,
+                                      uint<64> record_size, uint<64> record_type,
+                                      uint<8> has_lower, uint<64> lower,
+                                      uint<8> has_upper, uint<64> upper,
+                                      uint<64> fheap_root, uint<64> curr_root_rows,
+                                      uint<64> start_size, uint<64> max_direct_size,
+                                      uint<64> table_width, uint<64> off_size,
+                                      uint<8> checksum_dblocks,
+                                      uint<64> len_size, uint<64> file_size,
+                                      string object) void:
+{
+    var id_capacity = record_type == 6UL ? 7UL : 8UL;
+    if (1UL + off_size + len_size > id_capacity)
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID_WIDTH", "corrupt",
+                                rec_base#B, object,
+                                "dense creation-order record cannot contain the heap ID widths declared by its heap");
+            return;
+        }
+
+    var have_prev = 0;
+    var prev = 0UL;
+    var i = 0UL;
+    while (i < nrec)
+        {
+            var rec_off = rec_base + (i * record_size);
+            var id_off = record_type == 6UL ? rec_off + 8UL : rec_off;
+            var corder_off = record_type == 6UL ? rec_off : rec_off + 9UL;
+            var corder_size = record_type == 6UL ? 8UL : 4UL;
+            var corder = h5policy_msg_u64_at(ios, profile, corder_off#B,
+                                             corder_size);
+
+            if (have_prev && corder <= prev)
+                h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_ORDER", "corrupt",
+                                    corder_off#B, object,
+                                    "dense creation-order B-tree node records are not strictly ordered");
+            if ((has_lower != 0UB && corder <= lower)
+                || (has_upper != 0UB && corder >= upper))
+                h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_ORDER", "corrupt",
+                                    corder_off#B, object,
+                                    "dense creation-order B-tree record is outside its ancestor key bounds");
+            prev = corder;
+            have_prev = 1;
+
+            if (h5policy_seen_u64(h5policy_dense_corder_values, corder))
+                h5policy_emit_error("H5_CORRUPT_V2_BTREE_DUPLICATE_KEY", "corrupt",
+                                    corder_off#B, object,
+                                    "dense creation-order B-tree contains a duplicate key");
+            else
+                h5policy_dense_corder_values += [corder];
+
+            if (record_type == 9UL)
+                h5policy_validate_dense_attr_record_flags(
+                    h5policy_msg_u64_at(ios, profile, (rec_off + 8UL)#B, 1UL),
+                    (rec_off + 8UL)#B, object);
+
+            var id_flags = h5policy_msg_u64_at(ios, profile, id_off#B, 1UL);
+            if (((id_flags .>> 4) & 3UL) != 0UL)
+                {
+                    if (!h5policy_dense_corder_nonmanaged_reported)
+                        {
+                            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                                "unsupported", id_off#B, object,
+                                                "dense creation-order index uses a non-managed fractal-heap ID");
+                            h5policy_dense_corder_nonmanaged_reported = 1;
+                        }
+                }
+            else
+                {
+                    var heap_obj_off = h5policy_msg_u64_at(
+                        ios, profile, id_off#B + 1#B, off_size);
+                    var heap_obj_len = h5policy_msg_u64_at(
+                        ios, profile, id_off#B + (1UL + off_size)#B, len_size);
+                    if (heap_obj_len == 0UL)
+                        h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID", "corrupt",
+                                            id_off#B, object,
+                                            "dense creation-order index has a zero-length heap object ID");
+                    else
+                        {
+                            h5policy_match_dense_corder_heap_id(
+                                heap_obj_off, heap_obj_len, corder,
+                                id_off#B, object);
+                            var obj_off = h5policy_frhp_locate(
+                                ios, profile, fheap_root, curr_root_rows,
+                                start_size, max_direct_size, table_width,
+                                off_size, checksum_dblocks, heap_obj_off,
+                                file_size, object);
+                            if (obj_off == 0xffffffffffffffffUL)
+                                h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID",
+                                                    "corrupt", id_off#B, object,
+                                                    "dense creation-order heap ID cannot be resolved");
+                            else
+                                {
+                                    var object_ok = h5policy_checked_addr_range(
+                                        obj_off, heap_obj_len, file_size,
+                                        "dense creation-order heap object outside file",
+                                        id_off#B, object);
+                                }
+                        }
+                }
+            i = i + 1UL;
+        }
+}
+
+/* Recursively validate every node of a type-6 or type-9 B-tree.  The returned
+   count includes records in this node and all descendants, allowing both child
+   subtree counters and the header's total-record count to be checked. */
+fun h5policy_dense_corder_node = (int ios, H5PolicyProfile profile,
+                                   uint<64> node_addr, uint<64> node_depth,
+                                   uint<64> nrec, uint<64> node_size,
+                                   uint<64> record_size, uint<64> record_type,
+                                   uint<8> has_lower, uint<64> lower,
+                                   uint<8> has_upper, uint<64> upper,
+                                   uint<64> fheap_root, uint<64> curr_root_rows,
+                                   uint<64> start_size, uint<64> max_direct_size,
+                                   uint<64> table_width, uint<64> off_size,
+                                   uint<8> checksum_dblocks,
+                                   uint<64> len_size, uint<64> file_size,
+                                   string object) uint<64>:
+{
+    if (!h5policy_mark_visited_btree(node_addr))
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_CYCLE", "corrupt",
+                                node_addr#B, object,
+                                "dense creation-order B-tree node is referenced more than once");
+            return 0xffffffffffffffffUL;
+        }
+    if (node_depth > profile.resources.max_btree_depth)
+        {
+            h5policy_emit_error("H5_RESOURCE_BTREE_DEPTH", "resource",
+                                node_addr#B, object,
+                                "dense creation-order v2 B-tree depth exceeds the selected profile limit");
+            return 0xffffffffffffffffUL;
+        }
+
+    var o = global_sizeof_offsets as uint<64>;
+    var nrec_bytes = h5policy_bt2_nrec_bytes(node_size, record_size);
+    var sub_bytes = node_depth > 1UL
+                    ? h5policy_bt2_subtree_bytes(node_size, record_size,
+                                                 node_depth - 1UL)
+                    : 0UL;
+    var ptr_size = node_depth == 0UL ? 0UL : o + nrec_bytes + sub_bytes;
+    var recs = h5policy_checked_mul_u64(
+        nrec, record_size, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        "dense creation-order v2 B-tree node size overflow");
+    var ptrs = node_depth == 0UL ? 0UL : h5policy_checked_mul_u64(
+        nrec + 1UL, ptr_size, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        "dense creation-order v2 B-tree node size overflow");
+    var node_need = h5policy_checked_add_u64(
+        10UL, recs, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        "dense creation-order v2 B-tree node size overflow");
+    node_need = h5policy_checked_add_u64(
+        node_need, ptrs, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        "dense creation-order v2 B-tree node size overflow");
+    if (node_need > node_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
+                                node_addr#B, object,
+                                "dense creation-order v2 B-tree used node bytes exceed its declared node size");
+            return 0xffffffffffffffffUL;
+        }
+    if (!h5policy_checked_addr_range(
+            node_addr, node_need, file_size,
+            "dense creation-order v2 B-tree node outside file",
+            node_addr#B, object))
+        return 0xffffffffffffffffUL;
+
+    var expected_signature = node_depth == 0UL
+                             ? H5_FORMAT_BTLF_SIGNATURE
+                             : H5_FORMAT_BTIN_SIGNATURE;
+    if (h5policy_msg_bytes(ios, profile, node_addr#B, 4UL)
+        != expected_signature)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                node_addr#B, object,
+                                "dense creation-order v2 B-tree node signature mismatch");
+            return 0xffffffffffffffffUL;
+        }
+    h5policy_mark_reached(node_addr, node_depth == 0UL ? "BTLF" : "BTIN");
+    var version = h5policy_msg_u64_at(ios, profile, node_addr#B + 4#B, 1UL);
+    var stored_type = h5policy_msg_u64_at(ios, profile,
+                                          node_addr#B + 5#B, 1UL);
+    if (version != 0UL || stored_type != record_type)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_HEADER", "corrupt",
+                                node_addr#B, object,
+                                "dense creation-order v2 B-tree node version or record type is invalid");
+            return 0xffffffffffffffffUL;
+        }
+    h5policy_dense_verify_trailing_checksum(
+        ios, profile, node_addr, node_need, file_size, object,
+        "dense creation-order v2 B-tree node");
+    h5policy_dense_corder_records(
+        ios, profile, node_addr + 6UL, nrec, record_size, record_type,
+        has_lower, lower, has_upper, upper,
+        fheap_root, curr_root_rows, start_size, max_direct_size,
+        table_width, off_size, checksum_dblocks, len_size, file_size, object);
+
+    var total = nrec;
+    if (node_depth == 0UL)
+        return total;
+
+    var ptr_base = node_addr + 6UL + recs;
+    var valid_total = 1;
+    var j = 0UL;
+    while (j < nrec + 1UL)
+        {
+            var ptr_off = ptr_base + (j * ptr_size);
+            var child_raw = h5policy_msg_bytes(ios, profile, ptr_off#B, o);
+            var child_nrec = h5policy_msg_u64_at(ios, profile,
+                                                 ptr_off#B + o#B,
+                                                 nrec_bytes);
+            if (h5policy_msg_addr_is_undef(child_raw) || child_nrec == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_V2_BTREE_CHILD_POINTER",
+                                        "corrupt", ptr_off#B, object,
+                                        "dense creation-order internal node has an empty child pointer");
+                    valid_total = 0;
+                }
+            else
+                {
+                    var child_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(child_raw));
+                    if (child_addr >= file_size)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                "corrupt", ptr_off#B, object,
+                                                "dense creation-order v2 B-tree child address outside file");
+                            valid_total = 0;
+                        }
+                    else
+                        {
+                            var child_has_lower = has_lower;
+                            var child_lower = lower;
+                            var child_has_upper = has_upper;
+                            var child_upper = upper;
+                            var key_rel = record_type == 6UL ? 0UL : 9UL;
+                            var key_size = record_type == 6UL ? 8UL : 4UL;
+                            if (j > 0UL)
+                                {
+                                    child_has_lower = 1UB;
+                                    child_lower = h5policy_msg_u64_at(
+                                        ios, profile,
+                                        (node_addr + 6UL
+                                         + ((j - 1UL) * record_size)
+                                         + key_rel)#B,
+                                        key_size);
+                                }
+                            if (j < nrec)
+                                {
+                                    child_has_upper = 1UB;
+                                    child_upper = h5policy_msg_u64_at(
+                                        ios, profile,
+                                        (node_addr + 6UL
+                                         + (j * record_size) + key_rel)#B,
+                                        key_size);
+                                }
+                            var child_total = h5policy_dense_corder_node(
+                                ios, profile, child_addr, node_depth - 1UL,
+                                child_nrec, node_size, record_size, record_type,
+                                child_has_lower, child_lower,
+                                child_has_upper, child_upper,
+                                fheap_root, curr_root_rows, start_size,
+                                max_direct_size, table_width, off_size,
+                                checksum_dblocks, len_size, file_size, object);
+                            if (child_total == 0xffffffffffffffffUL)
+                                valid_total = 0;
+                            else
+                                {
+                                    if (sub_bytes != 0UL)
+                                        {
+                                            var declared_total = h5policy_msg_u64_at(
+                                                ios, profile,
+                                                ptr_off#B + (o + nrec_bytes)#B,
+                                                sub_bytes);
+                                            if (declared_total != child_total)
+                                                h5policy_emit_error(
+                                                    "H5_CORRUPT_V2_BTREE_SUBTREE_COUNT",
+                                                    "corrupt", ptr_off#B, object,
+                                                    "dense creation-order child subtree count is inconsistent");
+                                        }
+                                    if (child_total > 0xffffffffffffffffUL - total)
+                                        valid_total = 0;
+                                    else
+                                        total = total + child_total;
+                                }
+                        }
+                }
+            j = j + 1UL;
+        }
+    return valid_total ? total : 0xffffffffffffffffUL;
+}
+
+/* Validate the independent creation-order B-tree header and its entire node
+   graph, then compare its cardinality with the name index for the same heap. */
+fun h5policy_walk_dense_corder_btree = (
+    int ios, H5PolicyProfile profile, uint<64> btree_addr,
+    uint<64> record_type, uint<64> expected_total,
+    uint<64> fheap_root, uint<64> curr_root_rows,
+    uint<64> start_size, uint<64> max_direct_size,
+    uint<64> table_width, uint<64> off_size,
+    uint<8> checksum_dblocks, uint<64> len_size,
+    uint<64> file_size, off64 loc, string object) void:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var hdr_size = 22UL + o + el;
+    if (!h5policy_checked_addr_range(
+            btree_addr, hdr_size, file_size,
+            "dense creation-order v2 B-tree header outside file", loc, object))
+        return;
+    if (h5policy_msg_bytes(ios, profile, btree_addr#B, 4UL)
+        != H5_FORMAT_BTHD_SIGNATURE)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                btree_addr#B, object,
+                                "dense creation-order v2 B-tree header signature mismatch");
+            return;
+        }
+    h5policy_mark_reached(btree_addr, "BTHD");
+    var version = h5policy_msg_u64_at(ios, profile, btree_addr#B + 4#B, 1UL);
+    var stored_type = h5policy_msg_u64_at(ios, profile,
+                                          btree_addr#B + 5#B, 1UL);
+    if (version != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_V2_BTREE_VERSION",
+                                "corrupt", btree_addr#B, object,
+                                "dense creation-order v2 B-tree header has an unsupported version");
+            return;
+        }
+    if (stored_type != record_type)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_TYPE", "corrupt",
+                                btree_addr#B + 5#B, object,
+                                "dense creation-order B-tree has the wrong record type");
+            return;
+        }
+    h5policy_dense_verify_trailing_checksum(
+        ios, profile, btree_addr, hdr_size, file_size, object,
+        "dense creation-order v2 B-tree header");
+
+    var node_size = h5policy_msg_u64_at(ios, profile,
+                                         btree_addr#B + 6#B, 4UL);
+    var record_size = h5policy_msg_u64_at(ios, profile,
+                                           btree_addr#B + 10#B, 2UL);
+    var expected_record_size = record_type == 6UL ? 15UL : 13UL;
+    if (!h5policy_validate_v2_btree_geometry(node_size, record_size,
+                                              btree_addr#B, object))
+        return;
+    if (record_size != expected_record_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_LAYOUT", "corrupt",
+                                btree_addr#B + 10#B, object,
+                                "dense creation-order B-tree record size is invalid");
+            return;
+        }
+
+    var depth = h5policy_msg_u64_at(ios, profile,
+                                     btree_addr#B + 12#B, 2UL);
+    var root_raw = h5policy_msg_bytes(ios, profile,
+                                      btree_addr#B + 16#B, o);
+    var nroot = h5policy_msg_u64_at(ios, profile,
+                                    btree_addr#B + (16UL + o)#B, 2UL);
+    var total_nrec = h5policy_msg_u64_at(ios, profile,
+                                         btree_addr#B + (18UL + o)#B, el);
+    if (total_nrec != expected_total)
+        h5policy_emit_error("H5_CORRUPT_DENSE_INDEX_COUNT_MISMATCH", "corrupt",
+                            btree_addr#B + (18UL + o)#B, object,
+                            "dense name and creation-order indexes contain different record counts");
+
+    if (h5policy_msg_addr_is_undef(root_raw))
+        {
+            if (nroot != 0UL || total_nrec != 0UL)
+                h5policy_emit_error("H5_CORRUPT_V2_BTREE_ROOT", "corrupt",
+                                    btree_addr#B + 16#B, object,
+                                    "dense creation-order B-tree has records but no root");
+            return;
+        }
+    if (nroot == 0UL || total_nrec == 0UL || total_nrec < nroot)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_ROOT", "corrupt",
+                                btree_addr#B + 16#B, object,
+                                "dense creation-order B-tree root counts are inconsistent");
+            return;
+        }
+
+    var root_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(root_raw));
+    if (root_addr >= file_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                btree_addr#B + 16#B, object,
+                                "dense creation-order v2 B-tree root address outside file");
+            return;
+        }
+    h5policy_dense_corder_values = uint<64>[]();
+    h5policy_dense_corder_nonmanaged_reported = 0;
+    var walked_total = h5policy_dense_corder_node(
+        ios, profile, root_addr, depth, nroot, node_size, record_size,
+        record_type, 0UB, 0UL, 0UB, 0UL,
+        fheap_root, curr_root_rows, start_size, max_direct_size,
+        table_width, off_size, checksum_dblocks, len_size, file_size, object);
+    h5policy_finish_dense_corder_matches(btree_addr#B, object);
+    if (walked_total != 0xffffffffffffffffUL && walked_total != total_nrec)
+        h5policy_emit_error("H5_CORRUPT_V2_BTREE_TOTAL_COUNT", "corrupt",
+                            btree_addr#B + (18UL + o)#B, object,
+                            "dense creation-order B-tree total record count is inconsistent with its node graph");
 }
 
 /* Recursively descend a dense-link name v2 B-tree node.  A node at depth 0 is a
@@ -1027,6 +1682,7 @@ fun h5policy_dense_links_node = (int ios, H5PolicyProfile profile,
    info validator can emit a coverage-gap finding.  */
 fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
                                  uint<64> fheap_addr, uint<64> btree_addr,
+                                 uint<64> corder_btree_addr,
                                  off64 loc, string object) int:
 {
     var o = global_sizeof_offsets as uint<64>;
@@ -1120,8 +1776,15 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
         len_size = off_size;
     if (h5policy_msg_addr_is_undef(root_raw) || start_size == 0UL || table_width == 0UL)
         return 0;
+    if (1UL + off_size + len_size > 7UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID_WIDTH", "corrupt",
+                                fheap_addr#B, object,
+                                "dense link heap ID widths exceed the seven-byte record field");
+            return 1;
+        }
 
-    /* ---- name-indexed v2 B-tree (root leaf only) ---- */
+    /* ---- name-indexed v2 B-tree ---- */
     var bt_hdr = 22UL + o + el;
     if (!h5policy_checked_addr_range(btree_addr, bt_hdr, file_size,
                                      "dense link v2 B-tree header outside file", loc, object))
@@ -1160,10 +1823,17 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
 
     if (record_type != 5UL || h5policy_msg_addr_is_undef(bt_root_raw))
         return 0;
+    if (record_size != 11UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_LAYOUT", "corrupt",
+                                btree_addr#B + 10#B, object,
+                                "dense link name-index record size is invalid");
+            return 1;
+        }
 
-    /* Record type 5 is the name-indexed dense-link record.  Creation-order
-       indexes, if present, are redundant for reachability and are not followed
-       by this walker.  */
+    var name_total = h5policy_msg_u64_at(ios, profile,
+                                         btree_addr#B + (18UL + o)#B, el);
+    h5policy_reset_dense_name_index;
     if (bt_root >= file_size)
         h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
                             btree_addr#B + 16#B, object,
@@ -1174,6 +1844,13 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
                                   curr_root_rows, start_size, max_direct_size,
                                   table_width, off_size, checksum_dblocks,
                                   len_size, file_size, object);
+
+    if (corder_btree_addr != 0xffffffffffffffffUL)
+        h5policy_walk_dense_corder_btree(
+            ios, profile, corder_btree_addr, 6UL, name_total,
+            root_addr, curr_root_rows, start_size, max_direct_size,
+            table_width, off_size, checksum_dblocks, len_size,
+            file_size, loc, object);
     return 1;
 }
 
@@ -1197,9 +1874,8 @@ fun h5policy_validate_linfo_payload = (int ios,
     var flags = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
     var cur = 2UL;
 
-    /* Link-info flags optionally include maximum creation order and a second
-       creation-order index address.  The name index is sufficient for link
-       enumeration, but the optional bytes must still be skipped correctly.  */
+    /* Link-info flags optionally include maximum creation order and a second,
+       independently validated creation-order index address. */
     if (version != 0UL)
         {
             h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_LINK_INFO_VERSION",
@@ -1212,6 +1888,10 @@ fun h5policy_validate_linfo_payload = (int ios,
         h5policy_emit_error("H5_CORRUPT_LINK_INFO_FLAGS",
                             "corrupt", payload_off + 1#B, object,
                             "link-info message has invalid flag bits");
+    if ((flags & 2UL) != 0UL && (flags & 1UL) == 0UL)
+        h5policy_emit_error("H5_CORRUPT_LINK_INFO_FLAGS",
+                            "corrupt", payload_off + 1#B, object,
+                            "link-info creation-order index requires creation-order tracking");
 
     if ((flags & 1UL) != 0UL)
         {
@@ -1235,9 +1915,8 @@ fun h5policy_validate_linfo_payload = (int ios,
     if ((flags & 2UL) != 0UL)
         min_size = min_size + (global_sizeof_offsets as uint<64>);
 
-    /* Dense link storage needs at least a fractal heap address and a
-       name-indexed B-tree address.  A creation-order index, when present, is
-       ignored after being accounted for in min_size/cur.  */
+    /* Dense link storage needs a paired fractal heap/name index and, when the
+       indexed flag is set, a third address for the creation-order B-tree. */
     if (!h5policy_payload_range_ok(msg_size, 0UL, min_size,
                                    "H5_CORRUPT_LINK_INFO_MESSAGE_TOO_SMALL",
                                    payload_off, object,
@@ -1256,27 +1935,62 @@ fun h5policy_validate_linfo_payload = (int ios,
     var name_btree_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(name_btree_raw));
     cur = cur + (global_sizeof_offsets as uint<64>);
 
+    var corder_btree_addr = 0xffffffffffffffffUL;
+    var corder_is_undef = 1;
     if ((flags & 2UL) != 0UL)
-        cur = cur + (global_sizeof_offsets as uint<64>);
+        {
+            var corder_btree_raw = h5policy_msg_bytes(
+                ios, profile, payload_off + cur#B,
+                global_sizeof_offsets as uint<64>);
+            corder_is_undef = h5policy_msg_addr_is_undef(corder_btree_raw);
+            if (!corder_is_undef)
+                corder_btree_addr = hdf5_addr_to_file_u64(
+                    bytes_to_u64_le(corder_btree_raw));
+            cur = cur + (global_sizeof_offsets as uint<64>);
+        }
 
-    /* Any bytes beyond the advertised address fields mean this is not the
-       compact link-info form h5policy understands.  Treat that as structural
-       corruption rather than guessing at an extension.  */
-    if (msg_size != cur)
+    /* Version-1 object headers include alignment padding in the advertised
+       message size; version-2 messages must end at the address fields. */
+    if (!h5policy_message_size_matches(msg_size, cur))
         h5policy_emit_error("H5_CORRUPT_LINK_INFO_TRAILING_BYTES",
                             "corrupt", payload_off + cur#B, object,
                             "link-info message has trailing bytes");
 
+    var fheap_is_undef = h5policy_msg_addr_is_undef(fheap_raw);
+    var name_is_undef = h5policy_msg_addr_is_undef(name_btree_raw);
+    if (fheap_is_undef != name_is_undef)
+        {
+            h5policy_emit_error("H5_CORRUPT_LINK_INFO_ADDRESS_PAIR", "corrupt",
+                                payload_off, object,
+                                "link-info fractal-heap and name-index addresses are not both defined or both undefined");
+            return;
+        }
+    if ((flags & 2UL) != 0UL && !fheap_is_undef && corder_is_undef)
+        {
+            h5policy_emit_error("H5_CORRUPT_LINK_INFO_CORDER_ADDRESS", "corrupt",
+                                payload_off, object,
+                                "dense link-info message has an undefined creation-order index address");
+            return;
+        }
+    if (fheap_is_undef)
+        {
+            if ((flags & 2UL) != 0UL && !corder_is_undef)
+                h5policy_emit_error("H5_CORRUPT_LINK_INFO_CORDER_ADDRESS", "corrupt",
+                                    payload_off, object,
+                                    "link-info creation-order index is defined without dense storage");
+            return;
+        }
+
     var handled = 0;
-    if (!h5policy_msg_addr_is_undef(fheap_raw)
-        && !h5policy_msg_addr_is_undef(name_btree_raw))
+    if (!fheap_is_undef && !name_is_undef)
         /* The dense walker returns 0 for unsupported-but-recognized layouts
            such as filtered heaps.  That lets this wrapper emit one clean
            coverage finding at the link-info message.  */
         handled = h5policy_walk_dense_links(ios, profile, fheap_addr,
-                                            name_btree_addr, payload_off, object);
+                                            name_btree_addr, corder_btree_addr,
+                                            payload_off, object);
 
-    if (!handled && !h5policy_msg_addr_is_undef(fheap_raw))
+    if (!handled)
         h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
                             "unsupported", payload_off, object,
                             "dense link storage uses an unsupported fractal-heap/B-tree layout");

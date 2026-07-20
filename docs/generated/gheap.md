@@ -19,6 +19,20 @@ A global heap object is referenced from elsewhere by a Global Heap ID
 
 All fields are stored in little-endian byte order.
 
+**Layout: Global Heap Collection**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Version</td><td colspan="3">Reserved</td></tr>
+    <tr><td colspan="4">Collection Size<sup>L</sup></td></tr>
+    <tr><td colspan="4">Global Heap Objects (variable size)</td></tr>
+  </tbody>
+</table>
+
+`L` is the size of lengths.
+
 ## `gheap_id`
 
 Global Heap ID. Embedded in object header messages (for example a variable-length datatype) to reference one object inside a specific global heap collection. Total size is `sizeof_offsets + 4` bytes.
@@ -51,5 +65,3 @@ Per-object header within a collection. Followed by `data_size` bytes of object d
 | `ref_cnt_raw` | Reference count for this object (2-byte unsigned integer). |
 | `reserved` | Reserved. Must be zero (4 bytes). |
 | `data_size_raw` | For a nonzero index, the byte count of the object's data field. For the index-0 sentinel, the total span of the free region including this object header (`sizeof_lengths` bytes). |
-
-

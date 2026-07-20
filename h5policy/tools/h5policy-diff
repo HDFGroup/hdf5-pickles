@@ -31,7 +31,10 @@ metrics) and compares against:
 Cross-invariants (a hard failure exits non-zero; a warning is informational):
 
   A  libhdf5 structurally opens => h5policy is not reject_corrupt  (no false +)
-     unless a deeper libhdf5 probe also rejects attrs/data/tools (A+, warning);
+     unless a deeper libhdf5 probe also rejects attrs/data/tools (A+, warning),
+     or h5policy rejects only file-global metadata that libhdf5's read path
+     deliberately leaves unopened -- SOHM search indexes or free-space
+     managers (A~, warning);
      "tools" includes h5dump reading data (no -H), which unlike the header-only
      probe exercises filter/decompression rejections
   A' libhdf5 rejects           => h5policy explicitly refuses the file (no false -)
@@ -221,6 +224,28 @@ def eager_probe(path):
             list(obj.attrs.keys())
         except Exception as exc:
             record("attr_errors", _object_path(obj), "attrs.keys", exc)
+        try:
+            flags = obj.id.get_create_plist().get_attr_creation_order()
+            if flags & h5py.h5p.CRT_ORDER_INDEXED:
+                h5py.h5a.iterate(
+                    obj.id, lambda name: None,
+                    index_type=h5py.h5.INDEX_CRT_ORDER,
+                    order=h5py.h5.ITER_INC)
+        except Exception as exc:
+            record("attr_errors", _object_path(obj),
+                   "attrs.creation_order", exc)
+
+    def probe_link_corder(grp):
+        try:
+            flags = grp.id.get_create_plist().get_link_creation_order()
+            if flags & h5py.h5p.CRT_ORDER_INDEXED:
+                grp.id.links.iterate(
+                    lambda name: None,
+                    idx_type=h5py.h5.INDEX_CRT_ORDER,
+                    order=h5py.h5.ITER_INC)
+        except Exception as exc:
+            record("traversal_errors", _object_path(grp),
+                   "links.creation_order", exc)
 
     def probe_dataset(dset):
         facts["datasets_seen"] += 1
@@ -256,6 +281,7 @@ def eager_probe(path):
         while stack:
             grp = stack.pop()
             probe_attrs(grp)
+            probe_link_corder(grp)
             try:
                 keys = list(grp.keys())
             except Exception as exc:
@@ -327,6 +353,44 @@ def eager_evidence(eager, h5dump_rc, h5debug_rc, h5dump_data=None):
     return parts
 
 
+def lazy_global_metadata_only(report):
+    """Whether every corruption is in eagerly validated, file-global metadata
+    that libhdf5's read path deliberately leaves unopened.
+
+    Two structures qualify.  SOHM shared-message search indexes: shared-message
+    wrappers contain their heap IDs directly, so libhdf5 reads every object
+    without loading the SMLI/type-7 index.  Free-space managers: their FSHD/FSSE
+    structures are loaded only when a writer allocates or frees space, never on
+    a read-only open.  Both remain active metadata that h5policy intentionally
+    validates on discovery.  Keep this narrow: every finding must come from the
+    superblock-extension validator and carry its contextual message prefix
+    (including the generic checksum code).
+    """
+    findings = report.get("findings", [])
+    return bool(findings) and all(
+        finding.get("object") == "/<superblock-extension>"
+        and str(finding.get("message", "")).startswith(("SOHM ", "free-space "))
+        for finding in findings)
+
+
+def secondary_creation_order_only(report):
+    """Whether all corruption is confined to a dense secondary-order index.
+
+    Current libhdf5 read paths can enumerate through the primary name index
+    without authenticating every type-6/type-9 block.  h5policy deliberately
+    validates both active indexes.  Keep this exception message-scoped so an
+    unrelated corruption finding on the same object remains a hard A failure.
+    """
+    findings = report.get("findings", [])
+    return bool(findings) and all(
+        finding.get("class") == "corrupt"
+        and (str(finding.get("message", "")).startswith(
+                 "dense creation-order")
+             or str(finding.get("code", "")).startswith(
+                 "H5_CORRUPT_DENSE_CORDER"))
+        for finding in findings)
+
+
 def check(path):
     """Return (hard_failures, warnings, lines) for one file."""
     fails, warns, lines = [], [], []
@@ -354,6 +418,16 @@ def check(path):
                      "A+ libhdf5 opens structurally; h5policy eager "
                      f"reject_corrupt has deeper libhdf5 evidence "
                      f"({', '.join(evidence)})")
+            elif lazy_global_metadata_only(report):
+                soft(False,
+                     "A~ libhdf5 read traversal leaves file-global SOHM "
+                     "search / free-space metadata unopened; h5policy "
+                     "validates it eagerly")
+            elif secondary_creation_order_only(report):
+                soft(False,
+                     "A~ libhdf5 traverses the primary dense index without "
+                     "authenticating every secondary creation-order block; "
+                     "h5policy validates both indexes")
             else:
                 hard(False,
                      f"A  libhdf5 opens => not reject_corrupt (got {decision})")

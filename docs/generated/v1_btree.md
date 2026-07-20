@@ -24,6 +24,24 @@ Before mapping a type-1 node, call `set_bt1_ndims(n)` where n is the
 dataset dimensionality plus one. Use `print_v1_btree(addr#B, 0)` to
 recursively print the full tree.
 
+**Layout: Version 1 B-tree Node**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td colspan="4">Signature</td></tr>
+    <tr><td>Node Type</td><td>Node Level</td><td colspan="2">Entries Used</td></tr>
+    <tr><td colspan="4">Left Sibling Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Right Sibling Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">Key 1 (variable size)</td></tr>
+    <tr><td colspan="4">Child 1 Address<sup>O</sup></td></tr>
+    <tr><td colspan="4">…</td></tr>
+    <tr><td colspan="4">Final Key (variable size)</td></tr>
+  </tbody>
+</table>
+
+`O` is the size of offsets. Type 0 keys have width `L`, where `L` is the size of lengths.
+
 ## `key0`
 
 Key for a type-0 (group symbol table) B-tree node. Bounds a range of link names by their offset in the group's local heap.
@@ -94,5 +112,3 @@ Node body for a type-1 (raw-data chunk) node.
 |-------|-------------|
 | `pairs` | Array of `entries_used` `pair1` key/child pairs in ascending chunk-offset order. |
 | `final_key` | Trailing `key1` key bounding the right edge of the last chunk. |
-
-

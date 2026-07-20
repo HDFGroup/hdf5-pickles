@@ -1,5 +1,8 @@
 # Documentation workflow
 
+The generated format reference starts at the
+[H5Lens HDF5 File Format Reference](generated/README.md) landing page.
+
 Specification Markdown is generated from two sources of truth:
 
 - **`pickles/*.pk`** — the executable format definitions (shared constants,
@@ -52,6 +55,14 @@ intro: |               # introductory prose (plain Markdown)
 types:
   TypeName:
     desc: "One-sentence description of the type."
+    layouts:           # optional four-byte-wide format diagrams
+      - title: "TypeName"
+        rows:          # every row must total exactly four columns
+          - [{label: "Signature", span: 4}]
+          - ["Version", "Flags", {label: "Reserved", span: 2}]
+          - [{label: "Object Address", span: 4, width: O}]
+          - [{label: "Object Length", span: 4, width: L}]
+        note: "`O` is the size of offsets; `L` is the size of lengths."
     fields:             # top-level fields of the struct, in order
       field_name:
         desc: "What this field means."

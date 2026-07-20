@@ -17,6 +17,16 @@ pickle types only the two-byte prefix.
 
 All fields are stored in little-endian byte order.
 
+**Layout: Encoded Datatype**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td>Datatype Message ID</td><td>Encoding Version</td><td colspan="2">Datatype Message (variable size)</td></tr>
+    <tr><td colspan="4">Datatype Message (continued)</td></tr>
+  </tbody>
+</table>
+
 ## `dtype_enc_hdr`
 
 Two-byte prefix of an `H5Tencode` buffer. The Datatype Message itself begins immediately after and is decoded by `oh_msg_dtype`.
@@ -25,5 +35,3 @@ Two-byte prefix of an `H5Tencode` buffer. The Datatype Message itself begins imm
 |-------|-------------|
 | `dtype_id` | Datatype Message type ID. Must be 3. |
 | `encode_version` | Encode version (`H5T_ENCODE_VERSION`). Must be 0. |
-
-

@@ -10,6 +10,19 @@ the multi-file driver (`NCSAmult`) and family driver (`NCSAfami`)
 payloads explicitly. Other driver identifiers are preserved as raw
 bytes so callers can still inspect or skip the block safely.
 
+**Layout: Driver Information Block**
+
+<table class="format-layout">
+  <thead><tr><th>byte</th><th>byte</th><th>byte</th><th>byte</th></tr></thead>
+  <tbody>
+    <tr><td>Version</td><td colspan="3">Reserved</td></tr>
+    <tr><td colspan="4">Driver Information Size</td></tr>
+    <tr><td colspan="4">Driver Identification</td></tr>
+    <tr><td colspan="4">Driver Identification (continued)</td></tr>
+    <tr><td colspan="4">Driver Information (variable size)</td></tr>
+  </tbody>
+</table>
+
 ## `multi_drv_member_addr`
 
 Address range descriptor for one member file in the multi-file virtual file driver.
@@ -60,5 +73,3 @@ Fallback payload for unrecognized driver identifiers. The bytes are retained wit
 | Field | Description |
 |-------|-------------|
 | `data` | Raw driver-specific payload bytes. |
-
-
