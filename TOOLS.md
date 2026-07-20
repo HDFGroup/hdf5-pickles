@@ -14,10 +14,35 @@ tools/h5policy-fuzz      -> ../h5policy/tools/h5policy-fuzz
 tools/h5policy-fuzzlib   -> ../h5policy/tools/h5policy-fuzzlib
 tools/h5policy-crashfuzz -> ../h5policy/tools/h5policy-crashfuzz
 tools/h5policy-gencorpus -> ../h5policy/tools/h5policy-gencorpus
+tools/h5policy-probe     -> ../h5policy/tools/h5policy-probe
 ```
 
-`tools/pkdoc.py` is a repository-level helper script used by the documentation
-targets.
+`tools/pkdoc.py` and `tools/h5cve` are repository-level helper scripts (not
+symlinks): `pkdoc.py` backs the documentation targets, and `h5cve` is the CVE
+case orchestrator described below.
+
+## h5cve Case Orchestrator
+
+`tools/h5cve` chains the existing tools into one provenance-stamped CVE case
+bundle and auto-populates the [`registry/cve-case.yml`](registry/cve-case.yml)
+schema.  It duplicates no tool logic — it shells out to `h5policy`, `h5markers`,
+`h5explain`, and the exact-build probe, and maps the primary finding to its
+invariant through [`registry/findings.yml`](registry/findings.yml).
+
+```text
+h5cve init  <id> --poc FILE                 # bundle: PoC, sha256, skeleton case.yml
+h5cve triage <case>                         # oracle + census + registry mapping
+h5cve verify <case> --baseline BINDIR [--candidate BINDIR]   # exact-build probes
+h5cve minimize|variants <case>              # deferred: reducer/mutator (change #5)
+h5cve promote <case>                        # draft tests expectation + registry case
+```
+
+Bundles live under `cases/<id>/` (git-ignored working scratch); `promote` is
+what lands tracked artifacts in `h5policy/tests/` and `registry/`.  The exact-
+build probe (`tools/h5policy-probe`, and `h5policy/tools/probe/`) runs a selected
+libhdf5 build under an `LD_PRELOAD` activation interposer inside a sandbox and
+reports whether rejection preceded any OS-observable activation; see
+[`h5policy/tools/probe/README.md`](h5policy/tools/probe/README.md).
 
 ## Marker Scanner
 

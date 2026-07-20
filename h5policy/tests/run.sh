@@ -100,15 +100,38 @@ else
     echo "  skipped: h5cc or cc unavailable"
 fi
 
+# h5cve orchestrator smoke: init + triage must map the continuation fixture's
+# primary finding to its registry invariant.  Exercises the tool <-> registry
+# wiring without the exact-build toolchain (triage needs only h5policy + PyYAML).
+echo "== h5cve orchestrator smoke =="
+cve_status=0
+cve_case="_smoke_$$"
+if "$repo_dir/tools/h5cve" init "$cve_case" \
+        --poc "$tests_dir/malformed/continuation_overlaps_source.h5" \
+        --force >/dev/null 2>&1 \
+   && "$repo_dir/tools/h5cve" triage "$cve_case" >/dev/null 2>&1; then
+    cve_inv=$(python3 -c "import yaml; print(yaml.safe_load(open('$repo_dir/cases/$cve_case/case.yml')).get('violated_invariant',''))" 2>/dev/null)
+    if [[ "$cve_inv" == "continuation.no_source_overlap" ]]; then
+        echo "  triage mapped finding -> $cve_inv"
+    else
+        echo "  FAIL: expected continuation.no_source_overlap, got '$cve_inv'"
+        cve_status=1
+    fi
+else
+    echo "  FAIL: h5cve init/triage errored"
+    cve_status=1
+fi
+rm -rf "$repo_dir/cases/$cve_case"
+
 if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $fsinfo_status -eq 0 \
       && $limits_status -eq 0 && $reached_status -eq 0 \
       && $consumer_status -eq 0 \
       && $seam_status -eq 0 && $report_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
-      && $probe_status -eq 0 ]]; then
+      && $probe_status -eq 0 && $cve_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status cve=$cve_status)"
 exit 1
