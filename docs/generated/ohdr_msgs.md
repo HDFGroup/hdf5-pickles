@@ -7,11 +7,14 @@ messages describe the object's dataspace, datatype, storage layout,
 attributes, and other properties.
 
 Two object header versions are defined. Version 1 is the original
-format. Version 2 is more compact: it narrows several fields, makes
-timestamps and attribute phase-change thresholds optional, and adds a
-checksum over the entire header. An object header may span more than
-one contiguous block on disk; additional blocks are continuation chunks
-referenced by Object Header Continuation messages (type 0x0010).
+format and has no signature. Version 2 begins with the 4-byte signature
+`'OHDR'` and is more compact: it narrows several fields, makes timestamps
+and attribute phase-change thresholds optional, and adds a checksum over
+the entire header. An object header may span more than one contiguous
+block on disk; additional blocks are continuation chunks referenced by
+Object Header Continuation messages (type 0x0010). Version 2 continuation
+chunks begin with the 4-byte signature `'OCHK'`; version 1 continuation
+chunks have no signature.
 
 Each message occupies one slot in an object header chunk and is
 preceded by a `msg_prefix`, whose layout differs between version 1 and
@@ -54,7 +57,7 @@ All fields are stored in little-endian byte order.
   </tbody>
 </table>
 
-The flags select the optional timestamp, phase-change, and creation-order fields and the width of Chunk 0 Size.
+The signature is the four ASCII bytes `OHDR`. The flags select the optional timestamp, phase-change, and creation-order fields and the width of Chunk 0 Size.
 
 ## `dtype_hdr`
 
