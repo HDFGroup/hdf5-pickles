@@ -93,3 +93,12 @@ if "$tool" --max-walk-seconds 99999999999999999999 "$input_file" >/dev/null 2>&1
     exit 1
 fi
 printf 'PASS max_walk_seconds_argument_validation\n'
+
+alias_output=$("$tool" --continue-after-corruption "$input_file" 2>&1 >/dev/null)
+alias_status=$?
+if [[ $alias_status -ne 2 \
+      || "$alias_output" != *"h5policy: unknown option: --continue-after-corruption"* ]]; then
+    printf 'FAIL continue_after_corruption_alias_removed\n'
+    exit 1
+fi
+printf 'PASS continue_after_corruption_alias_removed\n'

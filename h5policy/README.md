@@ -42,7 +42,7 @@ Useful mode flags:
 - `--strict` / `--non-strict` force GNU poke strict or non-strict mapping.
 - `--continue-after-rejection` keeps walking after policy, resource,
   unsupported, or corruption findings so diagnostics include every reachable
-  issue. `--continue-after-corruption` remains a deprecated compatibility alias.
+  issue.
 - `--max-walk-seconds N` overrides the selected profile's internal wall-clock
   walk budget. The wrapper hard timeout is set to `N + 30` seconds.
 
