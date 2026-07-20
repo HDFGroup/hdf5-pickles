@@ -82,14 +82,33 @@ echo "== differential vs libhdf5 (h5py / h5dump / h5debug) =="
     grep -E '\[(PASS|FAIL|WARN)\]|FAIL |differential:'
 diff_status=${PIPESTATUS[0]}
 
+# Exact-build probe smoke check (roadmap change #3, OS-level layer).  Needs a C
+# toolchain and an h5cc; skipped (not failed) when either is absent, matching how
+# the rest of the suite degrades without optional tooling.  A valid file must
+# probe clean; the continuation self-overlap fixture must reject WITHOUT any
+# forbidden activation (external open, plugin load, write, network) or crash.
+echo "== exact-build libhdf5 probe (activation tracing) =="
+probe_status=0
+if command -v h5cc >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
+    forbid="external_open,plugin_load,write,network,crash"
+    "$overlay_dir/tools/h5policy-probe" "$tests_dir/valid/continuation_chunks.h5" \
+        --forbid "$forbid" || probe_status=1
+    "$overlay_dir/tools/h5policy-probe" \
+        "$tests_dir/malformed/continuation_overlaps_source.h5" \
+        --forbid "$forbid" || probe_status=1
+else
+    echo "  skipped: h5cc or cc unavailable"
+fi
+
 if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $fsinfo_status -eq 0 \
       && $limits_status -eq 0 && $reached_status -eq 0 \
       && $consumer_status -eq 0 \
       && $seam_status -eq 0 && $report_status -eq 0 \
-      && $corpus_status -eq 0 && $diff_status -eq 0 ]]; then
+      && $corpus_status -eq 0 && $diff_status -eq 0 \
+      && $probe_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status)"
 exit 1

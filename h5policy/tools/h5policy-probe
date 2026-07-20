@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 The HDF Group.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Exact-build libhdf5 probe with OS-level activation tracing.
+
+h5policy-diff observes whichever libhdf5 h5py bundles; h5policy-crashfuzz drives
+whatever tools are on PATH.  Neither pins an exact build, and neither proves that
+a rejection preceded activation.  This tool does both:
+
+  * It compiles the h5probe C program against a SELECTED build (--hdf5-bindir,
+    default: the build behind h5cc on PATH) and runs it on one file, so the
+    result is attributable to an exact, provenance-stamped libhdf5.
+
+  * It runs that probe under the h5trace LD_PRELOAD interposer inside a sandbox
+    (read-only input, isolated work dir, resource limits, controlled plugin
+    path) and reports the OS-observable activation events the corpus forbids on
+    a hostile file: external/VDS/EFL opens, filter-plugin dlopen, writes, and
+    network.
+
+libhdf5's behaviour on a malformed file is NOT specification truth: the declared
+invariant (the h5policy oracle) is.  This tool answers a different question --
+"did the selected build reject safely, and did anything activate before it did?"
+-- which is what a release gate needs.  Internal event counters (cache-insertion
+order, ID registration) require a patched libhdf5 and are out of scope here.
+
+Outcome is one of: accepted (opened, no traversal error), rejected_at_open,
+rejected_in_traversal (opened but a later call refused, no crash), crashed
+(killed by a signal), timeout, or build_unavailable.
+
+Usage:
+  h5policy-probe FILE [--hdf5-bindir DIR] [--json]
+                      [--forbid external_open,plugin_load,write,network,crash]
+Exit: 0 clean; 2 a forbidden activation/crash occurred; 3 the build/toolchain
+was unavailable (skip, like the differential harness).
+"""
+import argparse
+import hashlib
+import json
+import os
+import resource
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+PROBE_SRC = os.path.join(HERE, "probe", "h5probe.c")
+TRACE_SRC = os.path.join(HERE, "probe", "h5trace.c")
+BUILD_ROOT = os.path.join(HERE, "probe", ".build")
+
+# Path prefixes whose opens are loader/libc/toolchain noise, never activation.
+SYSTEM_PREFIXES = ("/usr/", "/lib/", "/lib64/", "/etc/", "/proc/", "/sys/",
+                   "/dev/", "/run/", "/opt/", "/bin/", "/sbin/")
+FORBIDDABLE = ("external_open", "plugin_load", "write", "network", "crash")
+
+
+def _die_skip(msg, as_json):
+    out = {"tool": "h5policy-probe", "outcome": "build_unavailable", "reason": msg}
+    print(json.dumps(out, indent=2) if as_json else f"h5policy-probe: {msg}")
+    sys.exit(3)
+
+
+def resolve_h5cc(bindir):
+    if bindir:
+        cand = os.path.join(bindir, "h5cc")
+        return cand if os.path.exists(cand) else None
+    return shutil.which("h5cc")
+
+
+def build_identity(h5cc):
+    """Provenance for the selected build: authoritative linked version comes
+    later from the probe itself (dladdr); this is the static configuration."""
+    ident = {"h5cc": os.path.realpath(h5cc)}
+    try:
+        cfg = subprocess.run([h5cc, "-showconfig"], capture_output=True,
+                             text=True, timeout=30).stdout
+    except Exception:
+        cfg = ""
+    fields = {
+        "HDF5 Version": "hdf5_version_configured",
+        "Configured on": "configured_on",
+        "Build Mode": "build_mode",
+        "C Compiler": "compiler",
+        "Parallel HDF5": "parallel",
+        "Thread Safety": "thread_safe",
+    }
+    cflags = ""
+    for line in cfg.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k, v = k.strip(), v.strip()
+        if k in fields:
+            ident[fields[k]] = v
+        if "CFLAGS" in k or "FLAGS" in k:
+            cflags += " " + v
+    ident["sanitizers"] = sorted({
+        tok.split("=", 1)[1] if "=" in tok else "on"
+        for tok in cflags.split() if tok.startswith("-fsanitize")
+    }) or []
+    # Pin the exact configuration by hashing libhdf5.settings if we can find it.
+    libdir = os.path.join(os.path.dirname(os.path.dirname(ident["h5cc"])), "lib")
+    settings = os.path.join(libdir, "libhdf5.settings")
+    if os.path.exists(settings):
+        ident["settings_sha256"] = hashlib.sha256(
+            open(settings, "rb").read()).hexdigest()
+    ident["plugin_path"] = os.environ.get("HDF5_PLUGIN_PATH", "(default)")
+    return ident
+
+
+def ensure_built(h5cc, ident, as_json):
+    """Compile probe (against the selected build) and interposer, cached by a
+    key over the toolchain + config so a build swap recompiles."""
+    if not shutil.which("cc"):
+        _die_skip("cc not found; cannot build the activation interposer", as_json)
+    key = hashlib.sha256(
+        (ident["h5cc"] + ident.get("settings_sha256", "") +
+         str(os.path.getmtime(PROBE_SRC)) + str(os.path.getmtime(TRACE_SRC))
+         ).encode()).hexdigest()[:16]
+    bdir = os.path.join(BUILD_ROOT, key)
+    probe = os.path.join(bdir, "h5probe")
+    trace = os.path.join(bdir, "h5trace.so")
+    if os.path.exists(probe) and os.path.exists(trace):
+        return probe, trace
+    os.makedirs(bdir, exist_ok=True)
+    try:
+        subprocess.run([h5cc, "-O2", "-o", probe, PROBE_SRC],
+                       check=True, capture_output=True, text=True, timeout=120)
+        subprocess.run(["cc", "-O2", "-fPIC", "-shared", "-o", trace, TRACE_SRC,
+                        "-ldl"], check=True, capture_output=True, text=True,
+                       timeout=120)
+    except subprocess.CalledProcessError as e:
+        _die_skip(f"probe build failed: {e.stderr.strip()[:400]}", as_json)
+    return probe, trace
+
+
+def _limits(cpu, mem_mb, fsize_mb):
+    def apply():
+        soft_as = mem_mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 2))
+        resource.setrlimit(resource.RLIMIT_AS, (soft_as, soft_as))
+        resource.setrlimit(resource.RLIMIT_FSIZE,
+                           (fsize_mb * 1024 * 1024, fsize_mb * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+        try:
+            resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+        except (ValueError, OSError):
+            pass
+    return apply
+
+
+def classify(trace_lines, input_realpath, workdir):
+    ext_open, writes, plugins, net = [], [], [], 0
+    for line in trace_lines:
+        parts = line.rstrip("\n").split("\t")
+        kind = parts[0]
+        if kind == "OPEN" and len(parts) >= 3:
+            mode, path = parts[1], parts[2]
+            abspath = path if os.path.isabs(path) else os.path.join(workdir, path)
+            try:
+                rp = os.path.realpath(abspath)
+            except Exception:
+                rp = abspath
+            if mode == "W":
+                writes.append(path)
+            elif rp == input_realpath:
+                continue                                   # the file under test
+            elif any(rp.startswith(p) for p in SYSTEM_PREFIXES):
+                continue                                   # loader/libc noise
+            else:
+                ext_open.append(path)                      # external / VDS / EFL
+        elif kind == "DLOPEN" and len(parts) >= 2:
+            plugins.append(parts[1])
+        elif kind == "NET":
+            net += 1
+    return {
+        "external_open": {"count": len(ext_open), "paths": ext_open},
+        "plugin_load": {"count": len(plugins), "names": plugins},
+        "write": {"count": len(writes), "paths": writes},
+        "network": {"count": net},
+    }
+
+
+def probe_file(path, probe, trace, ident, timeout, cpu, mem_mb, fsize_mb):
+    workdir = tempfile.mkdtemp(prefix="h5probe-")
+    result = {"timed_out": False, "signal": None}
+    try:
+        local = os.path.join(workdir, "input.h5")
+        shutil.copy(path, local)
+        os.chmod(local, 0o444)                             # read-only input
+        input_realpath = os.path.realpath(local)
+
+        plugin_iso = os.path.join(workdir, "noplugins")
+        os.makedirs(plugin_iso, exist_ok=True)
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "LD_PRELOAD": trace,
+            "H5TRACE_FD": "3",
+            "HDF5_PLUGIN_PATH": plugin_iso,                # no arbitrary plugins
+            "HDF5_DISABLE_VERSION_CHECK": "1",
+            "HOME": workdir,
+        }
+        trace_path = os.path.join(workdir, "trace.txt")
+        with open(trace_path, "w") as tf:
+            try:
+                proc = subprocess.run(
+                    [probe, "input.h5"], cwd=workdir, env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    pass_fds=(tf.fileno(),),
+                    preexec_fn=_limits(cpu, mem_mb, fsize_mb),
+                    timeout=timeout)
+            except subprocess.TimeoutExpired:
+                result.update(outcome="timeout", timed_out=True,
+                              probe=None, activation=classify(
+                                  open(trace_path).readlines()
+                                  if os.path.exists(trace_path) else [],
+                                  input_realpath, workdir))
+                return result
+
+        trace_lines = open(trace_path).readlines()
+        activation = classify(trace_lines, input_realpath, workdir)
+
+        probe_json = None
+        try:
+            probe_json = json.loads(proc.stdout.decode())
+        except Exception:
+            pass
+
+        if proc.returncode < 0:
+            result["outcome"] = "crashed"
+            result["signal"] = -proc.returncode
+        elif probe_json is None:
+            result["outcome"] = "crashed"                  # died without valid JSON
+            result["signal"] = result["signal"]
+        elif probe_json["decision"] == "rejected":
+            result["outcome"] = "rejected_at_open"
+        elif probe_json["materialization"]["call_errors"] > 0:
+            result["outcome"] = "rejected_in_traversal"
+        else:
+            result["outcome"] = "accepted"
+
+        result["probe"] = probe_json
+        result["activation"] = activation
+        return result
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="exact-build libhdf5 probe")
+    ap.add_argument("file")
+    ap.add_argument("--hdf5-bindir", help="dir containing the h5cc of the build "
+                    "under test (default: h5cc on PATH)")
+    ap.add_argument("--forbid", default="",
+                    help="comma list; nonzero exit if any occur: " +
+                    ",".join(FORBIDDABLE))
+    ap.add_argument("--json", action="store_true", help="emit the full result")
+    ap.add_argument("--timeout", type=int, default=60)
+    ap.add_argument("--cpu", type=int, default=30, help="RLIMIT_CPU seconds")
+    ap.add_argument("--mem-mb", type=int, default=2048, help="RLIMIT_AS")
+    ap.add_argument("--fsize-mb", type=int, default=64, help="RLIMIT_FSIZE")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.file):
+        _die_skip(f"no such file: {args.file}", args.json)
+    h5cc = resolve_h5cc(args.hdf5_bindir)
+    if not h5cc:
+        _die_skip("h5cc not found (need --hdf5-bindir or h5cc on PATH)", args.json)
+
+    ident = build_identity(h5cc)
+    probe, trace = ensure_built(h5cc, ident, args.json)
+
+    result = probe_file(args.file, probe, trace, ident, args.timeout,
+                        args.cpu, args.mem_mb, args.fsize_mb)
+    # Authoritative linked identity comes from the probe (dladdr / H5get_libversion).
+    if result.get("probe"):
+        ident["libhdf5_version"] = result["probe"]["libhdf5_version"]
+        ident["linked_library"] = result["probe"]["linked_library"]
+
+    forbid = [f.strip() for f in args.forbid.split(",") if f.strip()]
+    bad = [f for f in forbid if f not in FORBIDDABLE]
+    if bad:
+        _die_skip(f"unknown --forbid token(s): {','.join(bad)}", args.json)
+
+    violations = []
+    act = result.get("activation", {})
+    for f in forbid:
+        if f == "crash" and result["outcome"] in ("crashed", "timeout"):
+            violations.append("crash")
+        elif f in act and act[f]["count"] > 0:
+            violations.append(f)
+
+    out = {
+        "tool": "h5policy-probe",
+        "input": args.file,
+        "outcome": result["outcome"],
+        "signal": result.get("signal"),
+        "timed_out": result.get("timed_out", False),
+        "build": ident,
+        "probe": result.get("probe"),
+        "activation": act,
+        "forbid": forbid,
+        "violations": violations,
+    }
+    if args.json:
+        print(json.dumps(out, indent=2))
+    else:
+        v = f"  VIOLATIONS: {','.join(violations)}" if violations else ""
+        print(f"{result['outcome']:>22}  {os.path.basename(args.file)}  "
+              f"[hdf5 {ident.get('libhdf5_version','?')}]{v}")
+    sys.exit(2 if violations else 0)
+
+
+if __name__ == "__main__":
+    main()
