@@ -308,11 +308,19 @@ def cmd_triage(args):
 
 # -------------------------------------------------------------- verify --------
 
-def _probe(inp, bindir):
+CANARY_BY_RECORD = {
+    "external_link": "external_link",
+    "external_file_list": "external_file_list",
+    "virtual_dataset": "virtual_dataset",
+}
+
+
+def _probe(inp, bindir, exercise="generic"):
     cmd = [H5PROBE, inp, "--json", "--forbid",
            "external_open,plugin_load,write,network,crash"]
     if bindir:
         cmd += ["--hdf5-bindir", bindir]
+    cmd += ["--exercise", exercise]
     rep, rc = run_json(cmd, timeout=180)
     return rep, rc
 
@@ -322,14 +330,25 @@ def cmd_verify(args):
     case = load_case(cdir)
     inp = os.path.join(cdir, "input.h5")
 
-    base, base_rc = _probe(inp, args.baseline)
+    record = case.get("record")
+    exercise = CANARY_BY_RECORD.get(record)
+    canary_status = "coverage_gap" if not exercise else None
+    exercise = exercise or "generic"
+    base, base_rc = _probe(inp, args.baseline, exercise)
     json.dump(base, open(os.path.join(cdir, "baseline-result.json"), "w"), indent=2)
     result = {"baseline": _probe_summary(base)}
     if args.candidate:
-        cand, cand_rc = _probe(inp, args.candidate)
+        cand, cand_rc = _probe(inp, args.candidate, exercise)
         json.dump(cand, open(os.path.join(cdir, "candidate-result.json"), "w"), indent=2)
         result["candidate"] = _probe_summary(cand)
 
+    result["canary"] = _canary_summary(base, canary_status, exercise)
+    result["baseline"]["status"] = result["canary"]["status"]
+    result["baseline"]["entry_points_exercised"] = result["canary"]["entry_points_exercised"]
+    if args.candidate:
+        result["candidate"]["canary"] = _canary_summary(cand, canary_status, exercise)
+        result["candidate"]["status"] = result["candidate"]["canary"]["status"]
+        result["candidate"]["entry_points_exercised"] = result["candidate"]["canary"]["entry_points_exercised"]
     case["verification"] = {"exact_build_probe": result}
 
     # Fold the OS-observable assertions into the reproducer block from the
@@ -366,7 +385,30 @@ def _probe_summary(rep):
         "activation": {k: v.get("count") for k, v in
                        rep.get("activation", {}).items()},
         "violations": rep.get("violations", []),
+        "entry_points": [e.get("name") for e in
+                         (rep.get("probe") or {}).get("entry_points", [])],
     }
+
+
+def _canary_summary(rep, forced_status=None, exercise=None):
+    """Classify activation independently from the generic open outcome."""
+    if rep.get("outcome") == "build_unavailable":
+        status = "build_unavailable"
+    elif rep.get("violations"):
+        status = "violation"
+    else:
+        eps = (rep.get("probe") or {}).get("entry_points", [])
+        exercised = [e.get("name") for e in eps if e.get("calls", 0)]
+        required = {"external_link": ("H5Lvisit2", "H5Oopen"),
+                    "external_file_list": ("H5Dread", "H5Dwrite"),
+                    "virtual_dataset": ("H5Dread",)}.get(exercise, ())
+        status = forced_status or ("verified" if all(x in exercised for x in required)
+                                   else "unexercised")
+    return {"status": status,
+            "entry_points_exercised": [e.get("name") for e in
+                (rep.get("probe") or {}).get("entry_points", [])
+                if e.get("calls", 0)],
+            "violations": rep.get("violations", [])}
 
 
 # ------------------------------------------------ minimize / variants ---------

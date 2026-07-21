@@ -19,7 +19,9 @@
  * bundles), this opens one file through the public API and drives it through
  * the materialization/activation surface a real consumer would reach: it visits
  * every object, opens datasets, reads a bounded sample of raw data (exercising
- * filters, decompression, external/VDS storage), and reads attributes.
+ * filters, decompression, external/VDS storage), and reads attributes.  Named
+ * exercise modes additionally drive entry points that a generic object walk
+ * does not reach (external-link traversal and EFL writes).
  *
  * It reports a single JSON object on stdout describing what libhdf5 did and the
  * exact build identity.  It does NOT judge correctness: the h5policy oracle owns
@@ -47,15 +49,58 @@
 /* Bounded raw-data read: cap per-dataset elements so a hostile logical size
  * cannot make the probe itself the denial of service.  rlimits and a wall
  * timeout in the wrapper are the outer guard; this is the inner one. */
-#define PROBE_MAX_ELEMENTS 4096
+#define PROBE_MAX_ELEMENT_BYTES (4096 * 32)
+
+enum entry_point_id {
+    EP_H5FOPEN,
+    EP_H5LVISIT2,
+    EP_H5OVISIT3,
+    EP_H5OOPEN,
+    EP_H5DOPEN2,
+    EP_H5DREAD,
+    EP_H5DWRITE,
+    EP_COUNT
+};
+
+struct entry_point_stat {
+    const char *name;
+    unsigned long calls;
+    unsigned long successes;
+    unsigned long failures;
+};
 
 struct probe_stats {
     unsigned long objects;
     unsigned long datasets;
     unsigned long attributes;
     unsigned long data_reads;    /* datasets whose raw data was sampled */
+    unsigned long data_writes;   /* datasets whose isolated raw data was sampled */
     unsigned long call_errors;   /* post-open calls that failed (counted, not fatal) */
+    int exercise_write;
+    struct entry_point_stat entry_points[EP_COUNT];
 };
+
+static void init_stats(struct probe_stats *st)
+{
+    static const char *names[EP_COUNT] = {
+        "H5Fopen", "H5Lvisit2", "H5Ovisit3", "H5Oopen", "H5Dopen2",
+        "H5Dread", "H5Dwrite"
+    };
+    memset(st, 0, sizeof *st);
+    for (int i = 0; i < EP_COUNT; i++)
+        st->entry_points[i].name = names[i];
+}
+
+static void entry_point_result(struct probe_stats *st, enum entry_point_id id,
+                               int succeeded)
+{
+    struct entry_point_stat *ep = &st->entry_points[id];
+    ep->calls++;
+    if (succeeded)
+        ep->successes++;
+    else
+        ep->failures++;
+}
 
 static void json_escape(const char *s, char *out, size_t n)
 {
@@ -70,33 +115,65 @@ static void json_escape(const char *s, char *out, size_t n)
     out[o] = '\0';
 }
 
-static void read_bounded(hid_t dset, struct probe_stats *st)
+static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
 {
     hid_t space = H5Dget_space(dset);
     hid_t dtype = H5Dget_type(dset);
+    hid_t memspace = H5I_INVALID_HID;
+    hsize_t *coord = NULL;
     if (space < 0 || dtype < 0) { st->call_errors++; goto done; }
 
     hssize_t npoints = H5Sget_simple_extent_npoints(space);
     size_t tsize = H5Tget_size(dtype);
     if (npoints < 0 || tsize == 0) { st->call_errors++; goto done; }
 
-    /* Reading the whole set could reach filter/external paths, which is the
-     * point -- but bound the buffer.  Skip anything that would not fit our cap;
-     * opening + type/space query already exercised layout and pipeline init. */
-    if ((hsize_t)npoints > PROBE_MAX_ELEMENTS) goto done;
+    /* Select exactly one element.  This reaches EFL/VDS/filter I/O even when a
+     * hostile dataset declares a huge logical extent, while keeping the memory
+     * and file selection bounded.  Variable-length values are deliberately not
+     * materialized: their pointed-to payload is not bounded by H5Tget_size. */
+    if (npoints == 0 || tsize > PROBE_MAX_ELEMENT_BYTES ||
+        H5Tdetect_class(dtype, H5T_VLEN) > 0 || H5Tis_variable_str(dtype) > 0)
+        goto done;
 
-    size_t bytes = (size_t)npoints * tsize;
-    if (bytes == 0 || bytes > PROBE_MAX_ELEMENTS * 32) goto done;
+    int rank = H5Sget_simple_extent_ndims(space);
+    if (rank < 0) { st->call_errors++; goto done; }
+    if (rank > 0) {
+        coord = (hsize_t *)calloc((size_t)rank, sizeof *coord);
+        if (!coord) goto done;
+        if (H5Sselect_elements(space, H5S_SELECT_SET, 1, coord) < 0) {
+            st->call_errors++;
+            goto done;
+        }
+    } else if (H5Sselect_all(space) < 0) {
+        st->call_errors++;
+        goto done;
+    }
+    memspace = H5Screate(H5S_SCALAR);
+    if (memspace < 0) { st->call_errors++; goto done; }
 
-    void *buf = calloc(1, bytes ? bytes : 1);
+    void *buf = calloc(1, tsize);
     if (!buf) goto done;
-    if (H5Dread(dset, dtype, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf) < 0)
+    herr_t io = H5Dread(dset, dtype, memspace, space, H5P_DEFAULT, buf);
+    entry_point_result(st, EP_H5DREAD, io >= 0);
+    if (io < 0)
         st->call_errors++;                 /* a rejected read is a clean refusal */
     else
         st->data_reads++;
+
+    if (st->exercise_write) {
+        memset(buf, 0, tsize);
+        io = H5Dwrite(dset, dtype, memspace, space, H5P_DEFAULT, buf);
+        entry_point_result(st, EP_H5DWRITE, io >= 0);
+        if (io < 0)
+            st->call_errors++;
+        else
+            st->data_writes++;
+    }
     free(buf);
 
 done:
+    free(coord);
+    if (memspace >= 0) H5Sclose(memspace);
     if (space >= 0) H5Sclose(space);
     if (dtype >= 0) H5Tclose(dtype);
 }
@@ -137,17 +214,42 @@ static herr_t visit_cb(hid_t root, const char *name, const H5O_info2_t *info,
     struct probe_stats *st = (struct probe_stats *)op;
     st->objects++;
 
-    hid_t obj = H5Oopen(root, name, H5P_DEFAULT);
-    if (obj < 0) { st->call_errors++; return 0; }   /* keep visiting siblings */
-
-    probe_attributes(obj, st);
-
     if (info->type == H5O_TYPE_DATASET) {
+        hid_t obj = H5Dopen2(root, name, H5P_DEFAULT);
+        entry_point_result(st, EP_H5DOPEN2, obj >= 0);
+        if (obj < 0) { st->call_errors++; return 0; }
         st->datasets++;
-        read_bounded(obj, st);
+        probe_attributes(obj, st);
+        exercise_dataset_io(obj, st);
+        H5Dclose(obj);
+        return 0;
     }
+
+    hid_t obj = H5Oopen(root, name, H5P_DEFAULT);
+    entry_point_result(st, EP_H5OOPEN, obj >= 0);
+    if (obj < 0) { st->call_errors++; return 0; }   /* keep visiting siblings */
+    probe_attributes(obj, st);
     H5Oclose(obj);
     return 0;
+}
+
+/* H5Ovisit deliberately does not follow external links.  Enumerate links and
+ * explicitly open each external-link path so a clean trace really means the
+ * traversal entry point was exercised. */
+static herr_t external_link_cb(hid_t root, const char *name,
+                               const H5L_info2_t *info, void *op)
+{
+    struct probe_stats *st = (struct probe_stats *)op;
+    if (info->type != H5L_TYPE_EXTERNAL)
+        return 0;
+
+    hid_t obj = H5Oopen(root, name, H5P_DEFAULT);
+    entry_point_result(st, EP_H5OOPEN, obj >= 0);
+    if (obj < 0)
+        st->call_errors++;
+    else
+        H5Oclose(obj);
+    return 0;                              /* keep looking for sibling links */
 }
 
 static const char *linked_lib_path(void)
@@ -160,11 +262,25 @@ static const char *linked_lib_path(void)
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "usage: h5probe FILE\n");
+    const char *exercise = "generic";
+    const char *path = NULL;
+    if (argc == 2) {
+        path = argv[1];
+    } else if (argc == 4 && strcmp(argv[1], "--exercise") == 0) {
+        exercise = argv[2];
+        path = argv[3];
+    } else {
+        fprintf(stderr, "usage: h5probe [--exercise MODE] FILE\n");
         return 3;
     }
-    const char *path = argv[1];
+    int external_link = strcmp(exercise, "external_link") == 0;
+    int efl = strcmp(exercise, "external_file_list") == 0;
+    int vds = strcmp(exercise, "virtual_dataset") == 0;
+    int generic = strcmp(exercise, "generic") == 0;
+    if (!external_link && !efl && !vds && !generic) {
+        fprintf(stderr, "h5probe: unknown exercise mode: %s\n", exercise);
+        return 3;
+    }
 
     /* Never print the HDF5 error stack: a rejection is expected output, not a
      * diagnostic to leak, and stderr noise would confuse the wrapper. */
@@ -176,21 +292,36 @@ int main(int argc, char **argv)
     char lib_esc[4096];
     json_escape(linked_lib_path(), lib_esc, sizeof lib_esc);
 
-    struct probe_stats st = {0};
+    struct probe_stats st;
+    init_stats(&st);
+    st.exercise_write = efl;
     const char *decision;
     int rc;
 
-    hid_t f = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
+    hid_t f = H5Fopen(path, efl ? H5F_ACC_RDWR : H5F_ACC_RDONLY, H5P_DEFAULT);
+    entry_point_result(&st, EP_H5FOPEN, f >= 0);
     if (f < 0) {
         decision = "rejected";           /* libhdf5 refused the bytes at open */
         rc = 2;
     } else {
-        /* Visit in creation order where available; fall back to name order. */
-        if (H5Ovisit3(f, H5_INDEX_CRT_ORDER, H5_ITER_INC, visit_cb, &st,
-                      H5O_INFO_BASIC | H5O_INFO_NUM_ATTRS) < 0 &&
-            H5Ovisit3(f, H5_INDEX_NAME, H5_ITER_INC, visit_cb, &st,
-                      H5O_INFO_BASIC | H5O_INFO_NUM_ATTRS) < 0)
-            st.call_errors++;
+        if (external_link) {
+            herr_t visited = H5Lvisit2(f, H5_INDEX_NAME, H5_ITER_INC,
+                                       external_link_cb, &st);
+            entry_point_result(&st, EP_H5LVISIT2, visited >= 0);
+            if (visited < 0) st.call_errors++;
+        } else {
+            /* Visit in creation order where available; fall back to name order. */
+            herr_t visited = H5Ovisit3(f, H5_INDEX_CRT_ORDER, H5_ITER_INC,
+                                       visit_cb, &st,
+                                       H5O_INFO_BASIC | H5O_INFO_NUM_ATTRS);
+            entry_point_result(&st, EP_H5OVISIT3, visited >= 0);
+            if (visited < 0) {
+                visited = H5Ovisit3(f, H5_INDEX_NAME, H5_ITER_INC, visit_cb,
+                                    &st, H5O_INFO_BASIC | H5O_INFO_NUM_ATTRS);
+                entry_point_result(&st, EP_H5OVISIT3, visited >= 0);
+            }
+            if (visited < 0) st.call_errors++;
+        }
         H5Fclose(f);
         decision = "opened";
         rc = 0;
@@ -198,6 +329,7 @@ int main(int argc, char **argv)
 
     printf("{\n");
     printf("  \"tool\": \"h5probe\",\n");
+    printf("  \"exercise\": \"%s\",\n", exercise);
     printf("  \"decision\": \"%s\",\n", decision);
     printf("  \"libhdf5_version\": \"%u.%u.%u\",\n", maj, min, rel);
     printf("  \"linked_library\": \"%s\",\n", lib_esc);
@@ -206,8 +338,21 @@ int main(int argc, char **argv)
     printf("    \"datasets\": %lu,\n", st.datasets);
     printf("    \"attributes\": %lu,\n", st.attributes);
     printf("    \"data_reads\": %lu,\n", st.data_reads);
+    printf("    \"data_writes\": %lu,\n", st.data_writes);
     printf("    \"call_errors\": %lu\n", st.call_errors);
-    printf("  }\n");
+    printf("  },\n");
+    printf("  \"entry_points\": [\n");
+    int emitted = 0;
+    for (int i = 0; i < EP_COUNT; i++) {
+        struct entry_point_stat *ep = &st.entry_points[i];
+        if (ep->calls == 0) continue;
+        if (emitted) printf(",\n");
+        printf("    {\"name\": \"%s\", \"calls\": %lu, "
+               "\"successes\": %lu, \"failures\": %lu}",
+               ep->name, ep->calls, ep->successes, ep->failures);
+        emitted = 1;
+    }
+    printf("\n  ]\n");
     printf("}\n");
     fflush(stdout);
     return rc;
