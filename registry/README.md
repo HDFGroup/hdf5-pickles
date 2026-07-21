@@ -83,7 +83,7 @@ per §11.5, never assumed from `h5policy` accepting or rejecting.
 | catalogued finding codes | 126 across 16 record families |
 | explicit catalog backlog | 136 corruption codes |
 | catalogued ambiguous codes | 20, carrying 38 `contexts` rules |
-| expectations with an `h5cve` contract | 127 of 178 |
+| expectations with an `h5cve` contract | 127 of 179 |
 | families with an exact-build canary | 15 of 16 |
 
 `validation_controls` is the family without a canary, by design: it covers
@@ -91,11 +91,13 @@ budgets, base address, free-space managers and profile validity, which have no
 single traversal surface to exercise. Its fixtures state `coverage_gap` in
 `allowed_statuses` rather than claiming a canary ran.
 
-The 51 uncontracted expectations are fixtures the oracle **accepts**. A family
-cannot be derived mechanically for those: the only findings present are
+Of the 52 uncontracted expectations, 51 are fixtures the oracle **accepts**. A
+family cannot be derived mechanically for those: the only findings present are
 incidental advisories (a deflate-filter notice, say) that describe a property of
 the file rather than what the fixture exercises, so assigning a family from one
-points the canary at the wrong structure. They need hand-assignment.
+points the canary at the wrong structure. They need hand-assignment. The other
+is the focused forensic cache-image regression, which shares the existing
+cache-image fixture and canary rather than duplicating its exact-build row.
 
 ## Claimed vs measured libhdf5 behaviour
 
