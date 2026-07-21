@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 The HDF Group.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""h5mutate -- a typed semantic mutation engine (roadmap change #5, mutator half).
+
+The byte-level fuzzers are good research tools, but their structural mutations
+are generic.  h5mutate applies TYPED mutations that each target one named
+invariant, reseal the enclosing checksums, and emit a recipe sidecar recording
+the parent hash, intended invariant/finding, the exact changed byte ranges, and
+which checksums were resealed.  Each mutant is self-validating: h5policy must
+emit the intended finding.
+
+This slice covers the object-header continuation family (strategy §5 / the
+interval model): the adversarial neighborhood of a valid multi-chunk header --
+a continuation target overlapping the source chunk at its start / interior /
+end, a zero-size continuation, an out-of-file target, and an alias back onto an
+already-decoded chunk.  Together they exercise every continuation invariant in
+registry/validation-coverage.yml that carries a finding.
+
+The one non-trivial reseal primitive (Jenkins lookup3) is reused from the CVE
+seed builder; the OHDR/OCHK/superblock reseal wrappers are thin.
+
+Usage:
+  h5mutate list  [--seed FILE]
+  h5mutate apply --seed FILE --recipe NAME --out FILE [--sidecar FILE]
+  h5mutate family --seed FILE --out-dir DIR [--verify]
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import struct
+import subprocess
+import sys
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    sys.exit("h5mutate: PyYAML is required (pip install pyyaml)")
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+H5POLICY = os.path.join(HERE, "h5policy")
+
+
+def _jenkins():
+    """The vetted Jenkins lookup3 from the CVE seed builder (pure-python)."""
+    path = os.path.join(REPO, "h5policy", "tests", "cve", "make_cve_2020_10812.py")
+    loader = importlib.machinery.SourceFileLoader("cve_builder_mut", path)
+    spec = importlib.util.spec_from_loader("cve_builder_mut", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod.jenkins_lookup3
+
+
+JENKINS = _jenkins()
+
+
+# --------------------------------------------------------------- reseal -------
+
+def reseal_superblock(raw):
+    soff = raw[9]
+    off = 12 + 4 * soff
+    struct.pack_into("<I", raw, off, JENKINS(bytes(raw[:off])))
+    return ("superblock", 0)
+
+
+def reseal_v2_ohdr(raw, off):
+    assert raw[off:off + 4] == b"OHDR" and raw[off + 4] == 2
+    flags = raw[off + 5]
+    cur = off + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+    sw = 1 << (flags & 3)
+    csize = int.from_bytes(raw[cur:cur + sw], "little")
+    coff = cur + sw + csize
+    struct.pack_into("<I", raw, coff, JENKINS(bytes(raw[off:coff])))
+    return ("OHDR", off)
+
+
+def reseal_ochk(raw, off, size):
+    assert raw[off:off + 4] == b"OCHK"
+    coff = off + size - 4
+    struct.pack_into("<I", raw, coff, JENKINS(bytes(raw[off:coff])))
+    return ("OCHK", off)
+
+
+# --------------------------------------------------------------- parse --------
+
+def superblock(raw):
+    if raw[8] not in (2, 3):
+        raise ValueError("only v2/v3 superblocks are supported")
+    soff, loff = raw[9], raw[10]
+    root_off = int.from_bytes(raw[12 + 3 * soff:12 + 3 * soff + soff], "little")
+    return root_off, soff, loff
+
+
+def _conts_in_region(raw, mstart, mend, prefix, soff, loff):
+    """Every object-header continuation message (type 0x10) in [mstart, mend),
+    as (addr_field_off, size_field_off, target_addr, target_size)."""
+    out, i = [], mstart
+    while i + prefix <= mend:
+        mtype = raw[i]
+        msize = struct.unpack_from("<H", raw, i + 1)[0]
+        payload = i + prefix
+        if mtype == 0x10:
+            a = int.from_bytes(raw[payload:payload + soff], "little")
+            l = int.from_bytes(raw[payload + soff:payload + soff + loff], "little")
+            out.append((payload, payload + soff, a, l))
+        i = payload + msize
+    return out
+
+
+def parse_chunk(raw, off, size, is_ochk, root_flags, soff, loff):
+    """Return (phys_lo, phys_hi, conts).  For a v2 OCHK the physical size is not
+    self-describing, so it is taken from the parent continuation message."""
+    prefix = 4 + (2 if root_flags & 0x04 else 0)
+    if is_ochk:
+        assert raw[off:off + 4] == b"OCHK", "not an OCHK chunk"
+        mstart, mend, phys_hi = off + 4, off + size - 4, off + size
+    else:
+        flags = raw[off + 5]
+        cur = off + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        sw = 1 << (flags & 3)
+        csize = int.from_bytes(raw[cur:cur + sw], "little")
+        mstart = cur + sw
+        mend = mstart + csize
+        phys_hi = mend + 4                         # trailing checksum
+    conts = _conts_in_region(raw, mstart, mend, prefix, soff, loff)
+    return off, phys_hi, conts
+
+
+def walk_chain(raw):
+    """Follow root -> continuation -> continuation..., returning the ordered
+    edges and the root's flags/extent.  Each edge is the continuation message in
+    one chunk pointing at the next."""
+    root_off, soff, loff = superblock(raw)
+    if raw[root_off:root_off + 4] != b"OHDR" or raw[root_off + 4] != 2:
+        raise ValueError("root object header is not v2 OHDR")
+    root_flags = raw[root_off + 5]
+
+    edges = []
+    off, size, is_ochk = root_off, None, False
+    root_phys = None
+    seen = set()
+    while True:
+        lo, hi, conts = parse_chunk(raw, off, size, is_ochk, root_flags, soff, loff)
+        if root_phys is None:
+            root_phys = (lo, hi)
+        if not conts or off in seen:
+            break
+        seen.add(off)
+        addr_off, size_off, taddr, tsize = conts[0]
+        edges.append({"chunk_off": off, "is_ochk": is_ochk, "chunk_size": size,
+                      "addr_field_off": addr_off, "size_field_off": size_off,
+                      "target_addr": taddr, "target_size": tsize})
+        off, size, is_ochk = taddr, tsize, True
+    return {"root_off": root_off, "soff": soff, "loff": loff,
+            "root_flags": root_flags, "root_phys": root_phys, "edges": edges}
+
+
+# -------------------------------------------------------------- recipes -------
+
+def _set_uint(raw, off, width, value):
+    old = bytes(raw[off:off + width])
+    raw[off:off + width] = value.to_bytes(width, "little")
+    return {"offset": off, "length": width, "old": old.hex(),
+            "new": bytes(raw[off:off + width]).hex()}
+
+
+def _reseal_edge_chunk(raw, edge):
+    if edge["is_ochk"]:
+        return reseal_ochk(raw, edge["chunk_off"], edge["chunk_size"])
+    return reseal_v2_ohdr(raw, edge["chunk_off"])
+
+
+def _retarget_root(raw, ch, new_addr):
+    """Repoint the root's first continuation to new_addr, resealing the OHDR."""
+    e = ch["edges"][0]
+    ch_change = _set_uint(raw, e["addr_field_off"], ch["soff"], new_addr)
+    resealed = [reseal_v2_ohdr(raw, ch["root_off"])]
+    return [ch_change], resealed
+
+
+def recipe_overlap_source_start(raw, ch):
+    changed, resealed = _retarget_root(raw, ch, ch["root_off"])
+    return changed, resealed, "continuation target == source chunk start"
+
+
+def recipe_overlap_source_inside(raw, ch):
+    changed, resealed = _retarget_root(raw, ch, ch["root_off"] + 4)
+    return changed, resealed, "continuation target a few bytes inside the source chunk"
+
+
+def recipe_overlap_source_end(raw, ch):
+    changed, resealed = _retarget_root(raw, ch, ch["root_phys"][1] - 1)
+    return changed, resealed, "continuation target on the source chunk's last byte"
+
+
+def recipe_zero_size(raw, ch):
+    e = ch["edges"][0]
+    changed = [_set_uint(raw, e["size_field_off"], ch["loff"], 0)]
+    resealed = [reseal_v2_ohdr(raw, ch["root_off"])]
+    return changed, resealed, "continuation with zero declared size"
+
+
+def recipe_out_of_file(raw, ch):
+    changed, resealed = _retarget_root(raw, ch, len(raw) + 4096)
+    return changed, resealed, "continuation target past end of file"
+
+
+def recipe_alias_prior_chunk(raw, ch):
+    """Point the deepest continuation back onto the FIRST continuation chunk,
+    which is already decoded and disjoint from the current source -- an alias,
+    not a self-overlap."""
+    edges = ch["edges"]
+    if len(edges) < 3:
+        return None
+    last, first_target = edges[-1], edges[0]["target_addr"]
+    changed = [_set_uint(raw, last["addr_field_off"], ch["soff"], first_target)]
+    resealed = [_reseal_edge_chunk(raw, last)]
+    return changed, resealed, "continuation aliases an already-decoded chunk"
+
+
+# recipe name -> (fn, intended invariant, intended finding)
+RECIPES = {
+    "cont_overlap_source_start":
+        (recipe_overlap_source_start, "continuation.no_source_overlap",
+         "H5_CORRUPT_SELF_REFERENTIAL_CONTINUATION"),
+    "cont_overlap_source_inside":
+        (recipe_overlap_source_inside, "continuation.no_source_overlap",
+         "H5_CORRUPT_SELF_REFERENTIAL_CONTINUATION"),
+    "cont_overlap_source_end":
+        (recipe_overlap_source_end, "continuation.no_source_overlap",
+         "H5_CORRUPT_SELF_REFERENTIAL_CONTINUATION"),
+    "cont_zero_size":
+        (recipe_zero_size, "continuation.nonzero_extent",
+         "H5_CORRUPT_ZERO_CONTINUATION_CHUNK"),
+    "cont_out_of_file":
+        (recipe_out_of_file, "continuation.target_in_file",
+         "H5_CORRUPT_OFFSET_OUT_OF_FILE"),
+    "cont_alias_prior_chunk":
+        (recipe_alias_prior_chunk, "continuation.no_chunk_alias",
+         "H5_CORRUPT_NON_PROGRESS_LOOP"),
+}
+
+
+def sha256(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def apply_recipe(seed_bytes, name):
+    fn, invariant, finding = RECIPES[name]
+    raw = bytearray(seed_bytes)
+    ch = walk_chain(raw)
+    result = fn(raw, ch)
+    if result is None:
+        return None
+    changed, resealed, note = result
+    sidecar = {
+        "recipe": name,
+        "note": note,
+        "parent_sha256": sha256(bytes(seed_bytes)),
+        "mutant_sha256": sha256(bytes(raw)),
+        "intended_invariant": invariant,
+        "intended_finding": finding,
+        "changed_ranges": changed,
+        "resealed": [{"structure": s, "offset": o} for s, o in resealed],
+    }
+    return bytes(raw), sidecar
+
+
+# ------------------------------------------------------------------ cli -------
+
+def cmd_list(args):
+    seed = None
+    if args.seed:
+        try:
+            seed = walk_chain(bytearray(open(args.seed, "rb").read()))
+        except Exception as e:
+            print(f"# seed not parseable as a continuation chain: {e}")
+    for name, (_, inv, finding) in RECIPES.items():
+        note = ""
+        if seed is not None and name == "cont_alias_prior_chunk" \
+                and len(seed["edges"]) < 3:
+            note = "  (N/A: seed has < 3 continuation chunks)"
+        print(f"{name:30} {inv:34} -> {finding}{note}")
+    return 0
+
+
+def cmd_apply(args):
+    if args.recipe not in RECIPES:
+        sys.exit(f"h5mutate: unknown recipe {args.recipe!r}")
+    seed = open(args.seed, "rb").read()
+    out = apply_recipe(seed, args.recipe)
+    if out is None:
+        sys.exit(f"h5mutate: recipe {args.recipe} not applicable to this seed")
+    mutant, sidecar = out
+    with open(args.out, "wb") as f:
+        f.write(mutant)
+    sc = args.sidecar or (args.out + ".recipe.yml")
+    with open(sc, "w") as f:
+        yaml.safe_dump(sidecar, f, sort_keys=False)
+    print(f"{args.recipe}: wrote {os.path.relpath(args.out)} "
+          f"(+ {os.path.relpath(sc)})")
+    return 0
+
+
+def _verify(mutant_path, expected_finding):
+    try:
+        p = subprocess.run([H5POLICY, "--profile", "untrusted-strict", "--json",
+                            mutant_path], capture_output=True, text=True, timeout=60)
+        codes = [f.get("code") for f in json.loads(p.stdout).get("findings", [])]
+        return expected_finding in codes, codes
+    except Exception as e:
+        return False, [f"error: {e}"]
+
+
+def cmd_family(args):
+    seed = open(args.seed, "rb").read()
+    os.makedirs(args.out_dir, exist_ok=True)
+    rc = 0
+    made = 0
+    for name in RECIPES:
+        out = apply_recipe(seed, name)
+        if out is None:
+            print(f"{name:30} SKIP (not applicable to seed)")
+            continue
+        mutant, sidecar = out
+        mpath = os.path.join(args.out_dir, name + ".h5")
+        with open(mpath, "wb") as f:
+            f.write(mutant)
+        with open(mpath + ".recipe.yml", "w") as f:
+            yaml.safe_dump(sidecar, f, sort_keys=False)
+        made += 1
+        if args.verify:
+            ok, codes = _verify(mpath, sidecar["intended_finding"])
+            status = "PASS" if ok else "FAIL"
+            if not ok:
+                rc = 1
+            extra = "" if ok else f"  (got {codes})"
+            print(f"{name:30} {status}  {sidecar['intended_finding']}{extra}")
+        else:
+            print(f"{name:30} wrote  {sidecar['intended_finding']}")
+    print(f"\n{made} mutant(s) in {os.path.relpath(args.out_dir)}"
+          + ("  [--verify]" if args.verify else ""))
+    return rc
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list", help="list recipes (and applicability to a seed)")
+    p.add_argument("--seed")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("apply", help="apply one recipe")
+    p.add_argument("--seed", required=True)
+    p.add_argument("--recipe", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--sidecar")
+    p.set_defaults(fn=cmd_apply)
+
+    p = sub.add_parser("family", help="generate every applicable recipe")
+    p.add_argument("--seed", required=True)
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--verify", action="store_true",
+                   help="assert each mutant triggers its intended h5policy finding")
+    p.set_defaults(fn=cmd_family)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

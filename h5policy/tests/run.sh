@@ -123,15 +123,28 @@ else
 fi
 rm -rf "$repo_dir/cases/$cve_case"
 
+# Semantic mutation family (h5mutate): generate the continuation family from the
+# valid seed and assert every typed mutant triggers its intended invariant's
+# finding.  This exercises h5policy's interval model against the full adversarial
+# neighborhood, not just the single committed overlap fixture.
+echo "== semantic mutation family (h5mutate) =="
+mut_dir="$repo_dir/cases/_mutfamily_$$"
+"$repo_dir/h5policy/tools/h5mutate" family \
+    --seed "$tests_dir/valid/continuation_chunks.h5" \
+    --out-dir "$mut_dir" --verify | grep -E 'PASS|FAIL|mutant\(s\)'
+mut_status=${PIPESTATUS[0]}
+rm -rf "$mut_dir"
+
 if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $fsinfo_status -eq 0 \
       && $limits_status -eq 0 && $reached_status -eq 0 \
       && $consumer_status -eq 0 \
       && $seam_status -eq 0 && $report_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
-      && $probe_status -eq 0 && $cve_status -eq 0 ]]; then
+      && $probe_status -eq 0 && $cve_status -eq 0 \
+      && $mut_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status cve=$cve_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status cve=$cve_status mut=$mut_status)"
 exit 1

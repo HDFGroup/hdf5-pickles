@@ -15,6 +15,7 @@ tools/h5policy-fuzzlib   -> ../h5policy/tools/h5policy-fuzzlib
 tools/h5policy-crashfuzz -> ../h5policy/tools/h5policy-crashfuzz
 tools/h5policy-gencorpus -> ../h5policy/tools/h5policy-gencorpus
 tools/h5policy-probe     -> ../h5policy/tools/h5policy-probe
+tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
 `tools/pkdoc.py` and `tools/h5cve` are repository-level helper scripts (not
@@ -33,9 +34,31 @@ invariant through [`registry/findings.yml`](registry/findings.yml).
 h5cve init  <id> --poc FILE                 # bundle: PoC, sha256, skeleton case.yml
 h5cve triage <case>                         # oracle + census + registry mapping
 h5cve verify <case> --baseline BINDIR [--candidate BINDIR]   # exact-build probes
-h5cve minimize|variants <case>              # deferred: reducer/mutator (change #5)
+h5cve variants <case> [--seed VALID]        # typed semantic variants via h5mutate
+h5cve minimize <case>                        # deferred: structure-aware reducer
 h5cve promote <case>                        # draft tests expectation + registry case
 ```
+
+## h5mutate Semantic Mutation Engine
+
+`tools/h5mutate` applies **typed** mutations that each target one named invariant
+in [`registry/validation-coverage.yml`](registry/validation-coverage.yml), reseal
+the enclosing checksums, and emit a recipe sidecar (parent hash, intended
+invariant/finding, changed byte ranges, reseals).  Each mutant is
+self-validating — `family --verify` asserts h5policy emits the intended finding.
+
+```text
+h5mutate list  [--seed FILE]
+h5mutate apply --seed FILE --recipe NAME --out FILE
+h5mutate family --seed FILE --out-dir DIR [--verify]
+```
+
+The current slice covers the object-header continuation family (the interval
+model): target overlapping the source chunk at start/interior/end, zero-size,
+out-of-file, and alias onto an already-decoded chunk.  `run.sh` runs
+`family --verify` as a pinned check, and `h5cve variants` uses it to populate a
+case bundle.  The structure-aware **reducer** (`h5cve minimize`) is the
+remaining half of roadmap change #5.
 
 Bundles live under `cases/<id>/` (git-ignored working scratch); `promote` is
 what lands tracked artifacts in `h5policy/tests/` and `registry/`.  The exact-
