@@ -139,6 +139,17 @@ else
 fi
 rm -rf "$repo_dir/cases/$cve_case"
 
+# Truncation sweep (strategy-doc §12).  A bounded subset runs here as a
+# regression check that every prefix of a valid file still yields a verdict; the
+# exhaustive corpus sweep is on-demand (see tools/h5policy-truncate), like the
+# fuzzer, because it takes minutes rather than seconds.
+echo "== truncation sweep (bounded) =="
+"$overlay_dir/tools/h5policy-truncate" --max-prefixes 512 \
+    "$tests_dir/valid/empty.h5" \
+    "$tests_dir/valid/simple_dataset.h5" \
+    "$tests_dir/valid/nested_datatypes.h5"
+trunc_status=$?
+
 # Semantic mutation family (h5mutate): generate the continuation family from the
 # valid seed and assert every typed mutant triggers its intended invariant's
 # finding.  This exercises h5policy's interval model against the full adversarial
@@ -158,9 +169,10 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $seam_status -eq 0 && $report_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
-      && $matrix_status -eq 0 && $mut_status -eq 0 ]]; then
+      && $matrix_status -eq 0 && $mut_status -eq 0 \
+      && $trunc_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status trunc=$trunc_status)"
 exit 1

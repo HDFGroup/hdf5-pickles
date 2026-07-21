@@ -15,6 +15,7 @@ tools/h5policy-fuzzlib   -> ../h5policy/tools/h5policy-fuzzlib
 tools/h5policy-crashfuzz -> ../h5policy/tools/h5policy-crashfuzz
 tools/h5policy-gencorpus -> ../h5policy/tools/h5policy-gencorpus
 tools/h5policy-probe     -> ../h5policy/tools/h5policy-probe
+tools/h5policy-truncate  -> ../h5policy/tools/h5policy-truncate
 tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
@@ -97,6 +98,31 @@ soft `met`, and requirements that would need fixtures classified by hand are
 marked that way rather than inferred. `check_registry.py` enforces that every
 record is scored on every requirement, but not the scores themselves: the file
 measures distance from §12 rather than gating on it.
+
+## Truncation Sweep
+
+Every prefix of a valid file is a file an attacker can hand you, and each one
+must be *decided*: `h5policy` has to terminate with a verdict rather than escape
+with an exception, hang, or report an internal error.
+`tools/h5policy-truncate` walks those prefixes and asserts exactly that.
+
+```sh
+tools/h5policy-truncate h5policy/tests/valid/*.h5      # exhaustive, minutes
+tools/h5policy-truncate --max-prefixes 512 SEED...     # bounded
+```
+
+Analysis runs **in-process** through the `h5policy_analyze` seam, all prefixes
+in one poke session: ~250 prefixes/second against ~2/second for the CLI, which
+is what makes an exhaustive sweep practical at all.
+
+Coverage is reported per seed as `exhaustive` (every byte boundary) or `sampled`
+(the budget forced striding, spending half of it on every boundary of the
+metadata-dense head). A sampled sweep is not an exhaustive one and does not
+satisfy §12. `run.sh` runs a bounded subset as a regression check; the full
+corpus sweep is on-demand, like the fuzzer.
+
+Results land in [`registry/truncation-sweep.json`](registry/truncation-sweep.json),
+which `h5cve verification` reads to score the §12 truncation requirement.
 
 ## h5mutate Semantic Mutation Engine
 

@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 The HDF Group.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""h5policy-truncate -- the strategy-doc §12 truncation sweep.
+
+Every prefix of a valid file is a file an attacker can hand you, and every one
+of them must be *decided*: h5policy has to terminate with a verdict rather than
+escape with an exception, hang, or report an internal error.  This walks the
+prefixes of one or more seeds and asserts exactly that.
+
+Analysis runs IN-PROCESS through the h5policy_analyze seam, all prefixes in one
+poke session.  Driving the CLI instead costs ~0.55s per prefix -- 67 minutes for
+the valid corpus -- which is why no exhaustive sweep existed before.
+
+Violations (any of these fails the run):
+
+  escaped    an exception left h5policy_analyze; the caller gets no verdict
+  internal   an H5_INTERNAL_* finding: a path the validator does not handle
+  no_verdict the decision global was left empty
+
+Coverage is reported honestly per seed: `exhaustive` when every byte boundary
+was tested, `sampled` when the budget forced striding.  A sampled sweep is not
+an exhaustive one and must not be reported as satisfying §12.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+OVERLAY = os.path.dirname(HERE)
+REPO = os.path.dirname(OVERLAY)
+
+DECISIONS = {"accept", "accept_with_warnings", "reject_corrupt", "reject_resource",
+             "reject_policy", "unsupported_coverage_gap"}
+
+
+def prefix_lengths(size, budget):
+    """Which prefix lengths to test, and whether that is every boundary.
+
+    Metadata is front-loaded (superblock, root object header, message chunks),
+    so when the budget binds, spend half of it on every boundary of the head and
+    stride the remainder rather than striding uniformly and thinning the region
+    where the decoders actually live."""
+    if size + 1 <= budget:
+        return list(range(size + 1)), True
+    head = budget // 2
+    lengths = list(range(head))
+    remaining = budget - head
+    step = max(1, (size + 1 - head) // remaining)
+    lengths += list(range(head, size + 1, step))
+    return sorted(set(lengths)), False
+
+
+def sweep(seed, budget, timeout):
+    raw = open(seed, "rb").read()
+    lengths, exhaustive = prefix_lengths(len(raw), budget)
+    workdir = tempfile.mkdtemp(prefix="h5policy-truncate-")
+    paths = []
+    for n in lengths:
+        p = os.path.join(workdir, f"t{n:08d}")
+        with open(p, "wb") as f:
+            f.write(raw[:n])
+        paths.append(p)
+
+    script = os.path.join(workdir, "sweep.pk")
+    with open(script, "w") as f:
+        f.write("load h5_policy;\n")
+        f.write("var paths = [" + ",".join(f'"{p}"' for p in paths) + "];\n")
+        f.write(r"""
+fun sweep_has_internal = string:
+{
+    for (var i = 0UL; i < h5policy_finding_classes'length as uint<64>; i = i + 1UL)
+        if (h5policy_finding_classes[i] == "internal") return "1";
+    return "0";
+}
+
+for (var i = 0UL; i < paths'length as uint<64>; i = i + 1UL)
+  {
+    try
+      {
+        var ios = open(paths[i], IOS_M_RDONLY);
+        var ctx = h5policy_analyze(ios, h5policy_profile);
+        printf("%s|%s|%s\n", paths[i], h5policy_decision, sweep_has_internal);
+        close(ios);
+      }
+    catch (Exception e)
+      {
+        printf("%s|ESCAPED|0\n", paths[i]);
+      }
+  }
+""")
+
+    env = dict(os.environ)
+    load = f"{OVERLAY}/pickles:{REPO}/pickles"
+    env["POKE_LOAD_PATH"] = load + (":" + env["POKE_LOAD_PATH"]
+                                    if env.get("POKE_LOAD_PATH") else "")
+    try:
+        proc = subprocess.run(["poke", "--quiet", "-L", script],
+                              capture_output=True, text=True, env=env,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"seed": seed, "error": "timeout", "prefixes": len(lengths),
+                "exhaustive": exhaustive, "violations": [{"kind": "hang"}]}
+
+    seen, violations, histogram = {}, [], {}
+    for line in proc.stdout.splitlines():
+        if line.count("|") != 2:
+            continue
+        path, decision, internal = line.rsplit("|", 2)
+        n = int(os.path.basename(path).lstrip("t"))
+        seen[n] = decision
+        histogram[decision] = histogram.get(decision, 0) + 1
+        if decision == "ESCAPED":
+            violations.append({"kind": "escaped", "prefix": n})
+        elif internal == "1":
+            violations.append({"kind": "internal", "prefix": n,
+                               "decision": decision})
+        elif decision not in DECISIONS:
+            violations.append({"kind": "no_verdict", "prefix": n,
+                               "decision": decision})
+    for n in lengths:
+        if n not in seen:
+            violations.append({"kind": "no_verdict", "prefix": n,
+                               "decision": None})
+
+    return {"seed": os.path.relpath(seed, REPO), "bytes": len(raw),
+            "prefixes": len(lengths), "exhaustive": exhaustive,
+            "coverage": "exhaustive" if exhaustive else "sampled",
+            "decisions": histogram, "violations": violations}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("seeds", nargs="+")
+    ap.add_argument("--max-prefixes", type=int, default=4096,
+                    help="per-seed budget; above this the sweep is sampled")
+    ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--output")
+    args = ap.parse_args()
+
+    results = [sweep(s, args.max_prefixes, args.timeout) for s in args.seeds]
+    failed = sum(len(r.get("violations", [])) for r in results)
+    report = {"schema_version": 1, "seeds": results,
+              "total_violations": failed}
+
+    if args.json or args.output:
+        text = json.dumps(report, indent=2, sort_keys=True)
+        if args.output:
+            open(args.output, "w").write(text + "\n")
+        else:
+            print(text)
+    else:
+        for r in results:
+            v = r.get("violations", [])
+            print(f"{r['seed']}  {r['prefixes']} prefixes  {r.get('coverage','?')}"
+                  f"  {'OK' if not v else str(len(v)) + ' VIOLATION(S)'}")
+            for item in v[:10]:
+                print(f"    {item['kind']} at prefix {item.get('prefix')}")
+        print(f"truncation sweep: {len(results)} seed(s), {failed} violation(s)")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

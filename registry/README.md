@@ -15,6 +15,7 @@ Four files plus a case directory, one schema version:
 | [`validation-coverage.yml`](validation-coverage.yml) | For each record family: which invariants exist (per [§5](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) and §11.5), which finding each maps to, where the oracle enforces it, which tests and fuzz targets cover it, and its migration status. |
 | [`h5cve-matrix-policy.yml`](h5cve-matrix-policy.yml) | Which exact-build canary statuses each fixture is permitted to report. `coverage_gap` and `unexercised` are visible outcomes, never aliases for success. |
 | [`libhdf5-evidence.yml`](libhdf5-evidence.yml) | **Generated.** What the selected libhdf5 build actually did, per record family, measured by the canary matrix. |
+| [`truncation-sweep.json`](truncation-sweep.json) | **Generated.** Result of the §12 truncation sweep: every prefix of each seed, and whether coverage was exhaustive or sampled. |
 | [`verification-coverage.yml`](verification-coverage.yml) | **Generated.** Which of the [§12](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) verification requirements each record family demonstrably meets. |
 | [`cve-case.yml`](cve-case.yml) | The annotated **template** for a per-case record. Its fields are the §11.5 containment/systemic tracking block. |
 | [`cases/`](cases/) | Real per-case records: one proactive hardening case and four libhdf5 divergence records, including one open backlog of uninvestigated items. |
@@ -134,19 +135,20 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 | `absent` | mechanically demonstrated to be missing |
 | `not_assessed` | not determinable from artifacts; needs classification |
 
-**28 of 176 requirement-slots are currently `met`.** The distribution matters
+**50 of 176 requirement-slots are currently `met`.** The distribution matters
 more than the total:
 
-- Three requirements are `absent` for every family: systematic per-byte
-  truncation (only a *random* fuzz mutator and ad-hoc unit cases exist), lazy-
-  validation performance (no harness at all), and OSS-Fuzz integration.
+- Two requirements are `absent` for every family: lazy-validation performance
+  (no harness at all) and OSS-Fuzz integration.
 - Three are `not_assessed` for every family — boundary counts, integer overflow
   versus allocation budget, and deep nesting versus non-progress. These are
   deliberately **not** inferred from finding-code spelling; settling them needs
   fixtures classified by the case they represent.
 - Dedicated fuzz targets exist for 1 family of 16.
-- Only one family pins evidence locations as well as finding codes (4
-  expectations use `expected_finding_evidence_locations`).
+- 12 families pin evidence locations as well as finding codes; the remaining
+  4 need cursor arithmetic at the emit site rather than test metadata.
+- Truncation is `met` for 11 families and `partial` for 3 whose seed exceeds
+  the sweep budget; see [`truncation-sweep.json`](truncation-sweep.json).
 - The strongest column is no-activation-on-failure, `met` for 12 families,
   because the exact-build probe measures it directly.
 
