@@ -865,6 +865,11 @@ CANARY_BY_RECORD = {
     "dataset_layout_filter_fill": "dataset_layout",
     "btree_heap_index": "btree",
     "address_space_bounds": "address_space",
+    # Free-space managers are loaded lazily: neither a plain open nor an object
+    # walk decodes FSHD/FSSE, so only the free_space canary (H5Fget_free_sections)
+    # reaches this family.  Without the mapping every validation_controls case
+    # fell back to the generic exercise and reported a misleading "accepted".
+    "validation_controls": "free_space",
     "chunk_index": "chunk_index",
     "dense_index": "dense_index",
     "heap_structures": "heap_structures",
@@ -917,10 +922,12 @@ def cmd_verify(args):
     result["canary"] = _canary_summary(base, canary_status, exercise)
     result["baseline"]["status"] = result["canary"]["status"]
     result["baseline"]["entry_points_exercised"] = result["canary"]["entry_points_exercised"]
+    _qualify_outcome(result["baseline"], result["canary"])
     if args.candidate:
         result["candidate"]["canary"] = _canary_summary(cand, canary_status, exercise)
         result["candidate"]["status"] = result["candidate"]["canary"]["status"]
         result["candidate"]["entry_points_exercised"] = result["candidate"]["canary"]["entry_points_exercised"]
+        _qualify_outcome(result["candidate"], result["candidate"]["canary"])
         result["comparison"] = _comparison_verdict(result["baseline"],
                                                      result["candidate"])
     case["verification"] = {"exact_build_probe": result}
@@ -937,17 +944,79 @@ def cmd_verify(args):
         and mat.get("data_reads", 1) == 0
     a["fails_before_materialization"] = safe and mat.get("objects", 1) == 0
     # no_user_callback / no_legacy_fallback are not OS-observable here.
-    case["activation_before_validation"] = ["none"] if (
-        base.get("violations") == []) else base.get("violations")
+    case["activation_before_validation"] = _merge_activation(
+        case.get("activation_before_validation"), base)
+    # The raw --forbid tokens are evidence too, but they are a different
+    # vocabulary; keep them in their own field instead of overloading the enum.
+    case["probe_reported_violations"] = base.get("violations") or []
 
     save_case(cdir, case)
     v = base.get("violations") or []
-    print(f"verify: baseline outcome={base.get('outcome')} "
+    # Report the QUALIFIED outcome, not the raw probe verdict: see _qualify_outcome.
+    print(f"verify: baseline outcome={result['baseline']['outcome']} "
           f"violations={v or 'none'}")
+    if result["baseline"].get("outcome_note"):
+        print(f"        WARNING: {result['baseline']['outcome_note']}")
     if args.candidate:
         print(f"        candidate outcome={result['candidate']['outcome']} "
               f"violations={result['candidate']['violations'] or 'none'}")
+        if result["candidate"].get("outcome_note"):
+            print(f"        WARNING: {result['candidate']['outcome_note']}")
     return 2 if v else 0
+
+
+# cve-case.yml `activation_before_validation` vocabulary (strategy §11.5).
+ACTIVATION_KINDS = ("native_construction", "cache_publication", "public_id",
+                    "index_init", "plugin_load", "decompression", "callback",
+                    "external_open", "none")
+# The subset the exact-build probe can actually OBSERVE, as OS-level events.
+# Everything else in the enum -- native construction, cache publication, ID
+# registration, index init, user callbacks -- needs internal counters the probe
+# does not have, so those values are source-derived and must survive a re-run.
+PROBE_OBSERVABLE_ACTIVATION = ("external_open", "plugin_load")
+
+
+def _merge_activation(previous, base):
+    """Re-measure what the probe can see; preserve what only a human can.
+
+    This field used to be assigned straight from `base["violations"]`, which is
+    the wrong vocabulary: those are --forbid tokens (crash, write, network, ...),
+    not activation kinds, so a crashing case recorded `[crash]` -- not a member
+    of the enum.  It also clobbered hand-curated triage on every re-run.
+
+    So: drop tokens that are not activation kinds, refresh the two the probe
+    genuinely observes, and keep any non-observable kind already recorded.
+    """
+    act = base.get("activation", {})
+    observed = [k for k in PROBE_OBSERVABLE_ACTIVATION
+                if act.get(k, {}).get("count", 0) > 0]
+    kept = [k for k in (previous or [])
+            if k in ACTIVATION_KINDS and k != "none"
+            and k not in PROBE_OBSERVABLE_ACTIVATION]
+    merged = kept + [k for k in observed if k not in kept]
+    return merged or ["none"]
+
+
+def _qualify_outcome(summary, canary):
+    """Refuse to report a bare `accepted` the exercise did not earn.
+
+    When the record family has no canary exercise, `_probe` silently falls back
+    to `generic` -- a read-only open plus object walk.  Any structure that walk
+    does not decode (free-space managers being the motivating case) is never put
+    in front of the library, so `accepted` means "nothing looked", not "the build
+    is safe".  On GHSA-r856-frmw-wwvr that false negative masked a live SIGSEGV.
+
+    A crash or a rejection is real evidence whatever the exercise was, so only
+    the affirmative verdict is downgraded.  The original is kept verbatim.
+    """
+    if canary.get("status") == "coverage_gap" and summary.get("outcome") == "accepted":
+        summary["probe_outcome"] = "accepted"
+        summary["outcome"] = "unverified_coverage_gap"
+        summary["outcome_note"] = (
+            "libhdf5 did not reject the file, but the record family has no canary "
+            "exercise so the generic read-only open never decoded it. This is NOT "
+            "evidence of safety; add an exercise for this family before relying on it.")
+    return summary
 
 
 def _probe_summary(rep):
@@ -987,6 +1056,8 @@ def _canary_summary(rep, forced_status=None, exercise=None):
                     "btree": ("H5Lvisit2", "H5Oopen"),
                     "address_space": ("H5Fopen", "H5Fget_create_plist", "H5Pget_userblock",
                                       "H5Fget_eoa", "H5Fget_filesize", "H5Ovisit3"),
+                    "free_space": ("H5Fopen", "H5Fget_filesize",
+                                   "H5Fget_free_sections", "H5Ovisit3"),
                     "chunk_index": ("H5Ovisit3", "H5Dopen2", "H5Sselect_elements", "H5Dread"),
                     "dense_index": ("H5Lvisit2",),
                     "heap_structures": ("H5Ovisit3", "H5Aopen_by_idx", "H5Aread"),

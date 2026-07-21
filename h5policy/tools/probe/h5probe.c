@@ -54,6 +54,9 @@
 /* Bounds on the chunk_index sweep (see chunk_sample_coords). */
 #define PROBE_MAX_CHUNK_SAMPLES 4096
 #define PROBE_MAX_READ_BYTES (4096 * 32)
+/* The free-section count is decoded from the file, so it is attacker-controlled;
+ * cap what we are willing to materialize before asking for the section array. */
+#define PROBE_MAX_FREE_SECTIONS 4096
 
 enum entry_point_id {
     EP_H5FOPEN,
@@ -83,6 +86,7 @@ enum entry_point_id {
     EP_H5FGET_MDC_IMAGE_INFO,
     EP_H5FGET_MDC_SIZE,
     EP_H5GGET_CREATE_PLIST,
+    EP_H5FGET_FREE_SECTIONS,
     EP_COUNT
 };
 
@@ -105,6 +109,8 @@ struct probe_stats {
     unsigned long family_completed;
     unsigned long chunk_samples;   /* chunks touched by the chunk_index sweep */
     unsigned long chunk_sweep_skipped; /* datasets where the sweep was not applicable */
+    unsigned long free_sections;     /* sections reported by the free_space canary */
+    unsigned long free_sections_oob; /* ...of those, extents not inside the file */
     int exercise_write;
     int exercise_chunk_index;
     int exercise_btree;
@@ -118,6 +124,7 @@ struct probe_stats {
     int exercise_dataspace;
     int exercise_dataset_layout;
     int exercise_address_space;
+    int exercise_free_space;
     struct entry_point_stat entry_points[EP_COUNT];
 };
 
@@ -131,7 +138,7 @@ static void init_stats(struct probe_stats *st)
         "H5Sselect_elements", "H5Aopen_by_idx", "H5Aread", "H5Aget_type",
         "H5Fget_info2", "H5Gget_info", "H5Fget_create_plist", "H5Pget_userblock",
         "H5Fget_eoa", "H5Fget_filesize", "H5Fget_mdc_image_info",
-        "H5Fget_mdc_size", "H5Gget_create_plist"
+        "H5Fget_mdc_size", "H5Gget_create_plist", "H5Fget_free_sections"
     };
     memset(st, 0, sizeof *st);
     for (int i = 0; i < EP_COUNT; i++)
@@ -532,6 +539,7 @@ int main(int argc, char **argv)
     int btree = strcmp(exercise, "btree") == 0;
     int link_walk = btree || strcmp(exercise, "dense_index") == 0;
     int family_mode = strcmp(exercise, "address_space") == 0 ||
+                      strcmp(exercise, "free_space") == 0 ||
                       strcmp(exercise, "dataspace") == 0 ||
                       strcmp(exercise, "dataset_layout") == 0 ||
                       strcmp(exercise, "chunk_index") == 0 ||
@@ -572,6 +580,7 @@ int main(int argc, char **argv)
     st.exercise_dataspace = strcmp(exercise, "dataspace") == 0;
     st.exercise_dataset_layout = strcmp(exercise, "dataset_layout") == 0;
     st.exercise_address_space = strcmp(exercise, "address_space") == 0;
+    st.exercise_free_space = strcmp(exercise, "free_space") == 0;
     if (!generic) st.family_attempts = 1;
     const char *decision;
     int rc;
@@ -603,6 +612,60 @@ int main(int argc, char **argv)
                      (uintmax_t)userblock <= (uintmax_t)filesize)
                 st.family_completed++;
             if (fcpl >= 0) H5Pclose(fcpl);
+        }
+        if (st.exercise_free_space) {
+            /* Free-space managers are NOT decoded by opening the file or by an
+             * object walk: the section list is read lazily, when something locks
+             * the manager's section info.  H5Fget_free_sections is the public
+             * call that forces it, so it is the only entry point that puts the
+             * FSHD/FSSE records in front of the library at all.  Without this
+             * canary the whole validation_controls family is unreachable and a
+             * generic open reports a misleading "accepted". */
+            hsize_t file_size = 0;
+            herr_t size_rc = H5Fget_filesize(f, &file_size);
+            entry_point_result(&st, EP_H5FGET_FILESIZE, size_rc >= 0);
+
+            /* Count first (sect_info == NULL); this alone deserializes the
+             * section list, which is where a corrupt extent does its damage. */
+            ssize_t nsects = H5Fget_free_sections(f, H5FD_MEM_DEFAULT, 0, NULL);
+            entry_point_result(&st, EP_H5FGET_FREE_SECTIONS, nsects >= 0);
+            if (size_rc < 0 || nsects < 0)
+                st.call_errors++;
+            else if (nsects > 0) {
+                size_t want = (size_t)nsects;
+                if (want > PROBE_MAX_FREE_SECTIONS)
+                    want = PROBE_MAX_FREE_SECTIONS;
+                H5F_sect_info_t *sect = calloc(want, sizeof *sect);
+                if (sect) {
+                    ssize_t got = H5Fget_free_sections(f, H5FD_MEM_DEFAULT,
+                                                       want, sect);
+                    entry_point_result(&st, EP_H5FGET_FREE_SECTIONS, got >= 0);
+                    if (got < 0)
+                        st.call_errors++;
+                    else {
+                        /* Only a file that actually reported a section proves the
+                         * FSSE record was decoded -- a file with no free-space
+                         * manager returns 0 without reading anything, so counting
+                         * that as "completed" would overstate coverage (same rule
+                         * as the cache_image canary, which requires a real image).
+                         *
+                         * Whether the sections are SANE is the oracle's call, not
+                         * ours: record the out-of-bounds count as evidence, but
+                         * keep it out of call_errors, which would misreport this
+                         * as a refused call rather than a bad answer. */
+                        st.family_completed++;
+                        st.free_sections = (unsigned long)got;
+                        for (ssize_t i = 0; i < got; i++) {
+                            uintmax_t a = (uintmax_t)sect[i].addr;
+                            uintmax_t sz = (uintmax_t)sect[i].size;
+                            if (a > (uintmax_t)file_size ||
+                                sz > (uintmax_t)file_size - a)
+                                st.free_sections_oob++;
+                        }
+                    }
+                    free(sect);
+                }
+            }
         }
         if (st.exercise_cache_image) {
             haddr_t image_addr = HADDR_UNDEF;
@@ -652,7 +715,7 @@ int main(int argc, char **argv)
                        !st.exercise_shared_messages && !st.exercise_cache_image &&
                        !st.exercise_message_envelope && !st.exercise_legacy_messages && !st.exercise_datatype &&
                        !st.exercise_dataspace && !st.exercise_dataset_layout &&
-                       !st.exercise_address_space)
+                       !st.exercise_address_space && !st.exercise_free_space)
                        st.family_completed++; }
         }
         H5Fclose(f);
@@ -675,6 +738,8 @@ int main(int argc, char **argv)
     printf("    \"traversal_calls\": %lu,\n", st.traversal_calls);
     printf("    \"chunk_samples\": %lu,\n", st.chunk_samples);
     printf("    \"chunk_sweep_skipped\": %lu,\n", st.chunk_sweep_skipped);
+    printf("    \"free_sections\": %lu,\n", st.free_sections);
+    printf("    \"free_sections_out_of_bounds\": %lu,\n", st.free_sections_oob);
     printf("    \"call_errors\": %lu\n", st.call_errors);
     printf("  },\n");
     printf("  \"family_exercise\": {\"name\": \"%s\", \"attempts\": %lu, \"completed\": %lu},\n",
