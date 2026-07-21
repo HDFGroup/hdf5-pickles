@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 The HDF Group.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""h5policy-lazy -- the strategy-doc §12 lazy-validation measurement.
+
+"Validation remains lazy" is a falsifiable claim: the cost of validating a file
+must be a function of its METADATA, not of how much raw data it carries.  A
+validator that reads or decompresses payload would show cost rising with data
+volume; a lazy one does not move at all.
+
+Measured on deterministic counters from the report -- `metadata_bytes_seen` and
+`walk_operations` -- rather than wall-clock, which is dominated by interpreter
+startup and is too noisy to assert on in a test suite.  Wall time is recorded
+alongside as corroboration, with a deliberately generous bound.
+
+Three ladders:
+
+  data      same structure, raw data growing ~1000x.  Counters must not move.
+  filtered  same, with deflate.  Counters must not move -- a validator that
+            decompressed to inspect payload would show it here.
+  chunks    CONTROL: chunk count growing 100x, which is real metadata growth.
+            `walk_operations` MUST rise.  Without this the invariance above
+            could equally mean the counter is simply broken.
+
+The control is the part that makes the other two mean anything.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+OVERLAY = os.path.dirname(HERE)
+REPO = os.path.dirname(OVERLAY)
+H5POLICY = os.path.join(HERE, "h5policy")
+
+INVARIANT_COUNTERS = ("metadata_bytes_seen", "walk_operations")
+
+
+def build_ladders(outdir):
+    import h5py
+    import numpy as np
+
+    ladders = {"data": [], "filtered": [], "chunks": []}
+    for n in (16, 1_600, 160_000, 1_600_000):
+        p = os.path.join(outdir, f"data_{n}.h5")
+        with h5py.File(p, "w", libver="latest") as h:
+            h.create_dataset("d", data=np.arange(n, dtype="i4"), track_times=False)
+        ladders["data"].append((n, p))
+
+    # ONE chunk at every point: the chunk count is metadata, so letting it vary
+    # with n would measure metadata growth rather than data volume and confound
+    # the very thing this ladder isolates.
+    for n in (16, 1_600, 160_000, 1_600_000):
+        p = os.path.join(outdir, f"filt_{n}.h5")
+        with h5py.File(p, "w", libver="latest") as h:
+            h.create_dataset("d", data=np.arange(n, dtype="i4"),
+                             chunks=(n,), compression="gzip",
+                             track_times=False)
+        ladders["filtered"].append((n, p))
+
+    for nch in (4, 40, 400):
+        p = os.path.join(outdir, f"chunks_{nch}.h5")
+        with h5py.File(p, "w", libver="latest") as h:
+            h.create_dataset("d", shape=(nch * 10,), chunks=(10,),
+                             data=np.arange(nch * 10, dtype="i4"),
+                             track_times=False)
+        ladders["chunks"].append((nch, p))
+    return ladders
+
+
+def measure(path, repeats):
+    times = []
+    report = None
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        proc = subprocess.run([H5POLICY, "--profile", "untrusted-strict",
+                               "--json", path], capture_output=True, text=True)
+        times.append(time.perf_counter() - t0)
+        if report is None:
+            try:
+                report = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                return None
+    m, g = report.get("metrics", {}), report.get("geometry", {})
+    return {"physical_bytes": g.get("physical_bytes"),
+            "metadata_bytes_seen": m.get("metadata_bytes_seen"),
+            "walk_operations": m.get("walk_operations"),
+            "chunk_index_refs": m.get("chunk_index_refs"),
+            "seconds_best": round(min(times), 4)}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--counter-ratio", type=float, default=1.5,
+                    help="max/min bound on an invariant counter across a ladder")
+    ap.add_argument("--time-ratio", type=float, default=3.0,
+                    help="soft bound: slowest/fastest wall time across a ladder")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--output")
+    ap.add_argument("--keep", help="write the generated ladders here")
+    args = ap.parse_args()
+
+    try:
+        import h5py  # noqa: F401
+    except ImportError:
+        print("h5policy-lazy: h5py is required to build the ladders", file=sys.stderr)
+        return 0        # skip, matching how the suite degrades without optional tooling
+
+    outdir = args.keep or tempfile.mkdtemp(prefix="h5policy-lazy-")
+    os.makedirs(outdir, exist_ok=True)
+    ladders = build_ladders(outdir)
+
+    results, violations = {}, []
+    for name, points in ladders.items():
+        rows = []
+        for label, path in points:
+            r = measure(path, args.repeats)
+            if r is None:
+                violations.append({"ladder": name, "kind": "unparseable_report",
+                                   "point": label})
+                continue
+            r["point"] = label
+            rows.append(r)
+        results[name] = rows
+        if len(rows) < 2:
+            continue
+
+        if name == "chunks":
+            # Control: the counter must RISE with real metadata growth, or the
+            # invariance asserted below proves nothing about laziness.
+            ops = [r["walk_operations"] for r in rows]
+            if not all(b > a for a, b in zip(ops, ops[1:])):
+                violations.append({"ladder": name, "kind": "control_not_sensitive",
+                                   "walk_operations": ops})
+        else:
+            growth = rows[-1]["physical_bytes"] / max(1, rows[0]["physical_bytes"])
+            if growth < 100:
+                violations.append({"ladder": name, "kind": "ladder_too_shallow",
+                                   "growth": round(growth, 1)})
+            # The claim is that cost does not SCALE with data volume, not that
+            # it is bitwise identical: decoding a larger stored-size field can
+            # cost a few more operations without any payload being touched. A
+            # validator that read payload would grow with n, not by a constant.
+            # So bound the ratio while physical bytes grow >=100x.
+            for counter in INVARIANT_COUNTERS:
+                values = [r[counter] for r in rows]
+                ratio = max(values) / max(1, min(values))
+                if ratio > args.counter_ratio:
+                    violations.append({"ladder": name, "kind": "counter_scaled_with_data",
+                                       "counter": counter, "values": values,
+                                       "ratio": round(ratio, 3),
+                                       "data_growth": round(growth, 1)})
+            times = [r["seconds_best"] for r in rows]
+            ratio = max(times) / max(1e-9, min(times))
+            if ratio > args.time_ratio:
+                violations.append({"ladder": name, "kind": "wall_time_scaled_with_data",
+                                   "ratio": round(ratio, 2), "seconds": times})
+
+    report = {"schema_version": 1, "ladders": results,
+              "violations": violations, "total_violations": len(violations)}
+
+    if args.json or args.output:
+        text = json.dumps(report, indent=2, sort_keys=True)
+        if args.output:
+            open(args.output, "w").write(text + "\n")
+        else:
+            print(text)
+    else:
+        for name, rows in results.items():
+            tag = "CONTROL" if name == "chunks" else "invariant"
+            print(f"== {name} ladder ({tag})")
+            for r in rows:
+                print(f"   point={r['point']:<9} physical={r['physical_bytes']:<9}"
+                      f" metadata={r['metadata_bytes_seen']:<7}"
+                      f" walk_ops={r['walk_operations']:<7}"
+                      f" {r['seconds_best']}s")
+        for v in violations:
+            print(f"   VIOLATION {v}")
+        print(f"lazy validation: {len(violations)} violation(s)")
+    return 1 if violations else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

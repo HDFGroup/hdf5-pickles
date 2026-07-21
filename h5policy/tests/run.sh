@@ -150,6 +150,13 @@ echo "== truncation sweep (bounded) =="
     "$tests_dir/valid/nested_datatypes.h5"
 trunc_status=$?
 
+# Lazy-validation measurement (strategy-doc §12).  Asserts on deterministic
+# report counters rather than wall-clock, and includes a sensitivity control:
+# without it, invariant counters could equally mean the counters are broken.
+echo "== lazy validation =="
+"$overlay_dir/tools/h5policy-lazy" --repeats 1 | grep -E '^== |VIOLATION|lazy validation:'
+lazy_status=${PIPESTATUS[0]}
+
 # Semantic mutation family (h5mutate): generate the continuation family from the
 # valid seed and assert every typed mutant triggers its intended invariant's
 # finding.  This exercises h5policy's interval model against the full adversarial
@@ -170,9 +177,9 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
       && $matrix_status -eq 0 && $mut_status -eq 0 \
-      && $trunc_status -eq 0 ]]; then
+      && $trunc_status -eq 0 && $lazy_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status trunc=$trunc_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status trunc=$trunc_status lazy=$lazy_status)"
 exit 1

@@ -15,6 +15,7 @@ Four files plus a case directory, one schema version:
 | [`validation-coverage.yml`](validation-coverage.yml) | For each record family: which invariants exist (per [§5](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) and §11.5), which finding each maps to, where the oracle enforces it, which tests and fuzz targets cover it, and its migration status. |
 | [`h5cve-matrix-policy.yml`](h5cve-matrix-policy.yml) | Which exact-build canary statuses each fixture is permitted to report. `coverage_gap` and `unexercised` are visible outcomes, never aliases for success. |
 | [`libhdf5-evidence.yml`](libhdf5-evidence.yml) | **Generated.** What the selected libhdf5 build actually did, per record family, measured by the canary matrix. |
+| [`lazy-validation.json`](lazy-validation.json) | **Generated.** Measurement that validation cost tracks metadata rather than data volume, with a sensitivity control. |
 | [`truncation-sweep.json`](truncation-sweep.json) | **Generated.** Result of the §12 truncation sweep: every prefix of each seed, and whether coverage was exhaustive or sampled. |
 | [`verification-coverage.yml`](verification-coverage.yml) | **Generated.** Which of the [§12](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) verification requirements each record family demonstrably meets. |
 | [`cve-case.yml`](cve-case.yml) | The annotated **template** for a per-case record. Its fields are the §11.5 containment/systemic tracking block. |
@@ -138,8 +139,9 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 **50 of 176 requirement-slots are currently `met`.** The distribution matters
 more than the total:
 
-- Two requirements are `absent` for every family: lazy-validation performance
-  (no harness at all) and OSS-Fuzz integration.
+- OSS-Fuzz integration is the only requirement still `absent` for every family.
+- Lazy validation is `partial` everywhere: measured, and holding, but on the
+  oracle as a whole rather than family by family.
 - Three are `not_assessed` for every family — boundary counts, integer overflow
   versus allocation budget, and deep nesting versus non-progress. These are
   deliberately **not** inferred from finding-code spelling; settling them needs

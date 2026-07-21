@@ -16,6 +16,7 @@ tools/h5policy-crashfuzz -> ../h5policy/tools/h5policy-crashfuzz
 tools/h5policy-gencorpus -> ../h5policy/tools/h5policy-gencorpus
 tools/h5policy-probe     -> ../h5policy/tools/h5policy-probe
 tools/h5policy-truncate  -> ../h5policy/tools/h5policy-truncate
+tools/h5policy-lazy      -> ../h5policy/tools/h5policy-lazy
 tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
@@ -123,6 +124,36 @@ corpus sweep is on-demand, like the fuzzer.
 
 Results land in [`registry/truncation-sweep.json`](registry/truncation-sweep.json),
 which `h5cve verification` reads to score the §12 truncation requirement.
+
+## Lazy-Validation Measurement
+
+"Validation remains lazy" is falsifiable: the cost of validating a file must be
+a function of its **metadata**, not of how much raw data it carries.
+`tools/h5policy-lazy` measures that on the report's deterministic counters —
+`metadata_bytes_seen` and `walk_operations` — rather than wall-clock, which is
+dominated by interpreter startup and too noisy to assert on.
+
+```sh
+tools/h5policy-lazy                                  # human-readable
+tools/h5policy-lazy --output registry/lazy-validation.json
+```
+
+Three ladders, and the third is what makes the first two mean anything:
+
+| ladder | varies | expectation |
+|---|---|---|
+| `data` | raw data ~1000x, structure fixed | counters flat |
+| `filtered` | same with deflate, **one chunk throughout** | counters flat — a validator that decompressed to inspect payload would show it |
+| `chunks` | chunk count 100x — real metadata growth | `walk_operations` **must rise** |
+
+Without the control, flat counters could equally mean the counters are broken.
+The `filtered` ladder pins the chunk count deliberately: letting it vary with
+`n` would measure metadata growth rather than data volume.
+
+Counters are bounded by ratio, not equality — decoding a larger stored-size
+field can cost a few operations without any payload being touched, while a
+validator that read payload would grow with `n`. Current result: cost flat
+across a ~1000x data increase, with the control rising 375 → 987 → 7107.
 
 ## h5mutate Semantic Mutation Engine
 
