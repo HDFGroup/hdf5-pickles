@@ -35,6 +35,9 @@ overlay_dir="$(cd -- "$tests_dir/.." && pwd)"
 repo_dir="$(cd -- "$overlay_dir/.." && pwd)"
 export POKE_LOAD_PATH="$overlay_dir/pickles:$repo_dir/pickles${POKE_LOAD_PATH:+:$POKE_LOAD_PATH}"
 
+echo "== registry consistency =="
+python3 "$repo_dir/tools/check_registry.py" || exit 1
+
 echo "== generating corpus =="
 "$overlay_dir/tools/h5policy-gencorpus" "$tests_dir" || exit 1
 
@@ -100,6 +103,19 @@ else
     echo "  skipped: h5cc or cc unavailable"
 fi
 
+# Full expected-fixture canary matrix.  The versioned policy records which
+# activation violations are intentional regressions for the selected build;
+# coverage_gap and unexercised remain visible in the JSON artifact.
+echo "== h5cve expected-fixture matrix =="
+matrix_status=0
+matrix_artifact="${H5CVE_MATRIX_ARTIFACT:-/tmp/h5cve-matrix.json}"
+if command -v h5cc >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
+    "$repo_dir/tools/h5cve" matrix --output "$matrix_artifact" || matrix_status=1
+    echo "  artifact: $matrix_artifact"
+else
+    echo "  skipped: h5cc or cc unavailable"
+fi
+
 # h5cve orchestrator smoke: init + triage must map the continuation fixture's
 # primary finding to its registry invariant.  Exercises the tool <-> registry
 # wiring without the exact-build toolchain (triage needs only h5policy + PyYAML).
@@ -142,9 +158,9 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $seam_status -eq 0 && $report_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
-      && $mut_status -eq 0 ]]; then
+      && $matrix_status -eq 0 && $mut_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status cve=$cve_status mut=$mut_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status)"
 exit 1

@@ -45,6 +45,7 @@ import os
 import shutil
 import subprocess
 import sys
+import glob
 
 try:
     import yaml
@@ -203,6 +204,85 @@ def cmd_init(args):
 
 # -------------------------------------------------------------- triage --------
 
+def cmd_census(args):
+    files = sorted(glob.glob(os.path.join(os.path.abspath(args.root), "**", "*.h5"), recursive=True))
+    counts = {}
+    for inp in files:
+        rep, rc = run_json([H5POLICY, "--profile", "untrusted-strict", "--json", inp], timeout=60)
+        key = rep.get("findings", [{}])[0].get("code") if rep.get("findings") else rep.get("decision", "error")
+        counts[key] = counts.get(key, 0) + 1
+    print(json.dumps({"root": os.path.abspath(args.root), "specimens": len(files), "by_primary_finding": counts}, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_matrix(args):
+    """Run registry-selected canaries for the expected-fixture matrix."""
+    findings = yaml.safe_load(open(FINDINGS_YML)).get("findings", {})
+    policy = yaml.safe_load(open(args.policy)) if args.policy else {"defaults": {}}
+    defaults = policy.get("defaults", {}).get("allowed_statuses", [])
+    overrides = policy.get("fixture_overrides", {})
+    rows = []
+    for path in sorted(glob.glob(os.path.join(EXPECTED_DIR, "*.yml"))):
+        expected = yaml.safe_load(open(path)) or {}
+        if expected.get("allow_missing_file"):
+            continue
+        codes = expected.get("required_findings", []) or []
+        fixture_policy = expected.get("h5cve", {}) or {}
+        entry = next((findings.get(c) for c in codes if findings.get(c)), None)
+        # The matrix has no finding message to resolve a shared code with, so an
+        # ambiguous entry supplies no default family; such a fixture must name
+        # its family explicitly or be reported as a coverage gap.
+        default_record = None if (entry or {}).get("ambiguous") \
+            else (entry.get("record") if entry else None)
+        # Registry association alone selects a diagnostic candidate, not an
+        # allowed verification result.  A fixture must state its family and
+        # permitted status explicitly before the exact-build canary is allowed
+        # to claim exercised coverage.
+        if not fixture_policy:
+            rows.append({"expectation": os.path.basename(path),
+                         "fixture": expected.get("file"), "record": default_record,
+                         "status": "coverage_gap", "h5cve_policy": fixture_policy})
+            continue
+        requested = fixture_policy.get("families", [fixture_policy.get("family", default_record)])
+        if not isinstance(requested, list):
+            requested = [requested]
+        if not entry and not any(requested):
+            rows.append({"expectation": os.path.basename(path), "fixture": expected.get("file"),
+                         "status": "coverage_gap",
+                         "h5cve_policy": fixture_policy})
+            continue
+        fixture = os.path.join(REPO, "h5policy", "tests", expected["file"])
+        for record in requested:
+            per_family = fixture_policy.get("family_policies", {}).get(record, {})
+            effective_policy = {**fixture_policy, **per_family}
+            effective_policy.pop("family_policies", None)
+            exercise = CANARY_BY_RECORD.get(record)
+            if not exercise:
+                rows.append({"expectation": os.path.basename(path), "fixture": expected["file"], "record": record,
+                             "status": "coverage_gap", "h5cve_policy": effective_policy})
+                continue
+            rep, _ = _probe(fixture, args.baseline, exercise)
+            canary = _canary_summary(rep, None, exercise)
+            alignment = _oracle_alignment(rep, expected.get("expected_decision"))
+            if effective_policy.get("require_oracle_alignment") and alignment == "divergent":
+                canary["status"] = "violation"
+            rows.append({"expectation": os.path.basename(path), "fixture": expected["file"], "record": record,
+                         "exercise": exercise, "oracle_alignment": alignment,
+                         "h5cve_policy": effective_policy, **canary})
+    for row in rows:
+        fixture_policy = row.pop("h5cve_policy", {})
+        permitted = fixture_policy.get("allowed_statuses",
+                    overrides.get(row.get("fixture"), {}).get("allowed_statuses", defaults))
+        row["allowed"] = row["status"] in permitted
+    report = {"policy": args.policy, "rows": rows}
+    rendered = json.dumps(report, indent=2, sort_keys=True)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(rendered + "\n")
+    else:
+        print(rendered)
+    return 0 if all(r["allowed"] for r in rows) else 2
+
 def _primary_finding(report):
     """The finding that best names the defect: the first corrupt one, else the
     first finding at all."""
@@ -211,6 +291,61 @@ def _primary_finding(report):
         if f.get("class") == "corrupt" or f.get("severity") == "corrupt":
             return f
     return findings[0] if findings else None
+
+
+def resolve_finding(code, message, findings_reg):
+    """Map an emitted finding to its record/invariant using its message.
+
+    Twenty catalogued codes are emitted by more than one walker (a checksum or
+    an out-of-file address means something different in a chunk index than in an
+    object header), so the catalog's top-level record/invariant names only ONE
+    of a code's roles.  Those entries carry `ambiguous: true` plus an ordered
+    `contexts` list matched against the finding message -- the only per-
+    occurrence discriminator h5policy reports, since messages are composed at
+    the emission site.
+
+    Returns a mapping with a `confidence`:
+      exact       a context matched; record (and invariant, when catalogued)
+      default     the code is unambiguous; the top-level mapping applies
+      ambiguous   ambiguous code, no context matched -- nothing is asserted and
+                  `candidates` lists the roles the catalog knows about
+      uncatalogued  the code is not in findings.yml at all
+
+    An ambiguous code with no matching context yields NO record/invariant on
+    purpose: an unnamed invariant is a visible gap, a wrong one is a wrong fix.
+    """
+    entry = findings_reg.get(code)
+    if not entry:
+        return {"confidence": "uncatalogued", "record": None, "invariant": None,
+                "scope": None, "candidates": [], "matched_context": None}
+    if not entry.get("ambiguous"):
+        return {"confidence": "default", "record": entry.get("record"),
+                "invariant": entry.get("invariant"), "scope": entry.get("scope"),
+                "candidates": [], "matched_context": None}
+
+    contexts = entry.get("contexts") or []
+    for ctx in contexts:
+        if message and ctx.get("match") and ctx["match"] in message:
+            # When the context names the same role the catalog entry describes,
+            # the entry's other fields apply; otherwise only what the context
+            # states is trustworthy.
+            same_role = ctx.get("record") == entry.get("record")
+            return {
+                "confidence": "exact",
+                "record": ctx.get("record"),
+                "invariant": ctx.get("invariant") or
+                             (entry.get("invariant") if same_role else None),
+                "scope": ctx.get("scope") or
+                         (entry.get("scope") if same_role else None),
+                "candidates": [],
+                "matched_context": ctx.get("match"),
+                "evidence": ctx.get("evidence"),
+            }
+
+    candidates = sorted({c.get("record") for c in contexts if c.get("record")} |
+                        ({entry.get("record")} if entry.get("record") else set()))
+    return {"confidence": "ambiguous", "record": None, "invariant": None,
+            "scope": None, "candidates": candidates, "matched_context": None}
 
 
 def cmd_triage(args):
@@ -267,33 +402,60 @@ def cmd_triage(args):
     coverage = yaml.safe_load(open(COVERAGE_YML)).get("records", []) \
         if os.path.exists(COVERAGE_YML) else []
 
+    code = prim.get("code") if prim else None
+    msg = prim.get("message") if prim else None
     case["oracle"] = {
         "profile": "untrusted-strict",
         "decision": strict.get("decision"),
-        "primary_finding": prim.get("code") if prim else None,
+        "primary_finding": code,
+        # The message is what disambiguates a shared code, so the case records
+        # the exact text the mapping was resolved from.
+        "primary_finding_message": msg,
         "object_path": prim.get("object") if prim else None,
         "offset": offset,
     }
 
-    code = prim.get("code") if prim else None
     case["reproducers"]["assertions"]["stable_finding"] = code is not None
     entry = findings_reg.get(code)
-    if entry:
-        case["record"] = entry.get("record")
-        case["versions"] = entry.get("versions", [])
-        case["violated_invariant"] = entry.get("invariant")
-        case["root_cause_classification"] = SCOPE_TO_CLASS.get(entry.get("scope"),
-                                                               entry.get("scope"))
+    mapping = resolve_finding(code, msg, findings_reg)
+    case["mapping"] = mapping
+
+    if mapping["record"]:
+        case["record"] = mapping["record"]
+        case["versions"] = entry.get("versions", []) if entry else []
+        case["violated_invariant"] = mapping["invariant"]
+        case["root_cause_classification"] = SCOPE_TO_CLASS.get(mapping["scope"],
+                                                               mapping["scope"])
         # semantic boundary + closure hint from the coverage manifest
         for rec in coverage:
-            if rec.get("record") == entry.get("record"):
+            if rec.get("record") == mapping["record"]:
                 case["systemic"]["semantic_boundary"] = rec.get("semantic_boundary")
                 case["validation_closure"] = rec.get("semantic_boundary")
                 break
+        if mapping["invariant"]:
+            case["coverage_manifest_change"] = \
+                f"{mapping['record']} already covered " \
+                f"(invariant {mapping['invariant']})"
+            note = (f"mapped {code} -> {mapping['invariant']} "
+                    f"[{mapping['scope']}] via registry "
+                    f"({mapping['confidence']})")
+        else:
+            # Family resolved, invariant not catalogued: still enough to select
+            # the right exact-build canary, and it names the registry gap.
+            case["coverage_manifest_change"] = \
+                f"TODO: {mapping['record']} has no catalogued invariant for " \
+                f"{code} in this context ({msg!r})"
+            note = (f"mapped {code} -> record {mapping['record']} "
+                    f"(no catalogued invariant for this context; "
+                    f"add one to validation-coverage.yml)")
+    elif mapping["confidence"] == "ambiguous":
         case["coverage_manifest_change"] = \
-            f"{entry.get('record')} already covered (invariant {entry.get('invariant')})"
-        note = f"mapped {code} -> {entry.get('invariant')} " \
-               f"[{entry.get('scope')}] via registry"
+            f"TODO: add a `contexts` entry for {code} matching {msg!r}"
+        note = (f"finding {code} is emitted by more than one walker and no "
+                f"`contexts` rule matches {msg!r}; candidates: "
+                f"{', '.join(mapping['candidates']) or 'none'}. "
+                "Invariant deliberately left unset -- add a contexts rule to "
+                "registry/findings.yml rather than assuming the default.")
     else:
         note = (f"finding {code!r} is not catalogued in registry/findings.yml; "
                 "triage fields left for manual completion (registry coverage gap)")
@@ -309,6 +471,24 @@ def cmd_triage(args):
 # -------------------------------------------------------------- verify --------
 
 CANARY_BY_RECORD = {
+    "datatypes": "datatype",
+    "dataspace_dimension": "dataspace",
+    "dataset_layout_filter_fill": "dataset_layout",
+    "btree_heap_index": "btree",
+    "address_space_bounds": "address_space",
+    "chunk_index": "chunk_index",
+    "dense_index": "dense_index",
+    "heap_structures": "heap_structures",
+    "shared_messages_legacy": "shared_messages_legacy",
+    "cache_image_dependency_graph": "cache_image",
+    "message_envelope": "message_envelope",
+    # Continuation chunks are decoded as part of object-header materialization,
+    # which is exactly what the message_envelope exercise drives; the family had
+    # no canary at all before, so its fixtures could only ever report
+    # coverage_gap.  validation_controls deliberately has none: it is a controls
+    # family (budgets, base address, free-space managers, profile validity) with
+    # no single traversal surface to exercise.
+    "object_header_continuation": "message_envelope",
     "external_link": "external_link",
     "external_file_list": "external_file_list",
     "virtual_dataset": "virtual_dataset",
@@ -337,10 +517,13 @@ def cmd_verify(args):
     base, base_rc = _probe(inp, args.baseline, exercise)
     json.dump(base, open(os.path.join(cdir, "baseline-result.json"), "w"), indent=2)
     result = {"baseline": _probe_summary(base)}
+    oracle_decision = case.get("oracle", {}).get("decision")
+    result["baseline"]["oracle_alignment"] = _oracle_alignment(base, oracle_decision)
     if args.candidate:
         cand, cand_rc = _probe(inp, args.candidate, exercise)
         json.dump(cand, open(os.path.join(cdir, "candidate-result.json"), "w"), indent=2)
         result["candidate"] = _probe_summary(cand)
+        result["candidate"]["oracle_alignment"] = _oracle_alignment(cand, oracle_decision)
 
     result["canary"] = _canary_summary(base, canary_status, exercise)
     result["baseline"]["status"] = result["canary"]["status"]
@@ -349,6 +532,8 @@ def cmd_verify(args):
         result["candidate"]["canary"] = _canary_summary(cand, canary_status, exercise)
         result["candidate"]["status"] = result["candidate"]["canary"]["status"]
         result["candidate"]["entry_points_exercised"] = result["candidate"]["canary"]["entry_points_exercised"]
+        result["comparison"] = _comparison_verdict(result["baseline"],
+                                                     result["candidate"])
     case["verification"] = {"exact_build_probe": result}
 
     # Fold the OS-observable assertions into the reproducer block from the
@@ -379,12 +564,15 @@ def cmd_verify(args):
 def _probe_summary(rep):
     return {
         "outcome": rep.get("outcome"),
+        "exercise": (rep.get("probe") or {}).get("exercise"),
         "libhdf5_version": rep.get("build", {}).get("libhdf5_version"),
         "linked_library": rep.get("build", {}).get("linked_library"),
         "settings_sha256": rep.get("build", {}).get("settings_sha256"),
         "activation": {k: v.get("count") for k, v in
                        rep.get("activation", {}).items()},
         "violations": rep.get("violations", []),
+        "post_open_call_errors": (rep.get("probe") or {}).get(
+            "materialization", {}).get("call_errors", 0),
         "entry_points": [e.get("name") for e in
                          (rep.get("probe") or {}).get("entry_points", [])],
     }
@@ -399,16 +587,89 @@ def _canary_summary(rep, forced_status=None, exercise=None):
     else:
         eps = (rep.get("probe") or {}).get("entry_points", [])
         exercised = [e.get("name") for e in eps if e.get("calls", 0)]
+        succeeded = {e.get("name") for e in eps if e.get("successes", 0)}
         required = {"external_link": ("H5Lvisit2", "H5Oopen"),
                     "external_file_list": ("H5Dread", "H5Dwrite"),
-                    "virtual_dataset": ("H5Dread",)}.get(exercise, ())
-        status = forced_status or ("verified" if all(x in exercised for x in required)
+                    "virtual_dataset": ("H5Dread",),
+                    "datatype": ("H5Tget_size", "H5Tget_class",
+                                  "H5Tget_nmembers"),
+                    "dataspace": ("H5Sget_simple_extent_npoints", "H5Dread"),
+                    "dataset_layout": ("H5Dget_create_plist", "H5Dread"),
+                    "btree": ("H5Lvisit2", "H5Oopen"),
+                    "address_space": ("H5Fopen", "H5Fget_create_plist", "H5Pget_userblock",
+                                      "H5Fget_eoa", "H5Fget_filesize", "H5Ovisit3"),
+                    "chunk_index": ("H5Ovisit3", "H5Dopen2", "H5Sselect_elements", "H5Dread"),
+                    "dense_index": ("H5Lvisit2",),
+                    "heap_structures": ("H5Ovisit3", "H5Aopen_by_idx", "H5Aread"),
+                    "shared_messages_legacy": ("H5Ovisit3", "H5Aopen_by_idx", "H5Aget_type"),
+                    "message_envelope": ("H5Ovisit3", "H5Oopen",
+                                          "H5Gget_create_plist"),
+                    "legacy_messages": ("H5Ovisit3", "H5Gget_info"),
+                    "cache_image": ("H5Fget_mdc_image_info", "H5Fget_mdc_size",
+                                    "H5Fget_filesize", "H5Ovisit3")}.get(exercise, ())
+        traversal_modes = {"btree", "chunk_index", "dense_index",
+                           "heap_structures", "shared_messages_legacy", "cache_image",
+                           "message_envelope", "legacy_messages"}
+        traversed = (rep.get("probe") or {}).get("materialization", {}).get(
+            "traversal_calls", 0)
+        family_completed = (rep.get("probe") or {}).get(
+            "family_exercise", {}).get("completed", 0)
+        # A generic successful open is not evidence: the selected family mode
+        # and every required traversal entry point must have been called.
+        selected = (rep.get("probe") or {}).get("exercise")
+        if exercise and selected != exercise:
+            return {"status": "unexercised", "entry_points_exercised": exercised,
+                    "violations": rep.get("violations", [])}
+        status = forced_status or ("verified" if all(x in succeeded for x in required)
+                                   and (exercise not in traversal_modes or traversed > 0)
+                                   and (exercise in (None, "generic") or family_completed > 0)
                                    else "unexercised")
     return {"status": status,
+            "family_exercise": (rep.get("probe") or {}).get("family_exercise", {}),
             "entry_points_exercised": [e.get("name") for e in
                 (rep.get("probe") or {}).get("entry_points", [])
                 if e.get("calls", 0)],
             "violations": rep.get("violations", [])}
+
+
+def _comparison_verdict(baseline, candidate):
+    """A conservative release verdict; unknown evidence never becomes a pass."""
+    blocked = {"unexercised", "coverage_gap", "build_unavailable"}
+    before, after = baseline["status"], candidate["status"]
+    if baseline.get("oracle_alignment") == "divergent" and \
+       candidate.get("oracle_alignment") == "aligned":
+        return "fixed"
+    if candidate.get("oracle_alignment") == "divergent":
+        return "regression"
+    if before in blocked or after in blocked:
+        return "inconclusive"
+    if before == "violation" and after == "verified":
+        return "fixed"
+    if before != "violation" and after == "violation":
+        return "regression"
+    if before == after:
+        return "unchanged"
+    return "inconclusive"
+
+
+def _oracle_alignment(rep, oracle_decision):
+    """Compare the oracle's decision with what the build under test did.
+
+    Only `reject_corrupt` is a claim ABOUT THE FILE that libhdf5 can agree or
+    disagree with.  `reject_resource` and `reject_policy` are decisions about
+    the selected PROFILE -- a traversal budget or a denied feature -- and
+    libhdf5 has no equivalent, so it accepting such a file is expected by design
+    and must not be reported as a divergence.
+    """
+    if not oracle_decision:
+        return "unknown"
+    if oracle_decision == "accept":
+        return "aligned" if rep.get("outcome") == "accepted" else "divergent"
+    if oracle_decision == "reject_corrupt":
+        return "aligned" if rep.get("outcome") != "accepted" else "divergent"
+    if oracle_decision.startswith("reject_"):
+        return "not_comparable"
+    return "unknown"
 
 
 # ------------------------------------------------ minimize / variants ---------
@@ -511,6 +772,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("census", help="read-only oracle census of an HDF5 tree")
+    p.add_argument("root")
+    p.set_defaults(fn=cmd_census)
+
+    p = sub.add_parser("matrix", help="run registry canaries for expected fixtures")
+    p.add_argument("--baseline", help="bindir of the build under test")
+    p.add_argument("--policy", default=os.path.join(REPO, "registry", "h5cve-matrix-policy.yml"))
+    p.add_argument("--output", help="write the JSON matrix artifact to this path")
+    p.set_defaults(fn=cmd_matrix)
 
     p = sub.add_parser("init", help="new case bundle from a PoC")
     p.add_argument("id"); p.add_argument("--poc", required=True)

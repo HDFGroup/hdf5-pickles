@@ -85,6 +85,18 @@ def _write_fsm_persist(path, fn):
         fn(h)
 
 
+def _write_cache_image(path):
+    """Create a valid on-disk metadata cache image through public C APIs."""
+    source = os.path.join(os.path.dirname(__file__), "probe", "make_cache_image.c")
+    with tempfile.TemporaryDirectory() as build:
+        helper = os.path.join(build, "make_cache_image")
+        subprocess.run(["h5cc", "-O2", "-o", helper, source], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        subprocess.run([helper, path], check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+
+
 def _base_bytes(build, libver="latest"):
     """Return the raw bytes of a fresh h5py base file.
 
@@ -119,6 +131,7 @@ def _gen_valid(root):
     simple_path = f"{root}/valid/simple_dataset.h5"
     _write(simple_path,
            lambda h: h.create_dataset("a", data=np.arange(6, dtype="i4")))
+    _write_cache_image(f"{root}/valid/cache_image.h5")
     # Extra physical bytes after the superblock's declared EOA are legal and
     # remain outside the metadata address space.  This fixture pins geometry
     # reporting without turning a trailer into a corruption finding.
@@ -337,6 +350,9 @@ def _gen_policy(root):
     _write(f"{root}/policy/vds_absolute_source.h5", _vds_absolute_source)
     _make_vds_nentries_overflow(
         f"{root}/cve/vds_nentries_mult_overflow.h5",
+        f"{root}/policy/vds_absolute_source.h5")
+    _make_vds_nentries_overcount(
+        f"{root}/malformed/vds_nentries_overcount.h5",
         f"{root}/policy/vds_absolute_source.h5")
 
 
@@ -757,6 +773,8 @@ def _gen_malformed(root):
         f"{root}/valid/fsm_persist.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
+    _make_contiguous_data_past_eof(
+        f"{root}/malformed/contiguous_data_past_eof.h5")
     _make_bad_dataset_missing_layout(
         f"{root}/malformed/bad_dataset_missing_layout.h5")
     _make_bad_compact_layout_overrun(
@@ -1393,6 +1411,40 @@ def _make_vds_nentries_overflow(path, base_path):
     if obj_size < 13 or data + obj_size > len(raw):
         raise RuntimeError("generated VDS heap object geometry changed")
     struct.pack_into("<Q", raw, data + 1, 0x2000000000000000)
+    checksum = data + obj_size - 4
+    struct.pack_into("<I", raw, checksum,
+                     _jenkins_lookup3()(bytes(raw[data:checksum])))
+    _patch(path, raw)
+
+
+def _make_vds_nentries_overcount(path, base_path):
+    """VDS mapping count overstated by one, rather than made absurd.
+
+    The sibling cve/vds_nentries_mult_overflow.h5 sets the count to 2^61 so the
+    allocation arithmetic overflows, and the selected libhdf5 CRASHES on it --
+    which makes it useless as a canary specimen, since the probe forbids crash
+    and never reaches the family surface at all.
+
+    Overstating the count by one instead keeps the arithmetic ordinary: libhdf5
+    opens the file (h5ls -r exits 0) and rejects when it decodes the second,
+    non-existent mapping (h5dump exits 1), with no crash and no source-file
+    open.  That is what makes this the virtual_dataset canary specimen.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    # create_virtual_dataset can't set track_times=False; pin the timestamps so
+    # this fixture stays byte-reproducible.
+    _pin_ohdr_times(raw)
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError("generated VDS fixture has no global heap")
+    data = gcol + 32
+    obj_size = struct.unpack_from("<Q", raw, gcol + 24)[0]
+    if obj_size < 13 or data + obj_size > len(raw):
+        raise RuntimeError("generated VDS heap object geometry changed")
+    nentries = struct.unpack_from("<Q", raw, data + 1)[0]
+    if nentries != 1:
+        raise RuntimeError(f"expected a single-mapping VDS base, got {nentries}")
+    struct.pack_into("<Q", raw, data + 1, nentries + 1)
     checksum = data + obj_size - 4
     struct.pack_into("<I", raw, checksum,
                      _jenkins_lookup3()(bytes(raw[data:checksum])))
@@ -2568,8 +2620,13 @@ def _make_bad_message_count_compat(path):
 
 
 def _make_bad_link_name_charset(path, base_path):
-    """ASCII compact-link name containing a high-bit byte.  h5py/libhdf5 rejects
-    this during link traversal even though the enclosing object header is valid."""
+    """ASCII compact-link name containing a high-bit byte.
+
+    libhdf5 does NOT reject this -- h5dump, h5ls and h5py all traverse the file
+    and hand back the name with its high-bit byte, so the declared charset is
+    unenforced.  h5policy is deliberately stricter; see
+    registry/cases/link-name-charset-unenforced.yml.
+    """
     raw = bytearray(open(base_path, "rb").read())
     name = b"dataset_with_a_long_name_00"
     off = raw.find(name)
@@ -2740,6 +2797,69 @@ def _make_bad_contiguous_layout_size(path):
     if off < 0:
         raise RuntimeError("could not locate the rank-1 dataspace message")
     struct.pack_into("<Q", raw, off + 16, 0)
+    _patch(path, bytes(raw))
+
+
+def _contiguous_layout_payload(raw):
+    """Locate the first v3/v4 CONTIGUOUS Data Layout message (type 0x08) in any
+    version-2 object header: (payload_offset, containing_ohdr_offset).
+
+    The dataset's layout message lives in the DATASET's object header, not the
+    root's, so this scans every OHDR rather than following the root chain."""
+    pos = 0
+    while True:
+        ohdr = raw.find(b"OHDR", pos)
+        if ohdr < 0:
+            raise RuntimeError("could not locate a contiguous layout message")
+        pos = ohdr + 4
+        if raw[ohdr + 4] != 2:
+            continue
+        flags = raw[ohdr + 5]
+        cursor = ohdr + 6 + (16 if flags & (1 << 5) else 0) \
+            + (4 if flags & (1 << 4) else 0)
+        size_width = 1 << (flags & 3)
+        chunk_size = int.from_bytes(raw[cursor:cursor + size_width], "little")
+        mstart = cursor + size_width
+        mend = mstart + chunk_size
+        prefix = 4 + (2 if flags & 0x04 else 0)
+        i = mstart
+        while i + prefix <= mend:
+            mtype = raw[i]
+            msize = struct.unpack_from("<H", raw, i + 1)[0]
+            payload = i + prefix
+            if mtype == 0x08 and raw[payload] in (3, 4) and raw[payload + 1] == 1:
+                return payload, ohdr
+            i = payload + msize
+
+
+def _make_contiguous_data_past_eof(path):
+    """Contiguous dataset whose data ADDRESS is inside the file but whose data
+    RANGE ends past the end-of-file.
+
+    Deliberately distinct from inflated_eoa_ext_addr, which libhdf5 refuses at
+    open: the superblock here is untouched and valid, so libhdf5 opens the file
+    (h5ls -r succeeds) and only trips when the dataset itself is opened or read.
+    That is what makes this the address_space_bounds canary specimen -- the
+    family's other fixtures are rejected at H5Fopen, so the probe never reaches
+    the family surface and the canary proves nothing.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(6, dtype="i4"),
+                                   track_times=False))
+    assert raw[8] in (2, 3) and raw[9] == 8, "expected a v3 superblock, 8-byte offsets"
+    # track_times=False pins the dataset header only; the root group still
+    # embeds wall-clock times, so the fixture drifts without this.
+    _pin_ohdr_times(raw)
+    eof = int.from_bytes(raw[12 + 2 * 8:12 + 3 * 8], "little")
+    payload, ohdr = _contiguous_layout_payload(raw)
+    size = int.from_bytes(raw[payload + 10:payload + 18], "little")
+    assert size > 1, "contiguous dataset has no storage to overrun"
+    # Address stays below EOF (so no superblock/open-time check fires) while
+    # address + size runs past it.
+    new_addr = eof - size // 2
+    assert new_addr < eof < new_addr + size
+    struct.pack_into("<Q", raw, payload + 2, new_addr)
+    _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 
 

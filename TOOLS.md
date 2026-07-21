@@ -37,7 +37,43 @@ h5cve verify <case> --baseline BINDIR [--candidate BINDIR]   # exact-build probe
 h5cve variants <case> [--seed VALID]        # typed semantic variants via h5mutate
 h5cve minimize <case>                        # deferred: structure-aware reducer
 h5cve promote <case>                        # draft tests expectation + registry case
+h5cve census <root>                         # read-only oracle census of an HDF5 tree
+h5cve matrix [--baseline BINDIR] [--output F]  # exact-build canary matrix
 ```
+
+`triage` names the violated invariant from the primary finding. Twenty finding
+codes are emitted by more than one walker, so the mapping is resolved with the
+finding **message** via the `contexts` rules in `registry/findings.yml`. When no
+rule matches, triage asserts **nothing** and reports the candidate families
+instead — an unnamed invariant is a visible gap, a wrong one is a wrong fix.
+
+## Exact-Build Canary Matrix
+
+`h5cve matrix` runs the selected libhdf5 build against every corpus fixture that
+declares an `h5cve` contract, and reports one row per fixture/family:
+
+| status | meaning |
+|---|---|
+| `verified` | the family exercise ran and every required entry point succeeded |
+| `unexercised` | the exercise was selected but did not complete — typically because libhdf5 rejected the file, which is the expected result for a malformed fixture |
+| `violation` | a forbidden activation occurred, or the build diverged from the oracle where the fixture requires alignment |
+| `coverage_gap` | no canary exists for that family, or the fixture declares no contract |
+
+[`registry/h5cve-matrix-policy.yml`](registry/h5cve-matrix-policy.yml) pins which
+statuses each fixture may report; the matrix exits non-zero on anything else. A
+fixture must state its family and permitted statuses explicitly, so a new canary
+or a changed traversal surface cannot silently inherit a passing outcome.
+
+Only `reject_corrupt` is compared against the build for alignment.
+`reject_resource` and `reject_policy` are decisions about the selected *profile*
+— a traversal budget or a denied feature — which libhdf5 has no equivalent of,
+so those rows report `not_comparable` rather than a divergence.
+
+A canary that passes on a valid fixture does not show it could detect a defect.
+Each family therefore also needs a malformed fixture that libhdf5 opens
+successfully and that carries the family's defect: one rejected at `H5Fopen`
+never reaches the family surface at all. All 15 families with canaries currently
+have such a specimen.
 
 ## h5mutate Semantic Mutation Engine
 

@@ -11,6 +11,20 @@ controlled outcome; a change that alters any decision is surfaced for review.
   `external_open`, `plugin_load`, `write`). A fixture can be reused by several
   expectations. Every report is also checked for schema version 1 and internally
   consistent file geometry; `expected_geometry` can pin individual values.
+  An optional `h5cve` block declares the fixture's exact-build canary contract:
+
+  ```yaml
+  h5cve:
+    family: chunk_index              # registry record whose exercise to run
+    require_oracle_alignment: true   # a divergence from libhdf5 is a violation
+    allowed_statuses: [unexercised, verified]
+  ```
+
+  The contract is what `../../tools/h5cve matrix` consumes; a fixture without one
+  is reported as a coverage gap rather than inheriting a pass. `allowed_statuses`
+  states intent, not observation — a fixture permitted to report `violation`
+  carries a comment saying why, and the reason is recorded in
+  `../../registry/cases/`.
 - `unit_datatype.pk` — synthetic checks for the bounded, depth-guarded
   datatype validator (recursion cap and truncation handling), run under poke.
 - `unit_messages.pk` — fixed-envelope and dispatch checks for old/new mtime,
