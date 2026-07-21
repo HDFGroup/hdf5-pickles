@@ -50,6 +50,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import resource
 import shutil
 import subprocess
@@ -74,6 +75,15 @@ def _is_runtime_noise(rp):
     /etc or /usr prefix allowlist would defeat the tracer's purpose."""
     base = os.path.basename(rp)
     if ".so" in base:                          # shared objects, any version suffix
+        return True
+    # Separated debug info an in-process symbolizer reads while formatting a
+    # crash report (the ASAN build is the motivating case): the split-debuglink
+    # (*.debug), the /usr/lib/debug tree, and .build-id / .debug lookup dirs.
+    # None is ever a legitimate HDF5 external-data target, so filtering them
+    # keeps a real /etc/passwd-style read visible while dropping symbolizer noise.
+    if base.endswith(".debug") or rp.startswith("/usr/lib/debug"):
+        return True
+    if "/.build-id/" in rp or "/.debug/" in rp:
         return True
     if rp.startswith(("/proc/", "/sys/", "/dev/")):
         return True
@@ -139,13 +149,31 @@ def build_identity(h5cc):
     return ident
 
 
+def is_asan(ident):
+    """True when the build under test is AddressSanitizer-instrumented.
+
+    Derived from the linked build's own CFLAGS (build_identity), so it reflects
+    the library we will actually load -- not a flag we chose.  This gates the
+    ASAN-specific handling everywhere: the harness must be built with ASAN so
+    libasan initializes ahead of the instrumented libhdf5, and RLIMIT_AS must be
+    dropped because ASAN reserves a ~20 TB shadow at startup that a 2 GB address
+    cap would refuse.
+    """
+    return any("address" in s for s in ident.get("sanitizers", []))
+
+
+# Bumped whenever the compile recipe below changes so old cache dirs recompile.
+_PROBE_BUILD_RECIPE = "v2-asan"
+
+
 def ensure_built(h5cc, ident, as_json):
     """Compile probe (against the selected build) and interposer, cached by a
     key over the toolchain + config so a build swap recompiles."""
     if not shutil.which("cc"):
         _die_skip("cc not found; cannot build the activation interposer", as_json)
+    asan = is_asan(ident)
     key = hashlib.sha256(
-        (ident["h5cc"] + ident.get("settings_sha256", "") +
+        (ident["h5cc"] + ident.get("settings_sha256", "") + _PROBE_BUILD_RECIPE +
          str(os.path.getmtime(PROBE_SRC)) + str(os.path.getmtime(TRACE_SRC))
          ).encode()).hexdigest()[:16]
     bdir = os.path.join(BUILD_ROOT, key)
@@ -154,9 +182,17 @@ def ensure_built(h5cc, ident, as_json):
     if os.path.exists(probe) and os.path.exists(trace):
         return probe, trace
     os.makedirs(bdir, exist_ok=True)
+    # Match the library's instrumentation: an ASAN libhdf5 requires the main
+    # executable to carry -fsanitize=address (libasan must be the first runtime
+    # loaded).  The LD_PRELOAD interposer stays uninstrumented -- it only wraps
+    # open()/etc. via dlsym and needs no shadow of its own.
+    probe_cmd = [h5cc, "-O2", "-o", probe, PROBE_SRC]
+    if asan:
+        probe_cmd = [h5cc, "-O1", "-g", "-fno-omit-frame-pointer",
+                     "-fsanitize=address", "-o", probe, PROBE_SRC]
     try:
-        subprocess.run([h5cc, "-O2", "-o", probe, PROBE_SRC],
-                       check=True, capture_output=True, text=True, timeout=120)
+        subprocess.run(probe_cmd,
+                       check=True, capture_output=True, text=True, timeout=180)
         subprocess.run(["cc", "-O2", "-fPIC", "-shared", "-o", trace, TRACE_SRC,
                         "-ldl"], check=True, capture_output=True, text=True,
                        timeout=120)
@@ -165,11 +201,16 @@ def ensure_built(h5cc, ident, as_json):
     return probe, trace
 
 
-def _limits(cpu, mem_mb, fsize_mb):
+def _limits(cpu, mem_mb, fsize_mb, asan=False):
     def apply():
-        soft_as = mem_mb * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 2))
-        resource.setrlimit(resource.RLIMIT_AS, (soft_as, soft_as))
+        # ASAN maps an enormous (~20 TB) shadow region at startup; a virtual
+        # address-space cap makes it abort before main().  Skip RLIMIT_AS for an
+        # ASAN build and rely on RLIMIT_CPU/timeout plus ASAN's own
+        # hard_rss_limit_mb (set in the env) to bound runaway memory instead.
+        if not asan:
+            soft_as = mem_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (soft_as, soft_as))
         resource.setrlimit(resource.RLIMIT_FSIZE,
                            (fsize_mb * 1024 * 1024, fsize_mb * 1024 * 1024))
         resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
@@ -178,6 +219,27 @@ def _limits(cpu, mem_mb, fsize_mb):
         except (ValueError, OSError):
             pass
     return apply
+
+
+_ASAN_ERROR_RE = re.compile(r"ERROR: AddressSanitizer: ([a-z0-9-]+)")
+
+
+def parse_asan(stderr_text):
+    """Extract a structured summary from an AddressSanitizer stderr report.
+
+    Returns None when the text contains no ASAN error (a clean exit, or a
+    non-ASAN crash).  Otherwise the error kind, the read/write access line, and
+    the first few symbolized frames -- enough to prove which invariant faulted
+    without pasting a full report into the case bundle.
+    """
+    m = _ASAN_ERROR_RE.search(stderr_text)
+    if not m:
+        return None
+    lines = stderr_text.splitlines()
+    access = next((ln.strip() for ln in lines
+                   if re.search(r"(READ|WRITE) of size ", ln)), None)
+    frames = [ln.strip() for ln in lines if re.match(r"\s*#\d+ ", ln)][:6]
+    return {"error": m.group(1), "access": access, "top_frames": frames}
 
 
 def classify(trace_lines, input_realpath, workdir):
@@ -196,7 +258,10 @@ def classify(trace_lines, input_realpath, workdir):
                 writes.append(path)
             elif rp == input_realpath:
                 continue                                   # the file under test
-            elif _is_runtime_noise(rp):
+            elif _is_runtime_noise(rp) or _is_runtime_noise(abspath):
+                # Check both the resolved and the raw path: a symbolizer reading
+                # /proc/self/exe resolves to the probe binary (not itself noise),
+                # but the /proc/ path it actually opened is.
                 continue                                   # loader/libc/runtime noise
             else:
                 ext_open.append(path)                      # external / VDS / EFL
@@ -213,7 +278,7 @@ def classify(trace_lines, input_realpath, workdir):
 
 
 def probe_file(path, probe, trace, ident, timeout, cpu, mem_mb, fsize_mb,
-               exercise="generic"):
+               exercise="generic", asan=False):
     workdir = tempfile.mkdtemp(prefix="h5probe-")
     result = {"timed_out": False, "signal": None}
     try:
@@ -233,14 +298,33 @@ def probe_file(path, probe, trace, ident, timeout, cpu, mem_mb, fsize_mb,
             "HDF5_DISABLE_VERSION_CHECK": "1",
             "HOME": workdir,
         }
+        if asan:
+            # Stop at the first error, abort so it presents as a signal (the
+            # existing crash path), and suppress LeakSanitizer -- a corrupt file
+            # that leaves the library "closing" mid-teardown floods the report
+            # with leaks that would bury the actual out-of-bounds access we came
+            # for.  hard_rss_limit_mb substitutes for the RLIMIT_AS we dropped.
+            # verify_asan_link_order=0: the harness is linked with -fsanitize=
+            # address, so libasan initializes from its own DT_NEEDED constructor.
+            # But the activation interposer is LD_PRELOADed ahead of it, which
+            # trips ASAN's "runtime does not come first" guard and aborts before
+            # main(). Disabling the *order check* (not the runtime) lets the
+            # uninstrumented interposer coexist with the instrumented library.
+            env["ASAN_OPTIONS"] = (
+                "abort_on_error=1:halt_on_error=1:detect_leaks=0:"
+                "verify_asan_link_order=0:symbolize=1:print_legend=0:"
+                f"hard_rss_limit_mb={mem_mb}")
+        # ASAN writes its report to stderr; capture it so a fault can be turned
+        # into a structured finding instead of an opaque signal.
+        stderr_dst = subprocess.PIPE if asan else subprocess.DEVNULL
         trace_path = os.path.join(workdir, "trace.txt")
         with open(trace_path, "w") as tf:
             try:
                 proc = subprocess.run(
                     [probe, "--exercise", exercise, "input.h5"], cwd=workdir, env=env,
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=stderr_dst,
                     pass_fds=(tf.fileno(),),
-                    preexec_fn=_limits(cpu, mem_mb, fsize_mb),
+                    preexec_fn=_limits(cpu, mem_mb, fsize_mb, asan),
                     timeout=timeout)
             except subprocess.TimeoutExpired:
                 result.update(outcome="timeout", timed_out=True,
@@ -249,6 +333,11 @@ def probe_file(path, probe, trace, ident, timeout, cpu, mem_mb, fsize_mb,
                                   if os.path.exists(trace_path) else [],
                                   input_realpath, workdir))
                 return result
+
+        if asan and proc.stderr:
+            report = parse_asan(proc.stderr.decode(errors="replace"))
+            if report:
+                result["asan"] = report
 
         trace_lines = open(trace_path).readlines()
         activation = classify(trace_lines, input_realpath, workdir)
@@ -311,10 +400,12 @@ def main():
         _die_skip("h5cc not found (need --hdf5-bindir or h5cc on PATH)", args.json)
 
     ident = build_identity(h5cc)
+    asan = is_asan(ident)
     probe, trace = ensure_built(h5cc, ident, args.json)
 
     result = probe_file(args.file, probe, trace, ident, args.timeout,
-                        args.cpu, args.mem_mb, args.fsize_mb, args.exercise)
+                        args.cpu, args.mem_mb, args.fsize_mb, args.exercise,
+                        asan)
     # Authoritative linked identity comes from the probe (dladdr / H5get_libversion).
     if result.get("probe"):
         ident["libhdf5_version"] = result["probe"]["libhdf5_version"]
@@ -345,12 +436,16 @@ def main():
         "forbid": forbid,
         "violations": violations,
     }
+    if result.get("asan"):
+        out["asan"] = result["asan"]
     if args.json:
         print(json.dumps(out, indent=2))
     else:
         v = f"  VIOLATIONS: {','.join(violations)}" if violations else ""
+        a = f"  ASAN: {result['asan']['error']}" if result.get("asan") else ""
+        san = " +asan" if asan else ""
         print(f"{result['outcome']:>22}  {os.path.basename(args.file)}  "
-              f"[hdf5 {ident.get('libhdf5_version','?')}]{v}")
+              f"[hdf5 {ident.get('libhdf5_version','?')}{san}]{v}{a}")
     sys.exit(2 if violations else 0)
 
 

@@ -45,12 +45,14 @@
 #include <unistd.h>
 
 static int trace_fd = -1;
+static pid_t owner_pid = -1;
 
 __attribute__((constructor))
 static void h5trace_init(void)
 {
     const char *fd = getenv("H5TRACE_FD");
     trace_fd = fd ? atoi(fd) : -1;
+    owner_pid = getpid();
 }
 
 /* One event line, written with the real write(2) so we never re-enter our own
@@ -58,6 +60,12 @@ static void h5trace_init(void)
 static void emit(const char *kind, const char *a, const char *b)
 {
     if (trace_fd < 0) return;
+    /* Only the probe process itself is the activation subject.  Any child it
+     * (or a library) forks -- an ASAN build's symbolizer opening .debug/.so
+     * files during a crash report is the motivating case -- inherits this
+     * preload and the trace fd, and would otherwise be misread as external
+     * file activity.  A pid guard drops every forked helper's events. */
+    if (getpid() != owner_pid) return;
     char line[4352];
     int n;
     if (b)
