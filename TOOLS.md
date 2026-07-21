@@ -51,6 +51,9 @@ codes are emitted by more than one walker, so the mapping is resolved with the
 finding **message** via the `contexts` rules in `registry/findings.yml`. When no
 rule matches, triage asserts **nothing** and reports the candidate families
 instead — an unnamed invariant is a visible gap, a wrong one is a wrong fix.
+Production codes that have not reached that semantic review are source-tracked
+in `registry/finding-backlog.yml`; triage deliberately leaves their mapping
+unset until they move into `registry/findings.yml`.
 
 ## Exact-Build Canary Matrix
 

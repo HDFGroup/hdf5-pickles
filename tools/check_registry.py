@@ -11,17 +11,36 @@ import yaml
 
 coverage = yaml.safe_load(open("registry/validation-coverage.yml"))
 findings = yaml.safe_load(open("registry/findings.yml"))["findings"]
+BACKLOG_PATH = "registry/finding-backlog.yml"
+backlog_doc = yaml.safe_load(open(BACKLOG_PATH))
+finding_backlog = backlog_doc["findings"]
 records = {r["record"]: r for r in coverage["records"]}
 missing = []
 errors = 0
 
+# Production finding codes are string literals in the pickle validators and in
+# the h5policy shell wrapper's synthetic timeout report.  Include codes passed
+# through checked-range helpers as well as direct h5policy_emit_* calls, and the
+# collector's H5_POLICY_FINDINGS_TRUNCATED replacement.  Namespace filtering
+# excludes HDF5 format-signature/profile constants that are not findings.
+FINDING_CODE_RE = re.compile(
+    r'"(H5_(?:CORRUPT|RESOURCE|POLICY|ADVISORY|UNSUPPORTED|INTERNAL)_[A-Z0-9_]+)"')
+EMIT_SOURCES = sorted(glob.glob("h5policy/pickles/*.pk")) + [
+    "h5policy/tools/h5policy",
+]
+emitted_by = {}
+for path in EMIT_SOURCES:
+    with open(path) as source:
+        for code in set(FINDING_CODE_RE.findall(source.read())):
+            emitted_by.setdefault(code, set()).add(path)
+
 # A repeated code is silently dropped by YAML (last one wins), so a whole
 # definition can go dead unnoticed -- H5_CORRUPT_OFFSET_OUT_OF_FILE did exactly
 # that.  A code with more than one role belongs in `contexts`, not a second key.
-seen_codes = set()
-for path in ("registry/findings.yml",):
+for path in ("registry/findings.yml", BACKLOG_PATH):
+    seen_codes = set()
     for line in open(path):
-        m = re.match(r"^  (H5_[A-Z0-9_]+):\s*$", line)
+        m = re.match(r"^  (H5_[A-Z0-9_]+):(?:\s|$)", line)
         if not m:
             continue
         if m.group(1) in seen_codes:
@@ -29,6 +48,49 @@ for path in ("registry/findings.yml",):
                   f"(YAML keeps only the last; use `contexts` for extra roles)")
             errors += 1
         seen_codes.add(m.group(1))
+
+# findings.yml is the reviewed semantic catalog; finding-backlog.yml is an
+# explicit inventory of codes whose family/invariant mapping is still pending.
+# A production code must be in exactly one.  Backlog source attribution is an
+# exact inventory; a catalog entry may intentionally name only its canonical
+# emitter while `contexts` describe other roles, but every claimed source must
+# really carry the code.  This reverses the old
+# one-way check (coverage -> catalog), which could stay green while h5policy
+# gained uncatalogued outputs.
+catalog_codes = set(findings)
+backlog_codes = set(finding_backlog)
+for code in sorted(catalog_codes & backlog_codes):
+    print(f"CATALOG_BACKLOG_OVERLAP finding={code}")
+    errors += 1
+
+tracked_codes = catalog_codes | backlog_codes
+emitted_codes = set(emitted_by)
+for code in sorted(emitted_codes - tracked_codes):
+    print(f"UNTRACKED_EMIT finding={code} emitted_in={sorted(emitted_by[code])}")
+    errors += 1
+for code in sorted(tracked_codes - emitted_codes):
+    print(f"STALE_TRACKED_FINDING finding={code}")
+    errors += 1
+
+def check_emitted_in(kind, code, claimed):
+    global errors
+    if not isinstance(claimed, list) or not claimed:
+        print(f"INVALID_EMITTED_IN kind={kind} finding={code}")
+        errors += 1
+        return
+    actual = emitted_by.get(code, set())
+    wanted = set(claimed)
+    source_drift = wanted != actual if kind == "backlog" else not wanted <= actual
+    if source_drift:
+        print(f"EMITTED_IN_DRIFT kind={kind} finding={code} "
+              f"registry={sorted(wanted)} source={sorted(actual)}")
+        errors += 1
+
+for code, entry in findings.items():
+    check_emitted_in("catalog", code, entry.get("emitted_in"))
+for code, sources in finding_backlog.items():
+    check_emitted_in("backlog", code, sources)
+
 for record in coverage["records"]:
     for inv in record.get("invariants", []):
         code = inv.get("finding")
@@ -188,5 +250,7 @@ for specimen in glob.glob("h5policy/tests/**/*.h5", recursive=True):
         print(f"UNOWNED generated_fixture={specimen}")
         errors += 1
 
-print(f"records={len(records)} findings={len(findings)} missing={len(missing)} errors={errors}")
+print(f"records={len(records)} findings={len(findings)} "
+      f"backlog={len(finding_backlog)} emitted={len(emitted_by)} "
+      f"missing={len(missing)} errors={errors}")
 sys.exit(1 if errors else 0)

@@ -7,11 +7,12 @@ between `h5policy` as an independent semantic oracle and any native
 implementation: a native library can consume these invariant ids and boundaries
 without importing GPLv3 pickle source into a differently-licensed build.
 
-Four files plus a case directory, one schema version:
+Registry files plus a case directory, one schema version:
 
 | File | Answers |
 |---|---|
-| [`findings.yml`](findings.yml) | For each stable finding code: what invariant does it prove, at which validation scope, for which record and versions, and — when the code is emitted by more than one walker — which role applies to a given occurrence. |
+| [`findings.yml`](findings.yml) | For each reviewed stable finding code: what invariant does it prove, at which validation scope, for which record and versions, and — when the code is emitted by more than one walker — which role applies to a given occurrence. |
+| [`finding-backlog.yml`](finding-backlog.yml) | Exact source inventory for emitted codes whose semantic record/invariant mapping is still pending. An entry here is visible migration debt, not a catalog mapping. |
 | [`validation-coverage.yml`](validation-coverage.yml) | For each record family: which invariants exist (per [§5](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) and §11.5), which finding each maps to, where the oracle enforces it, which tests and fuzz targets cover it, and its migration status. |
 | [`h5cve-matrix-policy.yml`](h5cve-matrix-policy.yml) | Which exact-build canary statuses each fixture is permitted to report. `coverage_gap` and `unexercised` are visible outcomes, never aliases for success. |
 | [`libhdf5-evidence.yml`](libhdf5-evidence.yml) | **Generated.** What the selected libhdf5 build actually did, per record family, measured by the canary matrix. |
@@ -21,12 +22,15 @@ Four files plus a case directory, one schema version:
 | [`cve-case.yml`](cve-case.yml) | The annotated **template** for a per-case record. Its fields are the §11.5 containment/systemic tracking block. |
 | [`cases/`](cases/) | Real per-case records: one proactive hardening case and four libhdf5 divergence records, including one open backlog of uninvestigated items. |
 
-[`../tools/check_registry.py`](../tools/check_registry.py) enforces the
-cross-file constraints: every invariant referenced by a finding or a context
-rule exists in its record, every expectation points at a catalogued finding and
-an existing fixture, every generated fixture is owned by an expectation, and no
-finding code is defined twice (a duplicate key is silently dropped by YAML, so
-a whole definition can otherwise go dead unnoticed).
+[`../tools/check_registry.py`](../tools/check_registry.py) derives the production
+emit inventory from the pickle validators and the wrapper-generated timeout
+report. It requires every emitted code to appear in exactly one of the semantic
+catalog or the explicit backlog, validates source attribution, and rejects
+untracked or stale codes. It also enforces the cross-file constraints: every
+invariant referenced by a finding or a context rule exists in its record, every
+required fixture finding is catalogued, every generated fixture is owned by an
+expectation, and no finding code is defined twice (a duplicate key is silently
+dropped by YAML, so a whole definition can otherwise go dead unnoticed).
 
 ## Vocabulary (from the strategy doc)
 
@@ -75,8 +79,10 @@ per §11.5, never assumed from `h5policy` accepting or rejecting.
 
 | | |
 |---|---|
-| catalogued finding codes | 117 across 16 record families |
-| codes emitted by more than one walker | 20, carrying 38 `contexts` rules |
+| production finding codes | 262, all source-tracked |
+| catalogued finding codes | 126 across 16 record families |
+| explicit catalog backlog | 136 corruption codes |
+| catalogued ambiguous codes | 20, carrying 38 `contexts` rules |
 | expectations with an `h5cve` contract | 127 of 178 |
 | families with an exact-build canary | 15 of 16 |
 
