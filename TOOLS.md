@@ -39,6 +39,8 @@ h5cve minimize <case>                        # deferred: structure-aware reducer
 h5cve promote <case>                        # draft tests expectation + registry case
 h5cve census <root>                         # read-only oracle census of an HDF5 tree
 h5cve matrix [--baseline BINDIR] [--output F]  # exact-build canary matrix
+h5cve evidence [--matrix F]                 # measured libhdf5 verdict per family
+h5cve verification                          # §12 requirement status per family
 ```
 
 `triage` names the violated invariant from the primary finding. Twenty finding
@@ -74,6 +76,27 @@ Each family therefore also needs a malformed fixture that libhdf5 opens
 successfully and that carries the family's defect: one rejected at `H5Fopen`
 never reaches the family surface at all. All 15 families with canaries currently
 have such a specimen.
+
+`h5cve evidence` turns a matrix run into a per-family verdict on the selected
+build (`enforced`, `partial`, `diverges`, `unmeasured`) and writes
+[`registry/libhdf5-evidence.yml`](registry/libhdf5-evidence.yml). That file is
+the **measurement**; `validation-coverage.yml`'s `validators.hdf5` is the
+hand-maintained **claim**, and `tools/check_registry.py` fails on any
+disagreement — so a claim about libhdf5 cannot drift from what was observed.
+Regenerate after changing the build under test or the corpus:
+
+```sh
+tools/h5cve evidence --libhdf5-version 2.2.0    # ~8s, runs the matrix itself
+```
+
+`h5cve verification` scores each family against the eleven §12 verification
+requirements and writes
+[`registry/verification-coverage.yml`](registry/verification-coverage.yml).
+Statuses are `met`, `partial`, `absent` or `not_assessed` — the last is not a
+soft `met`, and requirements that would need fixtures classified by hand are
+marked that way rather than inferred. `check_registry.py` enforces that every
+record is scored on every requirement, but not the scores themselves: the file
+measures distance from §12 rather than gating on it.
 
 ## h5mutate Semantic Mutation Engine
 

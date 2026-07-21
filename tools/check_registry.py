@@ -82,6 +82,59 @@ for code, entry in findings.items():
             print(f"CONTEXT_UNKNOWN_SCOPE finding={code} scope={scope}")
             errors += 1
 
+# The manifest's `validators.hdf5` is a hand-maintained CLAIM;
+# libhdf5-evidence.yml is what `h5cve evidence` actually measured. A claim that
+# has drifted from the measurement is the failure mode this gate exists for --
+# either the build changed and evidence needs regenerating, or someone asserted
+# a verdict nothing observed.
+EVIDENCE_PATH = "registry/libhdf5-evidence.yml"
+if os.path.exists(EVIDENCE_PATH):
+    evidence = (yaml.safe_load(open(EVIDENCE_PATH)) or {}).get("records", {})
+    for record in coverage["records"]:
+        name = record["record"]
+        claimed = (record.get("validators") or {}).get("hdf5")
+        measured = evidence.get(name, {}).get("verdict", "unmeasured")
+        if claimed != measured:
+            print(f"EVIDENCE_DRIFT record={name} manifest={claimed} "
+                  f"measured={measured} (regenerate with `h5cve evidence`)")
+            errors += 1
+    for name in evidence:
+        if name not in records:
+            print(f"EVIDENCE_UNKNOWN_RECORD record={name}")
+            errors += 1
+else:
+    print(f"NOTE {EVIDENCE_PATH} absent; libhdf5 verdicts unverified "
+          f"(run `h5cve evidence`)")
+
+# The §12 verification report must cover exactly the manifest's records, with
+# every requirement present. Its CONTENT is a distance measure, not a pass/fail:
+# most requirements are `absent` or `not_assessed` today and gating on that would
+# be permanently red and therefore ignored. Only the structure is enforced, so a
+# new record family cannot quietly escape the report.
+VERIFICATION_PATH = "registry/verification-coverage.yml"
+if os.path.exists(VERIFICATION_PATH):
+    vdoc = yaml.safe_load(open(VERIFICATION_PATH)) or {}
+    vrecords = vdoc.get("records", {})
+    reqs = set(vdoc.get("requirements", []))
+    for name in records:
+        if name not in vrecords:
+            print(f"VERIFICATION_MISSING_RECORD record={name} "
+                  f"(regenerate with `h5cve verification`)")
+            errors += 1
+            continue
+        got = set(vrecords[name])
+        if got != reqs:
+            print(f"VERIFICATION_INCOMPLETE record={name} "
+                  f"missing={sorted(reqs - got)}")
+            errors += 1
+    for name in vrecords:
+        if name not in records:
+            print(f"VERIFICATION_UNKNOWN_RECORD record={name}")
+            errors += 1
+else:
+    print(f"NOTE {VERIFICATION_PATH} absent; §12 status unknown "
+          f"(run `h5cve verification`)")
+
 for record in coverage["records"]:
     status = record.get("coverage_status")
     if status == "covered":
