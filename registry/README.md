@@ -12,7 +12,7 @@ Registry files plus a case directory, one schema version:
 | File | Answers |
 |---|---|
 | [`findings.yml`](findings.yml) | For each reviewed stable finding code: what invariant does it prove, at which validation scope, for which record and versions, and — when the code is emitted by more than one walker — which role applies to a given occurrence. |
-| [`finding-backlog.yml`](finding-backlog.yml) | Exact source inventory for emitted codes whose semantic record/invariant mapping is still pending. An entry here is visible migration debt, not a catalog mapping. |
+| [`finding-backlog.yml`](finding-backlog.yml) | Exact source inventory for future emitted codes whose semantic record/invariant mapping is still pending. It is currently empty; an entry here is visible migration debt, not a catalog mapping. |
 | [`validation-coverage.yml`](validation-coverage.yml) | For each record family: which invariants exist (per [§5](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) and §11.5), which finding each maps to, where the oracle enforces it, which tests and fuzz targets cover it, and its migration status. |
 | [`h5cve-matrix-policy.yml`](h5cve-matrix-policy.yml) | Which exact-build canary statuses each fixture is permitted to report. `coverage_gap` and `unexercised` are visible outcomes, never aliases for success. |
 | [`libhdf5-evidence.yml`](libhdf5-evidence.yml) | **Generated.** What the selected libhdf5 build actually did, per record family, measured by the canary matrix. |
@@ -42,7 +42,7 @@ decision, not the eventual crash site.
 `severity` — the `h5policy` finding class as emitted by `h5policy_emit_error`:
 `corrupt`, `resource`, `policy`, `warning`.
 
-`ambiguous` / `contexts` — twenty codes are emitted by more than one walker: a
+`ambiguous` / `contexts` — twenty-six codes are emitted by more than one walker: a
 checksum mismatch or an out-of-file address means a different thing in a chunk
 index than in an object header. Those entries are marked `ambiguous: true`,
 which says their top-level `record`/`invariant` name only **one** of the code's
@@ -80,9 +80,9 @@ per §11.5, never assumed from `h5policy` accepting or rejecting.
 | | |
 |---|---|
 | production finding codes | 262, all source-tracked |
-| catalogued finding codes | 126 across 16 record families |
-| explicit catalog backlog | 136 corruption codes |
-| catalogued ambiguous codes | 20, carrying 38 `contexts` rules |
+| catalogued finding codes | 262 across 16 record families |
+| explicit catalog backlog | 0 |
+| catalogued ambiguous codes | 26, carrying 49 `contexts` rules |
 | expectations with an `h5cve` contract | 127 of 179 |
 | families with an exact-build canary | 15 of 16 |
 

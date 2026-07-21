@@ -91,10 +91,42 @@ for code, entry in findings.items():
 for code, sources in finding_backlog.items():
     check_emitted_in("backlog", code, sources)
 
+# A code only belongs in findings.yml once it has a complete semantic mapping.
+# Keep this structural gate here so an entry cannot be removed from the backlog
+# by replacing its source inventory with a name-only catalog placeholder.
+CATALOG_REQUIRED_FIELDS = (
+    "severity", "scope", "invariant", "record", "versions", "shared",
+    "edge_type", "emitted_in", "message",
+)
+for code, entry in findings.items():
+    absent = [field for field in CATALOG_REQUIRED_FIELDS if field not in entry]
+    if absent:
+        print(f"INCOMPLETE_CATALOG finding={code} fields={','.join(absent)}")
+        errors += 1
+    if entry.get("scope") not in SCOPES:
+        print(f"CATALOG_UNKNOWN_SCOPE finding={code} scope={entry.get('scope')}")
+        errors += 1
+    if entry.get("record") not in records:
+        print(f"CATALOG_UNKNOWN_RECORD finding={code} record={entry.get('record')}")
+        errors += 1
+    if not isinstance(entry.get("invariant"), str) or not entry.get("invariant"):
+        print(f"CATALOG_INVALID_INVARIANT finding={code}")
+        errors += 1
+    if not isinstance(entry.get("versions"), list) or not entry.get("versions"):
+        print(f"CATALOG_INVALID_VERSIONS finding={code}")
+        errors += 1
+    if not isinstance(entry.get("shared"), bool):
+        print(f"CATALOG_INVALID_SHARED finding={code}")
+        errors += 1
+
+invariant_findings = {}
 for record in coverage["records"]:
     for inv in record.get("invariants", []):
         code = inv.get("finding")
         codes = code if isinstance(code, list) else [code]
+        invariant_findings[(record["record"], inv["id"])] = {
+            c for c in codes if c
+        }
         for c in codes:
             if c and c not in findings:
                 missing.append((record["record"], inv["id"], c))
@@ -110,6 +142,9 @@ for code, entry in findings.items():
     ids = {i.get("id") for i in known}
     if record and inv and inv not in ids:
         print(f"UNREFERENCED finding={code} record={record} invariant={inv}")
+        errors += 1
+    elif record and inv and code not in invariant_findings.get((record, inv), set()):
+        print(f"MAPPING_DRIFT finding={code} record={record} invariant={inv}")
         errors += 1
 
 # `contexts` disambiguate a code emitted by more than one walker.  Each rule
@@ -138,6 +173,9 @@ for code, entry in findings.items():
         inv = ctx.get("invariant")
         if inv and inv not in {i.get("id") for i in records[rec].get("invariants", [])}:
             print(f"CONTEXT_UNKNOWN_INVARIANT finding={code} record={rec} invariant={inv}")
+            errors += 1
+        elif inv and code not in invariant_findings.get((rec, inv), set()):
+            print(f"CONTEXT_MAPPING_DRIFT finding={code} record={rec} invariant={inv}")
             errors += 1
         scope = ctx.get("scope")
         if scope and scope not in SCOPES:
