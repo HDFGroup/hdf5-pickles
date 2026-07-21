@@ -17,6 +17,7 @@ tools/h5policy-gencorpus -> ../h5policy/tools/h5policy-gencorpus
 tools/h5policy-probe     -> ../h5policy/tools/h5policy-probe
 tools/h5policy-truncate  -> ../h5policy/tools/h5policy-truncate
 tools/h5policy-lazy      -> ../h5policy/tools/h5policy-lazy
+tools/h5policy-seamcheck -> ../h5policy/tools/h5policy-seamcheck
 tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
@@ -154,6 +155,38 @@ Counters are bounded by ratio, not equality — decoding a larger stored-size
 field can cost a few operations without any payload being touched, while a
 validator that read payload would grow with `n`. Current result: cost flat
 across a ~1000x data increase, with the control rising 375 → 987 → 7107.
+
+## In-Process Seam Self-Check
+
+Analysing through `h5policy_analyze` instead of the CLI is ~7x faster (the
+pickles load once, not per file), but every analysis then shares interpreter
+state. `h5policy_analyze`'s reset list is what keeps them independent, and a
+leak there is worse than slowness: one hostile input could silently change every
+verdict after it, and a fuzzer would report those corrupted verdicts as findings.
+
+**`tools/h5policy-seamcheck` is the gate on any work that batches analyses.**
+
+```sh
+tools/h5policy-seamcheck --count 120        # default: forensic profile
+tools/h5policy-seamcheck --profile legacy --count 60
+```
+
+Two checks, over adversarial mutants built with the fuzzer's own engine:
+
+| check | asserts |
+|---|---|
+| **A** agreement | the seam's (decision, finding codes, feature flags) equals the CLI's, which is the shipped behaviour and therefore ground truth |
+| **B** order | the same mutants in a *different* order give the same verdicts |
+
+Both passes select the same profile by construction — a forensic CLI run against
+a seam left on its `untrusted_strict` default produces a large and very
+plausible-looking divergence that has nothing to do with state.
+
+Its first production run found a real leak: `h5policy_heap_data_seg_size`
+survived into the next analysis, and a larger value from an earlier file
+silently disabled the bound three call sites check link-name offsets against.
+Check **A** caught it; check **B** did not, because the leak saturates within a
+few analyses and both orders then agree. Neither check subsumes the other.
 
 ## h5mutate Semantic Mutation Engine
 

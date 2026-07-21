@@ -177,8 +177,13 @@ for path in glob.glob("h5policy/tests/expected/*.yml"):
             print(f"UNREGISTERED fixture={path} finding={code} record={findings[code].get('record')}")
             errors += 1
 
+# fuzz-findings/ is git-ignored scratch written by h5policy-fuzz, not corpus.
+# Without this, running the fuzzer breaks the next suite run with UNOWNED errors.
+SCRATCH_DIRS = ("fuzz-findings",)
 for specimen in glob.glob("h5policy/tests/**/*.h5", recursive=True):
     rel = os.path.relpath(specimen, "h5policy/tests")
+    if rel.split(os.sep)[0] in SCRATCH_DIRS:
+        continue
     if rel not in expected_files:
         print(f"UNOWNED generated_fixture={specimen}")
         errors += 1

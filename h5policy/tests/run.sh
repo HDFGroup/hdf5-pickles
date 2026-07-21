@@ -17,15 +17,27 @@
 #
 # h5policy regression runner.
 #
-#   1. (re)generates the corpus fixtures with h5policy-gencorpus,
-#   2. runs synthetic datatype, assigned-message, file-space-info, and
-#      profile-limit checks,
-#   3. runs the reachability-record checks, including its walk-budget neutrality,
-#   4. checks the stable, read-only API exposed to in-process consumers,
-#   5. runs the h5policy_analyze seam checks that in-process consumers rely on,
-#   6. checks the wrapper-generated wall-timeout report,
-#   7. runs h5policy over every tests/expected/*.yml case and asserts the
-#      decision, exit code, required findings, and forbidden outcomes.
+# Oracle correctness:
+#   1. registry consistency (tools/check_registry.py), including the gate
+#      between the claimed and the measured libhdf5 verdicts,
+#   2. (re)generates the corpus fixtures with h5policy-gencorpus,
+#   3. synthetic datatype, assigned-message, file-space-info and profile-limit
+#      checks; reachability records; the read-only consumer API; the
+#      h5policy_analyze seam; the wrapper-generated wall-timeout report,
+#   4. h5policy over every tests/expected/*.yml case, asserting the decision,
+#      exit code, required findings, evidence locations and forbidden outcomes,
+#   5. the differential harness against libhdf5 (h5py / h5dump / h5debug).
+#
+# Behaviour of the libhdf5 build under test (skipped without h5cc + cc):
+#   6. exact-build probe smoke check (activation tracing),
+#   7. the full h5cve expected-fixture canary matrix,
+#   8. h5cve orchestrator smoke: init + triage map a finding to its invariant.
+#
+# Strategy-doc §12 measurements:
+#   9. in-process seam self-check -- the gate on batching analyses,
+#  10. bounded truncation sweep (the exhaustive one is on-demand),
+#  11. lazy-validation ladders, with a sensitivity control,
+#  12. the h5mutate semantic mutation family.
 #
 # Exit status is 0 only if every check passes.
 set -uo pipefail
@@ -139,6 +151,15 @@ else
 fi
 rm -rf "$repo_dir/cases/$cve_case"
 
+# In-process seam self-check.  h5policy_analyze shares interpreter state across
+# analyses, so any work that BATCHES them is gated on this: it compares the seam
+# against the CLI and checks the verdicts are order-independent.  It caught a
+# real leak (h5policy_heap_data_seg_size surviving into the next file, disabling
+# a bounds check), which is why it runs here and not only on demand.
+echo "== in-process seam self-check =="
+"$overlay_dir/tools/h5policy-seamcheck" --count 24
+seam_check_status=$?
+
 # Truncation sweep (strategy-doc §12).  A bounded subset runs here as a
 # regression check that every prefix of a valid file still yields a verdict; the
 # exhaustive corpus sweep is on-demand (see tools/h5policy-truncate), like the
@@ -177,9 +198,10 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
       && $matrix_status -eq 0 && $mut_status -eq 0 \
-      && $trunc_status -eq 0 && $lazy_status -eq 0 ]]; then
+      && $trunc_status -eq 0 && $lazy_status -eq 0 \
+      && $seam_check_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status trunc=$trunc_status lazy=$lazy_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status)"
 exit 1
