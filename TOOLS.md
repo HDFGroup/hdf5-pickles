@@ -55,6 +55,16 @@ Production codes that have not reached that semantic review are source-tracked
 in `registry/finding-backlog.yml`; triage deliberately leaves their mapping
 unset until they move into `registry/findings.yml`.
 
+`triage` also records **every** family the file implicates, not just the
+primary's, in `family_coverage`.  The strict profile stops at the first
+rejection, so on a file with several unrelated defects `record` names one family
+and a single canary would be all `verify` ever ran — a `verified` canary is then
+a statement about one finding, not about the file.  The forensic profile
+continues after rejection, so its finding list is the superset triage resolves.
+`verify` runs a canary for each of those families and reports one row apiece;
+a family with no canary is reported as an explicit `coverage_gap` row rather
+than omitted, and a forbidden activation in any of them fails the command.
+
 ## Exact-Build Canary Matrix
 
 `h5cve matrix` runs the selected libhdf5 build against every corpus fixture that

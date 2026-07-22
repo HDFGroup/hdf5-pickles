@@ -849,12 +849,68 @@ def cmd_triage(args):
         note = (f"finding {code!r} is not catalogued in registry/findings.yml; "
                 "triage fields left for manual completion (registry coverage gap)")
 
+    # --- every family the file implicates, not just the primary's ---------------
+    #
+    # The strict profile stops at the FIRST rejection, so `record` above names
+    # one family even when the file carries several unrelated defects -- and
+    # verify then runs exactly one canary.  On GHSA-3hmr-6c9r-mqq9/3.h5 that
+    # meant the primary (an out-of-file driver-info address, address_space_bounds)
+    # got a `verified` canary while a second forensic finding, a corrupt local-
+    # heap free list, was never exercised at all: its family surface is only
+    # reached by the heap_structures canary.  A `verified` canary is therefore
+    # not a statement about the file, only about one finding in it.
+    #
+    # The forensic profile continues after rejection, so its finding list is the
+    # superset.  Resolve every one of them and record the families here; verify
+    # runs a canary for each.
+    case["family_coverage"] = _family_coverage(forensic, findings_reg)
+
     save_case(cdir, case)
     print(f"triage: decision={case['oracle']['decision']} "
           f"finding={code} ({os.path.relpath(cdir)})")
     print(f"  {note}")
+    extra = [f for f in case["family_coverage"]
+             if f["record"] and f["record"] != case.get("record")]
+    if extra:
+        print(f"  forensic implicates {len(extra)} further "
+              f"{'family' if len(extra) == 1 else 'families'}; verify will "
+              "exercise each:")
+        for f in extra:
+            print(f"    {f['record']:<28} from {f['code']}"
+                  + ("" if f["exercise"] else "  (no canary: coverage_gap)"))
+    unmapped = [f for f in case["family_coverage"] if not f["record"]]
+    if unmapped:
+        print(f"  {len(unmapped)} forensic finding(s) map to no family: "
+              + ", ".join(sorted({f["code"] for f in unmapped})))
     print("next: h5cve verify " + case["id"] + " --baseline <bindir>")
     return 0
+
+
+def _family_coverage(report, findings_reg):
+    """Every record family implicated by a report's findings, in order, deduped.
+
+    One entry per family, tagged with the finding that named it, so a reader can
+    see WHY a canary was selected.  An unmapped finding is kept with a null
+    record rather than dropped: a family that cannot be named is a visible gap,
+    the same principle the primary mapping follows.
+    """
+    coverage, seen = [], set()
+    for f in report.get("findings", []):
+        code, msg = f.get("code"), f.get("message")
+        mapping = resolve_finding(code, msg, findings_reg)
+        record = mapping["record"]
+        key = record or f"<unmapped:{code}>"
+        if key in seen:
+            continue
+        seen.add(key)
+        coverage.append({
+            "record": record,
+            "code": code,
+            "message": msg,
+            "confidence": mapping["confidence"],
+            "exercise": CANARY_BY_RECORD.get(record) if record else None,
+        })
+    return coverage
 
 
 # -------------------------------------------------------------- verify --------
@@ -899,6 +955,51 @@ def _probe(inp, bindir, exercise="generic"):
     return rep, rc
 
 
+def _family_probe(inp, cdir, bindir, exercise, tag, oracle_decision):
+    """One canary run, summarised the same way the primary probe is."""
+    rep, _ = _probe(inp, bindir, exercise)
+    json.dump(rep, open(os.path.join(cdir, f"{tag}-result-{exercise}.json"), "w"),
+              indent=2)
+    summary = _probe_summary(rep)
+    summary["oracle_alignment"] = _oracle_alignment(rep, oracle_decision)
+    canary = _canary_summary(rep, None, exercise)
+    summary["canary"] = canary
+    summary["status"] = canary["status"]
+    summary["entry_points_exercised"] = canary["entry_points_exercised"]
+    _qualify_outcome(summary, canary)
+    return summary
+
+
+def _family_probes(cdir, case, inp, args, primary_record):
+    """Run a canary for every non-primary family the forensic profile named.
+
+    A family with no canary is recorded as an explicit `coverage_gap` row rather
+    than omitted: "we did not look" and "we looked and saw nothing" are
+    different results, and conflating them is what made a bare `accepted`
+    misleading in the first place.
+    """
+    out = {}
+    oracle_decision = case.get("oracle", {}).get("decision")
+    for fam in case.get("family_coverage") or []:
+        record = fam.get("record")
+        if not record or record == primary_record or record in out:
+            continue
+        exercise = CANARY_BY_RECORD.get(record)
+        if not exercise:
+            out[record] = {"status": "coverage_gap",
+                           "from_finding": fam.get("code"),
+                           "reason": f"no canary exercise is mapped to {record}"}
+            continue
+        row = _family_probe(inp, cdir, args.baseline, exercise, "baseline",
+                            oracle_decision)
+        row["from_finding"] = fam.get("code")
+        if args.candidate:
+            row["candidate"] = _family_probe(inp, cdir, args.candidate, exercise,
+                                             "candidate", oracle_decision)
+        out[record] = row
+    return out
+
+
 def cmd_verify(args):
     cdir = case_dir(args.case)
     case = load_case(cdir)
@@ -930,6 +1031,10 @@ def cmd_verify(args):
         _qualify_outcome(result["candidate"], result["candidate"]["canary"])
         result["comparison"] = _comparison_verdict(result["baseline"],
                                                      result["candidate"])
+    # The probe above covers the PRIMARY family only.  A file with several
+    # defects implicates several families, and a family surface no canary
+    # touches reports nothing at all -- see _family_coverage in cmd_triage.
+    result["family_probes"] = _family_probes(cdir, case, inp, args, record)
     case["verification"] = {"exact_build_probe": result}
 
     # Fold the OS-observable assertions into the reproducer block from the
@@ -962,7 +1067,26 @@ def cmd_verify(args):
               f"violations={result['candidate']['violations'] or 'none'}")
         if result["candidate"].get("outcome_note"):
             print(f"        WARNING: {result['candidate']['outcome_note']}")
-    return 2 if v else 0
+    fam_violations = []
+    for record, row in (result.get("family_probes") or {}).items():
+        if row.get("status") == "coverage_gap" and "outcome" not in row:
+            print(f"        {record}: coverage_gap ({row['reason']})")
+            continue
+        print(f"        {record}: outcome={row['outcome']} "
+              f"exercise={row['exercise']} status={row['status']} "
+              f"violations={row['violations'] or 'none'}")
+        if row.get("outcome_note"):
+            print(f"          WARNING: {row['outcome_note']}")
+        fam_violations += row.get("violations") or []
+        cand = row.get("candidate") or {}
+        if cand:
+            print(f"          candidate outcome={cand['outcome']} "
+                  f"violations={cand['violations'] or 'none'}")
+            fam_violations += cand.get("violations") or []
+    # A forbidden activation is evidence wherever it shows up, so a secondary
+    # family's violation has to fail the command too -- otherwise widening the
+    # coverage would have no effect on the exit status.
+    return 2 if (v or fam_violations) else 0
 
 
 # cve-case.yml `activation_before_validation` vocabulary (strategy §11.5).

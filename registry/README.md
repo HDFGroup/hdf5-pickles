@@ -79,11 +79,11 @@ per §11.5, never assumed from `h5policy` accepting or rejecting.
 
 | | |
 |---|---|
-| production finding codes | 262, all source-tracked |
-| catalogued finding codes | 262 across 16 record families |
+| production finding codes | 263, all source-tracked |
+| catalogued finding codes | 263 across 16 record families |
 | explicit catalog backlog | 0 |
 | catalogued ambiguous codes | 26, carrying 49 `contexts` rules |
-| expectations with an `h5cve` contract | 127 of 179 |
+| expectations with an `h5cve` contract | 128 of 180 |
 | families with an exact-build canary | 15 of 16 |
 
 `validation_controls` is the family without a canary, by design: it covers
