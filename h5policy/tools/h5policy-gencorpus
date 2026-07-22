@@ -844,6 +844,16 @@ def _gen_malformed(root):
     _make_zero_v2_btree_record_size(
         f"{root}/malformed/zero_v2_btree_record_size.h5",
         f"{root}/valid/dense_links.h5")
+    # One fixture per reader that used to compare the used-byte count only
+    # against file_size: the dense-LINK name index (type 5, depth 0 -> the root
+    # is a LEAF) and the dense-ATTRIBUTE name index (type 8, depth 1 -> the root
+    # is an INTERNAL node, whose checksum sits after the child pointers too).
+    _make_over_capacity_v2_btree_node(
+        f"{root}/malformed/over_capacity_v2_btree_leaf.h5",
+        f"{root}/valid/dense_links.h5", 5)
+    _make_over_capacity_v2_btree_node(
+        f"{root}/malformed/over_capacity_v2_btree_internal.h5",
+        f"{root}/valid/adjacent_null_messages.h5", 8)
     _make_filtered_dense_link_no_dblock_checksum(
         f"{root}/malformed/filtered_dense_link_no_dblock_checksum.h5",
         f"{root}/valid/dense_links.h5")
@@ -2131,6 +2141,44 @@ def _make_zero_v2_btree_record_size(path, base_path):
     raw = bytearray(open(base_path, "rb").read())
     bt = _dense_bthd_info(raw)
     struct.pack_into("<H", raw, bt["bthd"] + 10, 0)
+    struct.pack_into("<I", raw, bt["checksum"],
+                     _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_over_capacity_v2_btree_node(path, base_path, record_type):
+    """A v2 B-tree root node declaring more records than the node can hold.
+
+    libhdf5 allocates exactly node_size bytes for a node image, then locates the
+    trailing checksum at 6 + nrec*record_size (plus the child pointers for an
+    internal node).  Nothing validates nrec against the node's own capacity
+    first, so an inflated count places that read past the allocation:
+    heap-buffer-overflow in H5F_get_checksums, reached from
+    H5B2__cache_leaf_verify_chksum for a leaf and H5B2__cache_int_verify_chksum
+    for an internal node (both confirmed under ASAN, GHSA-hx9j-mp99-2p98/63).
+
+    The checksum is NOT a barrier: it is read at the position nrec selects, and
+    both it and the header checksum can be recomputed by whoever sets nrec.  The
+    bound has to be a decode precondition, which is what h5policy enforces in
+    every v2-btree node reader.
+
+    `record_type` picks which client's tree to corrupt, and the depth of that
+    tree decides whether the root is a leaf or an internal node -- so the two
+    call sites below cover the two readers that used to lack the check.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    bt = _bthd_info_for_type(raw, record_type)
+    if bt is None:
+        raise RuntimeError(f"no v2 B-tree header of type {record_type} in {base_path}")
+    record_size = bt["record_size"]
+    if record_size == 0:
+        raise RuntimeError("base fixture has a zero record width")
+    # Overshoot capacity by ~150 bytes, mirroring the corpus specimen rather than
+    # using an absurd count: a small overrun is the interesting case, because it
+    # stays inside the file and so survives every extent check.
+    capacity = (bt["node_size"] - 10) // record_size
+    nrec = min(0xFFFF, capacity + (150 // record_size) + 1)
+    struct.pack_into("<H", raw, bt["bthd"] + 16 + bt["off_size"], nrec)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]])))
     _patch(path, bytes(raw))
