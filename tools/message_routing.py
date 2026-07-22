@@ -181,6 +181,14 @@ def _resolve_expr(expr, spec_fields, client=None):
         by_client = spec_fields[f]
         for owner in ([client] if client is not None else by_client):
             values |= by_client.get(owner, set())
+    # A spec field assigned "" is a placeholder for a client that does not run
+    # the guarded check at all -- h5_chunkindex.pk sets `check_subtree_count = 0`
+    # and `subtree_count_message = ""`, so that emit is unreachable for it.  The
+    # guard is a runtime condition this static pass cannot evaluate, so drop the
+    # empty value rather than report an unroutable message that never occurs.
+    # A genuinely empty message from a LITERAL emit is still surfaced: only the
+    # spec-field path reaches here.
+    values.discard("")
     return values or None
 
 
