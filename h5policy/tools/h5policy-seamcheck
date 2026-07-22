@@ -94,13 +94,30 @@ def build_mutants(count, seed_glob, rng, outdir):
     return paths
 
 
+# Marker for "the CLI produced no verdict".  A verdict this harness cannot read
+# is NOT evidence that the in-process seam and the CLI disagree: there is
+# nothing to disagree with.  Scoring it as a disagreement is what made a wrapper
+# bug -- poke's stderr merged into the JSON -- look for days like the seam
+# leaking state between analyses, which is the one thing this tool exists to
+# detect.  Keep the two apart so a red run always names the right suspect.
+TOOL_ERROR = "__TOOL_ERROR__"
+KNOWN_EXITS = {0, 1, 2, 3, 4, 5, 70}
+
+
 def cli_verdict(path, profile):
+    """A verdict tuple, or (TOOL_ERROR, reason) when h5policy did not answer."""
     proc = subprocess.run([H5POLICY, "--profile", profile, "--json", path],
                           capture_output=True, text=True, errors="replace")
+    err = proc.stderr.strip()[:160]
+    if proc.returncode not in KNOWN_EXITS:
+        return (TOOL_ERROR, f"h5policy exited {proc.returncode}: {err}")
+    if proc.returncode == 70:
+        return (TOOL_ERROR, f"h5policy internal error (exit 70): {err}")
     try:
         rep = json.loads(proc.stdout)
     except (json.JSONDecodeError, ValueError):
-        return ("UNPARSEABLE", ())
+        return (TOOL_ERROR, "h5policy report is not JSON: "
+                            f"{proc.stdout.strip()[:120]!r} (stderr: {err})")
     feat = rep.get("features", {})
     return (rep.get("decision"),
             tuple(sorted(f.get("code") for f in rep.get("findings", []))),
@@ -195,7 +212,17 @@ def main():
         if p not in first or p not in second:
             problems.append({"kind": "missing_verdict", "mutant": os.path.basename(p)})
             continue
-        if first[p] != cli[p]:
+        # Attribute each failure to the side that actually broke.  Comparison A
+        # is only meaningful when BOTH sides produced a verdict.
+        if cli[p][0] == TOOL_ERROR:
+            problems.append({"kind": "cli_tool_error",
+                             "mutant": os.path.basename(p),
+                             "reason": cli[p][1]})
+        elif first[p][0] == "ESCAPED":
+            problems.append({"kind": "seam_escaped",
+                             "mutant": os.path.basename(p),
+                             "cli": cli[p]})
+        elif first[p] != cli[p]:
             problems.append({"kind": "disagrees_with_cli",
                              "mutant": os.path.basename(p),
                              "cli": cli[p], "seam": first[p]})
@@ -204,11 +231,14 @@ def main():
                              "mutant": os.path.basename(p),
                              "first": first[p], "shuffled": second[p]})
 
-    agree = sum(1 for p in paths if p in first and first[p] == cli[p])
+    comparable = [p for p in paths if p in first and cli[p][0] != TOOL_ERROR]
+    agree = sum(1 for p in comparable if first[p] == cli[p])
+    cli_tool_errors = sum(1 for p in paths if cli[p][0] == TOOL_ERROR)
     stable = sum(1 for p in paths if p in first and p in second
                  and first[p] == second[p])
     report = {"schema_version": 1, "profile": args.profile, "rng_seed": args.seed,
               "mutants": len(paths), "agree_with_cli": agree,
+              "comparable": len(comparable), "cli_tool_errors": cli_tool_errors,
               "order_stable": stable, "problems": problems,
               "total_problems": len(problems)}
 
@@ -220,8 +250,11 @@ def main():
             print(text)
     else:
         print(f"seamcheck ({args.profile}, {len(paths)} mutants, seed {args.seed})")
-        print(f"  A. seam agrees with CLI : {agree}/{len(paths)}")
+        print(f"  A. seam agrees with CLI : {agree}/{len(comparable)}")
         print(f"  B. order-independent    : {stable}/{len(paths)}")
+        if cli_tool_errors:
+            print(f"  !  CLI produced no verdict on {cli_tool_errors} mutant(s) "
+                  f"-- tool error, not a seam disagreement")
         for item in problems[:8]:
             print(f"     {item}")
         print("  RESULT:", "PASS" if not problems else "FAIL")
