@@ -854,6 +854,15 @@ def _gen_malformed(root):
     _make_over_capacity_v2_btree_node(
         f"{root}/malformed/over_capacity_v2_btree_internal.h5",
         f"{root}/valid/adjacent_null_messages.h5", 8)
+    # Pair: identical below-floor direct block, differing only in whether the
+    # heap checksums direct blocks.  The unchecksummed half is the one h5policy
+    # used to accept.
+    _make_dblock_size_below_floor(
+        f"{root}/malformed/dblock_size_below_floor.h5",
+        f"{root}/valid/sohm_list.h5", True)
+    _make_dblock_size_below_floor(
+        f"{root}/malformed/dblock_size_below_floor_nochecksum.h5",
+        f"{root}/valid/sohm_list.h5", False)
     _make_cache_image_shadowed_btree(
         f"{root}/malformed/cache_image_unshadowed_btree.h5",
         os.path.join(os.path.dirname(os.path.realpath(__file__)),
@@ -2278,6 +2287,44 @@ def _make_cache_image_shadowed_btree(path, helper_source):
     struct.pack_into("<H", raw, bthd + 16 + bt["off_size"], nrec)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bthd:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_dblock_size_below_floor(path, base_path, keep_checksums):
+    """A fractal heap whose direct blocks are smaller than their own prefix.
+
+    A direct block begins with signature (4), version (1), the heap-header
+    address and the block offset, so it cannot be shorter than that prefix --
+    plus four more bytes when the heap checksums direct blocks.  The header
+    declares the size (start_block_size, doubling per row) and libhdf5 floors it
+    nowhere: a declared 1 makes it allocate one byte and then read the checksum
+    at the prefix offset, a heap-buffer-overflow in
+    H5HF__cache_dblock_verify_chksum (GHSA-7ggx-c45p-66ph/61, under ASAN).
+
+    `keep_checksums` selects which half of the pair this is, and the pair is the
+    point.  h5policy's floor used to be a side effect of the checksum-position
+    check, which sits behind an early return for heaps that do not checksum
+    direct blocks -- so with checksums OFF a one-byte block was accepted
+    outright, exit 0, no findings.  The two fixtures differ in exactly that flag.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    o, el = raw[9], raw[10]
+    frhp = raw.find(b"FRHP")
+    if frhp < 0:
+        raise RuntimeError(f"no fractal heap header in {base_path}")
+    dtable = 14 + (10 * el) + (2 * o)
+    rows = int.from_bytes(
+        raw[frhp + dtable + 6 + 2 * el + o:frhp + dtable + 8 + 2 * el + o],
+        "little")
+    if rows != 0:
+        raise RuntimeError(f"{base_path} heap root is not a direct block "
+                           f"(cur_root_rows={rows}); the floor would not be reached")
+    struct.pack_into(f"<{'Q' if el == 8 else 'I'}", raw, frhp + dtable + 2, 1)
+    if not keep_checksums:
+        raw[frhp + 9] &= ~0x02          # clear "direct blocks are checksummed"
+    checksum = frhp + dtable + 6 + 2 * el + o + 2
+    struct.pack_into("<I", raw, checksum,
+                     _jenkins_lookup3()(bytes(raw[frhp:checksum])))
     _patch(path, bytes(raw))
 
 
