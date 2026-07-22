@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 The HDF Group.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""h5policy-seamcheck -- prove the in-process seam is safe to batch on.
+
+Running h5policy through h5policy_analyze instead of the CLI is ~7x faster
+because the pickles load once instead of per file.  The price is that every
+analysis shares interpreter state, and h5policy_analyze's reset list is what
+keeps them independent.  A leak there would be far worse than slowness: one
+hostile input could silently change every verdict that follows it, and the
+fuzzer would report those corrupted verdicts as findings.
+
+This is the gate on any work that batches analyses.  Two checks, on adversarial
+mutants built with the fuzzer's own mutation engine:
+
+  A  agreement   the seam's (decision, finding codes, feature flags) must
+                 equal the CLI's,
+                 which is the shipped behaviour and therefore ground truth.
+  B  order       the same mutants analysed in a DIFFERENT order must produce
+                 the same verdicts.  This is the sharper check: a state leak
+                 shows up as a verdict that depends on what ran before it,
+                 which check A alone would miss when both passes share an order.
+
+Both passes select the SAME profile by construction -- comparing a forensic CLI
+run against a seam left on its untrusted_strict default produces a large, very
+plausible-looking divergence that has nothing to do with state.
+
+Run it whenever h5policy_analyze's reset list changes, and before trusting any
+batched fuzzing result.
+"""
+import argparse
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import random
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+OVERLAY = os.path.dirname(HERE)
+REPO = os.path.dirname(OVERLAY)
+H5POLICY = os.path.join(HERE, "h5policy")
+FUZZLIB = os.path.join(HERE, "h5policy-fuzzlib")
+
+# Report feature flags, compared alongside the verdict: a flag left set from a
+# previous analysis is a state leak the decision alone would not reveal.
+FEATURE_KEYS = ("external_links", "external_storage", "vds", "unknown_messages")
+
+# CLI spelling -> the h5policy_profile_name the pickles select on.
+PROFILES = {"forensic": "forensic", "untrusted-strict": "untrusted_strict",
+            "trusted-fast": "trusted_fast", "legacy": "legacy"}
+
+
+def load_mutators():
+    loader = importlib.machinery.SourceFileLoader("fuzzlib", FUZZLIB)
+    spec = importlib.util.spec_from_loader("fuzzlib", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod.MUTATORS
+
+
+def build_mutants(count, seed_glob, rng, outdir):
+    seeds = [open(p, "rb").read() for p in sorted(glob.glob(seed_glob))]
+    if not seeds:
+        sys.exit(f"h5policy-seamcheck: no seeds matched {seed_glob}")
+    mutators = load_mutators()
+    names = sorted(mutators)
+    paths = []
+    for i in range(count):
+        base = rng.choice(seeds)
+        out = mutators[names[i % len(names)]](bytearray(base), rng)
+        if out is None:
+            out = bytearray(base)
+        p = os.path.join(outdir, f"m{i:06d}.h5")
+        with open(p, "wb") as f:
+            f.write(bytes(out))
+        paths.append(p)
+    return paths
+
+
+def cli_verdict(path, profile):
+    proc = subprocess.run([H5POLICY, "--profile", profile, "--json", path],
+                          capture_output=True, text=True, errors="replace")
+    try:
+        rep = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return ("UNPARSEABLE", ())
+    feat = rep.get("features", {})
+    return (rep.get("decision"),
+            tuple(sorted(f.get("code") for f in rep.get("findings", []))),
+            tuple(int(feat.get(k, 0)) for k in FEATURE_KEYS))
+
+
+def seam_verdicts(paths, profile_name, workdir, timeout):
+    script = os.path.join(workdir, "seamcheck.pk")
+    with open(script, "w") as f:
+        f.write("load h5_policy;\n")
+        f.write(f'h5policy_profile_name = "{profile_name}";\n')
+        f.write("var paths = [" + ",".join(f'"{p}"' for p in paths) + "];\n")
+        f.write(r"""
+fun codes_joined = string:
+{
+  var out = "";
+  for (var i = 0UL; i < h5policy_finding_codes'length as uint<64>; i = i + 1UL)
+    out = out + h5policy_finding_codes[i] + ",";
+  return out;
+}
+
+for (var i = 0UL; i < paths'length as uint<64>; i = i + 1UL)
+  {
+    try
+      {
+        var ios = open(paths[i], IOS_M_RDONLY);
+        var ctx = h5policy_analyze(ios, h5policy_profile);
+        printf("%s\t%s\t%s\t%u64d,%u64d,%u64d,%u64d\n",
+               paths[i], h5policy_decision, codes_joined,
+               h5policy_feature_external_links, h5policy_feature_external_storage,
+               h5policy_feature_vds, h5policy_feature_unknown_messages);
+        close(ios);
+      }
+    catch (Exception e)
+      {
+        printf("%s\tESCAPED\t\t0,0,0,0\n", paths[i]);
+      }
+  }
+""")
+    env = dict(os.environ)
+    load = f"{OVERLAY}/pickles:{REPO}/pickles"
+    env["POKE_LOAD_PATH"] = load + (":" + env["POKE_LOAD_PATH"]
+                                    if env.get("POKE_LOAD_PATH") else "")
+    try:
+        proc = subprocess.run(["poke", "--quiet", "-L", script], env=env,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    out = {}
+    for line in proc.stdout.splitlines():
+        if line.count("\t") != 3:
+            continue
+        path, decision, codes, feats = line.split("\t")
+        out[path] = (decision,
+                     tuple(sorted(c for c in codes.split(",") if c)),
+                     tuple(int(x) for x in feats.split(",")))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--count", type=int, default=120)
+    ap.add_argument("--seed", type=int, default=20260721,
+                    help="RNG seed; the mutant set is reproducible from it")
+    ap.add_argument("--profile", default="forensic", choices=sorted(PROFILES),
+                    help="forensic by default: the deepest walk, so the most "
+                         "traversal state to leak between analyses")
+    ap.add_argument("--seeds", default=os.path.join(OVERLAY, "tests", "valid", "*.h5"))
+    ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--output")
+    args = ap.parse_args()
+
+    rng = random.Random(args.seed)
+    workdir = tempfile.mkdtemp(prefix="h5policy-seamcheck-")
+    paths = build_mutants(args.count, args.seeds, rng, workdir)
+
+    cli = {p: cli_verdict(p, args.profile) for p in paths}
+    profile_name = PROFILES[args.profile]
+    first = seam_verdicts(paths, profile_name, workdir, args.timeout)
+    shuffled = paths[:]
+    random.Random(args.seed ^ 0x5EED).shuffle(shuffled)
+    second = seam_verdicts(shuffled, profile_name, workdir, args.timeout)
+
+    problems = []
+    if first is None or second is None:
+        problems.append({"kind": "seam_timeout"})
+        first = first or {}
+        second = second or {}
+    for p in paths:
+        if p not in first or p not in second:
+            problems.append({"kind": "missing_verdict", "mutant": os.path.basename(p)})
+            continue
+        if first[p] != cli[p]:
+            problems.append({"kind": "disagrees_with_cli",
+                             "mutant": os.path.basename(p),
+                             "cli": cli[p], "seam": first[p]})
+        if first[p] != second[p]:
+            problems.append({"kind": "order_dependent",
+                             "mutant": os.path.basename(p),
+                             "first": first[p], "shuffled": second[p]})
+
+    agree = sum(1 for p in paths if p in first and first[p] == cli[p])
+    stable = sum(1 for p in paths if p in first and p in second
+                 and first[p] == second[p])
+    report = {"schema_version": 1, "profile": args.profile, "rng_seed": args.seed,
+              "mutants": len(paths), "agree_with_cli": agree,
+              "order_stable": stable, "problems": problems,
+              "total_problems": len(problems)}
+
+    if args.json or args.output:
+        text = json.dumps(report, indent=2, sort_keys=True)
+        if args.output:
+            open(args.output, "w").write(text + "\n")
+        else:
+            print(text)
+    else:
+        print(f"seamcheck ({args.profile}, {len(paths)} mutants, seed {args.seed})")
+        print(f"  A. seam agrees with CLI : {agree}/{len(paths)}")
+        print(f"  B. order-independent    : {stable}/{len(paths)}")
+        for item in problems[:8]:
+            print(f"     {item}")
+        print("  RESULT:", "PASS" if not problems else "FAIL")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

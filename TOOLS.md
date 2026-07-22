@@ -14,10 +14,210 @@ tools/h5policy-fuzz      -> ../h5policy/tools/h5policy-fuzz
 tools/h5policy-fuzzlib   -> ../h5policy/tools/h5policy-fuzzlib
 tools/h5policy-crashfuzz -> ../h5policy/tools/h5policy-crashfuzz
 tools/h5policy-gencorpus -> ../h5policy/tools/h5policy-gencorpus
+tools/h5policy-probe     -> ../h5policy/tools/h5policy-probe
+tools/h5policy-truncate  -> ../h5policy/tools/h5policy-truncate
+tools/h5policy-lazy      -> ../h5policy/tools/h5policy-lazy
+tools/h5policy-seamcheck -> ../h5policy/tools/h5policy-seamcheck
+tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
-`tools/pkdoc.py` is a repository-level helper script used by the documentation
-targets.
+`tools/pkdoc.py` and `tools/h5cve` are repository-level helper scripts (not
+symlinks): `pkdoc.py` backs the documentation targets, and `h5cve` is the CVE
+case orchestrator described below.
+
+## h5cve Case Orchestrator
+
+`tools/h5cve` chains the existing tools into one provenance-stamped CVE case
+bundle and auto-populates the [`registry/cve-case.yml`](registry/cve-case.yml)
+schema.  It duplicates no tool logic — it shells out to `h5policy`, `h5markers`,
+`h5explain`, and the exact-build probe, and maps the primary finding to its
+invariant through [`registry/findings.yml`](registry/findings.yml).
+
+```text
+h5cve init  <id> --poc FILE                 # bundle: PoC, sha256, skeleton case.yml
+h5cve triage <case>                         # oracle + census + registry mapping
+h5cve verify <case> --baseline BINDIR [--candidate BINDIR]   # exact-build probes
+h5cve variants <case> [--seed VALID]        # typed semantic variants via h5mutate
+h5cve minimize <case>                        # deferred: structure-aware reducer
+h5cve promote <case>                        # draft tests expectation + registry case
+h5cve census <root>                         # read-only oracle census of an HDF5 tree
+h5cve matrix [--baseline BINDIR] [--output F]  # exact-build canary matrix
+h5cve evidence [--matrix F]                 # measured libhdf5 verdict per family
+h5cve verification                          # §12 requirement status per family
+```
+
+`triage` names the violated invariant from the primary finding. Twenty finding
+codes are emitted by more than one walker, so the mapping is resolved with the
+finding **message** via the `contexts` rules in `registry/findings.yml`. When no
+rule matches, triage asserts **nothing** and reports the candidate families
+instead — an unnamed invariant is a visible gap, a wrong one is a wrong fix.
+Production codes that have not reached that semantic review are source-tracked
+in `registry/finding-backlog.yml`; triage deliberately leaves their mapping
+unset until they move into `registry/findings.yml`.
+
+## Exact-Build Canary Matrix
+
+`h5cve matrix` runs the selected libhdf5 build against every corpus fixture that
+declares an `h5cve` contract, and reports one row per fixture/family:
+
+| status | meaning |
+|---|---|
+| `verified` | the family exercise ran and every required entry point succeeded |
+| `unexercised` | the exercise was selected but did not complete — typically because libhdf5 rejected the file, which is the expected result for a malformed fixture |
+| `violation` | a forbidden activation occurred, or the build diverged from the oracle where the fixture requires alignment |
+| `coverage_gap` | no canary exists for that family, or the fixture declares no contract |
+
+[`registry/h5cve-matrix-policy.yml`](registry/h5cve-matrix-policy.yml) pins which
+statuses each fixture may report; the matrix exits non-zero on anything else. A
+fixture must state its family and permitted statuses explicitly, so a new canary
+or a changed traversal surface cannot silently inherit a passing outcome.
+
+Only `reject_corrupt` is compared against the build for alignment.
+`reject_resource` and `reject_policy` are decisions about the selected *profile*
+— a traversal budget or a denied feature — which libhdf5 has no equivalent of,
+so those rows report `not_comparable` rather than a divergence.
+
+A canary that passes on a valid fixture does not show it could detect a defect.
+Each family therefore also needs a malformed fixture that libhdf5 opens
+successfully and that carries the family's defect: one rejected at `H5Fopen`
+never reaches the family surface at all. All 15 families with canaries currently
+have such a specimen.
+
+`h5cve evidence` turns a matrix run into a per-family verdict on the selected
+build (`enforced`, `partial`, `diverges`, `unmeasured`) and writes
+[`registry/libhdf5-evidence.yml`](registry/libhdf5-evidence.yml). That file is
+the **measurement**; `validation-coverage.yml`'s `validators.hdf5` is the
+hand-maintained **claim**, and `tools/check_registry.py` fails on any
+disagreement — so a claim about libhdf5 cannot drift from what was observed.
+Regenerate after changing the build under test or the corpus:
+
+```sh
+tools/h5cve evidence --libhdf5-version 2.2.0    # ~8s, runs the matrix itself
+```
+
+`h5cve verification` scores each family against the eleven §12 verification
+requirements and writes
+[`registry/verification-coverage.yml`](registry/verification-coverage.yml).
+Statuses are `met`, `partial`, `absent` or `not_assessed` — the last is not a
+soft `met`, and requirements that would need fixtures classified by hand are
+marked that way rather than inferred. `check_registry.py` enforces that every
+record is scored on every requirement, but not the scores themselves: the file
+measures distance from §12 rather than gating on it.
+
+## Truncation Sweep
+
+Every prefix of a valid file is a file an attacker can hand you, and each one
+must be *decided*: `h5policy` has to terminate with a verdict rather than escape
+with an exception, hang, or report an internal error.
+`tools/h5policy-truncate` walks those prefixes and asserts exactly that.
+
+```sh
+tools/h5policy-truncate h5policy/tests/valid/*.h5      # exhaustive, minutes
+tools/h5policy-truncate --max-prefixes 512 SEED...     # bounded
+```
+
+Analysis runs **in-process** through the `h5policy_analyze` seam, all prefixes
+in one poke session: ~250 prefixes/second against ~2/second for the CLI, which
+is what makes an exhaustive sweep practical at all.
+
+Coverage is reported per seed as `exhaustive` (every byte boundary) or `sampled`
+(the budget forced striding, spending half of it on every boundary of the
+metadata-dense head). A sampled sweep is not an exhaustive one and does not
+satisfy §12. `run.sh` runs a bounded subset as a regression check; the full
+corpus sweep is on-demand, like the fuzzer.
+
+Results land in [`registry/truncation-sweep.json`](registry/truncation-sweep.json),
+which `h5cve verification` reads to score the §12 truncation requirement.
+
+## Lazy-Validation Measurement
+
+"Validation remains lazy" is falsifiable: the cost of validating a file must be
+a function of its **metadata**, not of how much raw data it carries.
+`tools/h5policy-lazy` measures that on the report's deterministic counters —
+`metadata_bytes_seen` and `walk_operations` — rather than wall-clock, which is
+dominated by interpreter startup and too noisy to assert on.
+
+```sh
+tools/h5policy-lazy                                  # human-readable
+tools/h5policy-lazy --output registry/lazy-validation.json
+```
+
+Three ladders, and the third is what makes the first two mean anything:
+
+| ladder | varies | expectation |
+|---|---|---|
+| `data` | raw data ~1000x, structure fixed | counters flat |
+| `filtered` | same with deflate, **one chunk throughout** | counters flat — a validator that decompressed to inspect payload would show it |
+| `chunks` | chunk count 100x — real metadata growth | `walk_operations` **must rise** |
+
+Without the control, flat counters could equally mean the counters are broken.
+The `filtered` ladder pins the chunk count deliberately: letting it vary with
+`n` would measure metadata growth rather than data volume.
+
+Counters are bounded by ratio, not equality — decoding a larger stored-size
+field can cost a few operations without any payload being touched, while a
+validator that read payload would grow with `n`. Current result: cost flat
+across a ~1000x data increase, with the control rising 375 → 987 → 7107.
+
+## In-Process Seam Self-Check
+
+Analysing through `h5policy_analyze` instead of the CLI is ~7x faster (the
+pickles load once, not per file), but every analysis then shares interpreter
+state. `h5policy_analyze`'s reset list is what keeps them independent, and a
+leak there is worse than slowness: one hostile input could silently change every
+verdict after it, and a fuzzer would report those corrupted verdicts as findings.
+
+**`tools/h5policy-seamcheck` is the gate on any work that batches analyses.**
+
+```sh
+tools/h5policy-seamcheck --count 120        # default: forensic profile
+tools/h5policy-seamcheck --profile legacy --count 60
+```
+
+Two checks, over adversarial mutants built with the fuzzer's own engine:
+
+| check | asserts |
+|---|---|
+| **A** agreement | the seam's (decision, finding codes, feature flags) equals the CLI's, which is the shipped behaviour and therefore ground truth |
+| **B** order | the same mutants in a *different* order give the same verdicts |
+
+Both passes select the same profile by construction — a forensic CLI run against
+a seam left on its `untrusted_strict` default produces a large and very
+plausible-looking divergence that has nothing to do with state.
+
+Its first production run found a real leak: `h5policy_heap_data_seg_size`
+survived into the next analysis, and a larger value from an earlier file
+silently disabled the bound three call sites check link-name offsets against.
+Check **A** caught it; check **B** did not, because the leak saturates within a
+few analyses and both orders then agree. Neither check subsumes the other.
+
+## h5mutate Semantic Mutation Engine
+
+`tools/h5mutate` applies **typed** mutations that each target one named invariant
+in [`registry/validation-coverage.yml`](registry/validation-coverage.yml), reseal
+the enclosing checksums, and emit a recipe sidecar (parent hash, intended
+invariant/finding, changed byte ranges, reseals).  Each mutant is
+self-validating — `family --verify` asserts h5policy emits the intended finding.
+
+```text
+h5mutate list  [--seed FILE]
+h5mutate apply --seed FILE --recipe NAME --out FILE
+h5mutate family --seed FILE --out-dir DIR [--verify]
+```
+
+The current slice covers the object-header continuation family (the interval
+model): target overlapping the source chunk at start/interior/end, zero-size,
+out-of-file, and alias onto an already-decoded chunk.  `run.sh` runs
+`family --verify` as a pinned check, and `h5cve variants` uses it to populate a
+case bundle.  The structure-aware **reducer** (`h5cve minimize`) is the
+remaining half of roadmap change #5.
+
+Bundles live under `cases/<id>/` (git-ignored working scratch); `promote` is
+what lands tracked artifacts in `h5policy/tests/` and `registry/`.  The exact-
+build probe (`tools/h5policy-probe`, and `h5policy/tools/probe/`) runs a selected
+libhdf5 build under an `LD_PRELOAD` activation interposer inside a sandbox and
+reports whether rejection preceded any OS-observable activation; see
+[`h5policy/tools/probe/README.md`](h5policy/tools/probe/README.md).
 
 ## Marker Scanner
 

@@ -1,0 +1,787 @@
+# h5policy validation-coverage manifest.
+#
+# One entry per record family: the invariants that family requires (strategy
+# doc §5 / §11.5), the finding each maps to, where the oracle enforces it, the
+# tests and fuzz targets that exercise it, and its migration status.
+#
+# `validators.h5policy` describes the ORACLE. `validators.hdf5` is a SEPARATE
+# claim about libhdf5 and must be proven per §11.4-11.5, never inferred from
+# h5policy's own verdict. `unverified` means exactly that: not yet established
+# by an exact-build probe.
+#
+# Statuses:
+#   coverage_status : covered | partial | coverage_gap
+#   migration_status: oracle-enforced | oracle-partial | not-modeled
+#   validators.*    : enforced | partial | unverified | not-modeled
+#
+# All 16 record families have catalogued vertical slices. `invariants[*].id`
+# values are the shared keys that findings.yml references; production codes
+# whose semantic mapping is still pending are tracked in finding-backlog.yml.
+schema_version: 1
+
+records:
+
+  - record: object_header_continuation
+    section: "IV.A.2 — Object Headers and Object Header Messages"
+    message_type: 0x0010
+    versions: [1, 2]
+    scope: reference_graph
+    child_reference: object_header_chunk       # v2 chunks begin with 'OCHK'; v1 have no signature
+    coordinator: h5policy_validate_msg_chunk    # h5policy/pickles/h5_dispatch.pk
+    semantic_boundary: object-header continuation closure   # strategy §11.3
+
+    # Interval model: the coordinator tracks each chunk's occupied [lo, hi)
+    # extent (h5policy_cont_lo/_hi in h5_walk.pk), not bare start addresses, and
+    # counts a chunk only after it clears the overlap gate.
+    invariants:
+      - id: continuation.local_encoding
+        strategy: "§5 local validation — fields fully encoded, arithmetic representable"
+        finding: null            # local decode; failure surfaces as a map/bounds error
+      - id: continuation.target_in_file
+        strategy: "§5 — target within the permitted file region"
+        finding: H5_CORRUPT_OFFSET_OUT_OF_FILE
+      - id: continuation.nonzero_extent
+        strategy: "§5 — chunk has a message region to parse"
+        finding: H5_CORRUPT_ZERO_CONTINUATION_CHUNK
+      - id: continuation.no_source_overlap
+        strategy: "§5 — target does not improperly overlap the current chunk"
+        finding: H5_CORRUPT_SELF_REFERENTIAL_CONTINUATION
+      - id: continuation.no_chunk_alias
+        strategy: "§5 — target does not overlap another object-header chunk"
+        finding: H5_CORRUPT_NON_PROGRESS_LOOP
+      - id: continuation.valid_envelope
+        strategy: "§5 — every chunk envelope (OCHK signature / size) is valid"
+        finding: [H5_CORRUPT_MESSAGE_OVERRUNS_CHUNK, H5_CORRUPT_BAD_SIGNATURE]
+      - id: continuation.valid_checksum
+        strategy: "§5 — every chunk checksum is valid"
+        finding: H5_CORRUPT_BAD_CHECKSUM
+      - id: continuation.unique_counting
+        strategy: "§5 — counts derive from the final set of validated unique chunks"
+        finding: null            # counting rule; the budget itself is a resource finding
+      - id: continuation.chunk_budget
+        strategy: "§8 — bounded traversal under profile limits"
+        finding: H5_RESOURCE_OBJECT_HEADER_CHUNKS
+
+    validators:
+      h5policy: enforced
+      hdf5: enforced   # measured; see libhdf5-evidence.yml
+
+    tests:
+      - path: h5policy/tests/expected/malformed-continuation_overlaps_source.yml
+        asserts: continuation.no_source_overlap
+      - path: h5policy/tests/expected/valid-continuation_chunks.yml
+        asserts: [continuation.valid_envelope, continuation.valid_checksum]
+      - path: h5policy/tests/expected/integration-object_header_chunks.yml
+        asserts: [continuation.chunk_budget, continuation.unique_counting]
+      - path: h5policy/tests/unit_limits.pk
+        asserts: [continuation.chunk_budget, continuation.unique_counting]
+
+    fuzz_targets:
+      seed: h5policy/tests/valid/continuation_chunks.h5
+      engine: h5mutate                        # h5policy/tools/h5mutate (family --verify)
+      recipes:                                # each self-validating against its invariant
+        - status: built
+          recipe: cont_overlap_source_start
+          mutation: continuation target == source chunk start
+          asserts: continuation.no_source_overlap
+        - status: built
+          recipe: cont_overlap_source_inside
+          mutation: continuation target a few bytes inside the source chunk
+          asserts: continuation.no_source_overlap
+        - status: built
+          recipe: cont_overlap_source_end
+          mutation: continuation target on the source chunk's last byte
+          asserts: continuation.no_source_overlap
+        - status: built
+          recipe: cont_zero_size
+          mutation: continuation with zero declared size
+          asserts: continuation.nonzero_extent
+        - status: built
+          recipe: cont_out_of_file
+          mutation: continuation target past end of file
+          asserts: continuation.target_in_file
+        - status: built
+          recipe: cont_alias_prior_chunk
+          mutation: continuation aliases an already-decoded chunk
+          asserts: continuation.no_chunk_alias
+        - status: planned                     # needs a deeper seed / synthesised chain
+          mutation: pending-node back edges, short and long cycles
+        - status: planned
+          mutation: message count vs validated unique-chunk count
+
+    coverage_status: covered
+    migration_status: oracle-enforced
+    related_cves: []             # continuation self-reference family; no numbered case bundled yet
+
+  # ── external-reference family: EFL, external links, VDS (strategy §7) ─────────
+  # "External links and VDS mappings [and EFL] are decoded as bounded strings and
+  # inert references ... external access occurs only during an explicitly
+  # authorised activation step."  h5policy DENIES these features under untrusted
+  # profiles (policy findings) and validates their record encoding; it never
+  # opens a target.  The exact-build probe supplies the libhdf5 side: on
+  # GHSA-rw9f-j585-9m4p it caught libhdf5 opening the EFL target /etc/passwd --
+  # a premature external open the oracle refuses.
+
+  - record: external_file_list
+    section: "IV.A.2.j — Data Storage: External Data Files (EFL)"
+    message_type: 0x0007
+    versions: [1]
+    scope: policy                       # feature gate; record decode is record_local
+    child_reference: external_file
+    coordinator: h5policy_validate_external_file_list   # h5policy/pickles/h5_external.pk
+    semantic_boundary: external file list message + its target-path decode
+    invariants:
+      - id: efl.no_external_open
+        strategy: "§7 — inert reference; no external open before authorised activation"
+        finding: H5_POLICY_EXTERNAL_STORAGE
+      - id: efl.target_path_classified
+        strategy: "§7 — classify the decoded target path (absolute/parent/relative), do not traverse"
+        finding: [H5_ADVISORY_EXTERNAL_STORAGE_ABSOLUTE_PATH, H5_ADVISORY_EXTERNAL_STORAGE_PARENT_PATH, H5_ADVISORY_EXTERNAL_STORAGE_RELATIVE_PATH]
+      - id: efl.segment_bounded
+        finding: H5_ADVISORY_EXTERNAL_STORAGE_UNLIMITED_SEGMENT
+      - id: efl.header_complete
+        finding: H5_CORRUPT_EXTERNAL_FILE_LIST_TRUNCATED_HEADER
+      - id: efl.supported_version
+        finding: H5_CORRUPT_UNSUPPORTED_EXTERNAL_FILE_LIST_VERSION
+      - id: efl.reserved_zero
+        finding: H5_CORRUPT_EXTERNAL_FILE_LIST_RESERVED
+      - id: efl.slot_count_consistent
+        finding: H5_CORRUPT_EXTERNAL_FILE_LIST_SLOT_COUNT
+      - id: efl.slots_present
+        finding: H5_CORRUPT_EXTERNAL_FILE_LIST_TRUNCATED_SLOTS
+      - id: efl.no_trailing_bytes
+        finding: H5_CORRUPT_EXTERNAL_FILE_LIST_TRAILING_BYTES
+      - id: efl.name_offset_in_heap
+        finding: H5_CORRUPT_EXTERNAL_FILE_LIST_NAME_OFFSET
+      - id: efl.segment_extent_representable
+        finding: H5_CORRUPT_EXTERNAL_FILE_LIST_SEGMENT_OVERFLOW
+    validators:
+      h5policy: enforced
+      hdf5: enforced   # measured; see libhdf5-evidence.yml
+    tests:
+      - {path: h5policy/tests/expected/policy-external_storage.yml, asserts: efl.no_external_open}
+      - {path: h5policy/tests/expected/policy-external_storage_parent_unlimited.yml, asserts: [efl.target_path_classified, efl.segment_bounded]}
+      - {path: h5policy/tests/expected/malformed-bad_efl_slot_count.yml, asserts: efl.slot_count_consistent}
+      - {path: h5policy/tests/expected/malformed-bad_efl_name_offset.yml, asserts: efl.name_offset_in_heap}
+      - {path: h5policy/tests/expected/malformed-overflowing_efl_segment.yml, asserts: efl.segment_extent_representable}
+    coverage_status: covered
+    migration_status: oracle-enforced
+    related_cves: [GHSA-rw9f-j585-9m4p, GHSA-6prg-6cfw-6mf7]   # EFL arbitrary read / write
+
+  - record: external_link
+    section: "IV.A.2.f — Link Message (external link value)"
+    message_type: 0x0006
+    versions: [1]
+    scope: policy
+    child_reference: external_target_path
+    coordinator: h5policy_validate_external_link        # h5policy/pickles/h5_dense_links.pk
+    semantic_boundary: external link message value (file + object path)
+    invariants:
+      - id: elink.no_external_traverse
+        strategy: "§7 — decode target, do not open the external file"
+        finding: H5_POLICY_EXTERNAL_LINK
+      - id: elink.no_user_defined_traverse
+        strategy: "§7 — user-defined links remain inert and are never activated"
+        finding: H5_POLICY_USER_DEFINED_LINK
+      - id: elink.target_path_classified
+        finding: [H5_ADVISORY_EXTERNAL_LINK_ABSOLUTE_PATH, H5_ADVISORY_EXTERNAL_LINK_PARENT_PATH, H5_ADVISORY_EXTERNAL_LINK_RELATIVE_PATH]
+      - id: elink.message_complete
+        finding: H5_CORRUPT_EXTERNAL_LINK_MESSAGE_TOO_SMALL
+      - id: elink.info_complete
+        finding: H5_CORRUPT_EXTERNAL_LINK_INFO_TOO_SMALL
+      - id: elink.value_terminated
+        strategy: "§1 — string searches bounded by their encoded region"
+        finding: H5_CORRUPT_EXTERNAL_LINK_VALUE_NOT_TERMINATED
+    validators:
+      h5policy: enforced
+      hdf5: enforced   # measured; see libhdf5-evidence.yml
+    tests:
+      - {path: h5policy/tests/expected/policy-external_link.yml, asserts: elink.no_external_traverse}
+      - {path: h5policy/tests/expected/policy-external_link_parent-legacy.yml, asserts: elink.target_path_classified}
+      - {path: h5policy/tests/expected/malformed-external_link_unterminated_value.yml, asserts: elink.value_terminated}
+      - {path: h5policy/tests/expected/malformed-bad_external_link_info.yml, asserts: elink.info_complete}
+    coverage_status: covered
+    migration_status: oracle-enforced
+    related_cves: [GHSA-vgg6-x295-v778, GHSA-8993-mw9r-68ff]   # extern traverse / elink path traversal
+
+  - record: virtual_dataset
+    section: "IV.A.2.l — Data Layout Message (version 4, virtual)"
+    message_type: 0x0008
+    versions: [4]
+    scope: policy
+    child_reference: vds_source
+    coordinator: h5policy_validate_vds_layout           # h5policy/pickles/h5_vds.pk
+    semantic_boundary: virtual layout message + per-mapping source name/selection
+    invariants:
+      - id: vds.no_source_open
+        strategy: "§7 — decode mappings as inert references; no source open before activation"
+        finding: H5_POLICY_VDS
+      - id: vds.source_path_classified
+        finding: [H5_ADVISORY_VDS_ABSOLUTE_SOURCE, H5_ADVISORY_VDS_PARENT_SOURCE, H5_ADVISORY_VDS_RELATIVE_SOURCE]
+      - id: vds.layout_complete
+        finding: H5_CORRUPT_VDS_LAYOUT_TOO_SMALL
+      - id: vds.mapping_header_complete
+        finding: H5_CORRUPT_VDS_MAPPING_HEADER
+      - id: vds.mapping_flags_valid
+        finding: H5_CORRUPT_VDS_MAPPING_FLAGS
+      - id: vds.no_mapping_trailing_bytes
+        finding: H5_CORRUPT_VDS_MAPPING_TRAILING_BYTES
+      - id: vds.selection_valid
+        finding: H5_CORRUPT_VDS_SELECTION
+      - id: vds.source_name_bounded
+        strategy: "§1 — bounded string decode"
+        finding: H5_CORRUPT_VDS_SOURCE_NAME
+      - id: vds.heap_object_present
+        finding: H5_CORRUPT_VDS_HEAP_OBJECT_MISSING
+      - id: vds.global_heap_header
+        finding: H5_CORRUPT_GLOBAL_HEAP_HEADER
+      - id: vds.global_heap_object
+        finding: H5_CORRUPT_GLOBAL_HEAP_OBJECT
+    validators:
+      h5policy: enforced
+      hdf5: enforced   # measured; see libhdf5-evidence.yml
+    tests:
+      - {path: h5policy/tests/expected/policy-vds_absolute_source.yml, asserts: [vds.no_source_open, vds.source_path_classified]}
+      - {path: h5policy/tests/expected/cve-vds_nentries_mult_overflow.yml, asserts: vds.layout_complete}
+    coverage_status: covered
+    migration_status: oracle-enforced
+    related_cves: [GHSA-96x8-6f7x-7r4f, GHSA-cqj6-3x6m-235g, GHSA-ggpr-6p6h-cv96]
+
+  # Partial vertical slices. Their emitted findings now have authoritative
+  # semantic mappings, while the remaining `backlog` blocks track validation
+  # evidence and migration work. Promote a family to `covered` only when the
+  # validator, fixtures, entry-point driver, and CI gate land together.
+  - record: datatypes
+    section: "IV.A.3 — Datatypes"
+    scope: local_decode
+    semantic_boundary: datatype recursion, member bounds, and size arithmetic
+    invariants:
+      - id: datatype.recursion_depth
+        finding: H5_RESOURCE_DATATYPE_RECURSION_DEPTH
+      - id: datatype.compound_member_bounds
+        finding: H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_BOUNDS
+      - id: datatype.size_arithmetic
+        finding: H5_CORRUPT_LENGTH_OVERFLOW
+      - {id: datatype.members_nonzero, finding: H5_CORRUPT_DATATYPE_ZERO_MEMBERS}
+      - {id: datatype.precision_bounds, finding: H5_CORRUPT_DATATYPE_PRECISION_BOUNDS}
+      - {id: datatype.unused_bits, finding: H5_CORRUPT_DATATYPE_UNUSED_BITS}
+      - {id: datatype.version_supported, finding: H5_CORRUPT_UNSUPPORTED_DATATYPE_VERSION}
+      - {id: datatype.message_complete, finding: H5_CORRUPT_DATATYPE_MESSAGE_TOO_SMALL}
+      - {id: datatype.nonzero_size, finding: H5_CORRUPT_DATATYPE_ZERO_SIZE}
+      - {id: datatype.class_known, finding: H5_CORRUPT_UNKNOWN_DATATYPE_CLASS}
+      - {id: datatype.array_shape, finding: [H5_CORRUPT_DATATYPE_ARRAY_DIMENSION, H5_CORRUPT_DATATYPE_ARRAY_RANK, H5_CORRUPT_DATATYPE_ARRAY_SIZE]}
+      - {id: datatype.enum_encoding, finding: [H5_CORRUPT_DATATYPE_ENUM_BASE_SIZE, H5_CORRUPT_DATATYPE_ENUM_NAME_EMPTY]}
+      - {id: datatype.float_fields, finding: [H5_CORRUPT_DATATYPE_FLOAT_EXPONENT, H5_CORRUPT_DATATYPE_FLOAT_MANTISSA, H5_CORRUPT_DATATYPE_FLOAT_SIGN]}
+    backlog:
+      validator: h5policy datatype validator (existing implementation; registry slice pending)
+      stable_findings:
+        - H5_RESOURCE_DATATYPE_RECURSION_DEPTH
+        - H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_BOUNDS
+        - H5_CORRUPT_LENGTH_OVERFLOW
+      fixtures:
+        - h5policy/tests/expected/cve-dtype_unbounded_recursion.yml
+        - h5policy/tests/expected/cve-dtype_compound_unbounded_recursion.yml
+        - h5policy/tests/expected/malformed-compound_member_array_bounds.yml
+        - h5policy/tests/expected/malformed-compound_member_array_nelem_overflow.yml
+        - h5policy/tests/expected/malformed-compound_member_offset_oob.yml
+      source_cases:
+        - cve/GHSA-6422-xp8g-rjf6/16_dtype-unbounded-recursion.h5
+        - cve/GHSA-v7v6-7rm9-q8xg/14_compound-v1-array-bounds.h5
+        - cve/GHSA-fqg8-mff7-72f6/compound_member_offset_oob.h5
+        - cve/GHSA-4rg2-qjqh-fcfc/15_array-create-nelem-overflow.h5
+      entry_point_driver: h5cve datatype canary (H5Topen/H5Tget_size/H5Tget_member_* and bounded dataset materialization)
+      ci_checks: exact-build probe plus recursion/resource limits, no-crash, and no-premature-materialization assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-nested_datatypes.yml, asserts: datatype.recursion_depth}
+      - {path: h5policy/tests/expected/malformed-bad_datatype_precision_bounds.yml, asserts: datatype.precision_bounds}
+      - {path: h5policy/tests/expected/valid-empty.yml, asserts: datatypes.bypass_unexercised}
+    validators: {h5policy: enforced, hdf5: partial}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: btree_heap_index
+    section: "III — B-tree, heap, and index structures"
+    scope: aggregate_object
+    semantic_boundary: traversal progress, entry counts, extents, and budgets
+    invariants:
+      - id: btree.entry_count
+        finding: H5_CORRUPT_BTREE_NODE_ENTRY_COUNT
+      - id: btree.extent_bounds
+        finding: [H5_CORRUPT_V2_BTREE_NODE_SIZE, H5_CORRUPT_LENGTH_OVERFLOW]
+      - id: btree.traversal_budget
+        finding: H5_RESOURCE_BTREE_DEPTH
+    backlog:
+      validator: h5policy structural traversal validators
+      stable_findings:
+        - H5_CORRUPT_BTREE_NODE_ENTRY_COUNT
+        - H5_CORRUPT_V2_BTREE_NODE_SIZE
+        - H5_RESOURCE_BTREE_DEPTH
+      fixtures:
+        - h5policy/tests/expected/valid-dense_links_deep.yml
+        - h5policy/tests/expected/malformed-bad_group_btree_declared_size.yml
+        - h5policy/tests/expected/integration-btree_depth.yml
+      source_cases:
+        - cve/GHSA-94rm-5gh9-v94p/64_bt2-hdrinit-divzero-assert.h5
+        - cve/GHSA-hx9j-mp99-2p98/63_bt2-chksize-oob-read.h5
+        - cve/GHSA-79pc-6c3v-2cp3/62_bt2-nrec-heap-overflow.h5
+        - cve/GHSA-9cjq-p566-7jc5/53_gheap-infinite-loop.h5
+      entry_point_driver: h5cve bounded H5Lvisit2 indexed-name resolution canary
+      ci_checks: exact-build probe with traversal budget, timeout, and no-crash assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-dense_links_deep.yml, asserts: btree.indexed_name_resolution}
+      - {path: h5policy/tests/expected/integration-btree_depth.yml, asserts: btree.traversal_budget}
+      - {path: h5policy/tests/expected/malformed-bad_group_btree_declared_size.yml, asserts: btree_heap_index.unexercised_on_traversal_reject}
+      - {path: h5policy/tests/expected/valid-empty.yml, asserts: btree_heap_index.bypass_unexercised}
+    validators: {h5policy: enforced, hdf5: enforced}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: dataset_layout_filter_fill
+    section: "IV.A.2.k — Dataset layout, filters, and fill values"
+    scope: aggregate_object
+    semantic_boundary: layout dimensions and filter/fill-size arithmetic
+    invariants:
+      - id: layout.fill_value_size
+        finding: H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH
+      - id: layout.logical_bytes_budget
+        finding: H5_RESOURCE_LOGICAL_DATASET_BYTES
+      - id: layout.filter_pipeline_bounds
+        finding: H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE
+      - id: layout.filter_element_count
+        finding: H5_CORRUPT_FILTER_NELMTS_MISMATCH
+      - id: layout.filter_element_size
+        finding: H5_CORRUPT_FILTER_ELEMENT_SIZE_MISMATCH
+      - id: layout.chunk_size_32bit
+        finding: H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT
+      - id: layout.rank_match
+        finding: H5_CORRUPT_LAYOUT_RANK_MISMATCH
+      - id: layout.chunk_size_budget
+        finding: H5_RESOURCE_CHUNK_TOO_SMALL
+      - id: layout.filter_decode_advisory
+        finding: H5_ADVISORY_DECODE_FILTER
+      - id: layout.dynamic_filter_policy
+        finding: H5_POLICY_DYNAMIC_FILTER
+      - id: layout.filtered_heap_checksum
+        finding: H5_CORRUPT_FILTERED_HEAP_NO_DBLOCK_CHECKSUM
+      - {id: layout.compact_size, finding: H5_CORRUPT_COMPACT_LAYOUT_SIZE_MISMATCH}
+      - {id: layout.fill_message_complete, finding: H5_CORRUPT_FILL_VALUE_MESSAGE_TOO_SMALL}
+      - {id: layout.fill_payload_bounded, finding: H5_CORRUPT_FILL_VALUE_OVERRUNS_MESSAGE}
+      - {id: layout.fill_version_supported, finding: H5_CORRUPT_UNSUPPORTED_FILL_VALUE_VERSION}
+      - {id: layout.pipeline_message_complete, finding: H5_CORRUPT_FILTER_PIPELINE_MESSAGE_TOO_SMALL}
+      - {id: layout.pipeline_version_supported, finding: H5_CORRUPT_UNSUPPORTED_FILTER_PIPELINE_VERSION}
+      - {id: layout.dimensionality, finding: H5_CORRUPT_LAYOUT_DIMENSIONALITY}
+      - {id: layout.class_known, finding: H5_CORRUPT_UNKNOWN_LAYOUT_CLASS}
+      - {id: layout.version_supported, finding: H5_CORRUPT_UNSUPPORTED_LAYOUT_VERSION}
+      - {id: layout.nbit_parameters, finding: [H5_CORRUPT_NBIT_PARAMS_CLASS, H5_CORRUPT_NBIT_PARAMS_OVERRUN]}
+      - {id: layout.chunk_dimensions_nonzero, finding: H5_CORRUPT_ZERO_CHUNK_DIMENSION}
+      - {id: layout.filter_count_budget, finding: H5_RESOURCE_FILTER_COUNT}
+      - {id: layout.filter_parameter_depth, finding: H5_RESOURCE_FILTER_PARAMETER_RECURSION_DEPTH}
+      - {id: layout.chunk_count_budget, finding: H5_RESOURCE_CHUNK_COUNT}
+      - {id: layout.metadata_bytes_budget, finding: H5_RESOURCE_ACCOUNTED_METADATA_BYTES}
+      - {id: layout.metadata_ratio_budget, finding: H5_RESOURCE_METADATA_RATIO}
+      - {id: layout.single_value_budget, finding: H5_RESOURCE_SINGLE_VALUE_BYTES}
+      - {id: layout.contiguous_size, finding: H5_CORRUPT_CONTIGUOUS_LAYOUT_SIZE_MISMATCH}
+      - {id: layout.dataset_present, finding: H5_CORRUPT_DATASET_MISSING_LAYOUT}
+      - {id: layout.storage_extent, finding: H5_CORRUPT_DATASET_STORAGE_OVERFLOW}
+    backlog:
+      validator: h5policy layout/filter validators (existing implementation; slice pending)
+      stable_findings:
+        - H5_RESOURCE_FILTER_COUNT
+        - H5_CORRUPT_LENGTH_OVERFLOW
+        - H5_CORRUPT_FILTERED_HEAP_NO_DBLOCK_CHECKSUM
+        - H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE
+        - H5_CORRUPT_FILTER_NELMTS_MISMATCH
+        - H5_CORRUPT_FILTER_ELEMENT_SIZE_MISMATCH
+        - H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT
+        - H5_CORRUPT_LAYOUT_RANK_MISMATCH
+        - H5_RESOURCE_CHUNK_TOO_SMALL
+        - H5_ADVISORY_DECODE_FILTER
+      fixtures:
+        - h5policy/tests/expected/integration-filter_count.yml
+        - h5policy/tests/expected/integration-filter_parameter_depth.yml
+        - h5policy/tests/expected/malformed-filtered_dense_link_pipeline_overrun.yml
+      source_cases:
+        - cve/GHSA-g8gr-rcqj-9rqw/41_huge-filter-size-overflow.h5
+        - cve/GHSA-vphp-6m8x-3gwq/52_fill-size-oob-read.h5
+        - cve/GHSA-jqv4-697v-vh6r/58_dblock-filter-size-mismatch.h5
+        - cve/GHSA-9cjq-p566-7jc5/53_gheap-infinite-loop.h5
+      entry_point_driver: h5cve dataset-I/O canary (bounded H5Dopen/H5Dread and creation-plist inspection)
+      ci_checks: exact-build bounded read, filter isolation, no-plugin-load, and no-crash assertions
+    tests:
+      - {path: h5policy/tests/expected/integration-multi_filter-baseline.yml, asserts: layout.filter_decode_advisory}
+      - {path: h5policy/tests/expected/malformed-scaleoffset_size_mismatch.yml, asserts: layout.filter_element_size}
+      - {path: h5policy/tests/expected/valid-empty.yml, asserts: dataset_layout_filter_fill.bypass_unexercised}
+    validators: {h5policy: enforced, hdf5: partial}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: cache_image_dependency_graph
+    section: "III.G — Metadata cache images and dependency graphs"
+    scope: reference_graph
+    semantic_boundary: cache-image extents and dependency-graph closure/order
+    invariants:
+      - id: mdci.entry_count
+        finding: H5_CORRUPT_MDCI_ENTRY_COUNT
+      - id: mdci.entry_extent
+        finding: H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE
+      - id: mdci.length_match
+        finding: H5_CORRUPT_MDCI_LENGTH_MISMATCH
+      - id: mdci.header_complete
+        finding: H5_CORRUPT_CACHE_IMAGE_MESSAGE_TOO_SMALL
+      - id: mdci.supported_version
+        finding: H5_CORRUPT_UNSUPPORTED_CACHE_IMAGE_VERSION
+      - {id: mdci.block_header_complete, finding: H5_CORRUPT_MDCI_HEADER_TOO_SMALL}
+      - {id: mdci.block_version_supported, finding: H5_CORRUPT_MDCI_BLOCK_VERSION}
+      - {id: mdci.block_flags_valid, finding: H5_CORRUPT_MDCI_BLOCK_FLAGS}
+      - {id: mdci.entry_header_valid, finding: [H5_CORRUPT_MDCI_ENTRY_ADDRESS, H5_CORRUPT_MDCI_ENTRY_FLAGS, H5_CORRUPT_MDCI_ENTRY_LENGTH]}
+      - {id: mdci.no_trailing_bytes, finding: H5_CORRUPT_MDCI_TRAILING_BYTES}
+    backlog:
+      validator: h5policy MDCI/cache-image envelope validator
+      stable_findings:
+        - H5_CORRUPT_MDCI_ENTRY_COUNT
+        - H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE
+        - H5_CORRUPT_MDCI_LENGTH_MISMATCH
+        - H5_CORRUPT_CACHE_IMAGE_MESSAGE_TOO_SMALL
+        - H5_CORRUPT_UNSUPPORTED_CACHE_IMAGE_VERSION
+      fixtures:
+        - h5policy/tests/expected/valid-cache_image.yml
+        - h5policy/tests/expected/cve-mdci_entry_offby_header.yml
+      source_cases:
+        - cve/GHSA-xmpx-xpfm-9wg8/29_mdci-pend-offby-header.h5
+      entry_point_driver: h5cve H5Fget_mdc_image_info/H5Fget_mdc_size bounded image and object traversal canary
+      ci_checks: entry-count/extent checks, dependency-order validation, timeout, and no-crash assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-cache_image.yml, asserts: mdci.entry_extent}
+      - {path: h5policy/tests/expected/cve-mdci_entry_offby_header.yml, asserts: mdci.entry_extent}
+      - {path: h5policy/tests/expected/valid-empty.yml, asserts: cache_image_dependency_graph.bypass_unexercised}
+    validators: {h5policy: partial, hdf5: enforced}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: dataspace_dimension
+    section: "IV.A.2.i — Dataspaces and dimension arithmetic"
+    scope: local_decode
+    semantic_boundary: rank, dimensions, maxima, element-count products, and selections
+    invariants:
+      - id: dataspace.nelem_product
+        finding: H5_CORRUPT_DATASPACE_NELEM_OVERFLOW
+      - id: dataspace.dimension_max
+        finding: H5_CORRUPT_DATASPACE_DIMENSION_EXCEEDS_MAX
+      - id: dataspace.rank_budget
+        finding: H5_RESOURCE_DATASPACE_RANK
+      - id: dataspace.version_supported
+        finding: H5_CORRUPT_UNSUPPORTED_DATASPACE_VERSION
+      - id: dataspace.padding_zero
+        finding: H5_CORRUPT_DATASPACE_NONZERO_PADDING
+      - {id: dataspace.message_complete, finding: H5_CORRUPT_DATASPACE_MESSAGE_TOO_SMALL}
+      - {id: dataspace.class_valid, finding: H5_CORRUPT_DATASPACE_INVALID_CLASS}
+      - {id: dataspace.rank_valid, finding: [H5_CORRUPT_DATASPACE_INVALID_RANK, H5_CORRUPT_DATASPACE_RANK_TOO_LARGE]}
+    backlog:
+      validator: h5policy dataspace validator (existing implementation; slice pending)
+      stable_findings:
+        - H5_CORRUPT_DATASPACE_NELEM_OVERFLOW
+        - H5_CORRUPT_DATASPACE_DIMENSION_EXCEEDS_MAX
+        - H5_RESOURCE_DATASPACE_RANK
+        - H5_CORRUPT_UNSUPPORTED_DATASPACE_VERSION
+        - H5_CORRUPT_DATASPACE_NONZERO_PADDING
+      fixtures:
+        - h5policy/tests/expected/malformed-dataspace_nelem_overflow.yml
+        - h5policy/tests/expected/malformed-bad_dataspace_maxdim.yml
+        - h5policy/tests/expected/integration-rank_limit.yml
+        - h5policy/tests/expected/malformed-bad_duplicate_dataspace_message.yml
+        - h5policy/tests/expected/malformed-bad_dataspace_trailing_bytes.yml
+      source_cases:
+        - cve/GHSA-8crq-5cfw-x78q/48_h5s-nelem-product-variants.h5
+        - cve/GHSA-hmrc-6jcw-3rww/47_nelem-wrap-compact-oob.h5
+      entry_point_driver: h5cve dataspace canary (bounded H5Sget_simple_extent_*, npoints, and selection APIs)
+      ci_checks: checked dimension products, rank budgets, bounded selections, timeout, and no-crash assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-chunk_single.yml, asserts: dataspace.nelem_product}
+      - {path: h5policy/tests/expected/malformed-bad_dataspace_maxdim.yml, asserts: dataspace.dimension_max}
+      - {path: h5policy/tests/expected/valid-empty.yml, asserts: dataspace_dimension.bypass_unexercised}
+    validators: {h5policy: enforced, hdf5: enforced}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: address_space_bounds
+    section: "III.A — File address space and EOA bounds"
+    scope: local_decode
+    semantic_boundary: address representability, end-of-address, and file-space extents
+    invariants:
+      - id: address.offset_in_file
+        finding: [H5_CORRUPT_OFFSET_OUT_OF_FILE, H5_CORRUPT_LENGTH_OVERFLOW]
+      - id: address.length_representable
+        finding: H5_CORRUPT_LENGTH_EXCEEDS_U64
+    backlog:
+      validator: h5policy address/EOA validator
+      stable_findings: [H5_CORRUPT_OFFSET_OUT_OF_FILE]
+      fixtures: [h5policy/tests/expected/malformed-inflated_eoa_ext_addr.yml]
+      source_cases: [cve/GHSA-3q59-vm8m-rmjw/38_ext-addr-eoa-bypass.h5]
+      entry_point_driver: bounded H5Fget_eoa/H5Fget_filesize and FCPL geometry canary
+      ci_checks: physical-file/EOA bounds, no wraparound, timeout, and no-crash assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-userblock_earliest.yml, asserts: address.offset_in_file}
+      - {path: h5policy/tests/expected/malformed-inflated_eoa_ext_addr.yml, asserts: address.offset_in_file}
+      - {path: h5policy/tests/expected/malformed-inflated_eoa_ext_addr.yml, asserts: address_space_bounds.unexercised_on_open_reject}
+    validators: {h5policy: enforced, hdf5: enforced}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: chunk_index
+    section: "IV.A.2.k — Chunk index structures"
+    scope: aggregate_object
+    semantic_boundary: chunk-index child pointers, cycles, records, and extents
+    invariants:
+      - {id: chunk.child_address, finding: [H5_CORRUPT_CHUNK_INDEX_CHILD_ADDRESS, H5_CORRUPT_OFFSET_OUT_OF_FILE]}
+      - {id: chunk.no_cycle, finding: H5_CORRUPT_CHUNK_INDEX_CYCLE}
+      - {id: chunk.record_layout, finding: H5_CORRUPT_V2_BTREE_RECORD_LAYOUT}
+      - {id: chunk.record_size, finding: H5_CORRUPT_V2_BTREE_RECORD_SIZE}
+      - {id: chunk.unlimited_dimension, finding: H5_CORRUPT_CHUNK_INDEX_WITHOUT_UNLIMITED_DIM}
+      - {id: chunk.stored_size, finding: H5_CORRUPT_CHUNK_STORED_SIZE}
+      - {id: chunk.index_type_known, finding: H5_CORRUPT_UNKNOWN_CHUNK_INDEX_TYPE}
+      - {id: chunk.btree_version_supported, finding: H5_CORRUPT_UNSUPPORTED_V2_BTREE_VERSION}
+      - {id: chunk.btree_node_header, finding: H5_CORRUPT_V2_BTREE_NODE_HEADER}
+      - {id: chunk.btree_root_count, finding: H5_CORRUPT_V2_BTREE_ROOT_COUNT}
+      - {id: chunk.btree_split_merge, finding: H5_CORRUPT_V2_BTREE_SPLIT_MERGE}
+      - {id: chunk.extensible_array_identity, finding: [H5_CORRUPT_EXTENSIBLE_ARRAY_BACKPOINTER, H5_CORRUPT_EXTENSIBLE_ARRAY_BLOCK_HEADER, H5_CORRUPT_EXTENSIBLE_ARRAY_BLOCK_OFFSET, H5_CORRUPT_EXTENSIBLE_ARRAY_CLIENT_ID]}
+      - {id: chunk.extensible_array_geometry, finding: [H5_CORRUPT_EXTENSIBLE_ARRAY_GEOMETRY, H5_CORRUPT_EXTENSIBLE_ARRAY_INDEX_ADDRESS]}
+      - {id: chunk.extensible_array_version, finding: H5_CORRUPT_UNSUPPORTED_EXTENSIBLE_ARRAY_VERSION}
+      - {id: chunk.fixed_array_client, finding: H5_CORRUPT_FIXED_ARRAY_CLIENT_ID}
+      - {id: chunk.fixed_array_version, finding: H5_CORRUPT_UNSUPPORTED_FIXED_ARRAY_VERSION}
+    backlog:
+      validator: h5policy chunk-index validators (existing implementation; slice pending)
+      stable_findings: [H5_CORRUPT_CHUNK_INDEX_CHILD_ADDRESS, H5_CORRUPT_CHUNK_INDEX_CYCLE, H5_CORRUPT_V2_BTREE_RECORD_LAYOUT]
+      candidate_findings: [H5_CORRUPT_V2_BTREE_RECORD_SIZE]
+      fixtures: [h5policy/tests/expected/malformed-filtered_dense_link_pipeline_overrun.yml]
+      source_cases: [cve/GHSA-79pc-6c3v-2cp3/62_bt2-nrec-heap-overflow.h5]
+      entry_point_driver: bounded H5Dopen/H5Dread chunk-index traversal canary
+      ci_checks: child-address bounds, cycle detection, traversal budgets, and no-crash assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-chunk_v2_btree.yml, asserts: chunk.record_layout}
+      - {path: h5policy/tests/expected/malformed-bad_chunk_v2_btree_child_address.yml, asserts: chunk.child_address}
+      - {path: h5policy/tests/expected/valid-simple_dataset.yml, asserts: chunk_index.bypass_unexercised}
+    validators: {h5policy: enforced, hdf5: enforced}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: dense_index
+    section: "IV.A.2.f — Dense link indexes and heaps"
+    scope: aggregate_object
+    semantic_boundary: dense-index IDs, counts, duplicate/missing entries, and heap references
+    invariants:
+      - {id: dense.count_match, finding: H5_CORRUPT_DENSE_INDEX_COUNT_MISMATCH}
+      - {id: dense.unique_name_ids, finding: H5_CORRUPT_DENSE_NAME_INDEX_DUPLICATE_ID}
+      - {id: dense.link_name_nonempty, finding: H5_CORRUPT_LINK_NAME_EMPTY}
+      - {id: dense.link_name_charset, finding: H5_CORRUPT_LINK_NAME_CHARSET}
+      - {id: dense.corder_index_closure, finding: [H5_CORRUPT_DENSE_CORDER_INDEX_DUPLICATE_ID, H5_CORRUPT_DENSE_CORDER_INDEX_MISSING_ID, H5_CORRUPT_DENSE_CORDER_INDEX_UNKNOWN_ID, H5_CORRUPT_DENSE_CORDER_MISMATCH]}
+      - {id: dense.link_info_addresses, finding: [H5_CORRUPT_LINK_INFO_ADDRESS_PAIR, H5_CORRUPT_LINK_INFO_CORDER_ADDRESS]}
+      - {id: dense.btree_child_pointer, finding: H5_CORRUPT_V2_BTREE_CHILD_POINTER}
+      - {id: dense.btree_no_cycle, finding: H5_CORRUPT_V2_BTREE_CYCLE}
+      - {id: dense.btree_unique_keys, finding: H5_CORRUPT_V2_BTREE_DUPLICATE_KEY}
+      - {id: dense.btree_record_order, finding: H5_CORRUPT_V2_BTREE_RECORD_ORDER}
+      - {id: dense.btree_record_type, finding: H5_CORRUPT_V2_BTREE_RECORD_TYPE}
+      - {id: dense.btree_root, finding: H5_CORRUPT_V2_BTREE_ROOT}
+      - {id: dense.btree_subtree_count, finding: H5_CORRUPT_V2_BTREE_SUBTREE_COUNT}
+      - {id: dense.btree_total_count, finding: H5_CORRUPT_V2_BTREE_TOTAL_COUNT}
+      - {id: dense.btree_node_header, finding: H5_CORRUPT_V2_BTREE_NODE_HEADER}
+      - {id: dense.btree_version_supported, finding: H5_CORRUPT_UNSUPPORTED_V2_BTREE_VERSION}
+    backlog:
+      validator: h5policy dense-link/index validators (existing implementation; slice pending)
+      stable_findings: [H5_CORRUPT_DENSE_INDEX_COUNT_MISMATCH, H5_CORRUPT_DENSE_NAME_INDEX_DUPLICATE_ID, H5_CORRUPT_FRACTAL_HEAP_ID]
+      candidate_findings: [H5_CORRUPT_LINK_NAME_EMPTY]
+      fixtures: [h5policy/tests/expected/malformed-filtered_dense_link_pipeline_overrun.yml]
+      source_cases: [cve/GHSA-vgg6-x295-v778/49_extern-traverse-strlen-oob.h5]
+      entry_point_driver: bounded H5Lvisit2/H5Ovisit3 dense-index canary
+      ci_checks: count consistency, ID uniqueness, heap bounds, and no-crash assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-dense_links.yml, asserts: dense.count_match}
+      - {path: h5policy/tests/expected/malformed-bad_dense_btin_checksum.yml, asserts: dense_index.oracle_rejection}
+      - {path: h5policy/tests/expected/valid-empty.yml, asserts: dense_index.bypass_unexercised}
+    validators: {h5policy: enforced, hdf5: partial}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: heap_structures
+    section: "III.E — Local and fractal heaps"
+    scope: aggregate_object
+    semantic_boundary: heap segments, free lists, IDs, offsets, and extents
+    invariants:
+      - id: heap.offset_bounds
+        finding: [H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS, H5_CORRUPT_LENGTH_OVERFLOW, H5_CORRUPT_OFFSET_OUT_OF_FILE]
+      - id: heap.free_list_valid
+        finding: H5_CORRUPT_LOCAL_HEAP_FREE_LIST
+      - id: heap.fractal_id_valid
+        finding: H5_CORRUPT_FRACTAL_HEAP_ID
+      - id: heap.global_progress
+        finding: H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP
+      - {id: heap.attribute_info_complete, finding: H5_CORRUPT_ATTRIBUTE_INFO_MESSAGE_TOO_SMALL}
+      - {id: heap.attribute_info_no_trailing_bytes, finding: H5_CORRUPT_ATTRIBUTE_INFO_TRAILING_BYTES}
+      - {id: heap.attribute_info_version, finding: H5_CORRUPT_UNSUPPORTED_ATTRIBUTE_INFO_VERSION}
+      - {id: heap.attribute_info_flags, finding: H5_CORRUPT_ATTRIBUTE_INFO_FLAGS}
+      - {id: heap.attribute_info_addresses, finding: [H5_CORRUPT_ATTRIBUTE_INFO_ADDRESS_PAIR, H5_CORRUPT_ATTRIBUTE_INFO_CORDER_ADDRESS]}
+      - {id: heap.fractal_id_width, finding: H5_CORRUPT_FRACTAL_HEAP_ID_WIDTH}
+      - {id: heap.fractal_version_supported, finding: H5_CORRUPT_UNSUPPORTED_FRACTAL_HEAP_VERSION}
+      - {id: heap.local_reserved_zero, finding: H5_CORRUPT_LOCAL_HEAP_RESERVED}
+      - {id: heap.local_version_supported, finding: H5_CORRUPT_UNSUPPORTED_LOCAL_HEAP_VERSION}
+      - {id: heap.btree_node_header, finding: H5_CORRUPT_V2_BTREE_NODE_HEADER}
+      - {id: heap.btree_version_supported, finding: H5_CORRUPT_UNSUPPORTED_V2_BTREE_VERSION}
+    backlog:
+      validator: h5policy heap validators (existing implementation; slice pending)
+      stable_findings: [H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS, H5_CORRUPT_LOCAL_HEAP_FREE_LIST, H5_CORRUPT_FRACTAL_HEAP_ID]
+      candidate_findings: [H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP]
+      fixtures: [h5policy/tests/expected/malformed-bad_heap_segment.yml]
+      source_cases: [cve/GHSA-9cjq-p566-7jc5/53_gheap-infinite-loop.h5]
+      entry_point_driver: bounded heap lookup/iteration canary
+      ci_checks: segment extents, free-list progress, ID bounds, timeout, and no-crash assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-dense_attribute.yml, asserts: heap.fractal_id_valid}
+      - {path: h5policy/tests/expected/malformed-bad_dense_attr_corder_leaf_checksum.yml, asserts: heap_structures.oracle_rejection}
+      - {path: h5policy/tests/expected/valid-userblock_earliest.yml, asserts: heap_structures.bypass_unexercised}
+    validators: {h5policy: enforced, hdf5: partial}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: shared_messages_legacy
+    section: "III.D/IV.A — Shared messages and legacy compatibility"
+    scope: reference_graph
+    semantic_boundary: shared-message references, versions, placement, and legacy padding
+    invariants:
+      - {id: legacy.mapping, finding: H5_CORRUPT_MAPPING_FAILED}
+      - {id: legacy.unknown_message_policy, finding: H5_POLICY_UNKNOWN_MESSAGE}
+      - {id: legacy.dangerous_message_policy, finding: H5_POLICY_LEGACY_DANGEROUS_MESSAGE}
+      - {id: sohm.child_address, finding: H5_CORRUPT_SOHM_BTREE_CHILD_ADDRESS}
+      - {id: sohm.no_cycle, finding: H5_CORRUPT_SOHM_BTREE_CYCLE}
+      - {id: sohm.location, finding: H5_CORRUPT_SOHM_LOCATION}
+      - {id: legacy.v1_reference_count, finding: H5_CORRUPT_REFERENCE_COUNT_IN_V1_OBJECT_HEADER}
+      - {id: shared.storage_address, finding: H5_CORRUPT_SOHM_STORAGE_ADDRESS}
+      - {id: shared.message_complete, finding: H5_CORRUPT_SHARED_MESSAGE_TOO_SMALL}
+      - {id: shared.message_version, finding: H5_CORRUPT_SHARED_MESSAGE_VERSION}
+      - {id: legacy.old_mtime_encoding, finding: [H5_CORRUPT_OLD_MTIME_FORMAT, H5_CORRUPT_OLD_MTIME_MESSAGE_SIZE, H5_CORRUPT_OLD_MTIME_RANGE, H5_CORRUPT_OLD_MTIME_RESERVED]}
+      - {id: legacy.refcount_encoding, finding: [H5_CORRUPT_REFCOUNT_MESSAGE_SIZE, H5_CORRUPT_UNSUPPORTED_REFCOUNT_VERSION]}
+      - {id: sohm.message_complete, finding: H5_CORRUPT_SOHM_MESSAGE_TOO_SMALL}
+      - {id: sohm.version_supported, finding: H5_CORRUPT_SOHM_VERSION}
+      - {id: sohm.index_definition, finding: [H5_CORRUPT_SOHM_INDEX_COUNT, H5_CORRUPT_SOHM_INDEX_TYPE, H5_CORRUPT_SOHM_MESSAGE_TYPES, H5_CORRUPT_SOHM_PHASE_CHANGE]}
+      - {id: sohm.message_count, finding: H5_CORRUPT_SOHM_MESSAGE_COUNT}
+      - {id: sohm.reference_count, finding: H5_CORRUPT_SOHM_REFERENCE_COUNT}
+      - {id: sohm.heap_id, finding: H5_CORRUPT_SOHM_HEAP_ID}
+      - {id: sohm.huge_object, finding: H5_CORRUPT_SOHM_HUGE_OBJECT}
+      - {id: sohm.object_header_address, finding: H5_CORRUPT_SOHM_OBJECT_HEADER_ADDRESS}
+      - {id: sohm.filter_mask, finding: H5_CORRUPT_FILTER_MASK}
+      - {id: sohm.reserved_zero, finding: H5_CORRUPT_RESERVED_FIELD}
+      - {id: sohm.btree_node_header, finding: H5_CORRUPT_V2_BTREE_NODE_HEADER}
+      - {id: sohm.btree_subtree_count, finding: H5_CORRUPT_V2_BTREE_SUBTREE_COUNT}
+      - {id: sohm.btree_root_count, finding: H5_CORRUPT_V2_BTREE_ROOT_COUNT}
+      - {id: sohm.btree_split_merge, finding: H5_CORRUPT_V2_BTREE_SPLIT_MERGE}
+      - {id: sohm.fractal_version_supported, finding: H5_CORRUPT_UNSUPPORTED_FRACTAL_HEAP_VERSION}
+    backlog:
+      validator: h5policy shared-message/legacy validators (existing implementation; slice pending)
+      stable_findings: [H5_CORRUPT_REFERENCE_COUNT_IN_V1_OBJECT_HEADER, H5_CORRUPT_UNSUPPORTED_BTREEK_VERSION, H5_CORRUPT_LENGTH_OVERFLOW]
+      candidate_findings: [H5_CORRUPT_MAPPING_FAILED, H5_POLICY_UNKNOWN_MESSAGE]
+      fixtures: [h5policy/tests/expected/malformed-bad_duplicate_dataspace_message.yml]
+      source_cases: [cve/GHSA-6mjw-q95m-vq87/37_sizeof-size-uninit-length.h5]
+      entry_point_driver: bounded shared-message resolution and legacy object-open canary
+      ci_checks: reference-count closure, version handling, padding checks, and no-crash assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-shared_attr_datatype.yml, asserts: shared.storage_address}
+      - {path: h5policy/tests/expected/malformed-bad_sohm_btree_child_address.yml, asserts: sohm.child_address}
+      - {path: h5policy/tests/expected/valid-userblock_latest.yml, asserts: shared_messages_legacy.bypass_unexercised}
+    validators: {h5policy: enforced, hdf5: partial}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: message_envelope
+    section: "IV.A.2 — Object-header messages and legacy envelopes"
+    scope: local_decode
+    semantic_boundary: message versions, flags, declared lengths, and padding
+    invariants:
+      - {id: envelope.layout_minimum_size, finding: H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL}
+      - {id: envelope.object_header_version, finding: H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION}
+      - {id: envelope.group_info_version, finding: H5_CORRUPT_UNSUPPORTED_GROUP_INFO_VERSION}
+      - {id: envelope.group_info_trailing_bytes, finding: H5_CORRUPT_GROUP_INFO_TRAILING_BYTES}
+      - {id: envelope.link_info_max_corder, finding: H5_CORRUPT_LINK_INFO_NEGATIVE_MAX_CORDER}
+      - {id: envelope.link_info_trailing_bytes, finding: H5_CORRUPT_LINK_INFO_TRAILING_BYTES}
+      - {id: envelope.message_flags, finding: H5_CORRUPT_MESSAGE_FLAG_COMBINATION}
+      - {id: envelope.null_gap, finding: H5_CORRUPT_NULL_MESSAGE_GAP}
+      - {id: envelope.message_count, finding: H5_CORRUPT_OBJECT_HEADER_MESSAGE_COUNT}
+      - {id: envelope.symbol_table_cache_type, finding: H5_CORRUPT_SYMBOL_TABLE_CACHE_TYPE}
+      - {id: envelope.symbol_table_node_version, finding: H5_CORRUPT_UNSUPPORTED_SYMBOL_TABLE_NODE_VERSION}
+      - {id: envelope.attribute_complete, finding: [H5_CORRUPT_ATTRIBUTE_MESSAGE_TOO_SMALL, H5_CORRUPT_ATTRIBUTE_OVERRUNS_MESSAGE]}
+      - {id: envelope.attribute_name_nonempty, finding: H5_CORRUPT_ATTRIBUTE_NAME_EMPTY}
+      - {id: envelope.attribute_version_supported, finding: H5_CORRUPT_UNSUPPORTED_ATTRIBUTE_VERSION}
+      - {id: envelope.group_info_complete, finding: H5_CORRUPT_GROUP_INFO_MESSAGE_TOO_SMALL}
+      - {id: envelope.group_info_flags, finding: H5_CORRUPT_GROUP_INFO_FLAGS}
+      - {id: envelope.link_info_complete, finding: H5_CORRUPT_LINK_INFO_MESSAGE_TOO_SMALL}
+      - {id: envelope.link_info_flags, finding: H5_CORRUPT_LINK_INFO_FLAGS}
+      - {id: envelope.link_info_version_supported, finding: H5_CORRUPT_UNSUPPORTED_LINK_INFO_VERSION}
+      - {id: envelope.link_message_complete, finding: H5_CORRUPT_LINK_MESSAGE_TOO_SMALL}
+      - {id: envelope.link_version_supported, finding: H5_CORRUPT_UNSUPPORTED_LINK_VERSION}
+      - {id: envelope.message_shareable, finding: H5_CORRUPT_MESSAGE_FLAG_UNSHAREABLE}
+      - {id: envelope.name_nonempty, finding: H5_CORRUPT_NAME_MESSAGE_EMPTY}
+      - {id: envelope.symbol_table_complete, finding: H5_CORRUPT_SYMBOL_TABLE_MESSAGE_TOO_SMALL}
+      - {id: envelope.symbol_table_reserved_zero, finding: H5_CORRUPT_SYMBOL_TABLE_NODE_RESERVED}
+      - {id: envelope.mtime_encoding, finding: [H5_CORRUPT_MTIME_MESSAGE_SIZE, H5_CORRUPT_MTIME_RESERVED, H5_CORRUPT_UNSUPPORTED_MTIME_VERSION]}
+    backlog:
+      validator: h5policy message/object-header validators
+      stable_findings: message-envelope catalog entries
+      fixtures:
+        - h5policy/tests/expected/valid-continuation_chunks.yml
+        - h5policy/tests/expected/malformed-bad_message_flag_combination.yml
+      entry_point_driver: h5cve bounded H5Ovisit3/H5Oopen object-header envelope traversal
+      ci_checks: version, length, flag, and padding checks
+    tests:
+      - {path: h5policy/tests/expected/valid-continuation_chunks.yml, asserts: envelope.message_flags}
+      - {path: h5policy/tests/expected/malformed-bad_message_flag_combination.yml, asserts: envelope.message_flags}
+      - {path: h5policy/tests/expected/malformed-bad_message_flag_combination.yml, asserts: message_envelope.unexercised_on_open_reject}
+    validators: {h5policy: enforced, hdf5: enforced}
+    coverage_status: partial
+    migration_status: oracle-partial
+
+  - record: validation_controls
+    section: "Validation coordinator — address, free-space, and resource controls"
+    scope: resource
+    semantic_boundary: global validation limits and file-space control messages
+    invariants:
+      - {id: control.base_address, finding: [H5_CORRUPT_BASE_ADDRESS_MISMATCH, H5_CORRUPT_BAD_SIGNATURE]}
+      - {id: control.fsm_section_count, finding: H5_CORRUPT_FSM_SECTION_COUNT}
+      - {id: control.fsm_section_type, finding: H5_CORRUPT_FSM_SECTION_TYPE}
+      - {id: control.link_depth, finding: H5_RESOURCE_LINK_TRAVERSAL_DEPTH}
+      - {id: control.walk_operations, finding: H5_UNSUPPORTED_WALK_OPERATION_BUDGET}
+      - {id: control.walk_time, finding: H5_UNSUPPORTED_WALK_TIME_BUDGET}
+      - {id: control.wall_timeout, finding: H5_UNSUPPORTED_WALK_TIMEOUT}
+      - {id: control.object_count, finding: H5_RESOURCE_OBJECT_COUNT}
+      - {id: control.attribute_count, finding: H5_RESOURCE_ATTRIBUTE_COUNT}
+      - {id: control.finding_limit, finding: H5_POLICY_FINDINGS_TRUNCATED}
+      - {id: control.profile_valid, finding: H5_INTERNAL_INVALID_PROFILE}
+      - {id: control.internal_error, finding: H5_INTERNAL_ERROR}
+      - {id: control.metadata_ratio_advisory, finding: H5_ADVISORY_METADATA_RATIO}
+      - {id: control.coverage_gap, finding: H5_UNSUPPORTED_PICKLE_COVERAGE_GAP}
+      - {id: control.btree_k_encoding, finding: [H5_CORRUPT_BTREEK_MESSAGE_SIZE, H5_CORRUPT_BTREEK_VALUE, H5_CORRUPT_UNSUPPORTED_BTREEK_VERSION]}
+      - {id: control.btree_k_placement, finding: H5_CORRUPT_BTREEK_PLACEMENT}
+      - {id: control.driver_info_encoding, finding: [H5_CORRUPT_DRVINFO_LENGTH, H5_CORRUPT_DRVINFO_MESSAGE_TOO_SMALL, H5_CORRUPT_UNSUPPORTED_DRVINFO_VERSION]}
+      - {id: control.driver_info_placement, finding: H5_CORRUPT_DRVINFO_PLACEMENT}
+      - {id: control.fsinfo_complete, finding: H5_CORRUPT_FSINFO_MESSAGE_TOO_SMALL}
+      - {id: control.fsinfo_version_supported, finding: H5_CORRUPT_UNSUPPORTED_FSINFO_VERSION}
+      - {id: control.free_space_page_size, finding: H5_CORRUPT_FREE_SPACE_PAGE_SIZE}
+      - {id: control.fsm_acyclic, finding: [H5_CORRUPT_FSM_HEADER_CYCLE, H5_CORRUPT_FSM_SECTION_LIST_CYCLE]}
+      - {id: control.fsm_section_list_header, finding: H5_CORRUPT_FSM_SECTION_LIST_HEADER}
+      - {id: control.fsm_section_list_size, finding: H5_CORRUPT_FSM_SECTION_LIST_SIZE}
+      - {id: control.fsm_section_bounded, finding: H5_CORRUPT_FSM_SECTION_OVERRUN}
+      # The section RECORD is bounded by the section list (fsm_section_bounded);
+      # this is the distinct invariant that the extent the record *describes*
+      # lies within the file. Both address-range codes are shared, so the
+      # mapping is resolved by message via `contexts` in findings.yml.
+      - {id: control.fsm_section_extent, finding: [H5_CORRUPT_OFFSET_OUT_OF_FILE, H5_CORRUPT_LENGTH_OVERFLOW]}
+      - {id: control.fsm_version_supported, finding: H5_CORRUPT_UNSUPPORTED_FSM_VERSION}
+      - {id: control.superblock_k_values, finding: H5_CORRUPT_SUPERBLOCK_K_VALUE}
+      - {id: control.superblock_reserved_zero, finding: H5_CORRUPT_SUPERBLOCK_RESERVED}
+      - {id: control.superblock_status_flags, finding: H5_CORRUPT_SUPERBLOCK_STATUS_FLAGS}
+      - {id: control.superblock_field_version, finding: H5_CORRUPT_UNSUPPORTED_SUPERBLOCK_FIELD_VERSION}
+    backlog:
+      validator: h5policy validation coordinator and file-space-message validator
+      stable_findings: validation-control catalog entries
+      fixtures: [h5policy/tests/expected/integration-walk_operation_budget.yml]
+      entry_point_driver: bounded file open and coordinator budget canary
+      ci_checks: address, FSM, profile, and budget assertions
+    validators: {h5policy: enforced, hdf5: unmeasured}
+    coverage_status: partial
+    migration_status: oracle-partial

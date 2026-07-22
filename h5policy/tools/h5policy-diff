@@ -487,11 +487,22 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="*", help="HDF5 files")
     ap.add_argument("--dir", help="check every *.h5 under this directory")
+    ap.add_argument("--hdf5-bindir", help="resolve h5dump/h5debug from this "
+                    "build's bin dir instead of PATH (h5py is not repointed; "
+                    "its version is recorded for provenance)")
+    ap.add_argument("--json", action="store_true",
+                    help="emit results and tool provenance as JSON")
     ap.add_argument("--introspect", metavar="FILE",
                     help=argparse.SUPPRESS)  # internal: out-of-process oracle
     ap.add_argument("--probe-eager", metavar="FILE",
                     help=argparse.SUPPRESS)  # internal: deeper libhdf5 probe
     args = ap.parse_args()
+
+    # Prepend the selected build's bin dir so shutil.which / subprocess pick its
+    # h5dump and h5debug.  h5py links its own libhdf5 in-process and cannot be
+    # repointed here; the differential still records which version that is.
+    if args.hdf5_bindir:
+        os.environ["PATH"] = args.hdf5_bindir + os.pathsep + os.environ.get("PATH", "")
 
     if args.introspect:  # child invocation: emit libhdf5 facts and exit
         print(json.dumps(introspect(args.introspect)))
@@ -514,23 +525,54 @@ def main():
         if shutil.which(tool) is None:
             print(f"note: {tool} not found; skipping its oracle", file=sys.stderr)
 
+    provenance = {
+        "hdf5_bindir": args.hdf5_bindir,
+        "h5py_hdf5_version": getattr(h5py.version, "hdf5_version", None),
+        "tools": {t: _tool_version_diff(t) for t in ("h5dump", "h5debug")},
+    }
+
     total_fail = 0
+    records = []
     for path in files:
         rel = os.path.relpath(path)
         try:
             fails, warns, lines = check(path)
         except Exception as exc:
-            print(f"\n{rel}\n  ERROR {exc}")
+            if not args.json:
+                print(f"\n{rel}\n  ERROR {exc}")
+            records.append({"file": rel, "status": "ERROR", "error": str(exc)})
             total_fail += 1
             continue
         status = "FAIL" if fails else ("WARN" if warns else "PASS")
-        print(f"\n{rel}  [{status}]")
-        for ln in lines + warns + fails:
-            print(f"  {ln}")
+        records.append({"file": rel, "status": status,
+                        "checks": lines, "warnings": warns, "failures": fails})
+        if not args.json:
+            print(f"\n{rel}  [{status}]")
+            for ln in lines + warns + fails:
+                print(f"  {ln}")
         total_fail += len(fails)
 
-    print(f"\ndifferential: {total_fail} hard failure(s) across {len(files)} file(s)")
+    if args.json:
+        print(json.dumps({"tool": "h5policy-diff", "provenance": provenance,
+                          "hard_failures": total_fail, "files": len(files),
+                          "results": records}, indent=2))
+    else:
+        print(f"\ndifferential: {total_fail} hard failure(s) across "
+              f"{len(files)} file(s)")
     return 1 if total_fail else 0
+
+
+def _tool_version_diff(tool):
+    if shutil.which(tool) is None:
+        return None
+    try:
+        out = subprocess.run([tool, "--version"], capture_output=True,
+                             text=True, timeout=10).stdout
+        import re
+        m = re.search(r"\d+\.\d+\.\d+", out)
+        return m.group(0) if m else "?"
+    except Exception:
+        return "?"
 
 
 if __name__ == "__main__":

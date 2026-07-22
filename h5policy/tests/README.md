@@ -11,6 +11,20 @@ controlled outcome; a change that alters any decision is surfaced for review.
   `external_open`, `plugin_load`, `write`). A fixture can be reused by several
   expectations. Every report is also checked for schema version 1 and internally
   consistent file geometry; `expected_geometry` can pin individual values.
+  An optional `h5cve` block declares the fixture's exact-build canary contract:
+
+  ```yaml
+  h5cve:
+    family: chunk_index              # registry record whose exercise to run
+    require_oracle_alignment: true   # a divergence from libhdf5 is a violation
+    allowed_statuses: [unexercised, verified]
+  ```
+
+  The contract is what `../../tools/h5cve matrix` consumes; a fixture without one
+  is reported as a coverage gap rather than inheriting a pass. `allowed_statuses`
+  states intent, not observation — a fixture permitted to report `violation`
+  carries a comment saying why, and the reason is recorded in
+  `../../registry/cases/`.
 - `unit_datatype.pk` — synthetic checks for the bounded, depth-guarded
   datatype validator (recursion cap and truncation handling), run under poke.
 - `unit_messages.pk` — fixed-envelope and dispatch checks for old/new mtime,
@@ -30,9 +44,26 @@ controlled outcome; a change that alters any decision is surfaced for review.
 ./run.sh
 ```
 
-This regenerates the fixtures, runs the datatype and profile-limit unit checks,
-runs `h5policy` over every `expected/*.yml` case and asserts the result, then
-runs the differential harness.
+This regenerates the fixtures and runs every gate in one pass:
+
+| gate | asserts |
+|---|---|
+| registry consistency | the cross-file constraints, including that the manifest's claim about libhdf5 matches what was measured |
+| unit checks | datatype, message, file-space-info, profile limits, reachability, consumer API, `h5policy_analyze` seam, timeout report |
+| corpus cases | every `expected/*.yml`: decision, exit code, required findings, evidence locations, forbidden outcomes |
+| differential | h5policy's parse against libhdf5 via h5py / h5dump / h5debug |
+| exact-build probe + canary matrix | what the selected libhdf5 build actually does per fixture (skipped without `h5cc`) |
+| seam self-check | the in-process seam agrees with the CLI and is order-independent — the gate on batching analyses |
+| truncation sweep | a bounded prefix sweep; the exhaustive one is on-demand |
+| lazy validation | validation cost tracks metadata, not data volume, with a sensitivity control |
+| mutation family | every typed `h5mutate` mutant triggers its intended invariant |
+
+The truncation sweep and lazy-validation ladders are strategy-doc §12
+measurements, and the mutation family feeds its fuzz-target requirement; the
+seam self-check is not a §12 item but the gate that makes batching analyses
+safe. See [`TOOLS.md`](../../TOOLS.md) for running any of them standalone, and
+[`registry/verification-coverage.yml`](../../registry/verification-coverage.yml)
+for what §12 currently scores.
 
 The suite is also wired into CTest (top-level `CMakeLists.txt`), so
 `ctest -R h5policy_regression` runs it from a CMake build. The test is skipped

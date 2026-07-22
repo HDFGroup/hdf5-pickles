@@ -76,8 +76,20 @@ type H5WalkContext = struct
    simple.  The walk budget charges linear membership tests so hostile graphs
    with many duplicate references still terminate under profile control.  */
 var h5policy_visited_ohdrs = uint<64>[]();
-var h5policy_visited_conts = uint<64>[]();
 var h5policy_visited_btrees = uint<64>[]();
+
+/* Continuation chunks are tracked as the [lo, hi) byte intervals they occupy,
+   not as bare start addresses.  A start-address set can only reject a target
+   that lands on a byte some earlier continuation started on; it cannot see a
+   target that begins a few bytes inside an already-decoded chunk -- including
+   the source chunk that referenced it.  That is exactly the object-header
+   continuation family: a continuation pointing just past a chunk's leading
+   bytes (OCHK signature, or the v2 header prefix) has a start address nobody
+   has claimed, yet it overlaps live, already-decoded metadata.  Half-open
+   intervals let the walk reject any overlap -- self, alias, or partial -- and
+   still count one validated chunk per non-overlapping target. */
+var h5policy_cont_lo = uint<64>[]();
+var h5policy_cont_hi = uint<64>[]();
 
 /* Reachability record: the structures the walk actually read, with the kind it
    read them as.  The visited sets above cannot answer this -- they exist to
@@ -195,7 +207,8 @@ var h5policy_super_indexed_internal_k = 32UL;
 fun h5policy_reset_traversal_state = void:
 {
     h5policy_visited_ohdrs = uint<64>[]();
-    h5policy_visited_conts = uint<64>[]();
+    h5policy_cont_lo = uint<64>[]();
+    h5policy_cont_hi = uint<64>[]();
     h5policy_visited_btrees = uint<64>[]();
     h5policy_pending_ohdrs = uint<64>[]();
     h5policy_pending_depths = uint<64>[]();
@@ -235,13 +248,49 @@ fun h5policy_mark_visited_ohdr = (uint<64> addr) int:
     return 1;
 }
 
-fun h5policy_mark_visited_cont = (uint<64> addr) int:
+/* Half-open interval overlap: [a_lo, a_hi) and [b_lo, b_hi) share a byte iff
+   each starts strictly before the other ends.  Callers guarantee hi > lo. */
+fun h5policy_intervals_overlap = (uint<64> a_lo, uint<64> a_hi,
+                                  uint<64> b_lo, uint<64> b_hi) int:
 {
-    if (h5policy_seen_u64(h5policy_visited_conts, addr))
-        return 0;
+    return (a_lo < b_hi && b_lo < a_hi) ? 1 : 0;
+}
 
-    h5policy_visited_conts += [addr];
-    return 1;
+/* Classify a continuation target interval [tgt_lo, tgt_hi) against the source
+   chunk that referenced it and the set of continuation chunks already decoded
+   on this walk, then record it when it is genuinely new:
+
+     0  unique -- disjoint from the source and every prior chunk; recorded.
+     1  overlaps the source chunk (self-referential, generalized from the old
+        exact cont_addr == chunk_off test to any shared byte).
+     2  overlaps a previously decoded continuation chunk (alias / non-progress
+        cycle), so following it would re-decode live metadata.
+
+   The membership scan is O(len) and charged to the walk budget, matching the
+   other visited-set helpers, so an adversarial fan-out of continuation
+   messages still terminates under profile control.  Overlapping targets are
+   deliberately NOT recorded: they are rejected, never counted or followed. */
+fun h5policy_claim_cont_interval = (uint<64> src_lo, uint<64> src_hi,
+                                    uint<64> tgt_lo, uint<64> tgt_hi) int:
+{
+    h5policy_walk_tick(h5policy_cont_lo'length + 1UL);
+
+    if (h5policy_intervals_overlap(tgt_lo, tgt_hi, src_lo, src_hi))
+        return 1;
+
+    var i = 0UL;
+    while (i < h5policy_cont_lo'length)
+        {
+            if (h5policy_intervals_overlap(tgt_lo, tgt_hi,
+                                           h5policy_cont_lo[i],
+                                           h5policy_cont_hi[i]))
+                return 2;
+            i = i + 1UL;
+        }
+
+    h5policy_cont_lo += [tgt_lo];
+    h5policy_cont_hi += [tgt_hi];
+    return 0;
 }
 
 fun h5policy_mark_visited_btree = (uint<64> addr) int:
