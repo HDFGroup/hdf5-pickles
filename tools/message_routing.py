@@ -121,6 +121,79 @@ def _role_values(sources):
     return out
 
 
+# Shared decoders that take their role as a PARAMETER instead of reading a role
+# global: fn -> index of that parameter.  Preferred when the function is its own
+# entry point, because then the compiler enforces that every call site names a
+# role.  The values come from the call sites, so this reads as the parameter's
+# possible arguments -- unlike COMPOSING_HELPERS, nothing about the message text
+# has to be restated here.
+ROLE_PARAMS = {
+    # h5_dense_links.pk: a link is encoded the same in an object-header message
+    # and in a dense index's heap record, so one decoder serves both families.
+    "h5policy_validate_link_payload": 5,
+}
+
+
+def _split_params(src, open_paren):
+    """Parameters of a `fun` signature, split at depth 1.
+
+    Unlike split_args, this also tracks ANGLE brackets: a declared type like
+    `offset<uint<64>,B>` carries a comma that is not a parameter separator, and
+    counting it shifts every index after it.  Safe here because a poke parameter
+    list has no comparison operators; do not reuse it for call arguments.
+    """
+    depth = angle = 0
+    current, out = "", []
+    for i in range(open_paren, len(src)):
+        c = src[i]
+        if c == "(":
+            depth += 1
+            if depth == 1:
+                continue
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                out.append(current)
+                return out
+        elif c == "<":
+            angle += 1
+        elif c == ">":
+            angle -= 1
+        if depth == 1 and angle == 0 and c == ",":
+            out.append(current)
+            current = ""
+        else:
+            current += c
+    return out
+
+
+def _role_params(sources):
+    """[(source, body start, body end, param name, {values})] for ROLE_PARAMS."""
+    spans = []
+    for path, src in sources.items():
+        for fn, idx in ROLE_PARAMS.items():
+            d = re.search(rf"^fun\s+{fn}\s*=\s*\(", src, re.M)
+            if not d:
+                continue
+            params = _split_params(src, d.end() - 1)
+            if len(params) <= idx:
+                continue
+            name = params[idx].split()[-1]
+            values = set()
+            for other in sources.values():         # call sites may be anywhere
+                for m in re.finditer(rf"\b{fn}\s*\(", other):
+                    args = split_args(other, m.end() - 1)
+                    if len(args) > idx:
+                        lit = _literal(args[idx])
+                        if lit:
+                            values.add(lit)
+            nxt = re.compile(r"^fun\s", re.M).search(src, d.end())
+            if values:
+                spans.append((path, d.start(),
+                              nxt.start() if nxt else len(src), name, values))
+    return spans
+
+
 def split_args(src, open_paren):
     """Arguments of the call whose '(' is at src[open_paren], split at depth 1."""
     depth = 0
@@ -270,6 +343,7 @@ def extract(pattern=PICKLES):
     sources = {p: open(p).read() for p in sorted(glob.glob(pattern))}
     spec_fields = _spec_fields(sources)
     roles = _role_values(sources)
+    param_roles = _role_params(sources)
     messages = {}
     unanalyzable = []
 
@@ -280,6 +354,14 @@ def extract(pattern=PICKLES):
         base = path.split("/")[-1]
         bodies = _helper_bodies(src)
         inside = lambda pos: any(a <= pos < b for a, b in bodies)
+
+        def roles_at(pos):
+            """Role globals, plus any role PARAMETER in scope at `pos`."""
+            local = dict(roles)
+            for rpath, start, end, name, values in param_roles:
+                if rpath == path and start <= pos < end:
+                    local[name] = values
+            return local
 
         for fn, (code_idx, msg_idx) in EMIT_SITES.items():
             for m in re.finditer(rf"\b{fn}\s*\(", src):
@@ -295,8 +377,10 @@ def extract(pattern=PICKLES):
                                          spec_fields)
                 if spec_code and spec_msg:
                     for client in spec_code[1] & spec_msg[1]:
-                        codes = _resolve_expr(args[code_idx], spec_fields, client, roles)
-                        msgs_ = _resolve_expr(args[msg_idx], spec_fields, client, roles)
+                        codes = _resolve_expr(args[code_idx], spec_fields, client,
+                                              roles_at(m.start()))
+                        msgs_ = _resolve_expr(args[msg_idx], spec_fields, client,
+                                              roles_at(m.start()))
                         for c in codes or ():
                             for v in msgs_ or ():
                                 add(c, v, base)
@@ -311,7 +395,8 @@ def extract(pattern=PICKLES):
                         unanalyzable.append(
                             (base, fn, " ".join(args[code_idx].split())[:90]))
                     continue
-                values = _resolve_expr(args[msg_idx], spec_fields, roles=roles)
+                values = _resolve_expr(args[msg_idx], spec_fields,
+                                      roles=roles_at(m.start()))
                 if values is None:
                     if not inside(m.start()):
                         unanalyzable.append(
@@ -325,7 +410,8 @@ def extract(pattern=PICKLES):
                 args = split_args(src, m.end() - 1)
                 if len(args) <= what_idx:
                     continue
-                values = _resolve_expr(args[what_idx], spec_fields, roles=roles)
+                values = _resolve_expr(args[what_idx], spec_fields,
+                                      roles=roles_at(m.start()))
                 if values is None:
                     if not inside(m.start()):
                         unanalyzable.append(
