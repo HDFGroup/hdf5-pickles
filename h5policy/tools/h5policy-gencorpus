@@ -854,6 +854,10 @@ def _gen_malformed(root):
     _make_over_capacity_v2_btree_node(
         f"{root}/malformed/over_capacity_v2_btree_internal.h5",
         f"{root}/valid/adjacent_null_messages.h5", 8)
+    _make_cache_image_shadowed_btree(
+        f"{root}/malformed/cache_image_unshadowed_btree.h5",
+        os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                     "probe", "make_cache_image_dense.c"))
     _make_filtered_dense_link_no_dblock_checksum(
         f"{root}/malformed/filtered_dense_link_no_dblock_checksum.h5",
         f"{root}/valid/dense_links.h5")
@@ -2143,6 +2147,137 @@ def _make_zero_v2_btree_record_size(path, base_path):
     struct.pack_into("<H", raw, bt["bthd"] + 10, 0)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _mdci_shadow_ranges(raw):
+    """[(addr, len, addr_field_offset)] a metadata cache image caches, or [].
+
+    Mirrors the entry walk in h5policy's h5policy_validate_mdci_payload; kept
+    deliberately simple because it only has to read images this script wrote.
+    The field offset is returned so a fixture can repoint one entry.
+    """
+    o, el = raw[9], raw[10]
+    img = raw.find(b"MDCI")
+    if img < 0:
+        return []
+    nentries = struct.unpack_from("<H", raw, img + 6 + el)[0]
+    cur, entry_header, out = 10 + el, 14 + o + el, []
+    for _ in range(nentries):
+        e = img + cur
+        parents = struct.unpack_from("<H", raw, e + 8)[0]
+        addr = int.from_bytes(raw[e + 14:e + 14 + o], "little")
+        body = int.from_bytes(raw[e + 14 + o:e + 14 + o + el], "little")
+        out.append((addr, body, e + 14))
+        cur += entry_header + parents * o + body
+    return out
+
+
+def _make_cache_image_shadowed_btree(path, helper_source):
+    """Corruption in an UNSHADOWED structure, behind a metadata cache image.
+
+    Guards the cache-image traversal boundary.  An image shadows the on-disk
+    bytes at the addresses it caches, so those must not be decoded -- forensic
+    once manufactured a corrupt-root-header finding from stale shadowed bytes.
+    The fix for that was a hard stop at the first cache image, which then hid
+    real corruption in metadata the image does NOT cache
+    (GHSA-79pc-6c3v-2cp3/62: a live libhdf5 SIGSEGV the oracle reported only as
+    unsupported_coverage_gap).  The boundary is now a per-address skip.
+
+    So this fixture needs corruption on the unshadowed side, and the assertions
+    below are the fixture's whole point: if the base file's layout ever shifts
+    so the B-tree header lands inside the image, the file would still be
+    "corrupt with a cache image" but would no longer test the distinction, and
+    would pass whether or not the boundary regressed.  Fail loudly instead.
+    """
+    with tempfile.TemporaryDirectory() as build:
+        helper = os.path.join(build, "make_cache_image_dense")
+        try:
+            subprocess.run(["h5cc", "-O2", "-o", helper, helper_source],
+                           check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError:
+            raise SystemExit("h5policy-gencorpus: h5cc not found on PATH; it is "
+                             "needed to build the cache-image fixtures")
+        except subprocess.CalledProcessError as e:
+            raise SystemExit(f"h5policy-gencorpus: could not build {helper_source}\n"
+                             f"{e.stderr or ''}".rstrip())
+        base = os.path.join(build, "base.h5")
+        subprocess.run([helper, base], check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+        raw = bytearray(open(base, "rb").read())
+
+    o, el = raw[9], raw[10]
+    shadow = _mdci_shadow_ranges(raw)
+    if not shadow:
+        raise RuntimeError("cache-image fixture base carries no cache image")
+
+    # A cached entry's on-disk bytes are whatever was last flushed -- for a file
+    # written with an image they are typically ZERO, the metadata living only
+    # inside the image.  Flush every cached body back to its address first, so
+    # the file is self-consistent and any finding the walk reports afterwards is
+    # about real metadata rather than an artefact of this construction.  (An
+    # earlier attempt skipped this and reproduced the very false
+    # "root object header is neither v1 nor v2" the boundary exists to prevent.)
+    img = raw.find(b"MDCI")
+    nentries = struct.unpack_from("<H", raw, img + 6 + el)[0]
+    cur, entry_header = 10 + el, 14 + o + el
+    for _ in range(nentries):
+        e = img + cur
+        parents = struct.unpack_from("<H", raw, e + 8)[0]
+        addr = int.from_bytes(raw[e + 14:e + 14 + o], "little")
+        body_len = int.from_bytes(raw[e + 14 + o:e + 14 + o + el], "little")
+        body = e + entry_header + parents * o
+        raw[addr:addr + body_len] = raw[body:body + body_len]
+        cur += entry_header + parents * o + body_len
+
+    bt = _bthd_info_for_type(raw, 5)          # re-locate: bodies just landed
+    if bt is None:
+        raise RuntimeError("cache-image fixture base has no dense-link v2 B-tree")
+    bthd = bt["bthd"]
+
+    # libhdf5 caches the ROOT object header, and skipping a shadowed header also
+    # drops everything reachable through it -- so left alone the walk would stop
+    # at the root and never reach the B-tree, testing nothing.  Repoint that one
+    # entry at the B-tree leaf: the shape the real specimen has
+    # (GHSA-79pc-6c3v-2cp3/62 caches exactly one entry, the leaf).  Legitimate
+    # only because the flush above made on-disk match the cache.  Just the
+    # address bytes change -- entry count, sizes and the trailing checksum
+    # position are untouched, and h5policy does not verify the image checksum
+    # VALUE, so the container stays structurally valid.
+    root_oh = int.from_bytes(raw[12 + 3 * o:12 + 4 * o], "little")
+    leaf = bt["root"]
+    # Repoint every entry that caches an OBJECT HEADER (or the B-tree header) at
+    # the B-tree leaf instead.  The walk skips shadowed object headers, and
+    # skipping one also drops everything reachable through it -- so an image
+    # caching the root and the group headers would stop the traversal before the
+    # B-tree regardless of the boundary logic, and the fixture would pass either
+    # way.  What is left shadowed is the leaf: a NON-header structure, which is
+    # exactly the specimen's shape and the case the boundary has to get right.
+    blocking = [(a, n, off) for a, n, off in shadow
+                if raw[a:a + 4] == b"OHDR" or (a <= bthd < a + n)]
+    if not blocking:
+        raise RuntimeError("cache image caches no object header; the fixture's "
+                           "premise no longer holds")
+    for _a, _n, addr_off in blocking:
+        raw[addr_off:addr_off + o] = leaf.to_bytes(o, "little")
+
+    shadow = _mdci_shadow_ranges(raw)
+    if not shadow:
+        raise RuntimeError("cache image shadows nothing; fixture proves nothing")
+    if any(a <= bthd < a + n for a, n, _ in shadow):
+        raise RuntimeError(
+            f"dense-link B-tree header at {bthd} is shadowed by the cache image; "
+            "this fixture must corrupt UNSHADOWED metadata to test the boundary")
+    if any(a <= root_oh < a + n for a, n, _ in shadow):
+        raise RuntimeError("root object header is still shadowed; the walk would "
+                           "not reach the corrupted B-tree")
+
+    capacity = (bt["node_size"] - 10) // bt["record_size"]
+    nrec = min(0xFFFF, capacity + (150 // bt["record_size"]) + 1)
+    struct.pack_into("<H", raw, bthd + 16 + bt["off_size"], nrec)
+    struct.pack_into("<I", raw, bt["checksum"],
+                     _jenkins_lookup3()(bytes(raw[bthd:bt["checksum"]])))
     _patch(path, bytes(raw))
 
 
