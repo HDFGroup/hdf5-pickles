@@ -95,6 +95,31 @@ COMPOSING_HELPERS = {
 # assigns it, which is what the engine does at runtime -- one code path serves
 # all of them -- so no separate handling is needed.
 
+# Globals that name the ROLE of a shared walker and are concatenated onto its
+# messages.  A spec field is passed per call; a role global is set once at the
+# walker's entry, so the same expansion applies but the values come from the
+# global's assignments instead.  Its declaration initializer is "" -- that is
+# the not-in-a-walk placeholder, never emitted -- and is dropped exactly as an
+# empty spec field is.
+ROLE_GLOBALS = {
+    # h5_dense_links.pk: the creation-order walker serves both the dense LINK
+    # (record type 6) and dense ATTRIBUTE (type 9) indexes, which belong to
+    # different record families.
+    "h5policy_dense_corder_role",
+}
+
+
+def _role_values(sources):
+    """role global -> {literal values it is ever assigned}."""
+    out = {}
+    for src in sources.values():
+        for name in ROLE_GLOBALS:
+            for m in re.finditer(rf"\b{name}\s*=(.*?);", src, re.S):
+                for lit in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)):
+                    if lit:
+                        out.setdefault(name, set()).add(lit)
+    return out
+
 
 def split_args(src, open_paren):
     """Arguments of the call whose '(' is at src[open_paren], split at depth 1."""
@@ -159,17 +184,44 @@ def _spec_clients(expr, spec_fields):
     return fields, clients
 
 
-def _resolve_expr(expr, spec_fields, client=None):
+def _role_concat(expr, roles):
+    """Values of a `role + " literal"` concatenation, else None.
+
+    Every term must be a literal or a known role global; anything else means a
+    composition style this pass does not model, which must stay unanalyzable.
+    """
+    terms = [t.strip() for t in expr.split("+")]
+    if not any(t in roles for t in terms):
+        return None
+    values = {""}
+    for t in terms:
+        lit = _literal(t)
+        if lit is not None:
+            options = {lit}
+        elif t in roles:
+            options = roles[t]
+        else:
+            return None
+        values = {prefix + o for prefix in values for o in options}
+    return values or None
+
+
+def _resolve_expr(expr, spec_fields, client=None, roles=None):
     """Literal values an emit expression can take, optionally for one client.
 
-    Handles a bare literal, `spec.FIELD`, and a ternary over spec fields.
-    Returns None when the expression is not understood -- the caller reports
-    that rather than dropping it.
+    Handles a bare literal, `spec.FIELD`, a ternary over spec fields, and a
+    concatenation of literals with a ROLE_GLOBALS role.  Returns None when the
+    expression is not understood -- the caller reports that rather than
+    dropping it.
     """
     expr = " ".join(expr.split())
     lit = _literal(expr)
     if lit is not None:
         return {lit}
+    if roles:
+        concat = _role_concat(expr, roles)
+        if concat is not None:
+            return concat
     if '"' in expr:
         return None
     resolved = _spec_clients(expr, spec_fields)
@@ -217,6 +269,7 @@ def extract(pattern=PICKLES):
     """
     sources = {p: open(p).read() for p in sorted(glob.glob(pattern))}
     spec_fields = _spec_fields(sources)
+    roles = _role_values(sources)
     messages = {}
     unanalyzable = []
 
@@ -242,8 +295,8 @@ def extract(pattern=PICKLES):
                                          spec_fields)
                 if spec_code and spec_msg:
                     for client in spec_code[1] & spec_msg[1]:
-                        codes = _resolve_expr(args[code_idx], spec_fields, client)
-                        msgs_ = _resolve_expr(args[msg_idx], spec_fields, client)
+                        codes = _resolve_expr(args[code_idx], spec_fields, client, roles)
+                        msgs_ = _resolve_expr(args[msg_idx], spec_fields, client, roles)
                         for c in codes or ():
                             for v in msgs_ or ():
                                 add(c, v, base)
@@ -258,7 +311,7 @@ def extract(pattern=PICKLES):
                         unanalyzable.append(
                             (base, fn, " ".join(args[code_idx].split())[:90]))
                     continue
-                values = _resolve_expr(args[msg_idx], spec_fields)
+                values = _resolve_expr(args[msg_idx], spec_fields, roles=roles)
                 if values is None:
                     if not inside(m.start()):
                         unanalyzable.append(
@@ -272,7 +325,7 @@ def extract(pattern=PICKLES):
                 args = split_args(src, m.end() - 1)
                 if len(args) <= what_idx:
                     continue
-                values = _resolve_expr(args[what_idx], spec_fields)
+                values = _resolve_expr(args[what_idx], spec_fields, roles=roles)
                 if values is None:
                     if not inside(m.start()):
                         unanalyzable.append(
