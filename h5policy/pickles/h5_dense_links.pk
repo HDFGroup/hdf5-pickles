@@ -1042,7 +1042,8 @@ fun h5policy_dense_link_records = (int ios, H5PolicyProfile profile,
 /* Validate one dense-link v2 B-tree leaf and process its records.  Leaf nodes
    have a fixed 6-byte prefix, n records, and a trailing checksum.  */
 fun h5policy_dense_leaf_links = (int ios, H5PolicyProfile profile,
-                                 uint<64> leaf_addr, uint<64> nrec, uint<64> record_size,
+                                 uint<64> leaf_addr, uint<64> nrec,
+                                 uint<64> node_size, uint<64> record_size,
                                  uint<64> fheap_root, uint<64> curr_root_rows,
                                  uint<64> start_size, uint<64> max_direct_size,
                                  uint<64> table_width, uint<64> off_size,
@@ -1065,6 +1066,23 @@ fun h5policy_dense_leaf_links = (int ios, H5PolicyProfile profile,
                                              "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
                                              leaf_addr#B, object,
                                              "dense link v2 B-tree leaf size overflow");
+    /* The record COUNT must fit the declared node, checked before leaf_need is
+       used for anything else: leaf_need is derived from nrec, so an unchecked
+       nrec makes every downstream conclusion about this node untrustworthy.
+       libhdf5 allocates exactly node_size bytes for the node image and then
+       locates the trailing checksum at 6 + nrec*record_size -- so an nrec past
+       capacity reads off the end of that allocation (heap-buffer-overflow in
+       H5F_get_checksums <- H5B2__cache_leaf_verify_chksum, confirmed under ASAN
+       on GHSA-hx9j-mp99-2p98/63).  h5_btree2.pk's shared engine and the
+       creation-order walker already check this; the two hand-written name-index
+       leaf readers did not, which is exactly the pair that reproduced. */
+    if (leaf_need > node_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
+                                leaf_addr#B, object,
+                                "dense link v2 B-tree used node bytes exceed its declared node size");
+            return;
+        }
     if (!h5policy_checked_addr_range(leaf_addr, leaf_need, file_size,
                                      "dense link v2 B-tree leaf outside file",
                                      leaf_addr#B, object))
@@ -1611,7 +1629,7 @@ fun h5policy_dense_links_node = (int ios, H5PolicyProfile profile,
 
     if (node_depth == 0UL)
         {
-            h5policy_dense_leaf_links(ios, profile, node_addr, nrec, record_size,
+            h5policy_dense_leaf_links(ios, profile, node_addr, nrec, node_size, record_size,
                                       fheap_root, curr_root_rows, start_size,
                                       max_direct_size, table_width, off_size,
                                       checksum_dblocks, len_size, file_size,
@@ -1656,6 +1674,17 @@ fun h5policy_dense_links_node = (int ios, H5PolicyProfile profile,
                                          "H5_CORRUPT_LENGTH_OVERFLOW",
                                          "corrupt", node_addr#B, object,
                                          "dense link v2 B-tree node size overflow");
+    /* Internal nodes need the same capacity check as leaves: libhdf5 places the
+       trailing checksum after the records AND the child pointers, so an
+       over-capacity nrec overflows the node_size allocation in
+       H5B2__cache_int_verify_chksum exactly as it does the leaf variant. */
+    if (node_need > node_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
+                                node_addr#B, object,
+                                "dense link v2 B-tree used node bytes exceed its declared node size");
+            return;
+        }
     if (!h5policy_checked_addr_range(node_addr, node_need, file_size,
                                      "dense link v2 B-tree internal node outside file",
                                      node_addr#B, object))
