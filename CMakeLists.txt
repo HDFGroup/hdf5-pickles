@@ -101,6 +101,8 @@ add_custom_target(docs-check
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/check_docs.py"
     COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5explain/tests/check_docs.py"
+    COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_lazy_docs.py"
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tool_overview.py"
@@ -126,6 +128,14 @@ add_test(
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 set_tests_properties(h5patch_docs_regression PROPERTIES TIMEOUT 30)
+
+add_test(
+    NAME h5explain_docs_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5explain/tests/check_docs.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(h5explain_docs_regression PROPERTIES TIMEOUT 30)
 
 add_test(
     NAME lazy_validation_docs_regression

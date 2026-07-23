@@ -33,10 +33,11 @@ after a rename. The same target executes every GNU poke command block in
 [`TUTORIAL.md`](../TUTORIAL.md) against disposable files and checks the
 documented h5policy cache-image boundary against live reports from every
 profile. It also checks the root h5patch overview against the authoritative
-repair catalog and derives the documented lazy-validation ratios from the
-tracked measurement before reproducing its deterministic fields. The Mermaid
-tool overview is checked for its required nodes, relationships, styles, and
-documentation entry points:
+repair catalog, checks the documented h5explain navigation-history semantics
+against the implementation, and derives the documented lazy-validation ratios
+from the tracked measurement before reproducing its deterministic fields. The
+Mermaid tool overview is checked for its required nodes, relationships, styles,
+and documentation entry points:
 
 ```sh
 cmake --build build --target docs-check

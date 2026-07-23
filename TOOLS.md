@@ -313,7 +313,10 @@ printf 'root\nls\n' | ./tools/h5explain file.h5
 
 **Navigation commands:** `root`, `h5super`, `cd ("PATH")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
 
-`cd` accepts a link name, a relative or absolute path, and `.`/`..` components. `back` retraces the full history one step per call. `go`/`gos` refuse offsets at or past the end of the file.
+`cd` accepts a link name, a relative or absolute path, and `.`/`..` components.
+`back` retraces a bounded multi-step history one location per call. Up to `256`
+prior locations are retained; after that, the oldest is discarded. `go`/`gos`
+refuse offsets at or past the end of the file.
 
 Version 1 object headers have no signature, so `go`/`gos` infer them from the version and message count. When a kind was inferred rather than confirmed by a signature, `pwd` and `info` mark it `(inferred: no signature)`; reaching the same address through `root` or `cd` corroborates it and the marker disappears.
 
@@ -327,4 +330,7 @@ Use `msgs` to list object-header messages, then `explain (N)` or `explain_msg (N
 
 `traverse` is the only command that recursively walks chunk indexes. Ordinary navigation and `info` map the current primitive only, so large chunk indexes are not traversed accidentally.
 
-`back` returns to the location before the most recent navigation step (`go`, `gos`, `cd`, `root`, `h5super`). Only one level of history is kept.
+`back` returns to the location before the most recent successful navigation
+step (`go`, `gos`, `cd`, `root`, `h5super`). Repeated calls keep retracing until
+the retained history is empty; a failed navigation that does not move the
+cursor adds no history entry.
