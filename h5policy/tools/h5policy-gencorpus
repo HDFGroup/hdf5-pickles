@@ -859,6 +859,8 @@ def _gen_malformed(root):
     # used to accept.
     _make_fill_value_size_mismatch(
         f"{root}/malformed/fill_value_size_mismatch.h5")
+    _make_nbit_member_offset_wrap(
+        f"{root}/malformed/nbit_member_offset_wrap.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -2289,6 +2291,61 @@ def _make_cache_image_shadowed_btree(path, helper_source):
     struct.pack_into("<H", raw, bthd + 16 + bt["off_size"], nrec)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bthd:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_nbit_member_offset_wrap(path):
+    """An n-bit compound whose member starts at the compound's own size.
+
+    The n-bit filter stores a self-describing type tree in cd_values, and
+    libhdf5's decompressor takes it on trust: H5Z__nbit_decompress allocates the
+    COMPOUND node's declared size and then writes each member at its declared
+    offset.  A member at (or past) that size therefore writes off the end of the
+    buffer -- heap-buffer-overflow WRITE in H5Z__nbit_decompress_one_nooptype
+    (GHSA-xj9h-m4g7-fw64/43: 1 byte past a 4294967280-byte region).
+
+    Note what is NOT wrong here: every parameter index stays inside cd_nelmts,
+    so the pre-existing structural walk is satisfied.  The numbers are in range;
+    they just describe a type that cannot exist.  That is why h5policy ACCEPTED
+    the corpus specimen (accept_with_warnings, exit 1) until the member-bounds
+    check was added.
+
+    Built by rewriting a valid n-bit compound's cd_values in place: same word
+    count, same tree shape, only the compound size and the single member's
+    offset changed.  Keeping the layout identical is deliberate -- it isolates
+    the semantic defect from any structural one.
+    """
+    def build(h):
+        dt = np.dtype([("a", "<u4")])
+        sid = h5py.h5s.create_simple((2,))
+        tid = h5py.h5t.py_create(dt, logical=True)
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_chunk((1,))
+        dcpl.set_filter(5, h5py.h5z.FLAG_MANDATORY, ())     # H5Z_FILTER_NBIT
+        did = h5py.h5d.create(h.id, b"dset", tid, sid, dcpl=dcpl)
+        did.write(h5py.h5s.ALL, h5py.h5s.ALL, np.zeros(2, dtype=dt))
+
+    raw = _base_bytes(build)
+    # cd_values live in the pipeline message; find the n-bit tree by its shape:
+    # [.., 3 (COMPOUND), size, nmembers, member_off, class, member_size, ..].
+    wrap = 0xFFFFFFF0
+    patched = False
+    for i in range(0, len(raw) - 28, 4):
+        w = struct.unpack_from("<7I", raw, i)
+        if w[0] == 3 and w[2] == 1 and w[3] == 0 and w[4] == 1:
+            # COMPOUND, size=w[1], nmembers=1, member offset 0, ATOMIC member
+            struct.pack_into("<I", raw, i + 4, wrap)          # compound size
+            struct.pack_into("<I", raw, i + 12, wrap)         # member offset
+            patched = True
+            break
+    if not patched:
+        raise RuntimeError("could not locate the n-bit COMPOUND node in cd_values")
+    # Repair the enclosing object header's checksum, or libhdf5 rejects the file
+    # before the filter ever runs and the fixture proves nothing.
+    ohdr = raw.rfind(b"OHDR", 0, i)
+    if ohdr < 0:
+        raise RuntimeError("pipeline message is not inside a v2 object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 
 
