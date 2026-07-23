@@ -16,13 +16,77 @@ The image includes:
 - Git, GitHub CLI, OpenSSH, ripgrep, jq, and ShellCheck; and
 - VS Code support for CMake, C/C++, Python, YAML, and HDF5 viewing.
 
+Image creation also makes a full-history clone of the official
+[`HDFGroup/hdf5`](https://github.com/HDFGroup/hdf5) repository. The writable
+checkout is available at `/opt/hdf5`, also exposed as `$HDF5_SOURCE_DIR`. This
+location is outside Codespaces' persistent `/workspaces` mount, so the
+image-layer clone remains visible when the development container starts. It
+follows the HDF5 remote's default branch at the time the Docker layer is built:
+
+```sh
+cd "$HDF5_SOURCE_DIR"
+git status
+git log -1 --oneline
+```
+
+The Arch `hdf5` package remains the installed library used by the H5Lens smoke
+checks. The source checkout is kept separate so an analysis can configure,
+instrument, or bisect an upstream build without changing the system package.
+It persists across stops and starts but is restored from the image when the
+container is rebuilt; commit or export analysis changes before rebuilding.
+Rebuilding may reuse Docker's cached clone layer, so run `git fetch` in the
+checkout when an analysis specifically requires newer upstream commits.
+
+## AddressSanitizer build of HDF5
+
+The image has GCC's AddressSanitizer compiler and runtime support, plus the zlib
+and libaec/SZIP development files. The startup check compiles, links, and runs a
+small ASan executable so a missing sanitizer runtime is detected before an
+analysis begins.
+
+Use a dedicated build tree and install into `/opt/hdf5-asan`, exposed as
+`$HDF5_ASAN_PREFIX`. This keeps the instrumented libraries and tools separate
+from Arch's HDF5 installation under `/usr`:
+
+```sh
+cd "$HDF5_SOURCE_DIR"
+
+cmake -S . -B build-asan \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_C_FLAGS_RELWITHDEBINFO="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
+  -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address" \
+  -DCMAKE_MODULE_LINKER_FLAGS="-fsanitize=address" \
+  -DCMAKE_INSTALL_PREFIX="$HDF5_ASAN_PREFIX" \
+  -DHDF5_ENABLE_ZLIB_SUPPORT=ON \
+  -DHDF5_ENABLE_SZIP_SUPPORT=ON
+
+cmake --build build-asan --parallel
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+  ctest --test-dir build-asan --output-on-failure -j"$(nproc)"
+cmake --install build-asan
+```
+
+This recipe covers the default serial C library, high-level library, tools,
+examples, and tests, with zlib and SZIP filters enabled. MPI, Fortran, Java,
+and C++ bindings remain disabled to keep the build focused. The existing
+toolchain can also build the optional C++ bindings; MPI, Fortran, and Java
+require additional packages. To run an installed ASan tool against the
+instrumented shared libraries:
+
+```sh
+LD_LIBRARY_PATH="$HDF5_ASAN_PREFIX/lib" \
+  "$HDF5_ASAN_PREFIX/bin/h5dump" -pBH suspect.h5
+```
+
 ## Creation check
 
 [`post-create.sh`](post-create.sh) validates every required command and Python
-module, configures a Debug CMake build, builds `h5markers`, and smoke-tests
-`h5policy`, `h5markers`, `h5dump`, and the exact-build activation probe against
-the sample file. Codespaces waits for these checks before attaching the editor.
-A successful creation ends with:
+module, confirms that the image-provided HDF5 checkout has the canonical
+origin, full history, and writable source files, configures a Debug CMake build,
+builds `h5markers`, and smoke-tests `h5policy`, `h5markers`, `h5dump`, and the
+exact-build activation probe against the sample file. Codespaces waits for
+these checks before attaching the editor. A successful creation ends with:
 
 ```text
 [H5Lens Codespace] Ready: Debug build and analysis smoke checks passed.

@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +22,16 @@ CONFIG = DEVCONTAINER / "devcontainer.json"
 POST_CREATE = DEVCONTAINER / "post-create.sh"
 README = DEVCONTAINER / "README.md"
 H5POLICY = ROOT / "tools" / "h5policy"
+
+HDF5_REPOSITORY = "https://github.com/HDFGroup/hdf5.git"
+HDF5_SOURCE_DIR = Path("/opt/hdf5")
+HDF5_ASAN_PREFIX = Path("/opt/hdf5-asan")
+MINIMUM_HDF5_CMAKE = (3, 26)
+
+REQUIRED_ASAN_HEADERS = (
+    Path("/usr/include/szlib.h"),
+    Path("/usr/include/zlib.h"),
+)
 
 POLICY_EXIT_CODES = {
     "accept": 0,
@@ -41,6 +53,8 @@ REQUIRED_PACKAGES = {
     "github-cli",
     "hdf5",
     "jq",
+    "libaec",
+    "libasan",
     "openssh",
     "poke",
     "procps-ng",
@@ -53,6 +67,8 @@ REQUIRED_PACKAGES = {
     "rsync",
     "shellcheck",
     "sudo",
+    "time",
+    "zlib",
 }
 
 REQUIRED_COMMANDS = (
@@ -77,6 +93,7 @@ REQUIRED_COMMANDS = (
     "python3",
     "rg",
     "shellcheck",
+    "time",
 )
 
 REQUIRED_MODULES = ("h5py", "numpy", "yaml")
@@ -127,6 +144,28 @@ def check_configuration() -> None:
     if "NOPASSWD:ALL" not in dockerfile:
         fail("Dockerfile does not configure development-user sudo")
 
+    if f"ARG HDF5_REPOSITORY={HDF5_REPOSITORY}" not in dockerfile:
+        fail("Dockerfile does not declare the canonical HDF5 repository")
+    if f"ENV HDF5_SOURCE_DIR={HDF5_SOURCE_DIR}" not in dockerfile:
+        fail("Dockerfile does not expose the HDF5 checkout location")
+    if f"HDF5_ASAN_PREFIX={HDF5_ASAN_PREFIX}" not in dockerfile:
+        fail("Dockerfile does not expose the HDF5 ASan install prefix")
+    if f"\n        {HDF5_ASAN_PREFIX} \\\n" not in dockerfile:
+        fail("Dockerfile does not create the HDF5 ASan install prefix")
+
+    clone_match = re.search(
+        r'RUN git clone \\\n'
+        r'\s+"\$\{HDF5_REPOSITORY\}" \\\n'
+        r'\s+"\$\{HDF5_SOURCE_DIR\}"',
+        dockerfile,
+    )
+    if clone_match is None:
+        fail("Dockerfile does not clone the HDF5 repository during image creation")
+    if dockerfile.index("USER ${USERNAME}") > clone_match.start():
+        fail("Dockerfile must clone HDF5 as the non-root development user")
+    if "--depth" in clone_match.group(0) or "--filter" in clone_match.group(0):
+        fail("Dockerfile must retain the complete HDF5 Git history")
+
     h5policy = H5POLICY.read_text()
     for decision, exit_code in POLICY_EXIT_CODES.items():
         if f"\n  {exit_code}  {decision}\n" not in h5policy:
@@ -150,6 +189,10 @@ def check_configuration() -> None:
         fail("postCreateCommand does not invoke the checked setup script")
     if config.get("waitFor") != "postCreateCommand":
         fail("Codespaces may attach before the post-create smoke checks finish")
+    if config.get("build", {}).get("args", {}).get(
+        "HDF5_REPOSITORY"
+    ) != HDF5_REPOSITORY:
+        fail("devcontainer build does not select the canonical HDF5 repository")
 
     run_args = set(config.get("runArgs", []))
     for argument in ("--cap-add=SYS_PTRACE", "--security-opt=seccomp=unconfined"):
@@ -171,8 +214,23 @@ def check_configuration() -> None:
     for argument in ("--policy-report", "--policy-exit"):
         if argument not in post_create:
             fail(f"post-create policy verdict validation is missing {argument}")
+    for path in (HDF5_SOURCE_DIR, HDF5_ASAN_PREFIX):
+        if str(path) not in post_create:
+            fail(f"post-create does not account for ownership of {path}")
     if not README.is_file():
         fail(".devcontainer/README.md is missing")
+    readme = README.read_text()
+    for fragment in (
+        "HDFGroup/hdf5",
+        f"`{HDF5_SOURCE_DIR}`",
+        "`$HDF5_SOURCE_DIR`",
+        "full-history",
+        f"`{HDF5_ASAN_PREFIX}`",
+        "`$HDF5_ASAN_PREFIX`",
+        "-fsanitize=address",
+    ):
+        if fragment not in readme:
+            fail(f"devcontainer guide does not document HDF5 checkout: {fragment}")
     if ".devcontainer/README.md" not in (ROOT / "README.md").read_text():
         fail("root README does not link the development-environment guide")
 
@@ -189,6 +247,115 @@ def version(command: list[str]) -> str:
     return result.stdout.strip().splitlines()[0]
 
 
+def hdf5_git_output(*arguments: str) -> str:
+    try:
+        return version(["git", "-C", str(HDF5_SOURCE_DIR), *arguments])
+    except (OSError, subprocess.SubprocessError) as exc:
+        fail(f"cannot inspect the image-provided HDF5 checkout: {exc}")
+
+
+def check_hdf5_checkout() -> None:
+    configured_dir = os.environ.get("HDF5_SOURCE_DIR")
+    if configured_dir != str(HDF5_SOURCE_DIR):
+        fail(
+            "HDF5_SOURCE_DIR must identify the image checkout at "
+            f"{HDF5_SOURCE_DIR}, found {configured_dir!r}"
+        )
+    if not (HDF5_SOURCE_DIR / ".git").is_dir():
+        fail(f"HDF5 Git checkout is missing at {HDF5_SOURCE_DIR}")
+    if not (HDF5_SOURCE_DIR / "src" / "H5F.c").is_file():
+        fail(f"HDF5 checkout at {HDF5_SOURCE_DIR} lacks src/H5F.c")
+    if not os.access(HDF5_SOURCE_DIR, os.W_OK):
+        fail(f"HDF5 checkout at {HDF5_SOURCE_DIR} is not writable")
+
+    origin = hdf5_git_output("remote", "get-url", "origin")
+    if origin != HDF5_REPOSITORY:
+        fail(f"HDF5 origin is {origin!r}, expected {HDF5_REPOSITORY!r}")
+
+    shallow = hdf5_git_output("rev-parse", "--is-shallow-repository")
+    if shallow != "false":
+        fail("HDF5 checkout is shallow; full history is required for analysis")
+
+    revision = hdf5_git_output("rev-parse", "--short=12", "HEAD")
+    print(
+        "DEVCONTAINER HDF5 CHECKOUT OK: "
+        f"{HDF5_SOURCE_DIR} at {revision} with full history"
+    )
+
+
+def check_asan_runtime() -> None:
+    configured_prefix = os.environ.get("HDF5_ASAN_PREFIX")
+    if configured_prefix != str(HDF5_ASAN_PREFIX):
+        fail(
+            "HDF5_ASAN_PREFIX must identify the image install prefix at "
+            f"{HDF5_ASAN_PREFIX}, found {configured_prefix!r}"
+        )
+    if not HDF5_ASAN_PREFIX.is_dir() or not os.access(HDF5_ASAN_PREFIX, os.W_OK):
+        fail(f"HDF5 ASan install prefix {HDF5_ASAN_PREFIX} is not writable")
+    missing_headers = [
+        str(header) for header in REQUIRED_ASAN_HEADERS if not header.is_file()
+    ]
+    if missing_headers:
+        fail(
+            "HDF5 ASan filter dependency header(s) missing: "
+            + ", ".join(missing_headers)
+        )
+
+    source = """
+#include <stdlib.h>
+int main(void) {
+    char *value = malloc(1);
+    if (value == NULL)
+        return 1;
+    value[0] = 0;
+    free(value);
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="h5lens-asan-") as temp_dir:
+        executable = Path(temp_dir) / "asan-smoke"
+        compile_result = subprocess.run(
+            [
+                "cc",
+                "-fsanitize=address",
+                "-fno-omit-frame-pointer",
+                "-g",
+                "-O1",
+                "-x",
+                "c",
+                "-",
+                "-o",
+                str(executable),
+            ],
+            input=source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        if compile_result.returncode != 0:
+            fail(
+                "cannot compile and link an AddressSanitizer executable:\n"
+                + compile_result.stdout
+            )
+
+        run_result = subprocess.run(
+            [str(executable)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0:halt_on_error=1"},
+        )
+        if run_result.returncode != 0:
+            fail(
+                "AddressSanitizer runtime smoke executable failed:\n"
+                + run_result.stdout
+            )
+
+    print("DEVCONTAINER ASAN OK: compiler, linker, and runtime passed")
+
+
 def check_runtime() -> None:
     missing_commands = [
         command for command in REQUIRED_COMMANDS if shutil.which(command) is None
@@ -203,8 +370,15 @@ def check_runtime() -> None:
             fail(f"Python module {module!r} is unavailable: {exc}")
 
     cmake_match = re.search(r"([0-9]+)\.([0-9]+)", version(["cmake", "--version"]))
-    if cmake_match is None or tuple(map(int, cmake_match.groups())) < (3, 19):
-        fail("CMake is older than the repository's 3.19 minimum")
+    if (
+        cmake_match is None
+        or tuple(map(int, cmake_match.groups())) < MINIMUM_HDF5_CMAKE
+    ):
+        minimum = ".".join(map(str, MINIMUM_HDF5_CMAKE))
+        fail(
+            "CMake is older than the image-provided HDF5 checkout's "
+            f"{minimum} minimum"
+        )
 
     emacs_major = version(
         [
@@ -217,6 +391,9 @@ def check_runtime() -> None:
     )
     if not emacs_major.isdigit() or int(emacs_major) < 30:
         fail(f"Emacs 30+ is required, found {emacs_major!r}")
+
+    check_hdf5_checkout()
+    check_asan_runtime()
 
     print(
         "DEVCONTAINER RUNTIME OK: "

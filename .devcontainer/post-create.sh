@@ -26,6 +26,15 @@ on_error() {
 }
 trap 'on_error "${LINENO}"' ERR
 
+readonly hdf5_source_dir="/opt/hdf5"
+readonly hdf5_asan_prefix="/opt/hdf5-asan"
+log "Checking the image-provided HDF5 source checkout"
+for writable_dir in "${hdf5_source_dir}" "${hdf5_asan_prefix}"; do
+    if [[ -d "${writable_dir}" && ! -w "${writable_dir}" ]]; then
+        sudo chown -R -- "$(id -u):$(id -g)" "${writable_dir}"
+    fi
+done
+
 log "Checking installed analysis tools and Python modules"
 python3 "${script_dir}/check.py" --runtime
 
