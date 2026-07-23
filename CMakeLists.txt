@@ -94,8 +94,10 @@ add_custom_target(docs
 
 add_custom_target(docs-check
     ${PKDOC_CHECK_COMMANDS}
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tutorial.py"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    COMMENT "Checking generated documentation sidecars"
+    COMMENT "Checking generated documentation sidecars and tutorial commands"
     VERBATIM
     USES_TERMINAL
 )
@@ -112,6 +114,14 @@ find_program(POKE_EXECUTABLE poke)
 # The shared format pickles have synthetic byte-level unit tests that require
 # GNU poke but do not require libhdf5 or h5py.
 if(POKE_EXECUTABLE)
+    add_test(
+        NAME tutorial_docs_regression
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tutorial.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(tutorial_docs_regression PROPERTIES TIMEOUT 30)
+
     add_test(
         NAME pickle_ohdr_msgs_regression
         COMMAND "${POKE_EXECUTABLE}" --quiet -L

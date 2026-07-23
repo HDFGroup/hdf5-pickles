@@ -21,10 +21,12 @@ tools/h5policy-seamcheck -> ../h5policy/tools/h5policy-seamcheck
 tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
-`tools/pkdoc.py`, `tools/finding_registry.py`, and `tools/h5cve` are
-repository-level helper scripts (not symlinks): `pkdoc.py` backs the
-documentation targets, `finding_registry.py` loads and exports the sharded
-finding registry, and `h5cve` is the CVE case orchestrator described below.
+`tools/pkdoc.py`, `tools/check_tutorial.py`, `tools/finding_registry.py`, and
+`tools/h5cve` are repository-level helper scripts (not symlinks): `pkdoc.py`
+generates and checks the format-reference sidecars, `check_tutorial.py`
+executes the GNU poke sessions embedded in `TUTORIAL.md`,
+`finding_registry.py` loads and exports the sharded finding registry, and
+`h5cve` is the CVE case orchestrator described below.
 
 ## h5cve Case Orchestrator
 

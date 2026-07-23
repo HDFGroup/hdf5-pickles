@@ -27,14 +27,15 @@ Output lands in `docs/generated/<name>.md`.
 
 The `--check` flag verifies that every type and field name in the sidecar
 actually appears in the corresponding pickle, catching stale documentation
-after a rename:
+after a rename. The same target executes every GNU poke command block in
+[`TUTORIAL.md`](../TUTORIAL.md) against disposable files:
 
 ```sh
 cmake --build build --target docs-check
 ```
 
-Exit code 0 = clean; 1 = issues found.  Wire this into CI so drift is
-caught automatically when a pickle field is renamed.
+Exit code 0 = clean; 1 = issues found. The tutorial check is skipped when GNU
+poke is unavailable.
 
 ## Adding a new pickle
 
