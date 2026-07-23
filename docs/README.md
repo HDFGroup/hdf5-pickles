@@ -30,7 +30,8 @@ actually appears in the corresponding pickle, catching stale documentation
 after a rename. The same target executes every GNU poke command block in
 [`TUTORIAL.md`](../TUTORIAL.md) against disposable files and checks the
 documented h5policy cache-image boundary against live reports from every
-profile:
+profile. It also checks the root h5patch overview against the authoritative
+repair catalog:
 
 ```sh
 cmake --build build --target docs-check

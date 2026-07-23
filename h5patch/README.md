@@ -63,7 +63,8 @@ same catalog repairs against the output copy and `h5policy` verifies the result.
 
 ## Repair Catalog
 
-The repair catalog intentionally favors byte-level changes backed by complete
+This is the authoritative and exhaustive list of implemented repair classes.
+The catalog intentionally favors byte-level changes backed by complete
 `h5policy` reachability and exact on-disk evidence:
 
 - restore the HDF5 file signature when the surrounding superblock fields are
