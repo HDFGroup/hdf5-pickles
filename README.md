@@ -27,6 +27,8 @@ repairs.
   through GNU poke.
 - [`examples/`](examples/) contains poke scripts for generating and inspecting
   HDF5 structures.
+- [`.devcontainer/`](.devcontainer/README.md) provides an analysis-ready
+  GitHub Codespaces and VS Code Dev Containers environment.
 - [`MARKERS.md`](MARKERS.md), [`TOOLS.md`](TOOLS.md), and
   [`TUTORIAL.md`](TUTORIAL.md) explain the format markers, helper tools, and a
   hands-on exploration path.

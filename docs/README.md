@@ -37,7 +37,9 @@ repair catalog, checks the documented h5explain navigation-history semantics
 against the implementation, and derives the documented lazy-validation ratios
 from the tracked measurement before reproducing its deterministic fields. The
 Mermaid tool overview is checked for its required nodes, relationships, styles,
-and documentation entry points:
+and documentation entry points. The same target checks that the Codespaces
+configuration retains its required packages, tools, editor support, startup
+check, and documentation:
 
 ```sh
 cmake --build build --target docs-check
