@@ -857,6 +857,8 @@ def _gen_malformed(root):
     # Pair: identical below-floor direct block, differing only in whether the
     # heap checksums direct blocks.  The unchecksummed half is the one h5policy
     # used to accept.
+    _make_fill_value_size_mismatch(
+        f"{root}/malformed/fill_value_size_mismatch.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -2287,6 +2289,58 @@ def _make_cache_image_shadowed_btree(path, helper_source):
     struct.pack_into("<H", raw, bthd + 16 + bt["off_size"], nrec)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bthd:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_fill_value_size_mismatch(path):
+    """A fill value shorter than the dataset's datatype, which libhdf5 copies
+    at the DATATYPE's size.
+
+    H5D__fill -> H5S_select_fill -> H5VM_array_fill memcpy()s `type_size` bytes
+    out of a buffer allocated at the fill message's declared size, so a fill
+    value of 1 byte behind a 256-byte type over-reads 255 bytes.  On libhdf5
+    2.2.0 that is NOT a crash: H5Dread returns 0 and hands the caller 255 bytes
+    of adjacent heap -- pointer values included -- as if it were data
+    (GHSA-vphp-6m8x-3gwq/52, verified; ASAN reports the over-read, the stock
+    build reports nothing).  A silent disclosure is exactly what a preflight
+    oracle is for, since nothing downstream sees an error.
+
+    Built by shrinking the fill message's declared size to 1 and leaving one
+    value byte, which is the shape the corpus specimen has.  The datatype is an
+    opaque 256-byte type so type_size >> fill_size without needing a compound.
+    """
+    def build(h):
+        dt = h5py.h5t.create(h5py.h5t.OPAQUE, 256)
+        sid = h5py.h5s.create_simple((1,))
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_fill_value(np.zeros(1, dtype="V256"))
+        h5py.h5d.create(h.id, b"dset", dt, sid, dcpl=dcpl)
+
+    raw = _base_bytes(build)
+    # Fill-value message (type 0x05) v3 payload: version(1) flags(1) size(4) value.
+    # Locate it via the v2 object-header message prefix: type, size(2), flags(1).
+    hit = None
+    for i in range(len(raw) - 12):
+        if raw[i] != 0x05:
+            continue
+        msg_size = struct.unpack_from("<H", raw, i + 1)[0]
+        pay = i + 4
+        if raw[pay] != 3 or msg_size < 6 or pay + msg_size > len(raw):
+            continue
+        size = struct.unpack_from("<I", raw, pay + 2)[0]
+        if size == 256:                      # the fill we just wrote
+            hit = (i, pay, msg_size, size)
+            break
+    if hit is None:
+        raise RuntimeError("could not locate the 256-byte v3 fill-value message")
+    i, pay, msg_size, size = hit
+    struct.pack_into("<I", raw, pay + 2, 1)  # declared fill size: 256 -> 1
+    # Repair the enclosing object header's checksum, or libhdf5 refuses the file
+    # before it ever reaches H5D__fill and the fixture proves nothing.
+    ohdr = raw.rfind(b"OHDR", 0, i)
+    if ohdr < 0:
+        raise RuntimeError("fill-value message is not inside a v2 object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 
 
