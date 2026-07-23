@@ -100,6 +100,8 @@ add_custom_target(docs-check
             "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_cache_image_docs.py"
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/check_docs.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_lazy_docs.py"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Checking generated docs, commands, policy boundaries, and summaries"
     VERBATIM
@@ -122,6 +124,14 @@ add_test(
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 set_tests_properties(h5patch_docs_regression PROPERTIES TIMEOUT 30)
+
+add_test(
+    NAME lazy_validation_docs_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_lazy_docs.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(lazy_validation_docs_regression PROPERTIES TIMEOUT 90)
 
 # The shared format pickles have synthetic byte-level unit tests that require
 # GNU poke but do not require libhdf5 or h5py.

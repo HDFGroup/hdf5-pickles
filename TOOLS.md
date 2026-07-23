@@ -160,9 +160,9 @@ Three ladders, and the third is what makes the first two mean anything:
 
 | ladder | varies | expectation |
 |---|---|---|
-| `data` | raw data ~1000x, structure fixed | counters flat |
-| `filtered` | same with deflate, **one chunk throughout** | counters flat — a validator that decompressed to inspect payload would show it |
-| `chunks` | chunk count 100x — real metadata growth | `walk_operations` **must rise** |
+| `data` | 16 → 1,600,000 elements (100,000×); physical file 2,112 → 6,402,048 bytes (3,031×), structure fixed | counters flat |
+| `filtered` | same element-count ladder with deflate and **one chunk throughout**; physical file 2,088 → 2,214,864 bytes (1,061×) | counters flat — a validator that decompressed to inspect payload would show it |
+| `chunks` | chunk count 4 → 400 (100×) — real metadata growth | `walk_operations` **must rise** |
 
 Without the control, flat counters could equally mean the counters are broken.
 The `filtered` ladder pins the chunk count deliberately: letting it vary with
@@ -170,8 +170,15 @@ The `filtered` ladder pins the chunk count deliberately: letting it vary with
 
 Counters are bounded by ratio, not equality — decoding a larger stored-size
 field can cost a few operations without any payload being touched, while a
-validator that read payload would grow with `n`. Current result: cost flat
-across a ~1000x data increase, with the control rising 375 → 987 → 7107.
+validator that read payload would grow with `n`. In the current tracked
+measurement, the unfiltered ladder's `metadata_bytes_seen`/`walk_operations`
+remain exactly 463/212 across the 3,031× physical-file increase. The filtered
+ladder remains at 463 metadata bytes while operations move only 229 → 233
+across 1,061× physical growth. The sensitivity control rises
+375 → 987 → 7,107 operations. These ratios are derived from the
+`physical_bytes` endpoints in
+[`registry/lazy-validation.json`](registry/lazy-validation.json), not from the
+nominal element-count ratio.
 
 ## In-Process Seam Self-Check
 

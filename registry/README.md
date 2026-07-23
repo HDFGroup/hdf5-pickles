@@ -17,7 +17,7 @@ Registry files plus a case directory, one schema version:
 | [`h5cve-matrix-policy.yml`](h5cve-matrix-policy.yml) | Which exact-build canary statuses each fixture is permitted to report. `coverage_gap` and `unexercised` are visible outcomes, never aliases for success. |
 | [`message-routing.yml`](message-routing.yml) | Measured inventory of finding **messages** that resolve to no record family. A shared code's family comes from its grouped route rules, and for an `ambiguous` code a message matching no rule names no family at all. Regenerate with `python3 tools/message_routing.py --write`; `check_registry.py` fails on drift either way. |
 | [`libhdf5-evidence.yml`](libhdf5-evidence.yml) | **Generated.** What the selected libhdf5 build actually did, per record family, measured by the canary matrix. |
-| [`lazy-validation.json`](lazy-validation.json) | **Generated.** Measurement that validation cost tracks metadata rather than data volume, with a sensitivity control. |
+| [`lazy-validation.json`](lazy-validation.json) | **Generated.** Measurement that validation cost tracks metadata rather than data volume, with physical-file endpoints for the growth ratio and a sensitivity control. |
 | [`truncation-sweep.json`](truncation-sweep.json) | **Generated.** Result of the §12 truncation sweep: every prefix of each seed, and whether coverage was exhaustive or sampled. |
 | [`verification-coverage.yml`](verification-coverage.yml) | **Generated.** Which of the [§12](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) verification requirements each record family demonstrably meets. |
 | [`cve-case.yml`](cve-case.yml) | The annotated **template** for a per-case record. Its fields are the §11.5 containment/systemic tracking block. |

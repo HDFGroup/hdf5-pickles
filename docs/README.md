@@ -31,7 +31,8 @@ after a rename. The same target executes every GNU poke command block in
 [`TUTORIAL.md`](../TUTORIAL.md) against disposable files and checks the
 documented h5policy cache-image boundary against live reports from every
 profile. It also checks the root h5patch overview against the authoritative
-repair catalog:
+repair catalog and derives the documented lazy-validation ratios from the
+tracked measurement before reproducing its deterministic fields:
 
 ```sh
 cmake --build build --target docs-check
