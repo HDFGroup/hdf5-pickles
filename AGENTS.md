@@ -24,6 +24,14 @@
 - Stop before anything tracked — no gencorpus generator, no `registry/` or
   `h5policy/tests/` edits. List them as promotion steps and I'll decide.
 
+## Documentation
+
+- Always keep the documentation up to date. If you add a new feature, tool, or API, or change an existing one, update the relevant documentation.
+
+- Make documentation testable and include them in the CI/CD pipeline to catch any discrepancies early.
+
+- If documentation tests are available, run them to ensure the documentation is accurate. Wire them into the CI/CD pipeline to catch any discrepancies early. See for example the `docs-check` target in [`CMakeLists.txt`](./CMakeLists.txt).
+
 ## Boundaries
 
 - **Ask first**
