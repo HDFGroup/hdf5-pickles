@@ -163,6 +163,19 @@ add_test(
 )
 set_tests_properties(devcontainer_config_regression PROPERTIES TIMEOUT 30)
 
+add_test(
+    NAME devcontainer_policy_verdict_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.devcontainer/check.py"
+            --policy-report
+            "${CMAKE_CURRENT_SOURCE_DIR}/.devcontainer/testdata/h5policy-accept-with-warnings.json"
+            --policy-exit 1
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(devcontainer_policy_verdict_regression PROPERTIES
+    TIMEOUT 30
+)
+
 # The shared format pickles have synthetic byte-level unit tests that require
 # GNU poke but do not require libhdf5 or h5py.
 if(POKE_EXECUTABLE)

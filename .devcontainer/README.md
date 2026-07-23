@@ -25,8 +25,20 @@ the sample file. Codespaces waits for these checks before attaching the editor.
 A successful creation ends with:
 
 ```text
-H5Lens Codespace ready: Debug build and analysis smoke checks passed.
+[H5Lens Codespace] Ready: Debug build and analysis smoke checks passed.
 ```
+
+`h5policy` uses nonzero exit codes for valid policy verdicts as well as for
+tool failures. In particular, the repository sample currently returns
+`accept_with_warnings` with exit code 1 because it declares deflate. The
+creation check validates the JSON decision against the documented exit-code
+mapping (0–5); it does not mistake a warning or rejection verdict for a broken
+Codespace. Exit 70, an unrecognized exit, malformed JSON, or a disagreement
+between the decision and exit code still fails creation.
+
+Each setup stage is prefixed with `[H5Lens Codespace]`. If creation fails, use
+the last prefixed stage and the reported script line to locate the failing
+dependency or smoke check in the Codespaces creation log.
 
 The smoke test is deliberately smaller than the regression suite. Run the full
 suite after opening the Codespace:

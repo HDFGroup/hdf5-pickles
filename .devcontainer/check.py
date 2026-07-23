@@ -19,6 +19,16 @@ DOCKERFILE = DEVCONTAINER / "Dockerfile"
 CONFIG = DEVCONTAINER / "devcontainer.json"
 POST_CREATE = DEVCONTAINER / "post-create.sh"
 README = DEVCONTAINER / "README.md"
+H5POLICY = ROOT / "tools" / "h5policy"
+
+POLICY_EXIT_CODES = {
+    "accept": 0,
+    "accept_with_warnings": 1,
+    "reject_corrupt": 2,
+    "reject_policy": 3,
+    "reject_resource": 4,
+    "unsupported_coverage_gap": 5,
+}
 
 REQUIRED_PACKAGES = {
     "bash-completion",
@@ -117,6 +127,14 @@ def check_configuration() -> None:
     if "NOPASSWD:ALL" not in dockerfile:
         fail("Dockerfile does not configure development-user sudo")
 
+    h5policy = H5POLICY.read_text()
+    for decision, exit_code in POLICY_EXIT_CODES.items():
+        if f"\n  {exit_code}  {decision}\n" not in h5policy:
+            fail(
+                "devcontainer h5policy exit mapping is stale for "
+                f"{decision!r}"
+            )
+
     try:
         config = json.loads(CONFIG.read_text())
     except json.JSONDecodeError as exc:
@@ -149,6 +167,10 @@ def check_configuration() -> None:
 
     if not POST_CREATE.is_file():
         fail(".devcontainer/post-create.sh is missing")
+    post_create = POST_CREATE.read_text()
+    for argument in ("--policy-report", "--policy-exit"):
+        if argument not in post_create:
+            fail(f"post-create policy verdict validation is missing {argument}")
     if not README.is_file():
         fail(".devcontainer/README.md is missing")
     if ".devcontainer/README.md" not in (ROOT / "README.md").read_text():
@@ -203,6 +225,40 @@ def check_runtime() -> None:
     )
 
 
+def check_policy_report(path: Path, exit_code: int) -> None:
+    if exit_code not in POLICY_EXIT_CODES.values():
+        fail(f"h5policy terminated with unexpected exit code {exit_code}")
+
+    try:
+        report = json.loads(path.read_text())
+    except OSError as exc:
+        fail(f"cannot read h5policy smoke report {path}: {exc}")
+    except json.JSONDecodeError as exc:
+        fail(f"h5policy smoke report is not valid JSON: {exc}")
+
+    if report.get("schema_version") != 1:
+        fail(
+            "h5policy smoke report has unsupported schema version "
+            f"{report.get('schema_version')!r}"
+        )
+
+    decision = report.get("decision")
+    if decision not in POLICY_EXIT_CODES:
+        fail(f"h5policy smoke report has unknown decision {decision!r}")
+
+    expected_exit = POLICY_EXIT_CODES[decision]
+    if exit_code != expected_exit:
+        fail(
+            f"h5policy decision {decision!r} requires exit {expected_exit}, "
+            f"but the command returned {exit_code}"
+        )
+
+    print(
+        "DEVCONTAINER POLICY SMOKE OK: "
+        f"{decision} is a valid verdict (exit {exit_code})"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -210,7 +266,23 @@ def main() -> int:
         action="store_true",
         help="also verify commands, Python modules, and minimum versions",
     )
+    parser.add_argument(
+        "--policy-report",
+        type=Path,
+        help="validate an h5policy JSON smoke report",
+    )
+    parser.add_argument(
+        "--policy-exit",
+        type=int,
+        help="exit code returned while producing --policy-report",
+    )
     args = parser.parse_args()
+
+    if (args.policy_report is None) != (args.policy_exit is None):
+        parser.error("--policy-report and --policy-exit must be used together")
+    if args.policy_report is not None:
+        check_policy_report(args.policy_report, args.policy_exit)
+        return 0
 
     check_configuration()
     print(
