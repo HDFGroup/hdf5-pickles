@@ -865,17 +865,35 @@ fun h5policy_nbit_walk_params = (int ios, H5PolicyProfile profile,
    walk records an n-bit/scale-offset filter's cd_values[2] (the chunk element
    count) into h5policy_pipeline_decode_nelmts for the finalize-time consistency
    check.  Fractal-heap pipeline checks pass false so dense storage can't seed it.  */
+/* A filter pipeline is encoded identically wherever it appears, so this one
+   decoder serves four clients: a dataset's object-header PLINE message
+   (h5_dispatch.pk) and the pipeline embedded in a filtered fractal heap header
+   for dense LINK storage (h5_dense_links.pk), dense ATTRIBUTE storage
+   (h5_dense_attrs.pk) and SOHM storage (h5_sohm.pk).  Those are four different
+   record families.
+
+   `role` names which one, exactly as h5policy_validate_link_payload does.
+   Without it every pipeline finding was catalogued against
+   dataset_layout_filter_fill -- so a filtered dense-link heap whose descriptor
+   overruns its own header (GHSA-7h4m-rp7v-c648/60: heap-buffer-overflow in
+   H5O__pline_decode off the END of the heap-header image, reached through
+   H5HF__cache_hdr_deserialize, nothing to do with a dataset layout) named the
+   dataset-layout family and would have been verified with its canary.
+
+   The phrasing has to match the `contexts` rules in registry/findings.yml, and
+   it prefixes the WHOLE message, so every message below reads "<role> ...".  */
 fun h5policy_validate_filter_pipeline_payload = (int ios,
                                                  H5PolicyProfile profile,
                                                  offset<uint<64>,B> payload_off,
                                                  uint<64> msg_size,
                                                  string object,
-                                                 int record_decode_nelmts) int:
+                                                 int record_decode_nelmts,
+                                                 string role) int:
 {
     if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
                                    "H5_CORRUPT_FILTER_PIPELINE_MESSAGE_TOO_SMALL",
                                    payload_off, object,
-                                   "filter pipeline message is too small"))
+                                   role + " filter pipeline message is too small"))
         return 0;
 
     var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
@@ -888,7 +906,7 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
     if (nfilters > profile.resources.max_filter_count)
         h5policy_emit_error("H5_RESOURCE_FILTER_COUNT", "resource",
                             payload_off, object,
-                            "filter count exceeds the selected profile limit");
+                            role + " filter count exceeds the selected profile limit");
 
     if (version == 1UL)
         cur = 8UL;
@@ -898,7 +916,7 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
         {
             h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_FILTER_PIPELINE_VERSION",
                                 "corrupt", payload_off, object,
-                                "unsupported filter pipeline version");
+                                role + " unsupported filter pipeline version");
             return 0;
         }
 
@@ -912,7 +930,7 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
             if (!h5policy_payload_range_ok(msg_size, cur, desc_header,
                                            "H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE",
                                            payload_off + cur#B, object,
-                                           "filter descriptor overruns the pipeline message"))
+                                           role + " filter descriptor overruns the pipeline message"))
                 return 0;
 
             var filter_id = h5policy_msg_u64_at(ios, profile,
@@ -946,7 +964,7 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                     if (profile.features.allow_dynamic_filters == 0UB)
                         h5policy_emit_error("H5_POLICY_DYNAMIC_FILTER", "policy",
                                             payload_off + cur#B, object,
-                                            "non-core filter required; profile disables dynamic filters");
+                                            role + " non-core filter required; profile disables dynamic filters");
                 }
             else if (h5policy_filter_decodes(filter_id))
                 {
@@ -961,7 +979,7 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                             h5policy_feature_decode_filters += [filter_id];
                             h5policy_emit_warning("H5_ADVISORY_DECODE_FILTER",
                                                   payload_off + cur#B, object,
-                                                  "dataset declares the "
+                                                  role + " declares the "
                                                   + h5policy_filter_name(filter_id)
                                                   + " filter; a consumer must decode/decompress "
                                                   + "untrusted data to read it");
@@ -974,21 +992,21 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                                                     "corrupt",
                                                     payload_off + cur#B,
                                                     object,
-                                                    "filter client-data byte count overflow");
+                                                    role + " filter client-data byte count overflow");
             var desc_size = h5policy_checked_add_u64(desc_header, name_len,
                                                      0xffffffffffffffffUL,
                                                      "H5_CORRUPT_LENGTH_OVERFLOW",
                                                      "corrupt",
                                                      payload_off + cur#B,
                                                      object,
-                                                     "filter descriptor size overflow");
+                                                     role + " filter descriptor size overflow");
             desc_size = h5policy_checked_add_u64(desc_size, cd_bytes,
                                                  0xffffffffffffffffUL,
                                                  "H5_CORRUPT_LENGTH_OVERFLOW",
                                                  "corrupt",
                                                  payload_off + cur#B,
                                                  object,
-                                                 "filter descriptor size overflow");
+                                                 role + " filter descriptor size overflow");
             if (version == 1UL && (cd_nelmts % 2UL) != 0UL)
                 /* v1 pads an odd number of 32-bit client-data words by one
                    additional word.  */
@@ -998,12 +1016,12 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                                                      "corrupt",
                                                      payload_off + cur#B,
                                                      object,
-                                                     "filter descriptor padding overflow");
+                                                     role + " filter descriptor padding overflow");
 
             if (!h5policy_payload_range_ok(msg_size, cur, desc_size,
                                            "H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE",
                                            payload_off + cur#B, object,
-                                           "filter descriptor overruns the pipeline message"))
+                                           role + " filter descriptor overruns the pipeline message"))
                 return 0;
 
             /* n-bit (5) and scale-offset (6) both store the chunk element count
@@ -1030,7 +1048,7 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                         h5policy_emit_error_ev(
                             "H5_CORRUPT_FILTER_NELMTS_MISMATCH", "corrupt",
                             payload_off + cur#B, object,
-                            "decode filters disagree on the chunk element count",
+                            role + " decode filters disagree on the chunk element count",
                             H5Evidence {
                                 field = "filter.decode_element_count",
                                 actual = d_nelmts,

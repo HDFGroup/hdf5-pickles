@@ -131,6 +131,10 @@ ROLE_PARAMS = {
     # h5_dense_links.pk: a link is encoded the same in an object-header message
     # and in a dense index's heap record, so one decoder serves both families.
     "h5policy_validate_link_payload": 5,
+    # h5_layout.pk: a filter pipeline is encoded the same in a dataset's PLINE
+    # message and in the header of a filtered fractal heap (dense link, dense
+    # attribute, SOHM) -- four clients, four families.
+    "h5policy_validate_filter_pipeline_payload": 6,
 }
 
 
