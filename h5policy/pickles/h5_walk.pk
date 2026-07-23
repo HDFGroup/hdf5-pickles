@@ -175,6 +175,13 @@ var h5policy_pending_depths = uint<64>[]();
 var h5policy_pending_paths = string[]();
 var h5policy_pending_index = 0UL;
 
+/* Address of the superblock extension's object header, or the undef sentinel
+   when the file has none.  Set by h5policy_walk_reachable_metadata just before
+   the extension is enqueued -- which happens BEFORE the root, so a later
+   enqueue landing on this address is an object-graph edge aliasing the
+   extension rather than the extension itself.  See h5policy_enqueue_ohdr.  */
+var h5policy_ext_ohdr_addr = 0xffffffffffffffffUL;
+
 /* Current-object scratch state.  Message validators use these values for
    contextual checks that are cheaper to do while a single object header is
    being parsed, such as v1 message-count repair support and link-depth labels.
@@ -214,6 +221,9 @@ fun h5policy_reset_traversal_state = void:
     h5policy_pending_depths = uint<64>[]();
     h5policy_pending_paths = string[]();
     h5policy_pending_index = 0UL;
+    /* Load-bearing: left set from a previous analysis this would make an
+       unrelated address in the next file look like an extension alias. */
+    h5policy_ext_ohdr_addr = 0xffffffffffffffffUL;
     h5policy_current_object_depth = 0UL;
     h5policy_current_object_msg_count = 0UL;
     h5policy_current_object_root_msg_count = 0UL;
@@ -329,7 +339,23 @@ fun h5policy_enqueue_ohdr = (H5PolicyProfile profile,
 
     if (h5policy_seen_u64(h5policy_visited_ohdrs, addr)
         || h5policy_seen_u64(h5policy_pending_ohdrs, addr))
-        return;
+        {
+            /* Duplicate hard links to one object are normal and are exactly
+               what this suppression is for.  The superblock extension is the
+               one address that must never be reached twice: it is file-level
+               metadata outside the object graph, and libhdf5 keeps it in its
+               own cache ring and refuses to re-protect it as a group or
+               dataset ("ring type mismatch occurred for cache entry",
+               H5Centry.c).  Without this the alias is silently merged into a
+               single walk and the file is accepted, with the object's findings
+               attributed to the extension's path.  */
+            if (h5policy_ext_ohdr_addr != 0xffffffffffffffffUL
+                && addr == h5policy_ext_ohdr_addr)
+                h5policy_emit_error("H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS",
+                                    "corrupt", loc, object,
+                                    "superblock extension address aliases a reachable object header");
+            return;
+        }
 
     h5policy_pending_ohdrs += [addr];
     h5policy_pending_depths += [depth];

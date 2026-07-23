@@ -15,6 +15,7 @@ Registry files plus a case directory, one schema version:
 | [`finding-backlog.yml`](finding-backlog.yml) | Exact source inventory for future emitted codes whose semantic record/invariant mapping is still pending. It is currently empty; an entry here is visible migration debt, not a catalog mapping. |
 | [`validation-coverage.yml`](validation-coverage.yml) | For each record family: which invariants exist (per [§5](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) and §11.5), which finding each maps to, where the oracle enforces it, which tests and fuzz targets cover it, and its migration status. |
 | [`h5cve-matrix-policy.yml`](h5cve-matrix-policy.yml) | Which exact-build canary statuses each fixture is permitted to report. `coverage_gap` and `unexercised` are visible outcomes, never aliases for success. |
+| [`message-routing.yml`](message-routing.yml) | Measured inventory of finding **messages** that resolve to no record family. A shared code's family comes from its message via `contexts`, and for an `ambiguous` code a message matching no rule names no family at all. Regenerate with `python3 tools/message_routing.py --write`; `check_registry.py` fails on drift either way. |
 | [`libhdf5-evidence.yml`](libhdf5-evidence.yml) | **Generated.** What the selected libhdf5 build actually did, per record family, measured by the canary matrix. |
 | [`lazy-validation.json`](lazy-validation.json) | **Generated.** Measurement that validation cost tracks metadata rather than data volume, with a sensitivity control. |
 | [`truncation-sweep.json`](truncation-sweep.json) | **Generated.** Result of the §12 truncation sweep: every prefix of each seed, and whether coverage was exhaustive or sampled. |
@@ -79,11 +80,11 @@ per §11.5, never assumed from `h5policy` accepting or rejecting.
 
 | | |
 |---|---|
-| production finding codes | 262, all source-tracked |
-| catalogued finding codes | 262 across 16 record families |
+| production finding codes | 263, all source-tracked |
+| catalogued finding codes | 263 across 16 record families |
 | explicit catalog backlog | 0 |
 | catalogued ambiguous codes | 26, carrying 49 `contexts` rules |
-| expectations with an `h5cve` contract | 127 of 179 |
+| expectations with an `h5cve` contract | 128 of 180 |
 | families with an exact-build canary | 15 of 16 |
 
 `validation_controls` is the family without a canary, by design: it covers

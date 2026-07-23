@@ -65,15 +65,36 @@ KNOWN_EXITS = {0, 1, 2, 3, 4, 5, 70}
 READ_PROBE_MAX_BYTES = 16 * 1024 * 1024
 
 
+class ToolError(RuntimeError):
+    """h5policy produced no readable verdict.
+
+    Deliberately NOT a differential result.  Every check below compares a
+    h5policy verdict against libhdf5, so a run that yields no verdict has
+    nothing to compare -- reporting it as a hard failure says "h5policy
+    disagrees with libhdf5" when what happened is that h5policy did not answer.
+    That miscue is exactly how a wrapper bug that prefixed the JSON with poke's
+    stderr got read for days as a differential regression.
+    """
+
+
 def run_h5policy(path):
     """Forensic run so metrics reflect the whole reachable graph."""
-    proc = subprocess.run([H5POLICY, "--profile", "forensic", "--json", path],
-                          capture_output=True, text=True, errors="replace",
-                          timeout=60)
+    try:
+        proc = subprocess.run([H5POLICY, "--profile", "forensic", "--json", path],
+                              capture_output=True, text=True, errors="replace",
+                              timeout=60)
+    except subprocess.TimeoutExpired:
+        raise ToolError("h5policy exceeded the 60s harness timeout")
+    err = proc.stderr.strip()[:200]
     if proc.returncode not in KNOWN_EXITS:
-        raise RuntimeError(f"h5policy crashed (exit {proc.returncode}): "
-                           f"{proc.stderr.strip()[:200]}")
-    return json.loads(proc.stdout), proc.returncode
+        raise ToolError(f"h5policy exited {proc.returncode}: {err}")
+    if proc.returncode == 70:
+        raise ToolError(f"h5policy internal error (exit 70): {err}")
+    try:
+        return json.loads(proc.stdout), proc.returncode
+    except (json.JSONDecodeError, ValueError):
+        raise ToolError("h5policy report is not JSON: "
+                        f"{proc.stdout.strip()[:120]!r} (stderr: {err})")
 
 
 def reference_rc(tool, path):
@@ -380,15 +401,65 @@ def secondary_creation_order_only(report):
     without authenticating every type-6/type-9 block.  h5policy deliberately
     validates both active indexes.  Keep this exception message-scoped so an
     unrelated corruption finding on the same object remains a hard A failure.
+
+    The prefixes must track h5policy_dense_corder_role in h5_dense_links.pk:
+    the corder walker names its role (link for type 6, attribute for type 9)
+    because the two belong to different record families, so there is no longer
+    a role-less "dense creation-order" message to match.
     """
+    corder_prefixes = ("dense link creation-order",
+                       "dense attribute creation-order")
     findings = report.get("findings", [])
     return bool(findings) and all(
         finding.get("class") == "corrupt"
-        and (str(finding.get("message", "")).startswith(
-                 "dense creation-order")
+        and (str(finding.get("message", "")).startswith(corder_prefixes)
              or str(finding.get("code", "")).startswith(
                  "H5_CORRUPT_DENSE_CORDER"))
         for finding in findings)
+
+
+def nbit_member_bounds_only(report):
+    """Whether the only defect is an n-bit member outside its parent type.
+
+    libhdf5 reads THIS file without complaint, because whether the malformed
+    parameter tree is actually dereferenced depends on the member class and the
+    stored chunk bytes -- on the corpus specimen it is, and the same defect is a
+    heap-buffer-overflow WRITE in H5Z__nbit_decompress_one_nooptype
+    (corpus seed 43).  A member declared at or past its compound's own
+    size is malformed either way; libhdf5 tolerating one instance of it is not
+    evidence that h5policy is wrong to refuse it.
+
+    So this is deliberately stricter than libhdf5, and invariant A must not read
+    "libhdf5 opens" as agreement.  Message-scoped like the other A~ cases: any
+    other finding on the same file stays a hard A failure.
+    """
+    findings = report.get("findings", [])
+    corrupt = [f for f in findings if f.get("class") == "corrupt"]
+    return bool(corrupt) and all(
+        f.get("code") == "H5_CORRUPT_NBIT_MEMBER_BOUNDS" for f in corrupt)
+
+
+def fill_value_size_mismatch_only(report):
+    """Whether the only defect is a fill value shorter than its datatype.
+
+    libhdf5 opens such a file, and h5dump/h5debug/h5dump --data all exit 0 --
+    so the A+ evidence path finds nothing to corroborate with.  That is not
+    because the file is fine: H5D__fill copies at the DATATYPE size out of a
+    buffer allocated at the fill message's declared size, so H5Dread returns 0
+    and hands the caller adjacent heap bytes as data (corpus seed 52 --
+    ASAN reports the over-read, the stock build reports nothing).
+
+    The defect lives in returned CONTENT, which this harness never inspects; it
+    compares exit codes and structure.  So "libhdf5 opens" carries no
+    information here, and invariant A must not read it as agreement.  Kept
+    message-scoped, like the other A~ cases: any other finding on the same file
+    stays a hard A failure.
+    """
+    findings = report.get("findings", [])
+    return bool(findings) and all(
+        f.get("class") == "corrupt"
+        and f.get("code") == "H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH"
+        for f in findings)
 
 
 def check(path):
@@ -423,6 +494,18 @@ def check(path):
                      "A~ libhdf5 read traversal leaves file-global SOHM "
                      "search / free-space metadata unopened; h5policy "
                      "validates it eagerly")
+            elif nbit_member_bounds_only(report):
+                soft(False,
+                     "A~ h5policy is deliberately stricter: an n-bit member "
+                     "declared at or past its compound's own size is malformed "
+                     "even where libhdf5 does not dereference the parameter "
+                     "tree (it does on the corpus specimen -- overflow WRITE)")
+            elif fill_value_size_mismatch_only(report):
+                soft(False,
+                     "A~ libhdf5 opens and reads this file without error; the "
+                     "fill-size defect surfaces only in H5Dread CONTENT (heap "
+                     "bytes returned as data), which this harness does not "
+                     "inspect")
             elif secondary_creation_order_only(report):
                 soft(False,
                      "A~ libhdf5 traverses the primary dense index without "
@@ -532,11 +615,21 @@ def main():
     }
 
     total_fail = 0
+    total_tool_error = 0
     records = []
     for path in files:
         rel = os.path.relpath(path)
         try:
             fails, warns, lines = check(path)
+        except ToolError as exc:
+            # Counted and reported SEPARATELY from differential failures: the
+            # tool misbehaved, it did not disagree with libhdf5.
+            if not args.json:
+                print(f"\n{rel}\n  TOOL_ERROR {exc}")
+            records.append({"file": rel, "status": "TOOL_ERROR",
+                            "error": str(exc)})
+            total_tool_error += 1
+            continue
         except Exception as exc:
             if not args.json:
                 print(f"\n{rel}\n  ERROR {exc}")
@@ -554,12 +647,20 @@ def main():
 
     if args.json:
         print(json.dumps({"tool": "h5policy-diff", "provenance": provenance,
-                          "hard_failures": total_fail, "files": len(files),
+                          "hard_failures": total_fail,
+                          "tool_errors": total_tool_error,
+                          "files": len(files),
                           "results": records}, indent=2))
     else:
-        print(f"\ndifferential: {total_fail} hard failure(s) across "
-              f"{len(files)} file(s)")
-    return 1 if total_fail else 0
+        summary = (f"\ndifferential: {total_fail} hard failure(s) across "
+                   f"{len(files)} file(s)")
+        if total_tool_error:
+            summary += (f"; {total_tool_error} file(s) produced NO h5policy "
+                        f"verdict (tool error, not a differential result)")
+        print(summary)
+    # Both are non-zero exits -- a tool that cannot answer still has to stop the
+    # suite -- but the counts stay distinct so the cause is never guessed at.
+    return 1 if (total_fail or total_tool_error) else 0
 
 
 def _tool_version_diff(tool):

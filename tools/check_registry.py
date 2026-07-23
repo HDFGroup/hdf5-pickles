@@ -288,7 +288,55 @@ for specimen in glob.glob("h5policy/tests/**/*.h5", recursive=True):
         print(f"UNOWNED generated_fixture={specimen}")
         errors += 1
 
+# Message routing.  A shared code's family is resolved from its finding MESSAGE
+# via the `contexts` rules, and for an `ambiguous` code a message matching no
+# rule resolves to NO record at all -- so `h5cve verify` cannot pick a canary
+# for it.  registry/message-routing.yml is the measured inventory of those gaps;
+# this gate recomputes it and fails on drift either way, so a new unroutable
+# message cannot be added silently and a fixed one cannot be left claimed.
+sys.path.insert(0, "tools")
+import message_routing                                          # noqa: E402
+import importlib.machinery                                      # noqa: E402
+import importlib.util                                           # noqa: E402
+
+_loader = importlib.machinery.SourceFileLoader("h5cve_for_registry", "tools/h5cve")
+_spec = importlib.util.spec_from_loader("h5cve_for_registry", _loader)
+_h5cve = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_h5cve)
+
+ROUTING_PATH = message_routing.ROUTING_PATH
+emitted_messages, unanalyzable = message_routing.extract()
+
+# An emit whose code or message expression is not understood is a hard error,
+# not a skip: silently dropping one is how these gaps went unnoticed. Declare
+# the new shape in message_routing.EMIT_SITES / COMPOSING_HELPERS.
+for source, fn, expr in unanalyzable:
+    print(f"MESSAGE_UNANALYZABLE source={source} fn={fn} expr={expr!r} "
+          f"(declare it in tools/message_routing.py)")
+    errors += 1
+
+measured = message_routing.unrouted(emitted_messages, findings,
+                                    _h5cve.resolve_finding)
+if os.path.exists(ROUTING_PATH):
+    declared = (yaml.safe_load(open(ROUTING_PATH)) or {}).get("unrouted") or {}
+    for code in sorted(set(measured) | set(declared)):
+        new = set(measured.get(code, [])) - set(declared.get(code, []))
+        gone = set(declared.get(code, [])) - set(measured.get(code, []))
+        for msg in sorted(new):
+            print(f"ROUTING_GAP finding={code} message={msg!r} "
+                  f"(add a `contexts` rule, or regenerate {ROUTING_PATH})")
+            errors += 1
+        for msg in sorted(gone):
+            print(f"ROUTING_STALE finding={code} message={msg!r} now routes "
+                  f"(regenerate with `python3 tools/message_routing.py --write`)")
+            errors += 1
+else:
+    print(f"NOTE {ROUTING_PATH} absent; message routing unverified "
+          f"(run `python3 tools/message_routing.py --write`)")
+
 print(f"records={len(records)} findings={len(findings)} "
       f"backlog={len(finding_backlog)} emitted={len(emitted_by)} "
+      f"messages={sum(len(v) for v in emitted_messages.values())} "
+      f"unrouted={sum(len(v) for v in measured.values())} "
       f"missing={len(missing)} errors={errors}")
 sys.exit(1 if errors else 0)

@@ -173,7 +173,8 @@ fi
 h5_export_load_path "$overlay_dir/pickles" "$repo_dir/pickles"
 
 cmd_file=$(mktemp "${TMPDIR:-/tmp}/h5policy.XXXXXX")
-trap 'rm -f "$cmd_file"' EXIT
+err_file=$(mktemp "${TMPDIR:-/tmp}/h5policy-err.XXXXXX")
+trap 'rm -f "$cmd_file" "$err_file"' EXIT
 
 {
     printf 'load h5_policy\n'
@@ -203,12 +204,22 @@ if [[ -n "$max_walk_seconds" ]]; then
     wall=$((max_walk_seconds + 30))
 fi
 
+# Keep poke's stderr OUT of the report stream.  The report is assembled from
+# every line that is not the exit-code marker, so anything merged in here ends
+# up prefixed to the JSON document and every consumer sees malformed output.
+# That is not hypothetical: poke's Boehm GC prints
+#   "GC Warning: Repeated allocation of very large block ..."
+# on stderr under memory pressure, which used to make h5policy emit unparseable
+# JSON at random and produced the flaky UNPARSEABLE verdicts in
+# h5policy-seamcheck and h5policy-diff.  stderr is still captured, and is
+# reported on the failure paths below, but it can never become the document.
 poke_status=0
 if command -v timeout >/dev/null 2>&1; then
-    poke_output=$(timeout "${wall}s" poke --quiet -s "$cmd_file" 2>&1) || poke_status=$?
+    poke_output=$(timeout "${wall}s" poke --quiet -s "$cmd_file" 2>"$err_file") || poke_status=$?
 else
-    poke_output=$(poke --quiet -s "$cmd_file" 2>&1) || poke_status=$?
+    poke_output=$(poke --quiet -s "$cmd_file" 2>"$err_file") || poke_status=$?
 fi
+poke_errors=$(cat "$err_file")
 
 # timeout(1) exits 124 when it kills the child: emit a coverage-gap and stop.
 if [[ $poke_status -eq 124 ]]; then
@@ -254,9 +265,29 @@ while IFS= read -r line; do
 done <<<"$poke_output"
 
 if [[ -z "$exit_code" ]]; then
+    # No marker: the run did not complete.  Surface BOTH streams on stderr --
+    # poke's diagnostics live in the second one now that they are kept apart.
     printf '%s' "$poke_output" >&2
+    if [[ -n "$poke_errors" ]]; then
+        printf '%s\n' "$poke_errors" >&2
+    fi
     if [[ $poke_status -ne 0 ]]; then
         exit "$poke_status"
+    fi
+    exit 70
+fi
+
+# The report is this tool's whole contract, and a consumer that cannot parse it
+# reports something misleading rather than nothing -- the seamcheck harness
+# scored an unparseable document as a verdict DISAGREEMENT, and h5policy-diff as
+# a differential failure.  Neither pointed at the real cause.  Fail loudly here
+# instead: whatever leaked in is on stderr, and the exit code says internal
+# error rather than a verdict the caller might believe.
+if [[ "${report#"${report%%[![:space:]]*}"}" != "{"* ]]; then
+    printf 'h5policy: internal error: report is not a JSON document\n' >&2
+    printf '%s' "$report" >&2
+    if [[ -n "$poke_errors" ]]; then
+        printf '%s\n' "$poke_errors" >&2
     fi
     exit 70
 fi

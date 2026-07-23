@@ -628,8 +628,14 @@ fun h5policy_walk_reachable_metadata = (int ios,
        treating 0 as absent (the walk finds the superblock magic and rejects).  */
     if (ext_addr != 0xffffffffffffffffUL
         && ext_addr < h5policy_ceiling(ios))
-        h5policy_enqueue_ohdr(profile, ext_addr, 0UL, "/<superblock-extension>",
-                              ext_addr#B, "/<superblock-extension>");
+        {
+            /* Record it before enqueuing: the extension goes in first, so from
+               here on any enqueue of this address comes from the object graph
+               and is an alias (h5policy_enqueue_ohdr). */
+            h5policy_ext_ohdr_addr = ext_addr;
+            h5policy_enqueue_ohdr(profile, ext_addr, 0UL, "/<superblock-extension>",
+                                  ext_addr#B, "/<superblock-extension>");
+        }
 
     /* SOHM is file-global and is advertised by the extension.  Queue the root
        after it so root messages can resolve shared heap IDs immediately. */
@@ -674,20 +680,42 @@ fun h5policy_walk_reachable_metadata = (int ios,
                     continue;
                 }
 
-            ctx = h5policy_validate_ohdr_raw(ios, profile, ctx,
-                                             addr#B, path, depth);
+            /* A metadata cache image (carried by the superblock extension,
+               which is walked before the root) shadows the on-disk bytes at the
+               addresses it caches.  Decoding a shadowed header would interpret
+               stale backing bytes as live metadata -- that is how forensic once
+               manufactured H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION on
+               valid/cache_image.h5.
 
-            /* A metadata cache image discovered while validating this object
-               (the superblock extension carries it, and is walked before the
-               root) shadows the remaining metadata addresses.  Stop at that
-               dependency boundary rather than decoding shadowed bytes -- this
-               overrides continue-after-corruption, so forensic mode does not
-               manufacture a corruption finding from the stale root header.  */
-            if (h5policy_cache_image_boundary)
+               Skip precisely the shadowed objects rather than abandoning the
+               walk.  The image lists which addresses it caches and h5policy
+               already decodes that index, so "we cannot vet this object" does
+               not have to mean "we cannot vet anything after it": a file whose
+               image covers one B-tree leaf still gets its headers, heaps and
+               remaining trees checked.  Stopping outright reported
+               unsupported_coverage_gap on corpus seed 62, whose
+               over-capacity record count -- a live libhdf5 SIGSEGV -- sits in an
+               UNSHADOWED header the walk never reached.
+
+               The walk is still not complete: shadowed objects were skipped, so
+               stop_reason/walk_completed keep reporting the coverage gap. */
+            if (h5policy_cache_image_boundary
+                && h5policy_addr_is_shadowed(addr))
                 {
                     h5policy_walk_stop_reason = "cache_image_coverage_gap";
-                    return ctx;
+                    continue;
                 }
+
+            ctx = h5policy_validate_ohdr_raw(ios, profile, ctx,
+                                             addr#B, path, depth);
+        }
+
+    /* A cache image leaves the walk incomplete even when every reachable
+       unshadowed object was vetted: the cached bodies were never decoded. */
+    if (h5policy_cache_image_boundary)
+        {
+            h5policy_walk_stop_reason = "cache_image_coverage_gap";
+            return ctx;
         }
 
     h5policy_walk_completed = 1;
