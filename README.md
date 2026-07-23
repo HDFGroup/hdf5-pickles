@@ -22,7 +22,7 @@ repairs.
 - [`tools/`](tools/) collects top-level command symlinks and repository helper
   scripts such as the documentation generator.
 - [`docs/`](docs/) contains YAML format notes and generated Markdown reference
-  pages.
+  pages, plus a [tool relationship overview](docs/tool-overview.md).
 - [`emacs/`](emacs/) contains an Emacs front end for inspecting HDF5 files
   through GNU poke.
 - [`examples/`](examples/) contains poke scripts for generating and inspecting

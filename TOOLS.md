@@ -1,5 +1,9 @@
 # Tools
 
+For a visual map of the executable format layer, primary commands, supporting
+harnesses, and generated artifacts, see the
+[tool relationship overview](docs/tool-overview.md).
+
 ## Command Entry Points
 
 The top-level `tools/` directory collects repository commands.  Most entries are
@@ -21,12 +25,12 @@ tools/h5policy-seamcheck -> ../h5policy/tools/h5policy-seamcheck
 tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
-`tools/pkdoc.py`, `tools/check_tutorial.py`, `tools/finding_registry.py`, and
-`tools/h5cve` are repository-level helper scripts (not symlinks): `pkdoc.py`
-generates and checks the format-reference sidecars, `check_tutorial.py`
-executes the GNU poke sessions embedded in `TUTORIAL.md`,
-`finding_registry.py` loads and exports the sharded finding registry, and
-`h5cve` is the CVE case orchestrator described below.
+`tools/pkdoc.py`, `tools/check_tutorial.py`, `tools/check_tool_overview.py`,
+`tools/finding_registry.py`, `tools/check_registry.py`,
+`tools/message_routing.py`, and `tools/h5cve` are repository-level helper
+scripts (not symlinks). They generate and test documentation, load and check
+the sharded finding registry and its message routes, and orchestrate the CVE
+case workflow described below.
 
 ## h5cve Case Orchestrator
 
