@@ -96,8 +96,10 @@ add_custom_target(docs-check
     ${PKDOC_CHECK_COMMANDS}
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tutorial.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_cache_image_docs.py"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    COMMENT "Checking generated documentation sidecars and tutorial commands"
+    COMMENT "Checking generated docs, tutorial commands, and policy boundaries"
     VERBATIM
     USES_TERMINAL
 )
@@ -121,6 +123,14 @@ if(POKE_EXECUTABLE)
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
     set_tests_properties(tutorial_docs_regression PROPERTIES TIMEOUT 30)
+
+    add_test(
+        NAME cache_image_docs_regression
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_cache_image_docs.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(cache_image_docs_regression PROPERTIES TIMEOUT 60)
 
     add_test(
         NAME pickle_ohdr_msgs_regression
