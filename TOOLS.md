@@ -21,9 +21,10 @@ tools/h5policy-seamcheck -> ../h5policy/tools/h5policy-seamcheck
 tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
-`tools/pkdoc.py` and `tools/h5cve` are repository-level helper scripts (not
-symlinks): `pkdoc.py` backs the documentation targets, and `h5cve` is the CVE
-case orchestrator described below.
+`tools/pkdoc.py`, `tools/finding_registry.py`, and `tools/h5cve` are
+repository-level helper scripts (not symlinks): `pkdoc.py` backs the
+documentation targets, `finding_registry.py` loads and exports the sharded
+finding registry, and `h5cve` is the CVE case orchestrator described below.
 
 ## h5cve Case Orchestrator
 
@@ -31,7 +32,7 @@ case orchestrator described below.
 bundle and auto-populates the [`registry/cve-case.yml`](registry/cve-case.yml)
 schema.  It duplicates no tool logic — it shells out to `h5policy`, `h5markers`,
 `h5explain`, and the exact-build probe, and maps the primary finding to its
-invariant through [`registry/findings.yml`](registry/findings.yml).
+invariant through [`registry/findings/`](registry/findings/).
 
 ```text
 h5cve init  <id> --poc FILE                 # bundle: PoC, sha256, skeleton case.yml
@@ -46,14 +47,15 @@ h5cve evidence [--matrix F]                 # measured libhdf5 verdict per famil
 h5cve verification                          # §12 requirement status per family
 ```
 
-`triage` names the violated invariant from the primary finding. Twenty finding
-codes are emitted by more than one walker, so the mapping is resolved with the
-finding **message** via the `contexts` rules in `registry/findings.yml`. When no
-rule matches, triage asserts **nothing** and reports the candidate families
-instead — an unnamed invariant is a visible gap, a wrong one is a wrong fix.
+`triage` names the violated invariant from the primary finding. Ambiguous
+finding codes are emitted by more than one walker, so the mapping is resolved
+with the finding **message** via grouped rules in
+`registry/findings/routes/`. When no rule matches, triage asserts **nothing**
+and reports the candidate families instead — an unnamed invariant is a visible
+gap, a wrong one is a wrong fix.
 Production codes that have not reached that semantic review are source-tracked
 in `registry/finding-backlog.yml`; triage deliberately leaves their mapping
-unset until they move into `registry/findings.yml`.
+unset until they move into the finding catalog.
 
 `triage` also records **every** family the file implicates, not just the
 primary's, in `family_coverage`.  The strict profile stops at the first

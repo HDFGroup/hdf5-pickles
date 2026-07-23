@@ -11,11 +11,11 @@ Registry files plus a case directory, one schema version:
 
 | File | Answers |
 |---|---|
-| [`findings.yml`](findings.yml) | For each reviewed stable finding code: what invariant does it prove, at which validation scope, for which record and versions, and — when the code is emitted by more than one walker — which role applies to a given occurrence. |
+| [`findings/`](findings/) | Authoritative finding registry: static catalog shards by record family plus grouped message-route shards for ambiguous codes. See its [maintenance guide](findings/README.md). |
 | [`finding-backlog.yml`](finding-backlog.yml) | Exact source inventory for future emitted codes whose semantic record/invariant mapping is still pending. It is currently empty; an entry here is visible migration debt, not a catalog mapping. |
 | [`validation-coverage.yml`](validation-coverage.yml) | For each record family: which invariants exist (per [§5](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) and §11.5), which finding each maps to, where the oracle enforces it, which tests and fuzz targets cover it, and its migration status. |
 | [`h5cve-matrix-policy.yml`](h5cve-matrix-policy.yml) | Which exact-build canary statuses each fixture is permitted to report. `coverage_gap` and `unexercised` are visible outcomes, never aliases for success. |
-| [`message-routing.yml`](message-routing.yml) | Measured inventory of finding **messages** that resolve to no record family. A shared code's family comes from its message via `contexts`, and for an `ambiguous` code a message matching no rule names no family at all. Regenerate with `python3 tools/message_routing.py --write`; `check_registry.py` fails on drift either way. |
+| [`message-routing.yml`](message-routing.yml) | Measured inventory of finding **messages** that resolve to no record family. A shared code's family comes from its grouped route rules, and for an `ambiguous` code a message matching no rule names no family at all. Regenerate with `python3 tools/message_routing.py --write`; `check_registry.py` fails on drift either way. |
 | [`libhdf5-evidence.yml`](libhdf5-evidence.yml) | **Generated.** What the selected libhdf5 build actually did, per record family, measured by the canary matrix. |
 | [`lazy-validation.json`](lazy-validation.json) | **Generated.** Measurement that validation cost tracks metadata rather than data volume, with a sensitivity control. |
 | [`truncation-sweep.json`](truncation-sweep.json) | **Generated.** Result of the §12 truncation sweep: every prefix of each seed, and whether coverage was exhaustive or sampled. |
@@ -28,10 +28,9 @@ emit inventory from the pickle validators and the wrapper-generated timeout
 report. It requires every emitted code to appear in exactly one of the semantic
 catalog or the explicit backlog, validates source attribution, and rejects
 untracked or stale codes. It also enforces the cross-file constraints: every
-invariant referenced by a finding or a context rule exists in its record, every
+invariant referenced by a finding or route rule exists in its record, every
 required fixture finding is catalogued, every generated fixture is owned by an
-expectation, and no finding code is defined twice (a duplicate key is silently
-dropped by YAML, so a whole definition can otherwise go dead unnoticed).
+expectation, and no YAML key or finding code is defined twice.
 
 ## Vocabulary (from the strategy doc)
 
@@ -43,23 +42,29 @@ decision, not the eventual crash site.
 `severity` — the `h5policy` finding class as emitted by `h5policy_emit_error`:
 `corrupt`, `resource`, `policy`, `warning`.
 
-`ambiguous` / `contexts` — twenty-six codes are emitted by more than one walker: a
+`ambiguous` / routes — some codes are emitted by more than one walker: a
 checksum mismatch or an out-of-file address means a different thing in a chunk
 index than in an object header. Those entries are marked `ambiguous: true`,
 which says their top-level `record`/`invariant` name only **one** of the code's
 roles and are a fallback, not an attribution.
 
 The only per-occurrence discriminator `h5policy` reports is the finding
-**message**, which is composed at the emission site, so `contexts` is an ordered
-list of substring rules matched against it (first match wins):
+**message**, which is composed at the emission site. Reviewed routing for an
+ambiguous code lives in a route shard that groups messages resolving to the
+same role:
 
 ```yaml
-contexts:
-  - match: "v2 B-tree chunk child address outside file"
-    record: chunk_index
-    invariant: chunk.child_address   # omit when none is catalogued yet
+routes:
+  - record: chunk_index
+    invariant: chunk.child_address
+    scope: reference_graph
     evidence: curated
+    matches:
+      - "v2 B-tree chunk child address outside file"
 ```
+
+The loader expands these groups and applies longest-substring-first precedence,
+so a broad match cannot shadow a more specific one.
 
 `evidence` records where a rule came from: `curated` from a fixture's own
 `h5cve.family` block, `fixture` from the structure the corpus fixture that
@@ -68,7 +73,7 @@ text alone. A rule may name a `record` without an `invariant`: that still
 selects the right exact-build canary, and the missing invariant is a visible
 entry on the backlog rather than a wrong one asserted silently.
 
-When an ambiguous code's message matches no rule, `h5cve triage` asserts
+When an ambiguous code's message matches no route, `h5cve triage` asserts
 **nothing** and reports the candidate records instead. An unnamed invariant is a
 gap; a wrong one is a wrong fix. Adding the missing rule is the fix.
 
@@ -78,14 +83,14 @@ per §11.5, never assumed from `h5policy` accepting or rejecting.
 
 ## Current coverage
 
-| | |
-|---|---|
-| production finding codes | 263, all source-tracked |
-| catalogued finding codes | 263 across 16 record families |
-| explicit catalog backlog | 0 |
-| catalogued ambiguous codes | 26, carrying 49 `contexts` rules |
-| expectations with an `h5cve` contract | 128 of 180 |
-| families with an exact-build canary | 15 of 16 |
+Finding and routing counts are derived rather than copied into this document:
+
+```sh
+python3 tools/finding_registry.py stats
+```
+
+There are currently 128 expectations with an `h5cve` contract out of 180, and
+15 of 16 record families have an exact-build canary.
 
 `validation_controls` is the family without a canary, by design: it covers
 budgets, base address, free-space managers and profile validity, which have no
