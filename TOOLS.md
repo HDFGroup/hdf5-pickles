@@ -1,5 +1,9 @@
 # Tools
 
+For a visual map of the executable format layer, primary commands, supporting
+harnesses, and generated artifacts, see the
+[tool relationship overview](docs/tool-overview.md).
+
 ## Command Entry Points
 
 The top-level `tools/` directory collects repository commands.  Most entries are
@@ -21,9 +25,12 @@ tools/h5policy-seamcheck -> ../h5policy/tools/h5policy-seamcheck
 tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
-`tools/pkdoc.py` and `tools/h5cve` are repository-level helper scripts (not
-symlinks): `pkdoc.py` backs the documentation targets, and `h5cve` is the CVE
-case orchestrator described below.
+`tools/pkdoc.py`, `tools/check_tutorial.py`, `tools/check_tool_overview.py`,
+`tools/finding_registry.py`, `tools/check_registry.py`,
+`tools/message_routing.py`, and `tools/h5cve` are repository-level helper
+scripts (not symlinks). They generate and test documentation, load and check
+the sharded finding registry and its message routes, and orchestrate the CVE
+case workflow described below.
 
 ## h5cve Case Orchestrator
 
@@ -31,7 +38,7 @@ case orchestrator described below.
 bundle and auto-populates the [`registry/cve-case.yml`](registry/cve-case.yml)
 schema.  It duplicates no tool logic — it shells out to `h5policy`, `h5markers`,
 `h5explain`, and the exact-build probe, and maps the primary finding to its
-invariant through [`registry/findings.yml`](registry/findings.yml).
+invariant through [`registry/findings/`](registry/findings/).
 
 ```text
 h5cve init  <id> --poc FILE                 # bundle: PoC, sha256, skeleton case.yml
@@ -46,14 +53,15 @@ h5cve evidence [--matrix F]                 # measured libhdf5 verdict per famil
 h5cve verification                          # §12 requirement status per family
 ```
 
-`triage` names the violated invariant from the primary finding. Twenty finding
-codes are emitted by more than one walker, so the mapping is resolved with the
-finding **message** via the `contexts` rules in `registry/findings.yml`. When no
-rule matches, triage asserts **nothing** and reports the candidate families
-instead — an unnamed invariant is a visible gap, a wrong one is a wrong fix.
+`triage` names the violated invariant from the primary finding. Ambiguous
+finding codes are emitted by more than one walker, so the mapping is resolved
+with the finding **message** via grouped rules in
+`registry/findings/routes/`. When no rule matches, triage asserts **nothing**
+and reports the candidate families instead — an unnamed invariant is a visible
+gap, a wrong one is a wrong fix.
 Production codes that have not reached that semantic review are source-tracked
 in `registry/finding-backlog.yml`; triage deliberately leaves their mapping
-unset until they move into `registry/findings.yml`.
+unset until they move into the finding catalog.
 
 `triage` also records **every** family the file implicates, not just the
 primary's, in `family_coverage`.  The strict profile stops at the first
@@ -156,9 +164,9 @@ Three ladders, and the third is what makes the first two mean anything:
 
 | ladder | varies | expectation |
 |---|---|---|
-| `data` | raw data ~1000x, structure fixed | counters flat |
-| `filtered` | same with deflate, **one chunk throughout** | counters flat — a validator that decompressed to inspect payload would show it |
-| `chunks` | chunk count 100x — real metadata growth | `walk_operations` **must rise** |
+| `data` | 16 → 1,600,000 elements (100,000×); physical file 2,112 → 6,402,048 bytes (3,031×), structure fixed | counters flat |
+| `filtered` | same element-count ladder with deflate and **one chunk throughout**; physical file 2,088 → 2,214,864 bytes (1,061×) | counters flat — a validator that decompressed to inspect payload would show it |
+| `chunks` | chunk count 4 → 400 (100×) — real metadata growth | `walk_operations` **must rise** |
 
 Without the control, flat counters could equally mean the counters are broken.
 The `filtered` ladder pins the chunk count deliberately: letting it vary with
@@ -166,8 +174,15 @@ The `filtered` ladder pins the chunk count deliberately: letting it vary with
 
 Counters are bounded by ratio, not equality — decoding a larger stored-size
 field can cost a few operations without any payload being touched, while a
-validator that read payload would grow with `n`. Current result: cost flat
-across a ~1000x data increase, with the control rising 375 → 987 → 7107.
+validator that read payload would grow with `n`. In the current tracked
+measurement, the unfiltered ladder's `metadata_bytes_seen`/`walk_operations`
+remain exactly 463/212 across the 3,031× physical-file increase. The filtered
+ladder remains at 463 metadata bytes while operations move only 229 → 233
+across 1,061× physical growth. The sensitivity control rises
+375 → 987 → 7,107 operations. These ratios are derived from the
+`physical_bytes` endpoints in
+[`registry/lazy-validation.json`](registry/lazy-validation.json), not from the
+nominal element-count ratio.
 
 ## In-Process Seam Self-Check
 
@@ -298,7 +313,10 @@ printf 'root\nls\n' | ./tools/h5explain file.h5
 
 **Navigation commands:** `root`, `h5super`, `cd ("PATH")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
 
-`cd` accepts a link name, a relative or absolute path, and `.`/`..` components. `back` retraces the full history one step per call. `go`/`gos` refuse offsets at or past the end of the file.
+`cd` accepts a link name, a relative or absolute path, and `.`/`..` components.
+`back` retraces a bounded multi-step history one location per call. Up to `256`
+prior locations are retained; after that, the oldest is discarded. `go`/`gos`
+refuse offsets at or past the end of the file.
 
 Version 1 object headers have no signature, so `go`/`gos` infer them from the version and message count. When a kind was inferred rather than confirmed by a signature, `pwd` and `info` mark it `(inferred: no signature)`; reaching the same address through `root` or `cd` corroborates it and the marker disappears.
 
@@ -312,4 +330,7 @@ Use `msgs` to list object-header messages, then `explain (N)` or `explain_msg (N
 
 `traverse` is the only command that recursively walks chunk indexes. Ordinary navigation and `info` map the current primitive only, so large chunk indexes are not traversed accidentally.
 
-`back` returns to the location before the most recent navigation step (`go`, `gos`, `cd`, `root`, `h5super`). Only one level of history is kept.
+`back` returns to the location before the most recent successful navigation
+step (`go`, `gos`, `cd`, `root`, `h5super`). Repeated calls keep retracing until
+the retained history is empty; a failed navigation that does not move the
+cursor adds no history entry.

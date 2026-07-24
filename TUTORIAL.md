@@ -14,7 +14,7 @@ At the `(poke)` prompt, load the pickles needed for the superblock and object he
 ```poke
 load common
 load superblock
-load ohdr
+load ohdr_msgs
 load lookup3
 ```
 
@@ -45,14 +45,32 @@ This tells us that `file.h5` uses a version 2 superblock and that the root objec
 ## 2. Decode the root object header
 
 ```poke
-var root = ohdr @ root_addr
+var root = oh_hdr @ root_addr
 root
 ```
 
 Expected output snippet:
 
 ```text
-ohdr {sig_peek=[79UB,72UB,68UB,82UB],_ohdr=struct {v2=struct {signature=[79UB,72UB,68UB,82UB],version=2UB,flags=32UB,timestamps=Timestamps {access=1773447782U,modification=1773447782U,change=1773447782U,birth=1773447782U},chunk0_size=[120UB],_msg_chunk=struct {msg_chunk=[2UB,18UB,0UB,0UB,0UB,0UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,10UB,2UB,0UB,1UB,0UB,0UB,6UB,26UB,0UB,0UB,1UB,0UB,15UB,68UB,105UB,114UB,101UB,99UB,116UB,67UB,104UB,117UB,110UB,107UB,68UB,97UB,116UB,97UB,195UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,58UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB]},chksum=[7UB,68UB,33UB,252UB]}}}
+oh_hdr {
+  sig_peek=[79UB,72UB,68UB,82UB],
+  _ohdr=struct {
+    v2=struct {
+      signature=[79UB,72UB,68UB,82UB],
+      version=2UB,
+      flags=32UB,
+      timestamps=hdr_timestamps {
+        access=1773447782U,
+        modification=1773447782U,
+        change=1773447782U,
+        birth=1773447782U
+      },
+      chunk0_size=[120UB],
+      ...
+      chksum=[7UB,68UB,33UB,252UB]
+    }
+  }
+}
 ```
 
 We are looking at a version 2 object header. Unlike the earlier version, it comes with a checksum. You can verify the checksum with the `lookup3_hashlittle` function from `lookup3.pk`:
@@ -98,7 +116,7 @@ msg_prefix {
     msg_flags=0UB
   }
 }
-H5O_msg_linfo {
+oh_msg_linfo {
   version=0UB,
   flags=0UB,
   fheap_addr_raw=[255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB],
@@ -113,9 +131,10 @@ msg_prefix {
     msg_flags=0UB
   }
 }
-H5O_msg_link {
+oh_msg_link {
   version=1UB,
   flags=0UB,
+  lnk_len=[15UB],
   lnk_name=[68UB,105UB,114UB,101UB,99UB,116UB,67UB,104UB,117UB,110UB,107UB,68UB,97UB,116UB,97UB],
   ohdr_addr_raw=[195UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB]
 }
@@ -128,7 +147,7 @@ The interesting part here is the link message: the byte array in `lnk_name` is t
 Now map that child object header and decode its messages:
 
 ```poke
-var dset = ohdr @ 195#B
+var dset = oh_hdr @ 195#B
 dset.get_messages ()
 ```
 
@@ -136,25 +155,29 @@ Expected output snippet:
 
 ```text
 Message 0...
-H5O_msg_sdspace {
+oh_msg_sdspace {
   version=2UB,
   space=struct {
     v2=struct {
       ndims=2UB,
       flags=1UB,
       space_type=1UB,
-      dim_size=[8UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB],
-      max=[8UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      dim_size=[
+        [8UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB],
+        [8UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      ],
+      max=[
+        [8UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB],
+        [8UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      ]
     }
   }
 }
 
 Message 1...
-H5O_msg_dtype {
-  hdr=dtype_hdr {
-    flags=2064U,
-    elm_size=4U
-  },
+oh_msg_dtype {
+  hdr.flags=2064U
+  hdr.elm_size=4U
   types=struct {
     fixed_point=struct {
       bit_offset=0UH,
@@ -164,7 +187,7 @@ H5O_msg_dtype {
 }
 
 Message 4...
-H5O_msg_layout {
+oh_msg_layout {
   version=3UB,
   layout=struct {
     v3=struct {
@@ -193,16 +216,18 @@ The dataset layout message above tells us where the chunk index lives:
 In this sample file, the chunk index starts with the signature `TREE`, so it is a version 1 B-tree for raw-data chunks. Load the B-tree pickles, set the raw-chunk key dimensionality, and map the node:
 
 ```poke
-load btree
+load v1_btree
 set_bt1_ndims (3UB)
-var bt = v1_btree @ 479#B
+var bt = bt1_hdr @ 479#B
 bt
 ```
 
 Why `3UB`? `v1_btree.pk` expects the raw-chunk key width to be the dataset dimensionality plus one. `file.h5` stores a 2-dimensional dataset (`8 x 8`), so the correct setting here is `2 + 1 = 3`.
 
-```text
-# Put these options in poke's config file (~/.pokerc) for prettier dumps of the B-tree nodes:
+Enable tree-style pretty printing in the current session. You can also put
+these commands in poke's configuration file (`~/.pokerc`):
+
+```poke
 .set pretty-print yes
 .set omode tree
 ```
@@ -210,7 +235,7 @@ Why `3UB`? `v1_btree.pk` expects the raw-chunk key width to be the dataset dimen
 Expected output (with options for readability):
 
 ```text
-v1_btree {
+bt1_hdr {
   signature=[84UB,82UB,69UB,69UB],
   node_type=1UB,
   node_level=0UB,
@@ -219,36 +244,36 @@ v1_btree {
   right_sib_raw=[255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB],
   body=struct {
     type1=struct {
-      pairs=[bt1_pair1 {
-        key=bt1_key1 {
+      pairs=[pair1 {
+        key=key1 {
           chunk_size=64U,
           filter_mask=1U,
           chunk_offsets=[0UL,0UL,0UL]
         },
         child_raw=[183UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
-      },bt1_pair1 {
-        key=bt1_key1 {
+      },pair1 {
+        key=key1 {
           chunk_size=40U,
           filter_mask=0U,
           chunk_offsets=[0UL,4UL,0UL]
         },
         child_raw=[63UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
-      },bt1_pair1 {
-        key=bt1_key1 {
+      },pair1 {
+        key=key1 {
           chunk_size=40U,
           filter_mask=0U,
           chunk_offsets=[4UL,0UL,0UL]
         },
         child_raw=[103UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
-      },bt1_pair1 {
-        key=bt1_key1 {
+      },pair1 {
+        key=key1 {
           chunk_size=40U,
           filter_mask=0U,
           chunk_offsets=[4UL,4UL,0UL]
         },
         child_raw=[143UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
       }],
-      final_key=bt1_key1 {
+      final_key=key1 {
         chunk_size=0U,
         filter_mask=0U,
         chunk_offsets=[4UL,4UL,4UL]
@@ -261,7 +286,7 @@ v1_btree {
 For a more readable dump, use the recursive printer:
 
 ```poke
-print_recurse_v1_btree (479#B, 0)
+print_v1_btree (479#B, 0)
 ```
 
 This prints the four chunk records in `file.h5`. Since `node_level=0`, this root node is also a leaf, so there are no child B-tree nodes to descend into; each `child_raw` value is the file address of the chunk payload itself.
@@ -269,7 +294,7 @@ This prints the four chunk records in `file.h5`. Since `node_level=0`, this root
 Expected output (with options for readability):
 
 ```text
-v1_btree {
+bt1_hdr {
   signature=[84UB,82UB,69UB,69UB]
   node_type=1UB
   node_level=0UB
@@ -278,39 +303,39 @@ v1_btree {
   right_sib=[255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB]
   body=struct {
     type1=struct {
-      pairs=[bt1_pair1 {
-        key[0UL]: key=bt1_key1 {
+      pairs=[pair1 {
+        key[0UL]: key=key1 {
           chunk_size=64U
           filter_mask=1U
           offsets=[0UL,0UL,0UL]
         }
       child[0UL]: child_raw=[183UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
       }]
-      pairs=[bt1_pair1 {
-        key[1UL]: key=bt1_key1 {
+      pairs=[pair1 {
+        key[1UL]: key=key1 {
           chunk_size=40U
           filter_mask=0U
           offsets=[0UL,4UL,0UL]
         }
       child[1UL]: child_raw=[63UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
       }]
-      pairs=[bt1_pair1 {
-        key[2UL]: key=bt1_key1 {
+      pairs=[pair1 {
+        key[2UL]: key=key1 {
           chunk_size=40U
           filter_mask=0U
           offsets=[4UL,0UL,0UL]
         }
       child[2UL]: child_raw=[103UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
       }]
-      pairs=[bt1_pair1 {
-        key[3UL]: key=bt1_key1 {
+      pairs=[pair1 {
+        key[3UL]: key=key1 {
           chunk_size=40U
           filter_mask=0U
           offsets=[4UL,4UL,0UL]
         }
       child[3UL]: child_raw=[143UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
       }]
-      key[4UL]: final_key=bt1_key1 {
+      key[4UL]: final_key=key1 {
         chunk_size=0U
         filter_mask=0U
         offsets=[4UL,4UL,4UL]
@@ -326,7 +351,7 @@ You can also ask poke what each pickle defines:
 
 ```poke
 .info type superblock
-.info type ohdr
+.info type oh_hdr
 ```
 
 This is useful when extending the pickles or when you want to discover methods such as `get_messages ()` directly from the REPL.
@@ -344,8 +369,8 @@ Then edit a scalar field through the mapped object header:
 
 ```poke
 load common
-load ohdr
-var root = ohdr @ 48#B
+load ohdr_msgs
+var root = oh_hdr @ 48#B
 root._ohdr.v2.timestamps.birth
 root._ohdr.v2.timestamps.birth = 0U
 root._ohdr.v2.timestamps.birth
@@ -394,10 +419,10 @@ Now stage the root-group messages in the memory IOS at offset `1024#B`. That off
 
 ```poke
 msg_prefix_v2 @ 1024#B = msg_prefix_v2 { msg_type = 2UB, msg_size = 18UH, msg_flags = 0UB }
-H5O_msg_linfo @ 1028#B = H5O_msg_linfo { version = 0UB, flags = 0UB, fheap_addr_raw = undef_addr, name_bt2_addr_raw = undef_addr }
+oh_msg_linfo @ 1028#B = oh_msg_linfo { version = 0UB, flags = 0UB, fheap_addr_raw = undef_addr, name_bt2_addr_raw = undef_addr }
 
 msg_prefix_v2 @ 1046#B = msg_prefix_v2 { msg_type = 10UB, msg_size = 2UH, msg_flags = 1UB }
-H5O_msg_ginfo @ 1050#B = H5O_msg_ginfo { version = 0UB, flags = 0UB }
+oh_msg_ginfo @ 1050#B = oh_msg_ginfo { version = 0UB, flags = 0UB }
 
 msg_prefix_v2 @ 1052#B = msg_prefix_v2 { msg_type = 0UB, msg_size = 88UH, msg_flags = 0UB }
 
@@ -422,7 +447,7 @@ Finally, map the image back using the parser pickles and verify it:
 
 ```poke
 var sb2 = superblock @ 0#B
-var root2 = ohdr @ 48#B
+var root2 = oh_hdr @ 48#B
 
 sb2.super_vers
 bytes_to_off (sb2.super.v2_v3.root_obj_addr_raw)
@@ -447,16 +472,16 @@ Expected output snippet:
 2898835909U
 
 Message 0...
-H5O_msg_linfo { ... }
+oh_msg_linfo { ... }
 
 Message 1...
-H5O_msg_ginfo {
+oh_msg_ginfo {
   version=0UB,
   flags=0UB
 }
 
 Message 2...
-H5O_msg_nil {
+oh_msg_nil {
 }
 ```
 

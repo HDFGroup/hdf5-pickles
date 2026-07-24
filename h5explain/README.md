@@ -56,8 +56,10 @@ needs a labeled starting point; a purely downward relative path is walked from
 the current header and works even where `go`/`gos` parked the cursor on an
 unlabeled one.  A `cd` that fails part-way leaves the cursor where it was.
 
-`back` retraces the full location history one step at a time, not just the last
-move.  `go` and `gos` refuse an offset at or past the end of the file.
+`back` retraces the bounded location history one step at a time. Up to `256`
+prior locations are retained; after that, the oldest is discarded. A failed
+navigation that does not move the cursor adds no history entry. `go` and `gos`
+refuse an offset at or past the end of the file.
 
 ## Policy checks
 

@@ -52,13 +52,14 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("h5cve: PyYAML is required (pip install pyyaml)")
 
+from finding_registry import RegistryError, load_findings
+
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 H5POLICY = os.path.join(REPO, "h5policy", "tools", "h5policy")
 H5PROBE = os.path.join(REPO, "h5policy", "tools", "h5policy-probe")
 H5MUTATE = os.path.join(REPO, "h5policy", "tools", "h5mutate")
 H5EXPLAIN = os.path.join(REPO, "h5explain", "tools", "h5explain")
 H5MARKERS = os.path.join(REPO, "build", "h5markers")   # optional built binary
-FINDINGS_YML = os.path.join(REPO, "registry", "findings.yml")
 COVERAGE_YML = os.path.join(REPO, "registry", "validation-coverage.yml")
 CASES_ROOT = os.path.join(REPO, "cases")
 EXPECTED_DIR = os.path.join(REPO, "h5policy", "tests", "expected")
@@ -76,6 +77,13 @@ SCOPE_TO_CLASS = {
 
 def die(msg):
     sys.exit(f"h5cve: {msg}")
+
+
+def findings_registry():
+    try:
+        return load_findings()
+    except RegistryError as exc:
+        die(f"invalid finding registry: {exc}")
 
 
 def sha256(path):
@@ -217,7 +225,7 @@ def cmd_census(args):
 
 def cmd_matrix(args):
     """Run registry-selected canaries for the expected-fixture matrix."""
-    findings = yaml.safe_load(open(FINDINGS_YML)).get("findings", {})
+    findings = findings_registry()
     policy = yaml.safe_load(open(args.policy)) if args.policy else {"defaults": {}}
     defaults = policy.get("defaults", {}).get("allowed_statuses", [])
     overrides = policy.get("fixture_overrides", {})
@@ -428,7 +436,7 @@ def cmd_evidence(args):
 # `not_assessed` is not a soft `met`.  Requirements 2, 3 and 4 are marked that
 # way rather than guessed at from finding-code names: inferring a family's
 # boundary-value or overflow coverage from code spelling is exactly the kind of
-# confident-but-wrong attribution the `contexts` mechanism exists to prevent.
+# confident-but-wrong attribution the route mechanism exists to prevent.
 
 # Reviewed mapping from invariant id to the §12 requirement-5 categories
 # (self-reference, overlap, duplicate-reference, structure-specific cycle).
@@ -685,20 +693,21 @@ def _primary_finding(report):
 def resolve_finding(code, message, findings_reg):
     """Map an emitted finding to its record/invariant using its message.
 
-    Twenty catalogued codes are emitted by more than one walker (a checksum or
+    Some catalogued codes are emitted by more than one walker (a checksum or
     an out-of-file address means something different in a chunk index than in an
     object header), so the catalog's top-level record/invariant names only ONE
-    of a code's roles.  Those entries carry `ambiguous: true` plus an ordered
-    `contexts` list matched against the finding message -- the only per-
-    occurrence discriminator h5policy reports, since messages are composed at
-    the emission site.
+    of a code's roles. Those entries carry `ambiguous: true`; the registry
+    loader expands their grouped route shards into a longest-first `contexts`
+    list matched against the finding message -- the only per-occurrence
+    discriminator h5policy reports, since messages are composed at the emission
+    site.
 
     Returns a mapping with a `confidence`:
       exact       a context matched; record (and invariant, when catalogued)
       default     the code is unambiguous; the top-level mapping applies
       ambiguous   ambiguous code, no context matched -- nothing is asserted and
                   `candidates` lists the roles the catalog knows about
-      uncatalogued  the code is not in findings.yml at all
+      uncatalogued  the code is not in the finding catalog at all
 
     An ambiguous code with no matching context yields NO record/invariant on
     purpose: an unnamed invariant is a visible gap, a wrong one is a wrong fix.
@@ -786,8 +795,7 @@ def cmd_triage(args):
             tf.write("# h5explain not found\n")
 
     # --- map the primary finding to the registry --------------------------------
-    findings_reg = yaml.safe_load(open(FINDINGS_YML)).get("findings", {}) \
-        if os.path.exists(FINDINGS_YML) else {}
+    findings_reg = findings_registry()
     coverage = yaml.safe_load(open(COVERAGE_YML)).get("records", []) \
         if os.path.exists(COVERAGE_YML) else []
 
@@ -839,14 +847,15 @@ def cmd_triage(args):
                     f"add one to validation-coverage.yml)")
     elif mapping["confidence"] == "ambiguous":
         case["coverage_manifest_change"] = \
-            f"TODO: add a `contexts` entry for {code} matching {msg!r}"
+            f"TODO: add a route for {code} matching {msg!r}"
         note = (f"finding {code} is emitted by more than one walker and no "
-                f"`contexts` rule matches {msg!r}; candidates: "
+                f"route rule matches {msg!r}; candidates: "
                 f"{', '.join(mapping['candidates']) or 'none'}. "
-                "Invariant deliberately left unset -- add a contexts rule to "
-                "registry/findings.yml rather than assuming the default.")
+                "Invariant deliberately left unset -- add a grouped rule to "
+                f"registry/findings/routes/{code}.yml rather than assuming "
+                "the default.")
     else:
-        note = (f"finding {code!r} is not catalogued in registry/findings.yml; "
+        note = (f"finding {code!r} is not catalogued in registry/findings/; "
                 "triage fields left for manual completion (registry coverage gap)")
 
     # --- every family the file implicates, not just the primary's ---------------
@@ -1233,12 +1242,26 @@ def _canary_summary(rep, forced_status=None, exercise=None):
             "violations": rep.get("violations", [])}
 
 
+def _faulted(summary):
+    """True when the probe outcome is itself the defect (crash/timeout)."""
+    return (summary.get("outcome") in ("crashed", "timeout")
+            or "crash" in (summary.get("violations") or [])
+            or "timeout" in (summary.get("violations") or []))
+
+
 def _comparison_verdict(baseline, candidate):
     """A conservative release verdict; unknown evidence never becomes a pass."""
     blocked = {"unexercised", "coverage_gap", "build_unavailable"}
     before, after = baseline["status"], candidate["status"]
     if baseline.get("oracle_alignment") == "divergent" and \
        candidate.get("oracle_alignment") == "aligned":
+        # A candidate whose alignment with the oracle's reject comes from a
+        # CRASH has confirmed the defect, not fixed it.  This is the normal
+        # shape for a sanitizer candidate on a file the stock baseline silently
+        # accepts: baseline `accepted` (divergent), ASan candidate `crashed`
+        # (aligned).  Calling that `fixed` is backwards.
+        if _faulted(candidate):
+            return "confirmed_by_sanitizer"
         return "fixed"
     if candidate.get("oracle_alignment") == "divergent":
         return "regression"

@@ -2,6 +2,8 @@
 
 The generated format reference starts at the
 [H5Lens HDF5 File Format Reference](generated/README.md) landing page.
+For the repository entry points and the dependencies between them, see the
+[tool overview](tool-overview.md).
 
 Specification Markdown is generated from two sources of truth:
 
@@ -27,14 +29,24 @@ Output lands in `docs/generated/<name>.md`.
 
 The `--check` flag verifies that every type and field name in the sidecar
 actually appears in the corresponding pickle, catching stale documentation
-after a rename:
+after a rename. The same target executes every GNU poke command block in
+[`TUTORIAL.md`](../TUTORIAL.md) against disposable files and checks the
+documented h5policy cache-image boundary against live reports from every
+profile. It also checks the root h5patch overview against the authoritative
+repair catalog, checks the documented h5explain navigation-history semantics
+against the implementation, and derives the documented lazy-validation ratios
+from the tracked measurement before reproducing its deterministic fields. The
+Mermaid tool overview is checked for its required nodes, relationships, styles,
+and documentation entry points. The same target checks that the Codespaces
+configuration retains its required packages, tools, editor support, startup
+check, and documentation:
 
 ```sh
 cmake --build build --target docs-check
 ```
 
-Exit code 0 = clean; 1 = issues found.  Wire this into CI so drift is
-caught automatically when a pickle field is renamed.
+Exit code 0 = clean; 1 = issues found. The tutorial check is skipped when GNU
+poke is unavailable.
 
 ## Adding a new pickle
 

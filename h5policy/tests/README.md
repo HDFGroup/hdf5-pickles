@@ -35,6 +35,11 @@ controlled outcome; a change that alters any decision is surfaced for review.
   compound rules, feature switches, and run-mode defaults.
 - `unit_report_wrapper.sh` — a deterministic hard-timeout simulation that
   validates the shell-generated partial report and its nullable geometry.
+- `check_cache_image_docs.py` — a focused documentation contract that checks
+  the cache-image boundary text and compares it with live reports from all four
+  profiles plus an explicit continuation override.
+- `check_lazy_docs.py` — derives the documented lazy-validation growth ratios
+  from the tracked artifact and reproduces its deterministic ladder fields.
 - `valid/ malformed/ policy/ resource/ coverage/ integration/ cve/` — generated
   fixtures (git-ignored build output; see below).
 
@@ -68,6 +73,16 @@ for what §12 currently scores.
 The suite is also wired into CTest (top-level `CMakeLists.txt`), so
 `ctest -R h5policy_regression` runs it from a CMake build. The test is skipped
 if `poke` or `python3` + `h5py` are unavailable.
+
+The smaller `cache_image_docs_regression` CTest test runs the cache-image
+documentation contract directly. It is also part of the top-level
+`docs-check` target, so a profile, decision, analysis-state, or documentation
+change at that hard boundary is reviewed as documentation drift.
+
+`lazy_validation_docs_regression` similarly checks the narrative against
+`registry/lazy-validation.json`, reruns the measurement when its optional
+dependencies are available, and ignores wall-clock fields while requiring the
+physical sizes and deterministic counters to match.
 
 ## Two-tier semantic integration cases
 

@@ -22,11 +22,13 @@ repairs.
 - [`tools/`](tools/) collects top-level command symlinks and repository helper
   scripts such as the documentation generator.
 - [`docs/`](docs/) contains YAML format notes and generated Markdown reference
-  pages.
+  pages, plus a [tool relationship overview](docs/tool-overview.md).
 - [`emacs/`](emacs/) contains an Emacs front end for inspecting HDF5 files
   through GNU poke.
 - [`examples/`](examples/) contains poke scripts for generating and inspecting
   HDF5 structures.
+- [`.devcontainer/`](.devcontainer/README.md) provides an analysis-ready
+  GitHub Codespaces and VS Code Dev Containers environment.
 - [`MARKERS.md`](MARKERS.md), [`TOOLS.md`](TOOLS.md), and
   [`TUTORIAL.md`](TUTORIAL.md) explain the format markers, helper tools, and a
   hands-on exploration path.
@@ -89,10 +91,21 @@ differential harness, and fuzzing workflow.
 approved JSON plan, writes an audit log, and verifies the result with
 `h5policy`. Planning is a what-if operation: it does not modify the input file.
 
-The first repair catalog is intentionally narrow and high-confidence: HDF5
-signature restoration, stale v2/v3 superblock flags, v2/v3 superblock
-checksums, and reachable v2 object-header checksums. See
-[`h5patch/README.md`](h5patch/README.md) for the plan format and workflow.
+The current catalog contains `12` evidence-gated repair classes. At a glance,
+they cover:
+
+- file bootstrap and superblock repairs: signature, base address, consistency
+  flags, and checksums;
+- reachable object-header repairs: v1 message counts, v2 checksums, v4
+  chunk-layout element size, and typed scale-offset/N-bit filter parameters;
+- counted or indexed metadata repairs: free-space section totals, symbol-table
+  node counts, and depth-0 v2 B-tree total-record counts; and
+- trailing-checksum repairs for reached free-space, v2 B-tree,
+  extensible-array, and shared-message metadata.
+
+This overview is intentionally non-exhaustive. The authoritative and exhaustive
+[repair catalog](h5patch/README.md#repair-catalog) documents each repair,
+its evidence requirements, atomic checksum handling, and fail-closed cases.
 
 ## Acknowledgments
 
