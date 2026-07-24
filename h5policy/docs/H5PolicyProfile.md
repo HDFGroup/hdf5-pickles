@@ -93,6 +93,36 @@ The JSON `analysis` object reports whether this walk started and completed, its
 stop reason, the effective continuation setting, and finding truncation. This
 makes a fail-fast rejection distinguishable from an exhaustive diagnostic pass.
 
+### Metadata cache-image hard boundary
+
+Metadata cache-image decode coverage is not controlled by
+`H5FeaturePolicy` and has no profile-specific `allow_*` switch. h5policy
+validates the cache-image message, bounded container and entry envelopes, then
+records the address ranges shadowed by its entries. The cached entry bodies are
+not decoded. Reading the ordinary bytes at a shadowed address would interpret
+stale backing storage as live metadata, so those ranges are never mapped as
+object headers or other live structures.
+
+For a structurally valid cache image, every built-in profile therefore returns
+exit `5`, decision `unsupported_coverage_gap`, and
+`H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`. `analysis.complete` and
+`analysis.walk_completed` remain `false`.
+
+Control flow still reflects the effective continuation setting:
+
+- without continuation, the unsupported finding triggers the normal fail-fast
+  path and `analysis.stop_reason` is `"rejection"`;
+- with continuation, shadowed addresses are skipped while reachable unshadowed
+  metadata continues to be checked, and
+  `analysis.stop_reason` is `"cache_image_coverage_gap"`.
+
+The `forensic` profile enables continuation by default, but this does not weaken
+the boundary. An explicit `--continue-after-rejection` behaves the same way:
+it can collect additional diagnostics from unshadowed metadata, but it cannot
+decode cached bodies, mark the walk complete, or convert the refusal into an
+acceptance. A corrupt cache-image envelope can instead produce
+`reject_corrupt` under the normal decision precedence.
+
 ### Report schema and file geometry
 
 Every machine-readable report carries integer `schema_version: 1`, including a

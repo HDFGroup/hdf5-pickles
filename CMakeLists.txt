@@ -94,8 +94,22 @@ add_custom_target(docs
 
 add_custom_target(docs-check
     ${PKDOC_CHECK_COMMANDS}
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tutorial.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_cache_image_docs.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/check_docs.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5explain/tests/check_docs.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_lazy_docs.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tool_overview.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.devcontainer/check.py"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    COMMENT "Checking generated documentation sidecars"
+    COMMENT "Checking generated docs, commands, policy boundaries, summaries, tool map, and devcontainer"
     VERBATIM
     USES_TERMINAL
 )
@@ -109,9 +123,78 @@ enable_testing()
 
 find_program(POKE_EXECUTABLE poke)
 
+add_test(
+    NAME h5patch_docs_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/check_docs.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(h5patch_docs_regression PROPERTIES TIMEOUT 30)
+
+add_test(
+    NAME h5explain_docs_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5explain/tests/check_docs.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(h5explain_docs_regression PROPERTIES TIMEOUT 30)
+
+add_test(
+    NAME lazy_validation_docs_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_lazy_docs.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(lazy_validation_docs_regression PROPERTIES TIMEOUT 90)
+
+add_test(
+    NAME tool_overview_docs_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tool_overview.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(tool_overview_docs_regression PROPERTIES TIMEOUT 30)
+
+add_test(
+    NAME devcontainer_config_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.devcontainer/check.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(devcontainer_config_regression PROPERTIES TIMEOUT 30)
+
+add_test(
+    NAME devcontainer_policy_verdict_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.devcontainer/check.py"
+            --policy-report
+            "${CMAKE_CURRENT_SOURCE_DIR}/.devcontainer/testdata/h5policy-accept-with-warnings.json"
+            --policy-exit 1
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(devcontainer_policy_verdict_regression PROPERTIES
+    TIMEOUT 30
+)
+
 # The shared format pickles have synthetic byte-level unit tests that require
 # GNU poke but do not require libhdf5 or h5py.
 if(POKE_EXECUTABLE)
+    add_test(
+        NAME tutorial_docs_regression
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tutorial.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(tutorial_docs_regression PROPERTIES TIMEOUT 30)
+
+    add_test(
+        NAME cache_image_docs_regression
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_cache_image_docs.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(cache_image_docs_regression PROPERTIES TIMEOUT 60)
+
     add_test(
         NAME pickle_ohdr_msgs_regression
         COMMAND "${POKE_EXECUTABLE}" --quiet -L
@@ -139,7 +222,11 @@ if(POKE_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0)
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/run.sh"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
-    set_tests_properties(h5policy_regression PROPERTIES TIMEOUT 300)
+    # The suite runs the full corpus, the h5cve exact-build matrix, a 154-file
+    # differential, truncation sweeps, and the mutation family; it sits near
+    # 300s on an unloaded host and exceeds it under parallel CTest load, so the
+    # ceiling is generous rather than tight.
+    set_tests_properties(h5policy_regression PROPERTIES TIMEOUT 600)
     add_test(
         NAME h5patch_regression
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/run.sh"

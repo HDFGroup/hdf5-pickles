@@ -147,9 +147,12 @@ Current coverage includes:
   bounds, and reachable object traversal with visited sets.
 - Dataspace, datatype, layout, filter pipeline, fill value, link, attribute,
   both modification-time forms, B-tree K override, reference-count,
-  free-space info, and metadata cache image messages. Driver-info envelopes are
-  validated and then explicitly refused because their VFD bodies can name
-  member files outside the single-file validation boundary.
+  free-space info, and metadata cache image message/container envelopes.
+  Cached metadata bodies remain outside decode coverage, as described in
+  [Metadata cache-image hard boundary](#metadata-cache-image-hard-boundary).
+  Driver-info envelopes are validated and then explicitly refused because
+  their VFD bodies can name member files outside the single-file validation
+  boundary.
 - Compact hard links, dense link storage, dense attribute storage, old-style
   group metadata, and chunk-index metadata. Dense storage covers both the name
   indexes and recursive type-6/type-9 creation-order B-trees, including
@@ -170,6 +173,39 @@ Current coverage includes:
   datatype semantics can be compared against `libhdf5` while layout checks still
   use on-disk storage size.
 
+### Metadata cache-image hard boundary
+
+A metadata cache image (`MDCI`) is a second serialization of live metadata.
+Its entries can shadow the ordinary bytes at the same logical file addresses,
+so parsing those backing bytes as if they were still live can manufacture false
+corruption findings.
+
+h5policy validates the cache-image message and the bounded container information
+needed to traverse it safely: the image extent, block signature/version/flags,
+declared length, entry count, entry envelopes, dependency counts and list
+sizes, body extents, and trailing layout. It records each validated
+`(address, length)` shadow range. It does **not** decode the cached entry bodies
+or validate their metadata semantics.
+
+That missing body decoder is a hard coverage boundary shared by every profile,
+not an `allow_*` feature policy:
+
+- a structurally valid file containing a cache image returns exit `5` with
+  decision `unsupported_coverage_gap` and finding
+  `H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`;
+- `analysis.complete` and `analysis.walk_completed` are `false`;
+- the default fail-fast profiles report `analysis.stop_reason: "rejection"`;
+- with continuation enabled (including the `forensic` default), the walk skips
+  shadowed addresses, continues checking reachable unshadowed metadata, and
+  finishes with `analysis.stop_reason: "cache_image_coverage_gap"`; and
+- `--continue-after-rejection` changes diagnostic traversal only. It never
+  decodes the cached bodies and never converts this refusal into an acceptance.
+
+Corruption found in the decoded message or container envelope can still produce
+`reject_corrupt`, which outranks the unsupported finding. In either case,
+consumers must not treat the file as preflight-approved while cached bodies
+remain unvalidated.
+
 Checksum coverage includes the HDF5 Jenkins checksums used by:
 
 - v2/v3 superblocks
@@ -186,6 +222,12 @@ Checksum coverage includes the HDF5 Jenkins checksums used by:
 Some defects live strictly beyond a metadata-only boundary and are reported as
 `unsupported_coverage_gap` rather than `reject_corrupt`, even when `libhdf5`
 crashes on them:
+
+- **Metadata cache-image bodies.** The message, container, entry envelopes, and
+  shadow ranges are validated, but each cached entry body remains opaque. This
+  is the [hard boundary described above](#metadata-cache-image-hard-boundary):
+  continuation can preserve findings from unshadowed metadata but cannot make
+  the analysis complete.
 
 - **Encoded SOHM message bodies.** h5policy completely walks the type-7 shared
   index and the heap's huge-object index, validating record layouts, object

@@ -9,8 +9,13 @@ import glob
 import sys
 import yaml
 
+from finding_registry import RegistryError, load_findings
+
 coverage = yaml.safe_load(open("registry/validation-coverage.yml"))
-findings = yaml.safe_load(open("registry/findings.yml"))["findings"]
+try:
+    findings = load_findings()
+except RegistryError as exc:
+    sys.exit(f"finding-registry: {exc}")
 BACKLOG_PATH = "registry/finding-backlog.yml"
 backlog_doc = yaml.safe_load(open(BACKLOG_PATH))
 finding_backlog = backlog_doc["findings"]
@@ -34,10 +39,10 @@ for path in EMIT_SOURCES:
         for code in set(FINDING_CODE_RE.findall(source.read())):
             emitted_by.setdefault(code, set()).add(path)
 
-# A repeated code is silently dropped by YAML (last one wins), so a whole
-# definition can go dead unnoticed -- H5_CORRUPT_OFFSET_OUT_OF_FILE did exactly
-# that.  A code with more than one role belongs in `contexts`, not a second key.
-for path in ("registry/findings.yml", BACKLOG_PATH):
+# The finding loader rejects duplicate keys within or across catalog shards.
+# Keep the lightweight source scan for the separate backlog document, where a
+# repeated code would otherwise be silently dropped by YAML (last one wins).
+for path in (BACKLOG_PATH,):
     seen_codes = set()
     for line in open(path):
         m = re.match(r"^  (H5_[A-Z0-9_]+):(?:\s|$)", line)
@@ -45,15 +50,16 @@ for path in ("registry/findings.yml", BACKLOG_PATH):
             continue
         if m.group(1) in seen_codes:
             print(f"DUPLICATE_KEY file={path} finding={m.group(1)} "
-                  f"(YAML keeps only the last; use `contexts` for extra roles)")
+                  f"(YAML keeps only the last; use a route shard for extra roles)")
             errors += 1
         seen_codes.add(m.group(1))
 
-# findings.yml is the reviewed semantic catalog; finding-backlog.yml is an
+# registry/findings/catalog is the reviewed semantic catalog;
+# finding-backlog.yml is an
 # explicit inventory of codes whose family/invariant mapping is still pending.
 # A production code must be in exactly one.  Backlog source attribution is an
 # exact inventory; a catalog entry may intentionally name only its canonical
-# emitter while `contexts` describe other roles, but every claimed source must
+# emitter while route shards describe other roles, but every claimed source must
 # really carry the code.  This reverses the old
 # one-way check (coverage -> catalog), which could stay green while h5policy
 # gained uncatalogued outputs.
@@ -91,7 +97,7 @@ for code, entry in findings.items():
 for code, sources in finding_backlog.items():
     check_emitted_in("backlog", code, sources)
 
-# A code only belongs in findings.yml once it has a complete semantic mapping.
+# A code only belongs in the catalog once it has a complete semantic mapping.
 # Keep this structural gate here so an entry cannot be removed from the backlog
 # by replacing its source inventory with a name-only catalog placeholder.
 CATALOG_REQUIRED_FIELDS = (
@@ -147,7 +153,8 @@ for code, entry in findings.items():
         print(f"MAPPING_DRIFT finding={code} record={record} invariant={inv}")
         errors += 1
 
-# `contexts` disambiguate a code emitted by more than one walker.  Each rule
+# Flattened route contexts disambiguate a code emitted by more than one walker.
+# Each rule
 # must name a real record, and any invariant it names must belong to THAT
 # record -- a rule pointing at the wrong family is the bug this data prevents.
 for code, entry in findings.items():
@@ -289,7 +296,7 @@ for specimen in glob.glob("h5policy/tests/**/*.h5", recursive=True):
         errors += 1
 
 # Message routing.  A shared code's family is resolved from its finding MESSAGE
-# via the `contexts` rules, and for an `ambiguous` code a message matching no
+# via the grouped route rules, and for an `ambiguous` code a message matching no
 # rule resolves to NO record at all -- so `h5cve verify` cannot pick a canary
 # for it.  registry/message-routing.yml is the measured inventory of those gaps;
 # this gate recomputes it and fails on drift either way, so a new unroutable
@@ -324,7 +331,8 @@ if os.path.exists(ROUTING_PATH):
         gone = set(declared.get(code, [])) - set(measured.get(code, []))
         for msg in sorted(new):
             print(f"ROUTING_GAP finding={code} message={msg!r} "
-                  f"(add a `contexts` rule, or regenerate {ROUTING_PATH})")
+                  f"(add a route in registry/findings/routes/{code}.yml, "
+                  f"or regenerate {ROUTING_PATH})")
             errors += 1
         for msg in sorted(gone):
             print(f"ROUTING_STALE finding={code} message={msg!r} now routes "

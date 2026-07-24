@@ -2,11 +2,11 @@
 """Enumerate the finding messages h5policy can emit, and where each one routes.
 
 A finding's MESSAGE is the only per-occurrence discriminator a report carries,
-so `registry/findings.yml` resolves a shared code's record family by matching
-`contexts` rules against it.  That makes an emitted message with no matching
-rule a real gap: `resolve_finding` deliberately refuses to fall back to the
-entry's own `record` for an `ambiguous` code, so such a finding names no family
-at all and `h5cve verify` cannot pick a canary for it.
+so `registry/findings/routes/` resolves a shared code's record family by
+matching grouped route rules against it. That makes an emitted message with no
+matching rule a real gap: `resolve_finding` deliberately refuses to fall back
+to the entry's own `record` for an `ambiguous` code, so such a finding names no
+family at all and `h5cve verify` cannot pick a canary for it.
 
 Enumerating the messages is harder than grepping for string literals, and every
 attempt to do it with a regex has undercounted:
@@ -454,13 +454,13 @@ HEADER = """# Finding messages that resolve to NO record family.
 #   * a message that routes to nothing and is NOT here -> a new gap
 #
 # Why it matters: a finding's message is the only per-occurrence discriminator a
-# report carries, so `contexts` rules in findings.yml resolve a shared code's
+# report carries, so the finding route shards resolve a shared code's
 # family from it.  For an `ambiguous` code, `resolve_finding` deliberately
 # refuses to fall back to the entry's own `record`, so a message matching no
 # rule names no family at all and `h5cve verify` cannot select a canary for it.
 #
 # Entries are a backlog, not an accepted state.  Emptying a code's list is the
-# work; see the git history of findings.yml for H5_CORRUPT_OFFSET_OUT_OF_FILE,
+# work; see the route shards for H5_CORRUPT_OFFSET_OUT_OF_FILE,
 # H5_CORRUPT_BAD_SIGNATURE and H5_CORRUPT_BAD_CHECKSUM as worked examples.
 """
 
@@ -485,13 +485,13 @@ if __name__ == "__main__":
     import importlib.machinery
     import importlib.util
     import sys
-    import yaml
+    from finding_registry import load_findings
 
     loader = importlib.machinery.SourceFileLoader("h5cve", "tools/h5cve")
     spec = importlib.util.spec_from_loader("h5cve", loader)
     h5cve = importlib.util.module_from_spec(spec)
     loader.exec_module(h5cve)
-    findings = yaml.safe_load(open("registry/findings.yml"))["findings"]
+    findings = load_findings()
 
     messages, unanalyzable = extract()
     for entry in unanalyzable:

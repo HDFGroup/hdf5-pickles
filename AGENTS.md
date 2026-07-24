@@ -6,6 +6,9 @@
   to the specimen(s) and produce the complete case documentation — the real
   artifacts, not a sketch of one.
 
+- Consider 32-bit vs. 64-bit platform differences, and any other relevant platform differences, when producing the
+  case documentation.
+
 - Local evidence only: no web fetches, no publishing, nothing outbound. If the
   advisory text would have mattered, say so in the record instead of going to get it.
 
@@ -24,6 +27,14 @@
 - Stop before anything tracked — no gencorpus generator, no `registry/` or
   `h5policy/tests/` edits. List them as promotion steps and I'll decide.
 
+## Documentation
+
+- Always keep the documentation up to date. If you add a new feature, tool, or API, or change an existing one, update the relevant documentation.
+
+- Make documentation testable and include them in the CI/CD pipeline to catch any discrepancies early.
+
+- If documentation tests are available, run them to ensure the documentation is accurate. Wire them into the CI/CD pipeline to catch any discrepancies early. See for example the `docs-check` target in [`CMakeLists.txt`](./CMakeLists.txt).
+
 ## Boundaries
 
 - **Ask first**
@@ -32,6 +43,7 @@
   - Destructive data or migration changes.
 - **Never**
   - Commit secrets, credentials, or tokens.
+  - Do not introduce GHSA-* IDs into comments or commit messages, as they are not authoritative and can be misleading. Use OSS-Fuzz numbers instead.
   - Edit generated files by hand when a generation workflow exists.
   - Use destructive git operations unless explicitly requested.
 

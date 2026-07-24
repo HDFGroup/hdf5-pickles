@@ -1,0 +1,115 @@
+# Free-space section size selects a bin past the manager's bin array.
+#
+# This is the investigated, oracle-hardened counterpart to the two open items in
+# fsm-section-divergences.yml. Those asked whether libhdf5 merely *reports* an
+# out-of-file free section or actually *uses* it. The answer here is stronger and
+# concerns a different field: the section SIZE is used as an array index, so a
+# malformed size is a memory-safety defect, not only a reporting gap.
+schema_version: 1
+
+id: fsm-section-bin-range
+title: free-space section size indexes sinfo->bins unchecked
+status: oracle-hardened          # h5policy rejects; libhdf5 containment still planned
+disclosure: "OSS-Fuzz 42521342, 42523993; advisory text not retrieved -- local
+  evidence only. Version range below is what this host measured."
+
+record: validation_controls
+root_cause_classification: aggregate_object
+violated_invariant: control.fsm_section_bin_range
+entry_points:
+  - h5policy (oracle) -- untrusted-strict, now rejects
+  - "libhdf5 H5Fget_free_sections -> H5MF_get_free_sections -> H5FS_sect_iterate
+     -> H5FS__sinfo_lock -> H5AC_protect -> H5FS__cache_sinfo_deserialize
+     -> H5FS_sect_add -> H5FS__sect_link -> H5FS__sect_link_size"
+  - "shipped tools: h5stat -s, h5stat -F. NOT reached by H5Fopen + object walk
+     (h5dump -H completes)."
+
+# ── The defect, read out of the source tree (HDF5 2.3.0 @4b1ffa68a84) ─────────
+defect: >-
+  H5FS__sinfo_new sizes sinfo->bins as H5VM_log2_gen(max_sect_size) entries
+  (H5FSsection.c:129,142), reading max_sect_size from the FSHD header.
+  H5FS__sect_link_size indexes that array with bin = H5VM_log2_gen(sect->size)
+  (H5FSsection.c:933) from an FSSE section record, guarded only by
+  assert(bin < sinfo->nbins) at :934 -- compiled out under NDEBUG. A section
+  whose size selects bin >= nbins reads off the end at :935 and writes off it at
+  :936 and :968. H5FS__cache_sinfo_deserialize (H5FScache.c:999) decodes
+  sect_size and validates only the section TYPE, never the size. The bound is
+  relational to the header, so it is an aggregate-object invariant: neither the
+  header nor the section record alone establishes it.
+  Three further unguarded sinfo->bins[bin] sites share the pattern:
+  H5FSsection.c:763, :1609 (indexed by an allocation request, not file data),
+  and :1981.
+
+boundary_note: >-
+  nbins = H5VM_log2_gen(max_sect_size) is itself off by one: a section of size
+  exactly max_sect_size yields bin == nbins, already one past the last slot. So
+  the safe boundary the oracle enforces is log2(sect_size) < log2(max_sect_size),
+  i.e. strictly less. A libhdf5 fix must decide whether to reject a maximal
+  section or widen nbins to log2+1; the fractal-heap manager (max_sect_size =
+  max_direct_size, H5HFspace.c:112) is where a maximal section could plausibly
+  arise on a VALID file, and is not yet audited.
+
+# ── Measured behaviour (see the 42523993 case bundle's variants-matrix.json) ──
+measured:
+  oracle_before: >-
+    accepted the three in-file neighbours variant_bin_edge / variant_bin_over /
+    variant_specimen_size_in_file -- a soundness gap, because it checked only the
+    section extent against the file, never the size against the bin array.
+  oracle_after: >-
+    rejects all three with H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX, while still
+    accepting the in-range controls variant_fit / variant_bin_last /
+    variant_header_permits (same 65535-byte section as a rejected row, but its
+    header declares max_sect_size = 65536, so bin < nbins).
+  libhdf5_stock: >-
+    heap-layout dependent: the out-of-bounds access happens deterministically but
+    does not always fault. The C probe SIGSEGVs on 42521342 and h5stat -s SIGSEGVs
+    on 42523993; each survives the other. On the tracked fixture (bin == nbins,
+    one slot past) stock silently reports the section.
+  libhdf5_asan: >-
+    both specimens and the tracked fixture fault identically -- heap-buffer-overflow
+    READ of size 8 in H5FS__sect_link_size (H5FSsection.c:935), bytes past end ==
+    32*(bin - nbins) + 24, a direct function of the encoded section size.
+
+# ── Containment vs systemic remediation (strategy doc §11.5) ──────────────────
+containment:
+  status: planned
+  description: >-
+    In H5FS__cache_sinfo_deserialize, reject sect_size >= ((hsize_t)1 <<
+    sinfo->nbins) before H5FS_sect_add; promote the assert at H5FSsection.c:934
+    to HGOTO_ERROR. Backportable; no effect on well-formed files.
+systemic:
+  semantic_boundary: >-
+    the free-space manager aggregate -- FSHD header plus the whole FSSE section
+    list validated as one object before any section is linked into native state.
+  status: planned
+  owner: n/a
+
+# ── Reproducers ───────────────────────────────────────────────────────────────
+reproducers:
+  direct_fixture: h5policy/tests/malformed/bad_fsm_section_bin_range.h5
+  generator: "h5policy-gencorpus _make_bad_fsm_section_bin_range (shrinks
+    max_sect_size to 4096, re-encodes one section of size 4096, extent in-file)"
+  expectation: h5policy/tests/expected/malformed-bad_fsm_section_bin_range.yml
+  integration_pocs:
+    - "OSS-Fuzz 42521342 case bundle (bin 23 vs nbins 16; size field wild, address legal)"
+    - "OSS-Fuzz 42523993 case bundle (bin 15 vs nbins 12; both size and address wild)"
+  fsm_targeted_probe: fsm-targeted-probe.c in each case bundle
+
+sibling_audit: >-
+  Two shapes share the defect. (1) The fractal-heap FSM (H5HFspace.c:112,
+  max_sect_size = max_direct_size) has a small nbins for well-formed files, so
+  the same unchecked sect_size reaches the same H5FS__sect_link_size -- combined
+  with the off-by-one boundary this is a latent-on-valid-files risk if a writer
+  can emit a max-sized heap section. (2) File FSMs (H5MF.c:397,
+  max_sect_size = maxaddr) have nbins ~ 63 and hide the bug, which is why the
+  fuzzer had to shrink max_sect_size in the header to reach it.
+
+coverage_manifest_change: >-
+  validation-coverage.yml validation_controls gains control.fsm_section_bin_range;
+  findings/catalog/validation_controls.yml gains H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX
+  (scope aggregate_object, non-shared, so no route rule).
+
+provenance:
+  found_by: "OSS-Fuzz specimens 42521342 and 42523993; worked end to end 2026-07-23"
+  hdf5_build: "HDF5 2.3.0 @4b1ffa68a84; baseline ~/.local Release, candidate
+    ~/.local/hdf5-asan RelWithDebInfo -fsanitize=address"

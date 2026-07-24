@@ -70,6 +70,35 @@ The process exit code mirrors the JSON `decision`:
 and boundary, and [H5PolicyProfile.md](H5PolicyProfile.md) for the complete
 profile semantics.
 
+### Metadata cache-image hard boundary
+
+All profiles share the same cache-image decode boundary. h5policy validates the
+`MDCI` message, bounded container and entry envelopes, and records the address
+ranges shadowed by cache entries. It does not decode the cached entry bodies.
+A structurally valid cache-image fixture therefore returns exit `5`,
+`unsupported_coverage_gap`, and
+`H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`; `analysis.complete` and
+`analysis.walk_completed` are `false`.
+
+`--continue-after-rejection` is not a cache-image enable switch. With
+continuation enabled, h5policy skips only shadowed addresses and continues
+checking reachable unshadowed metadata, then reports
+`analysis.stop_reason: "cache_image_coverage_gap"`. Without continuation, the
+normal fail-fast stop reason is `"rejection"`. Neither mode accepts the file.
+
+For example:
+
+```sh
+./h5policy/tools/h5policy --profile forensic \
+    --continue-after-rejection h5policy/tests/valid/cache_image.h5
+echo $?  # 5
+```
+
+The complete coverage description is in the
+[main README](../README.md#metadata-cache-image-hard-boundary); the
+[profile reference](H5PolicyProfile.md#metadata-cache-image-hard-boundary)
+documents the control-flow semantics.
+
 ## `h5policy-diff`
 
 `h5policy-diff` is an asymmetric differential oracle. It does not require
