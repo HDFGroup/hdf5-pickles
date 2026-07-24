@@ -6,6 +6,9 @@
   to the specimen(s) and produce the complete case documentation — the real
   artifacts, not a sketch of one.
 
+- Consider 32-bit vs. 64-bit platform differences, and any other relevant platform differences, when producing the
+  case documentation.
+
 - Local evidence only: no web fetches, no publishing, nothing outbound. If the
   advisory text would have mattered, say so in the record instead of going to get it.
 
