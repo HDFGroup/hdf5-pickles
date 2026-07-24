@@ -40,6 +40,7 @@
   - Destructive data or migration changes.
 - **Never**
   - Commit secrets, credentials, or tokens.
+  - Do not introduce GHSA-* IDs into comments or commit messages, as they are not authoritative and can be misleading. Use OSS-Fuzz numbers instead.
   - Edit generated files by hand when a generation workflow exists.
   - Use destructive git operations unless explicitly requested.
 
