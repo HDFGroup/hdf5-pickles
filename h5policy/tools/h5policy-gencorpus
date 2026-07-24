@@ -787,6 +787,9 @@ def _gen_malformed(root):
     _make_bad_fsm_section_count(
         f"{root}/malformed/bad_fsm_section_count.h5",
         f"{root}/valid/fsm_persist.h5")
+    _make_bad_fsm_section_bin_range(
+        f"{root}/malformed/bad_fsm_section_bin_range.h5",
+        f"{root}/valid/fsm_persist.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
     _make_contiguous_data_past_eof(
@@ -2023,6 +2026,70 @@ def _make_bad_fsm_section_count(path, base_path):
     struct.pack_into("<I", raw, fsm["hdr_checksum"],
                      _jenkins_lookup3()(
                          bytes(raw[fsm["hdr"]:fsm["hdr_checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_bad_fsm_section_bin_range(path, base_path):
+    """A free section whose size selects a bin past the manager's bin array.
+
+    libhdf5 sizes sinfo->bins as H5VM_log2_gen(max_sect_size) entries
+    (H5FS__sinfo_new) and indexes it with H5VM_log2_gen(sect->size)
+    (H5FS__sect_link_size), never checking the two agree -- an oversized section
+    reads and writes off the end of the array.
+
+    The base manager has max_sect_size == maxaddr (nbins ~ 63), so no *in-file*
+    section can reach that bin.  We shrink max_sect_size to 4096 (nbins = 12) and
+    re-encode the section list as a single node of one section sized exactly
+    4096 -- bin == nbins, the minimal one-past-the-end violation.  The extent is
+    kept well inside the file so the address-space rule cannot fire and the
+    bin-range fault is the ONLY one: this is the direct semantic fixture, where
+    the two CVE PoCs additionally run their extent out of file.  Shrinking
+    max_sect_size narrows the section-length encode width
+    from l to len_size, so the whole FSSE record is rewritten with the widths
+    H5FS__sinfo_new would derive, and both covering checksums are repaired.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    fsm = _fsm_file_sinfo(raw)
+    l, o, hdr, sect = fsm["l"], fsm["o"], fsm["hdr"], fsm["sect_addr"]
+
+    new_max = 4096                       # nbins = log2(4096) = 12
+    new_size = new_max                   # bin = log2(4096) = 12 == nbins (edge)
+    len_size = (max(new_max, 1).bit_length() - 1) // 8 + 1   # H5VM_limit_enc_size
+    cnt_size = 1                         # one serialized section
+    off_size = fsm["off_size"]
+    sect_extent_addr = 0x1000            # 4096; extent [4096, 8192) is in-file
+    assert sect_extent_addr + new_size <= len(raw)
+
+    # FSHD header: max_sect_size, and the count triple made consistent with the
+    # single section we are about to write.
+    raw[hdr + 14 + 4*l:hdr + 14 + 5*l] = new_max.to_bytes(l, "little")
+    raw[hdr + 6 + l:hdr + 6 + 2*l] = (1).to_bytes(l, "little")   # tot_sect_count
+    raw[hdr + 6 + 2*l:hdr + 6 + 3*l] = (1).to_bytes(l, "little")  # serial_sect_count
+    raw[hdr + 6 + 3*l:hdr + 6 + 4*l] = (0).to_bytes(l, "little")  # ghost_sect_count
+
+    # FSSE section list, rewritten from its 13-byte prefix (signature, version,
+    # header back-pointer are already correct) onward with the new widths.
+    prefix = 5 + o
+    body = bytearray()
+    body += (1).to_bytes(cnt_size, "little")               # node_count
+    body += new_size.to_bytes(len_size, "little")          # section size
+    body += sect_extent_addr.to_bytes(off_size, "little")  # section address
+    body += bytes([0])                                     # section type 0
+    used = prefix + len(body) + 4
+    raw[sect + prefix:sect + prefix + len(body)] = body
+    # Any bytes left over from the wider original encoding are now dead space.
+    old_alloc = fsm["used"]
+    if old_alloc > used:
+        raw[sect + used - 4:sect + old_alloc] = bytes(old_alloc - used + 4)
+
+    # FSHD records the section list's used and allocated sizes; make both the
+    # new used size and repair the FSSE checksum over [sect, sect+used-4).
+    raw[hdr + 14 + 5*l + o:hdr + 14 + 6*l + o] = used.to_bytes(l, "little")
+    raw[hdr + 14 + 6*l + o:hdr + 14 + 7*l + o] = used.to_bytes(l, "little")
+    struct.pack_into("<I", raw, sect + used - 4,
+                     _jenkins_lookup3()(bytes(raw[sect:sect + used - 4])))
+    struct.pack_into("<I", raw, fsm["hdr_checksum"],
+                     _jenkins_lookup3()(bytes(raw[hdr:fsm["hdr_checksum"]])))
     _patch(path, bytes(raw))
 
 

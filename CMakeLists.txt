@@ -222,7 +222,11 @@ if(POKE_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0)
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/run.sh"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
-    set_tests_properties(h5policy_regression PROPERTIES TIMEOUT 300)
+    # The suite runs the full corpus, the h5cve exact-build matrix, a 154-file
+    # differential, truncation sweeps, and the mutation family; it sits near
+    # 300s on an unloaded host and exceeds it under parallel CTest load, so the
+    # ceiling is generous rather than tight.
+    set_tests_properties(h5policy_regression PROPERTIES TIMEOUT 600)
     add_test(
         NAME h5patch_regression
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/run.sh"

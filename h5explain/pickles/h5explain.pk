@@ -18,6 +18,7 @@
 
 load "common.pk";
 load "superblock.pk";
+load "fsm.pk";
 load "ohdr_msgs.pk";
 load "v1_btree.pk";
 load "v2_btree.pk";
@@ -52,6 +53,8 @@ var H5EX_KIND_EA_IBLOCK = 11;
 var H5EX_KIND_EA_SBLOCK = 12;
 var H5EX_KIND_EA_DBLOCK = 13;
 var H5EX_KIND_LHEAP = 14;
+var H5EX_KIND_FSHD = 15;
+var H5EX_KIND_FSSE = 16;
 
 type h5explain_lheap = struct {
     byte[4] signature == H5_FORMAT_HEAP_SIGNATURE;
@@ -141,6 +144,8 @@ fun h5explain_kind_name = (int kind) string:
     if (kind == H5EX_KIND_EA_SBLOCK) return "extensible array secondary block";
     if (kind == H5EX_KIND_EA_DBLOCK) return "extensible array data block";
     if (kind == H5EX_KIND_LHEAP) return "local heap";
+    if (kind == H5EX_KIND_FSHD) return "free-space manager header";
+    if (kind == H5EX_KIND_FSSE) return "free-space section list";
     return "raw bytes";
 }
 
@@ -208,6 +213,24 @@ fun h5explain_map_lheap = (offset<uint<64>,B> off) h5explain_lheap:
 {
     if (h5explain_non_strict) return h5explain_lheap @! off;
     return h5explain_lheap @ off;
+}
+
+/* Free-space manager header (FSHD): fs_hdr (pickles/fsm.pk) sets the derived
+   global_fshd_* widths that the section list relies on. */
+fun h5explain_map_fshd = (offset<uint<64>,B> off) fs_hdr:
+{
+    if (h5explain_non_strict) return fs_hdr @! off;
+    return fs_hdr @ off;
+}
+
+/* Free-space section list (FSSE).  fs_sinfo reads global_fshd_sect_size bytes
+   and decodes the variable-width section records with the global widths, so the
+   owning fs_hdr must have been mapped first -- h5explain_prime_current does that
+   from the list's own back-pointer when the cursor lands here directly. */
+fun h5explain_map_fsse = (offset<uint<64>,B> off) fs_sinfo:
+{
+    if (h5explain_non_strict) return fs_sinfo @! off;
+    return fs_sinfo @ off;
 }
 
 fun h5explain_map_fa_hdr = (offset<uint<64>,B> off) fa_hdr:
@@ -331,6 +354,8 @@ fun h5explain_detect_kind = (offset<uint<64>,B> off) int:
     if (sig == H5_FORMAT_EASB_SIGNATURE) return H5EX_KIND_EA_SBLOCK;
     if (sig == H5_FORMAT_EADB_SIGNATURE) return H5EX_KIND_EA_DBLOCK;
     if (sig == H5_FORMAT_HEAP_SIGNATURE) return H5EX_KIND_LHEAP;
+    if (sig == H5_FORMAT_FSHD_SIGNATURE) return H5EX_KIND_FSHD;
+    if (sig == H5_FORMAT_FSSE_SIGNATURE) return H5EX_KIND_FSSE;
 
     if (h5explain_map_byte(off) == 1UB && h5explain_map_byte(off + 1#B) == 0UB) {
         var msg_count = (h5explain_map_byte(off + 2#B) as uint<64>)
@@ -527,6 +552,16 @@ fun h5explain_prime_current = void:
                                - (global_sizeof_offsets as uint<16>)
                                - (global_sizeof_lengths as uint<16>)
                                - 4UH) / 8UH as uint<8>);
+        } else if (h5explain_cur_kind == H5EX_KIND_FSHD) {
+            /* Mapping the header sets the derived global_fshd_* widths. */
+            var h = h5explain_map_fshd(h5explain_cur_off);
+        } else if (h5explain_cur_kind == H5EX_KIND_FSSE) {
+            /* The section list depends on the header's derived widths; prime
+               them from the list's own back-pointer (FSSE layout is
+               [sig:4][ver:1][fspace_hdr_addr:O]). */
+            var off_sz = global_sizeof_offsets as uint<64>;
+            var back_raw = byte[off_sz] @ (h5explain_cur_off + 5#B);
+            var h = h5explain_map_fshd(bytes_to_off(back_raw));
         }
     } catch (Exception e) {
         printf("warning: the %s at %v did not decode (%s); its context is unset and fields may be garbage\n",
@@ -642,6 +677,10 @@ fun cur = any:
         return h5explain_map_snod(h5explain_cur_off);
     if (h5explain_cur_kind == H5EX_KIND_LHEAP)
         return h5explain_map_lheap(h5explain_cur_off);
+    if (h5explain_cur_kind == H5EX_KIND_FSHD)
+        return h5explain_map_fshd(h5explain_cur_off);
+    if (h5explain_cur_kind == H5EX_KIND_FSSE)
+        return h5explain_map_fsse(h5explain_cur_off);
     if (h5explain_cur_kind == H5EX_KIND_FA_HDR)
         return h5explain_map_fa_hdr(h5explain_cur_off);
     if (h5explain_cur_kind == H5EX_KIND_FA_DBLOCK)
@@ -1038,6 +1077,52 @@ fun h5explain_explain_snod = void:
     printf("Next:\n");
     printf("  info                       print the symbol entries\n");
     printf("  cur                        inspect the raw SNOD struct\n");
+}
+
+fun h5explain_explain_fshd = void:
+{
+    var h = h5explain_map_fshd(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A free-space manager header. It tracks freed regions for one client\n");
+    printf("  (File or Fractal Heap) and points at the serialized section list.\n\n");
+
+    printf("Decoded header:\n");
+    h._print;
+
+    printf("\nWhy it matters:\n");
+    printf("  max_sect_size sizes the section-size bin array: libhdf5 allocates\n");
+    printf("  nbins = floor(log2(max_sect_size)) bins (H5FS__sinfo_new) and indexes\n");
+    printf("  them with floor(log2(section size)) (H5FS__sect_link_size), unchecked.\n");
+    printf("  A section whose size selects a bin at or past nbins overruns that\n");
+    printf("  array; h5policy enforces control.fsm_section_bin_range.\n\n");
+
+    printf("Next:\n");
+    printf("  go (sect_addr#B)           jump to the FSSE section list (see sect_addr above)\n");
+    printf("  cur                        inspect the raw FSHD struct\n");
+}
+
+fun h5explain_explain_fsse = void:
+{
+    var s = h5explain_map_fsse(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A free-space section list. It holds the individual free sections for\n");
+    printf("  one manager, grouped by size.\n\n");
+
+    printf("Decoded sections:\n");
+    s._print;
+
+    printf("\nWhy it matters:\n");
+    printf("  Each section's size and address come straight off disk. libhdf5 uses\n");
+    printf("  the size to index the manager's bin array and the address as a file\n");
+    printf("  offset, so both must be validated: h5policy checks the extent lies in\n");
+    printf("  the file (control.fsm_section_extent) and that the size stays within the\n");
+    printf("  bin range (control.fsm_section_bin_range).\n\n");
+
+    printf("Next:\n");
+    printf("  go (fspace_hdr_addr#B)     return to the owning FSHD header\n");
+    printf("  cur                        inspect the raw FSSE bytes\n");
 }
 
 fun h5explain_explain_lheap = void:
@@ -1553,6 +1638,10 @@ fun explain = (int msg_index = -1) void:
         h5explain_explain_snod;
     else if (h5explain_cur_kind == H5EX_KIND_LHEAP)
         h5explain_explain_lheap;
+    else if (h5explain_cur_kind == H5EX_KIND_FSHD)
+        h5explain_explain_fshd;
+    else if (h5explain_cur_kind == H5EX_KIND_FSSE)
+        h5explain_explain_fsse;
     else if (h5explain_cur_kind == H5EX_KIND_FA_HDR)
         h5explain_explain_fa;
     else if (h5explain_cur_kind == H5EX_KIND_EA_HDR)
