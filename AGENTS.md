@@ -3,8 +3,11 @@
 ## CVE process
 
 - Apply the [§11 CVE process](./docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md)
-  to the specimen(s) and produce the complete case documentation — the real
-  artifacts, not a sketch of one.
+  to the specimen(s) and produce the complete case documentation `CASE.md`, using the template
+  `./registry/cve-case.yml`, — the real artifacts, not a sketch of one. Include
+  a source audit in a separate `source-audit.md` file, and any other relevant files.
+  The goal is to produce a complete, self-contained case bundle that can be used
+  to make a CVE submission or to confirm the presence of a vulnerability.
 
 - Consider 32-bit vs. 64-bit platform differences, and any other relevant platform differences, when producing the
   case documentation.
