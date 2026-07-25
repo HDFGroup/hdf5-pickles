@@ -55,6 +55,8 @@ REQUIRED_PACKAGES = {
     "jq",
     "libaec",
     "libasan",
+    "nodejs",
+    "npm",
     "openssh",
     "poke",
     "procps-ng",
@@ -76,6 +78,7 @@ REQUIRED_COMMANDS = (
     "cc",
     "c++",
     "cmake",
+    "codex",
     "ctest",
     "emacs",
     "gdb",
@@ -143,6 +146,8 @@ def check_configuration() -> None:
         fail("Dockerfile does not select the non-root development user")
     if "NOPASSWD:ALL" not in dockerfile:
         fail("Dockerfile does not configure development-user sudo")
+    if "npm install --global @openai/codex" not in dockerfile:
+        fail("Dockerfile does not install the Codex CLI globally")
 
     if f"ARG HDF5_REPOSITORY={HDF5_REPOSITORY}" not in dockerfile:
         fail("Dockerfile does not declare the canonical HDF5 repository")
@@ -228,6 +233,7 @@ def check_configuration() -> None:
         f"`{HDF5_ASAN_PREFIX}`",
         "`$HDF5_ASAN_PREFIX`",
         "-fsanitize=address",
+        "Codex CLI (installed as `codex`)",
     ):
         if fragment not in readme:
             fail(f"devcontainer guide does not document HDF5 checkout: {fragment}")

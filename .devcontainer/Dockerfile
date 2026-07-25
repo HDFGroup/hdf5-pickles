@@ -22,6 +22,8 @@ RUN pacman -Syu --noconfirm --needed \
         libaec \
         libasan \
         man-db \
+        nodejs \
+        npm \
         openssh \
         poke \
         procps-ng \
@@ -40,6 +42,11 @@ RUN pacman -Syu --noconfirm --needed \
         which \
         zlib \
     && pacman -Scc --noconfirm
+
+# Install Codex in the image so it is available as soon as a Codespace starts,
+# without relying on a user-scoped install or a post-create network request.
+RUN npm install --global @openai/codex \
+    && codex --version
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8

@@ -13,8 +13,20 @@ The image includes:
 - Python with h5py, NumPy, PyYAML, and pip;
 - Emacs 30+ for the inspector front end and its ERT tests;
 - GDB and ptrace permissions for crash-fuzzer backtraces;
-- Git, GitHub CLI, OpenSSH, ripgrep, jq, and ShellCheck; and
+- Codex CLI (installed as `codex`), Git, GitHub CLI, OpenSSH, ripgrep, jq,
+  and ShellCheck; and
 - VS Code support for CMake, C/C++, Python, YAML, and HDF5 viewing.
+
+Codex is installed globally while the image builds, so it is immediately
+available in every Codespaces terminal:
+
+```sh
+codex --version
+codex
+```
+
+Sign in with the account or API-key flow appropriate for your organization;
+authentication is not stored in the image or repository.
 
 Image creation also makes a full-history clone of the official
 [`HDFGroup/hdf5`](https://github.com/HDFGroup/hdf5) repository. The writable
