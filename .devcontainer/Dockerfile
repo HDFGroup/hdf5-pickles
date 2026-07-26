@@ -48,7 +48,9 @@ RUN pacman -Syu --noconfirm --needed \
 # Codespace starts, without user-scoped installs or post-create network requests.
 RUN npm install --global @openai/codex \
     && codex --version \
-    && npm install --global @anthropic-ai/claude-code \
+    && npm install --global \
+        --allow-scripts=@anthropic-ai/claude-code \
+        @anthropic-ai/claude-code \
     && claude --version
 
 ENV LANG=C.UTF-8 \

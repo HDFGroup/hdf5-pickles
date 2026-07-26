@@ -27,6 +27,11 @@ claude --version
 claude
 ```
 
+Arch's npm allowlists installation scripts. The image permits only Claude
+Code's required native-binary installer with
+`--allow-scripts=@anthropic-ai/claude-code`; it does not enable lifecycle
+scripts globally.
+
 Sign in to each tool with the account or API-key flow appropriate for your
 organization; authentication is not stored in the image or repository.
 

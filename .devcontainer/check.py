@@ -152,8 +152,13 @@ def check_configuration() -> None:
         fail("Dockerfile does not configure development-user sudo")
     if "npm install --global @openai/codex" not in dockerfile:
         fail("Dockerfile does not install the Codex CLI globally")
-    if "npm install --global @anthropic-ai/claude-code" not in dockerfile:
-        fail("Dockerfile does not install Claude Code globally")
+    claude_install = (
+        "npm install --global \\\n"
+        "        --allow-scripts=@anthropic-ai/claude-code \\\n"
+        "        @anthropic-ai/claude-code"
+    )
+    if claude_install not in dockerfile:
+        fail("Dockerfile does not install Claude Code with its scoped postinstall")
 
     if f"ARG HDF5_REPOSITORY={HDF5_REPOSITORY}" not in dockerfile:
         fail("Dockerfile does not declare the canonical HDF5 repository")
@@ -245,6 +250,7 @@ def check_configuration() -> None:
         "ELF32",
         "Codex CLI (installed as `codex`)",
         "Claude Code (installed as `claude`)",
+        "`--allow-scripts=@anthropic-ai/claude-code`",
     ):
         if fragment not in readme:
             fail(f"devcontainer guide does not document HDF5 checkout: {fragment}")
