@@ -250,6 +250,8 @@ def check_configuration() -> None:
             fail(f"post-create does not account for ownership of {path}")
     if not BUILD_HDF5.is_file():
         fail(".devcontainer/build-hdf5.sh is missing")
+    if not os.access(BUILD_HDF5, os.X_OK):
+        fail(".devcontainer/build-hdf5.sh is not executable")
     build_hdf5 = BUILD_HDF5.read_text()
     for fragment in (
         "RelWithDebInfo",
@@ -286,8 +288,8 @@ def check_configuration() -> None:
         f"`{HDF5_32_PREFIX}`",
         "`$HDF5_32_PREFIX`",
         "build-hdf5.sh",
-        "-fsanitize=address",
-        "## 32-bit build of HDF5",
+        "## HDF5 variant builds",
+        "AddressSanitizer",
         "`-m32`",
         "gcc-multilib",
         "ELF32",

@@ -87,6 +87,10 @@ build_32() {
         || die "32-bit h5dump is not an ELF32 executable"
 }
 
+if (($# == 1)) && [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    usage
+    exit 0
+fi
 [[ -d "${hdf5_source_dir}" ]] || die "HDF5 source checkout is missing: ${hdf5_source_dir}"
 if (($# == 0)); then
     set -- release asan 32
@@ -97,7 +101,6 @@ for variant in "$@"; do
         release) build_release ;;
         asan) build_asan ;;
         32) build_32 ;;
-        -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown variant: ${variant}" ;;
     esac
 done
