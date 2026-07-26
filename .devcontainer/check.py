@@ -288,6 +288,7 @@ def check_configuration() -> None:
         f"`{HDF5_32_PREFIX}`",
         "`$HDF5_32_PREFIX`",
         "build-hdf5.sh",
+        "`--test`",
         "## HDF5 variant builds",
         "AddressSanitizer",
         "`-m32`",

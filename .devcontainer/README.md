@@ -58,8 +58,8 @@ checkout when an analysis specifically requires newer upstream commits.
 
 ## HDF5 variant builds
 
-[`build-hdf5.sh`](build-hdf5.sh) configures, builds, tests, and installs the
-HDF5 variants used for analysis. It uses separate build trees inside
+[`build-hdf5.sh`](build-hdf5.sh) configures, builds, and installs the HDF5
+variants used for analysis. It uses separate build trees inside
 `$HDF5_SOURCE_DIR` and installs to writable prefixes outside the system HDF5
 package:
 
@@ -76,12 +76,14 @@ default. zlib and SZIP are deliberately disabled for that variant because the
 image does not include matching 32-bit filter libraries. The script verifies
 the installed `h5dump` is `ELF32`.
 
-Run all variants, or name one or more variants to limit the work:
+Run all variants, or name one or more variants to limit the work. Builds skip
+the HDF5 CTest suite by default; add `--test` when validation is required:
 
 ```sh
 .devcontainer/build-hdf5.sh
 .devcontainer/build-hdf5.sh release asan
 .devcontainer/build-hdf5.sh 32
+.devcontainer/build-hdf5.sh --test asan
 ```
 
 Run an installed ASan or 32-bit tool against the matching libraries:

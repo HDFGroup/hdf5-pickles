@@ -19,10 +19,13 @@ die() {
 
 usage() {
     cat <<EOF
-Usage: ${script_name} [release] [asan] [32]
+Usage: ${script_name} [--test] [release] [asan] [32]
 
 Builds the requested HDF5 variants from ${hdf5_source_dir}. With no arguments,
 builds all variants.
+
+Options:
+  --test   Run the HDF5 CTest suite for each requested variant
 
   release  RelWithDebInfo build with zlib and SZIP filters
   asan     RelWithDebInfo AddressSanitizer build with zlib and SZIP filters
@@ -41,12 +44,16 @@ build_variant() {
     cmake -S "${hdf5_source_dir}" -B "${build_dir}" "$@"
     log "Building ${variant}"
     cmake --build "${build_dir}" --parallel
-    log "Testing ${variant}"
-    if [[ "${variant}" == "asan" ]]; then
-        ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+    if [[ "${run_tests}" == true ]]; then
+        log "Testing ${variant}"
+        if [[ "${variant}" == "asan" ]]; then
+            ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+                ctest --test-dir "${build_dir}" --output-on-failure -j"$(nproc)"
+        else
             ctest --test-dir "${build_dir}" --output-on-failure -j"$(nproc)"
+        fi
     else
-        ctest --test-dir "${build_dir}" --output-on-failure -j"$(nproc)"
+        log "Skipping tests for ${variant} (use --test to enable)"
     fi
     log "Installing ${variant} in ${prefix}"
     cmake --install "${build_dir}"
@@ -87,16 +94,21 @@ build_32() {
         || die "32-bit h5dump is not an ELF32 executable"
 }
 
-if (($# == 1)) && [[ "$1" == "-h" || "$1" == "--help" ]]; then
-    usage
-    exit 0
-fi
+run_tests=false
+variants=()
+for argument in "$@"; do
+    case "${argument}" in
+        --test) run_tests=true ;;
+        -h|--help) usage; exit 0 ;;
+        *) variants+=("${argument}") ;;
+    esac
+done
 [[ -d "${hdf5_source_dir}" ]] || die "HDF5 source checkout is missing: ${hdf5_source_dir}"
-if (($# == 0)); then
-    set -- release asan 32
+if ((${#variants[@]} == 0)); then
+    variants=(release asan 32)
 fi
 
-for variant in "$@"; do
+for variant in "${variants[@]}"; do
     case "${variant}" in
         release) build_release ;;
         asan) build_asan ;;
