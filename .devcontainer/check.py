@@ -168,15 +168,13 @@ def check_configuration() -> None:
         fail("Dockerfile does not declare the canonical HDF5 repository")
     if f"ENV HDF5_SOURCE_DIR={HDF5_SOURCE_DIR}" not in dockerfile:
         fail("Dockerfile does not expose the HDF5 checkout location")
-    for prefix, label in (
-        (HDF5_RELEASE_PREFIX, "release"),
-        (HDF5_32_PREFIX, "32-bit"),
-        (HDF5_ASAN_PREFIX, "ASan"),
+    for variable, prefix, label in (
+        ("HDF5_RELEASE_PREFIX", HDF5_RELEASE_PREFIX, "release"),
+        ("HDF5_32_PREFIX", HDF5_32_PREFIX, "32-bit"),
+        ("HDF5_ASAN_PREFIX", HDF5_ASAN_PREFIX, "ASan"),
     ):
-        if f"HDF5_{label.upper().replace('-', '_')}_PREFIX={prefix}" not in dockerfile:
+        if f"{variable}={prefix}" not in dockerfile:
             fail(f"Dockerfile does not expose the HDF5 {label} install prefix")
-    if f"HDF5_ASAN_PREFIX={HDF5_ASAN_PREFIX}" not in dockerfile:
-        fail("Dockerfile does not expose the HDF5 ASan install prefix")
     for prefix in (HDF5_RELEASE_PREFIX, HDF5_32_PREFIX, HDF5_ASAN_PREFIX):
         if f"\n        {prefix} \\\n" not in dockerfile:
             fail(f"Dockerfile does not create the HDF5 install prefix {prefix}")

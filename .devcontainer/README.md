@@ -56,89 +56,41 @@ container is rebuilt; commit or export analysis changes before rebuilding.
 Rebuilding may reuse Docker's cached clone layer, so run `git fetch` in the
 checkout when an analysis specifically requires newer upstream commits.
 
-## AddressSanitizer build of HDF5
+## HDF5 variant builds
 
-The image has GCC's AddressSanitizer compiler and runtime support, plus the zlib
-and libaec/SZIP development files. The startup check compiles, links, and runs a
-small ASan executable so a missing sanitizer runtime is detected before an
-analysis begins.
+[`build-hdf5.sh`](build-hdf5.sh) configures, builds, tests, and installs the
+HDF5 variants used for analysis. It uses separate build trees inside
+`$HDF5_SOURCE_DIR` and installs to writable prefixes outside the system HDF5
+package:
 
-Use a dedicated build tree and install into `/opt/hdf5-asan`, exposed as
-`$HDF5_ASAN_PREFIX`. This keeps the instrumented libraries and tools separate
-from Arch's HDF5 installation under `/usr`:
+- `release`: a `RelWithDebInfo` build with zlib and SZIP filters, installed to
+  `/opt/hdf5-release` (`$HDF5_RELEASE_PREFIX`);
+- `asan`: a `RelWithDebInfo` AddressSanitizer build with zlib and SZIP filters,
+  installed to `/opt/hdf5-asan` (`$HDF5_ASAN_PREFIX`); and
+- `32`: a `RelWithDebInfo`, `-m32` build without external filters, installed to
+  `/opt/hdf5-32` (`$HDF5_32_PREFIX`).
+
+The 32-bit build supports analyses that must reproduce 32-bit integer sizes or
+address-space limits. The image includes `gcc-multilib` and `lib32-gcc-libs` by
+default. zlib and SZIP are deliberately disabled for that variant because the
+image does not include matching 32-bit filter libraries. The script verifies
+the installed `h5dump` is `ELF32`.
+
+Run all variants, or name one or more variants to limit the work:
 
 ```sh
-cd "$HDF5_SOURCE_DIR"
-
-cmake -S . -B build-asan \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_C_FLAGS_RELWITHDEBINFO="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address" \
-  -DCMAKE_MODULE_LINKER_FLAGS="-fsanitize=address" \
-  -DCMAKE_INSTALL_PREFIX="$HDF5_ASAN_PREFIX" \
-  -DHDF5_ENABLE_ZLIB_SUPPORT=ON \
-  -DHDF5_ENABLE_SZIP_SUPPORT=ON
-
-cmake --build build-asan --parallel
-ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
-  ctest --test-dir build-asan --output-on-failure -j"$(nproc)"
-cmake --install build-asan
+.devcontainer/build-hdf5.sh
+.devcontainer/build-hdf5.sh release asan
+.devcontainer/build-hdf5.sh 32
 ```
 
-This recipe covers the default serial C library, high-level library, tools,
-examples, and tests, with zlib and SZIP filters enabled. MPI, Fortran, Java,
-and C++ bindings remain disabled to keep the build focused. The existing
-toolchain can also build the optional C++ bindings; MPI, Fortran, and Java
-require additional packages. To run an installed ASan tool against the
-instrumented shared libraries:
+Run an installed ASan or 32-bit tool against the matching libraries:
 
 ```sh
 LD_LIBRARY_PATH="$HDF5_ASAN_PREFIX/lib" \
   "$HDF5_ASAN_PREFIX/bin/h5dump" -pBH suspect.h5
-```
-
-## 32-bit build of HDF5
-
-The image and its installed HDF5 package are 64-bit. Build the source checkout
-in a separate tree with `-m32` when an analysis must reproduce 32-bit integer
-sizes or address-space limits. The image includes `gcc-multilib` and
-`lib32-gcc-libs` by default, so no additional compiler or runtime package
-installation is required.
-
-The following build deliberately disables zlib and SZIP filters, because the
-image does not include matching 32-bit filter libraries. This keeps the recipe
-self-contained; add the appropriate 32-bit library and CMake option only when
-the specimen requires that filter.
-
-```sh
-cd "$HDF5_SOURCE_DIR"
-hdf5_32_prefix="$HOME/.local/hdf5-32"
-
-cmake -S . -B build-32 \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_C_FLAGS="-m32" \
-  -DCMAKE_CXX_FLAGS="-m32" \
-  -DCMAKE_EXE_LINKER_FLAGS="-m32" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-m32" \
-  -DCMAKE_MODULE_LINKER_FLAGS="-m32" \
-  -DCMAKE_INSTALL_PREFIX="$hdf5_32_prefix" \
-  -DHDF5_ENABLE_ZLIB_SUPPORT=OFF \
-  -DHDF5_ENABLE_SZIP_SUPPORT=OFF
-
-cmake --build build-32 --parallel
-ctest --test-dir build-32 --output-on-failure -j"$(nproc)"
-cmake --install build-32
-readelf -h "$hdf5_32_prefix/bin/h5dump" | rg '^  Class:\s+ELF32$'
-```
-
-The final command must print `ELF32`; that verifies the tool is a 32-bit ELF
-binary rather than merely a 64-bit executable built from a separate tree. Run
-an installed tool with its corresponding libraries:
-
-```sh
-LD_LIBRARY_PATH="$hdf5_32_prefix/lib" \
-  "$hdf5_32_prefix/bin/h5dump" -pBH suspect.h5
+LD_LIBRARY_PATH="$HDF5_32_PREFIX/lib" \
+  "$HDF5_32_PREFIX/bin/h5dump" -pBH suspect.h5
 ```
 
 ## Creation check
