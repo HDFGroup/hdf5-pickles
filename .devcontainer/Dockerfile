@@ -14,6 +14,7 @@ RUN pacman -Syu --noconfirm --needed \
         curl \
         emacs-nox \
         gdb \
+        gcc-multilib \
         git \
         github-cli \
         hdf5 \
@@ -43,10 +44,12 @@ RUN pacman -Syu --noconfirm --needed \
         zlib \
     && pacman -Scc --noconfirm
 
-# Install Codex in the image so it is available as soon as a Codespace starts,
-# without relying on a user-scoped install or a post-create network request.
+# Install Codex and Claude Code in the image so they are available as soon as a
+# Codespace starts, without user-scoped installs or post-create network requests.
 RUN npm install --global @openai/codex \
-    && codex --version
+    && codex --version \
+    && npm install --global @anthropic-ai/claude-code \
+    && claude --version
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8

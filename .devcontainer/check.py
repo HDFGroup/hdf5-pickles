@@ -27,6 +27,7 @@ HDF5_REPOSITORY = "https://github.com/HDFGroup/hdf5.git"
 HDF5_SOURCE_DIR = Path("/opt/hdf5")
 HDF5_ASAN_PREFIX = Path("/opt/hdf5-asan")
 MINIMUM_HDF5_CMAKE = (3, 26)
+MINIMUM_CLAUDE_NODE = (22, 0)
 
 REQUIRED_ASAN_HEADERS = (
     Path("/usr/include/szlib.h"),
@@ -49,6 +50,7 @@ REQUIRED_PACKAGES = {
     "curl",
     "emacs-nox",
     "gdb",
+    "gcc-multilib",
     "git",
     "github-cli",
     "hdf5",
@@ -80,6 +82,7 @@ REQUIRED_COMMANDS = (
     "cmake",
     "codex",
     "ctest",
+    "claude",
     "emacs",
     "gdb",
     "git",
@@ -92,6 +95,7 @@ REQUIRED_COMMANDS = (
     "h5repack",
     "h5stat",
     "jq",
+    "node",
     "poke",
     "python3",
     "rg",
@@ -148,6 +152,8 @@ def check_configuration() -> None:
         fail("Dockerfile does not configure development-user sudo")
     if "npm install --global @openai/codex" not in dockerfile:
         fail("Dockerfile does not install the Codex CLI globally")
+    if "npm install --global @anthropic-ai/claude-code" not in dockerfile:
+        fail("Dockerfile does not install Claude Code globally")
 
     if f"ARG HDF5_REPOSITORY={HDF5_REPOSITORY}" not in dockerfile:
         fail("Dockerfile does not declare the canonical HDF5 repository")
@@ -233,7 +239,12 @@ def check_configuration() -> None:
         f"`{HDF5_ASAN_PREFIX}`",
         "`$HDF5_ASAN_PREFIX`",
         "-fsanitize=address",
+        "## 32-bit build of HDF5",
+        "`-m32`",
+        "gcc-multilib",
+        "ELF32",
         "Codex CLI (installed as `codex`)",
+        "Claude Code (installed as `claude`)",
     ):
         if fragment not in readme:
             fail(f"devcontainer guide does not document HDF5 checkout: {fragment}")
@@ -362,6 +373,41 @@ int main(void) {
     print("DEVCONTAINER ASAN OK: compiler, linker, and runtime passed")
 
 
+def check_multilib_runtime() -> None:
+    source = "int main(void) { return 0; }\n"
+    with tempfile.TemporaryDirectory(prefix="h5lens-multilib-") as temp_dir:
+        executable = Path(temp_dir) / "multilib-smoke"
+        compile_result = subprocess.run(
+            ["cc", "-m32", "-x", "c", "-", "-o", str(executable)],
+            input=source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        if compile_result.returncode != 0:
+            fail(
+                "cannot compile and link a 32-bit executable with -m32:\n"
+                + compile_result.stdout
+            )
+        if executable.read_bytes()[:5] != b"\x7fELF\x01":
+            fail("-m32 compiler smoke executable is not ELF32")
+
+        run_result = subprocess.run(
+            [str(executable)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+        if run_result.returncode != 0:
+            fail(
+                "32-bit compiler smoke executable failed:\n" + run_result.stdout
+            )
+
+    print("DEVCONTAINER MULTILIB OK: 32-bit compiler, linker, and runtime passed")
+
+
 def check_runtime() -> None:
     missing_commands = [
         command for command in REQUIRED_COMMANDS if shutil.which(command) is None
@@ -386,6 +432,17 @@ def check_runtime() -> None:
             f"{minimum} minimum"
         )
 
+    node_match = re.search(r"v?([0-9]+)\.([0-9]+)", version(["node", "--version"]))
+    if (
+        node_match is None
+        or tuple(map(int, node_match.groups())) < MINIMUM_CLAUDE_NODE
+    ):
+        minimum = ".".join(map(str, MINIMUM_CLAUDE_NODE))
+        fail(
+            "Node.js is older than Claude Code's "
+            f"{minimum} minimum"
+        )
+
     emacs_major = version(
         [
             "emacs",
@@ -400,6 +457,7 @@ def check_runtime() -> None:
 
     check_hdf5_checkout()
     check_asan_runtime()
+    check_multilib_runtime()
 
     print(
         "DEVCONTAINER RUNTIME OK: "

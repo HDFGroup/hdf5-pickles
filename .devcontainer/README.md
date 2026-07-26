@@ -13,20 +13,22 @@ The image includes:
 - Python with h5py, NumPy, PyYAML, and pip;
 - Emacs 30+ for the inspector front end and its ERT tests;
 - GDB and ptrace permissions for crash-fuzzer backtraces;
-- Codex CLI (installed as `codex`), Git, GitHub CLI, OpenSSH, ripgrep, jq,
-  and ShellCheck; and
+- Codex CLI (installed as `codex`), Claude Code (installed as `claude`), Git,
+  GitHub CLI, OpenSSH, ripgrep, jq, and ShellCheck; and
 - VS Code support for CMake, C/C++, Python, YAML, and HDF5 viewing.
 
-Codex is installed globally while the image builds, so it is immediately
-available in every Codespaces terminal:
+Codex and Claude Code are installed globally while the image builds, so they
+are immediately available in every Codespaces terminal:
 
 ```sh
 codex --version
 codex
+claude --version
+claude
 ```
 
-Sign in with the account or API-key flow appropriate for your organization;
-authentication is not stored in the image or repository.
+Sign in to each tool with the account or API-key flow appropriate for your
+organization; authentication is not stored in the image or repository.
 
 Image creation also makes a full-history clone of the official
 [`HDFGroup/hdf5`](https://github.com/HDFGroup/hdf5) repository. The writable
@@ -91,12 +93,55 @@ LD_LIBRARY_PATH="$HDF5_ASAN_PREFIX/lib" \
   "$HDF5_ASAN_PREFIX/bin/h5dump" -pBH suspect.h5
 ```
 
+## 32-bit build of HDF5
+
+The image and its installed HDF5 package are 64-bit. Build the source checkout
+in a separate tree with `-m32` when an analysis must reproduce 32-bit integer
+sizes or address-space limits. The image includes `gcc-multilib` by default,
+so no additional package installation is required.
+
+The following build deliberately disables zlib and SZIP filters, because the
+image does not include matching 32-bit filter libraries. This keeps the recipe
+self-contained; add the appropriate 32-bit library and CMake option only when
+the specimen requires that filter.
+
+```sh
+cd "$HDF5_SOURCE_DIR"
+hdf5_32_prefix="$HOME/.local/hdf5-32"
+
+cmake -S . -B build-32 \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_C_FLAGS="-m32" \
+  -DCMAKE_CXX_FLAGS="-m32" \
+  -DCMAKE_EXE_LINKER_FLAGS="-m32" \
+  -DCMAKE_SHARED_LINKER_FLAGS="-m32" \
+  -DCMAKE_MODULE_LINKER_FLAGS="-m32" \
+  -DCMAKE_INSTALL_PREFIX="$hdf5_32_prefix" \
+  -DHDF5_ENABLE_ZLIB_SUPPORT=OFF \
+  -DHDF5_ENABLE_SZIP_SUPPORT=OFF
+
+cmake --build build-32 --parallel
+ctest --test-dir build-32 --output-on-failure -j"$(nproc)"
+cmake --install build-32
+readelf -h "$hdf5_32_prefix/bin/h5dump" | rg '^  Class:\s+ELF32$'
+```
+
+The final command must print `ELF32`; that verifies the tool is a 32-bit ELF
+binary rather than merely a 64-bit executable built from a separate tree. Run
+an installed tool with its corresponding libraries:
+
+```sh
+LD_LIBRARY_PATH="$hdf5_32_prefix/lib" \
+  "$hdf5_32_prefix/bin/h5dump" -pBH suspect.h5
+```
+
 ## Creation check
 
 [`post-create.sh`](post-create.sh) validates every required command and Python
 module, confirms that the image-provided HDF5 checkout has the canonical
-origin, full history, and writable source files, configures a Debug CMake build,
-builds `h5markers`, and smoke-tests `h5policy`, `h5markers`, `h5dump`, and the
+origin, full history, and writable source files, smoke-tests the 32-bit
+compiler, linker, and runtime, configures a Debug CMake build, builds
+`h5markers`, and smoke-tests `h5policy`, `h5markers`, `h5dump`, and the
 exact-build activation probe against the sample file. Codespaces waits for
 these checks before attaching the editor. A successful creation ends with:
 
