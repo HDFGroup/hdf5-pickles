@@ -102,8 +102,9 @@ LD_LIBRARY_PATH="$HDF5_ASAN_PREFIX/lib" \
 
 The image and its installed HDF5 package are 64-bit. Build the source checkout
 in a separate tree with `-m32` when an analysis must reproduce 32-bit integer
-sizes or address-space limits. The image includes `gcc-multilib` by default,
-so no additional package installation is required.
+sizes or address-space limits. The image includes `gcc-multilib` and
+`lib32-gcc-libs` by default, so no additional compiler or runtime package
+installation is required.
 
 The following build deliberately disables zlib and SZIP filters, because the
 image does not include matching 32-bit filter libraries. This keeps the recipe

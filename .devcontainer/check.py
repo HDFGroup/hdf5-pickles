@@ -20,11 +20,14 @@ DEVCONTAINER = ROOT / ".devcontainer"
 DOCKERFILE = DEVCONTAINER / "Dockerfile"
 CONFIG = DEVCONTAINER / "devcontainer.json"
 POST_CREATE = DEVCONTAINER / "post-create.sh"
+BUILD_HDF5 = DEVCONTAINER / "build-hdf5.sh"
 README = DEVCONTAINER / "README.md"
 H5POLICY = ROOT / "tools" / "h5policy"
 
 HDF5_REPOSITORY = "https://github.com/HDFGroup/hdf5.git"
 HDF5_SOURCE_DIR = Path("/opt/hdf5")
+HDF5_RELEASE_PREFIX = Path("/opt/hdf5-release")
+HDF5_32_PREFIX = Path("/opt/hdf5-32")
 HDF5_ASAN_PREFIX = Path("/opt/hdf5-asan")
 MINIMUM_HDF5_CMAKE = (3, 26)
 MINIMUM_CLAUDE_NODE = (22, 0)
@@ -57,6 +60,7 @@ REQUIRED_PACKAGES = {
     "jq",
     "libaec",
     "libasan",
+    "lib32-gcc-libs",
     "nodejs",
     "npm",
     "openssh",
@@ -164,10 +168,18 @@ def check_configuration() -> None:
         fail("Dockerfile does not declare the canonical HDF5 repository")
     if f"ENV HDF5_SOURCE_DIR={HDF5_SOURCE_DIR}" not in dockerfile:
         fail("Dockerfile does not expose the HDF5 checkout location")
+    for prefix, label in (
+        (HDF5_RELEASE_PREFIX, "release"),
+        (HDF5_32_PREFIX, "32-bit"),
+        (HDF5_ASAN_PREFIX, "ASan"),
+    ):
+        if f"HDF5_{label.upper().replace('-', '_')}_PREFIX={prefix}" not in dockerfile:
+            fail(f"Dockerfile does not expose the HDF5 {label} install prefix")
     if f"HDF5_ASAN_PREFIX={HDF5_ASAN_PREFIX}" not in dockerfile:
         fail("Dockerfile does not expose the HDF5 ASan install prefix")
-    if f"\n        {HDF5_ASAN_PREFIX} \\\n" not in dockerfile:
-        fail("Dockerfile does not create the HDF5 ASan install prefix")
+    for prefix in (HDF5_RELEASE_PREFIX, HDF5_32_PREFIX, HDF5_ASAN_PREFIX):
+        if f"\n        {prefix} \\\n" not in dockerfile:
+            fail(f"Dockerfile does not create the HDF5 install prefix {prefix}")
 
     clone_match = re.search(
         r'RUN git clone \\\n'
@@ -230,9 +242,37 @@ def check_configuration() -> None:
     for argument in ("--policy-report", "--policy-exit"):
         if argument not in post_create:
             fail(f"post-create policy verdict validation is missing {argument}")
-    for path in (HDF5_SOURCE_DIR, HDF5_ASAN_PREFIX):
+    for path in (
+        HDF5_SOURCE_DIR,
+        HDF5_RELEASE_PREFIX,
+        HDF5_32_PREFIX,
+        HDF5_ASAN_PREFIX,
+    ):
         if str(path) not in post_create:
             fail(f"post-create does not account for ownership of {path}")
+    if not BUILD_HDF5.is_file():
+        fail(".devcontainer/build-hdf5.sh is missing")
+    build_hdf5 = BUILD_HDF5.read_text()
+    for fragment in (
+        "RelWithDebInfo",
+        "-fsanitize=address",
+        "-m32",
+        "HDF5_ENABLE_ZLIB_SUPPORT=OFF",
+        "ELF32",
+    ):
+        if fragment not in build_hdf5:
+            fail(f"build-hdf5.sh lacks the expected variant setting: {fragment}")
+    try:
+        subprocess.run(
+            ["bash", "-n", str(BUILD_HDF5)],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+    except subprocess.SubprocessError as exc:
+        fail(f"build-hdf5.sh has invalid shell syntax: {exc}")
     if not README.is_file():
         fail(".devcontainer/README.md is missing")
     readme = README.read_text()
@@ -243,6 +283,11 @@ def check_configuration() -> None:
         "full-history",
         f"`{HDF5_ASAN_PREFIX}`",
         "`$HDF5_ASAN_PREFIX`",
+        f"`{HDF5_RELEASE_PREFIX}`",
+        "`$HDF5_RELEASE_PREFIX`",
+        f"`{HDF5_32_PREFIX}`",
+        "`$HDF5_32_PREFIX`",
+        "build-hdf5.sh",
         "-fsanitize=address",
         "## 32-bit build of HDF5",
         "`-m32`",
