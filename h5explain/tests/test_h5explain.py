@@ -489,6 +489,19 @@ def test_layout_explainer_labels_the_stored_element_size():
     assert "stored_element_size=8" in out, out
 
 
+def test_layout_explainer_decodes_version_5():
+    # Layout versions 4 and 5 share an encoding, so the explainer decodes v5
+    # through the same union arm.  The fixture is the h5policy corpus's
+    # byte-patched v5 file: h5py's libhdf5 cannot write one.
+    path = corpus("valid/layout_v5_chunked.h5")
+    listing = explain_path(path, "root", 'cd ("d")', "msgs")
+    index = decoded_message_index(listing, "oh_msg_layout")
+    out = explain_path(path, "root", 'cd ("d")', f"explain ({index})")
+    assert "version=5UB" in out, out
+    assert "layout_class=2UB (chunked)" in out, out
+    assert "stored_element_size=4" in out, out
+
+
 def test_h5dump_covers_the_primitive_extent():
     out = explain("latest.h5", "root", "h5dump")
     # The hex dump is anchored at the header and shows its signature bytes.

@@ -91,6 +91,7 @@ carry-forward · **✝** retained for compatibility but superseded · — not pr
 | "Complex dataspace" (promised, never defined) | ● | ● | — | — | — | HDF5 1.0 aspiration; removed from later specs | — (abandoned) |
 | Data layout message v1–2 (contiguous/chunked/compact) | ● | ◐ | ◐ | ○ | ○ | HDF5 1.0; v3 reorganization in 1.6/1.8 | — |
 | Data layout v4 (virtual class; per-index-type encodings) | — | — | — | ● | ○ | HDF5 1.10 (VDS + chunk indexes) | [RFC: HDF5 Virtual Dataset](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/HDF5-VDS-requirements-use-cases-2014-12-10.pdf) |
+| Data layout v5 (filtered-chunk sizes widened to `sizeof_lengths`) | — | — | — | — | ● | HDF5 2.0 (chunks larger than 4 GiB; filters that grow a chunk) | — |
 | Global heap (`GCOL`; VL data, old references) | ● | ○ | ○ | ◐ | ○ | HDF5 1.0; extended for VDS blocks in 1.10 | Original format spec |
 | Global Heap Block for Virtual Datasets (`VHDB`) | — | — | — | ● | ○ | HDF5 1.10 (VDS mapping storage) | VDS RFC (above) |
 | External file list (`EFL` + local heap) | ● | ○ | ○ | ○ | ○ | HDF5 1.0 | Original format spec |
@@ -127,6 +128,7 @@ carry-forward · **✝** retained for compatibility but superseded · — not pr
   against public sources; the 1.8-era design documents (group revisions, fractal heap, SOHM, SWMR)
   circulated in various forms and are less uniformly archived.
 - Spec 3.0 and 4.0 as currently published on support.hdfgroup.org both incorporate the HDF5 2.0
-  change list; the substantive 3.0→4.0 delta is datatype message v5 and the Complex class (11).
+  change list; the substantive 3.0→4.0 delta is datatype message v5 with the Complex
+  class (11), and data layout message v5.
 - The spec ↔ library mapping is approximate at the edges: 1.1-era structures phased in across
   1.4/1.6, and 2.0 structures are written by 1.8+ only when the "latest format" bounds are enabled.
