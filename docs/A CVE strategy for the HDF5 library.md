@@ -33,14 +33,14 @@ validated object description
 native materialization and activation
 ```
 
-Validation remains lazy: opening one object validates the closure needed for that object, not the entire file.
+**Validation remains lazy:** opening one object validates the closure needed for that object, not the entire file.
 
 ## Motivation
 
 Many decoder vulnerabilities are ordinary implementation errors:
 
 - Reading a field without checking that enough input remains.
-- Forming an invalid end pointer for an empty buffer.
+- Computing an inclusive last-byte pointer as `buffer + length - 1` when `length` may be zero, thereby forming an out-of-bounds pointer.
 - Overflowing a size calculation.
 - Allocating from an unchecked encoded count.
 - Failing to prove that a loop consumes input.
@@ -88,23 +88,17 @@ This proposal does not require:
 
 ## Terminology
 
-Raw record
-: An inert representation of encoded fields. It may contain offsets, lengths, integers, bounded strings, and child references, but no initialized `H5O_t`, `H5T_t`, `H5S_t`, cache entry, plugin, or external-file handle.
+**Raw record:** An inert representation of encoded fields. It may contain offsets, lengths, integers, bounded strings, and child references, but no initialized `H5O_t`, `H5T_t`, `H5S_t`, cache entry, plugin, or external-file handle.
 
-Child reference
-: A typed description of another region or resource, such as `{kind, address, extent}`. It does not follow or load the target.
+**Child reference:** A typed description of another region or resource, such as `{kind, address, extent}`. It does not follow or load the target.
 
-Validation closure
-: The set of raw records that must be inspected to establish the semantics needed for a requested operation. It is generally smaller than the entire file.
+**Validation closure:** The set of raw records that must be inspected to establish the semantics needed for a requested operation. It is generally smaller than the entire file.
 
-Validated record
-: An opaque internal value proving that the required local and contextual validation has succeeded.
+**Validated record:** An opaque internal value proving that the required local and contextual validation has succeeded.
 
-Materialization
-: Construction of native HDF5 structures from validated descriptions.
+**Materialization:** Construction of native HDF5 structures from validated descriptions.
 
-Activation
-: Operations with side effects, including cache publication, public ID registration, index initialization, plugin loading, decompression, user callbacks, and external-file access.
+**Activation:** Operations with side effects, including cache publication, public ID registration, index initialization, plugin loading, decompression, user callbacks, and external-file access.
 
 ## 1. Safe local decoding
 
@@ -115,13 +109,17 @@ Existing decoders should be rewritten around a small set of rules:
 - Addition, multiplication, alignment, and address calculations are checked.
 - Attacker-controlled counts are validated and charged against a budget before allocation.
 - Every variable-length loop demonstrates forward progress.
-- String searches are bounded by their encoded region.
+- Searches for string terminators or delimiters examine only the validated byte extent assigned to the string and never continue into an adjacent field or beyond the enclosing record.
 - The decoder distinguishes required complete consumption from permitted trailing or opaque data.
 - Failures identify the field and absolute input offset where possible.
 
 These rules may be implemented with a cursor, pointer plus remaining length, or another convention. A common helper library would improve consistency and reviewability, but the security contract matters more than the representation.
 
-A bounded mode must never substitute `SIZE_MAX` for a missing input extent. Existing size-less APIs therefore cannot provide the bounded guarantee and will eventually need size-aware alternatives or explicit legacy status.
+A bounded mode must never substitute `SIZE_MAX` for a missing input extent. Bounded decoding requires the caller to provide or establish the actual number of readable input bytes. An unknown extent must not be represented as `SIZE_MAX`, because doing so disables the bounds checks.
+
+The important distinction is that `SIZE_MAX` may sensibly represent an unlimited policy budget in some contexts, but it must not represent an unknown physical input extent.
+
+ Existing size-less APIs therefore cannot provide the bounded guarantee and will eventually need size-aware alternatives or explicit legacy status.
 
 ## 2. Raw records must be inert
 
@@ -184,7 +182,7 @@ Reference-graph validation is the central focus of this proposal.
 
 ## 4. Reference discovery and traversal
 
-Raw decoders return typed child references to a traversal coordinator. The coordinator is the only component allowed to perform secondary reads.
+Raw decoders return typed child references to a traversal coordinator. *The coordinator is the only component allowed to perform secondary reads.*
 
 It maintains:
 
@@ -249,7 +247,7 @@ Raw<T> → validate → Validated<T> → materialize → Native<T>
 
 The materializer should not accept an unvalidated raw record. For aggregate objects, an aggregate certificate proves that relevant cross-message rules have also succeeded.
 
-Historical compatibility repairs should be represented as an explicit normalization plan produced by validation. The parser must not silently modify values. The materializer may apply authorized normalizations under the compatibility profile.
+Historical compatibility repairs should be represented as an explicit normalization plan produced by validation. *The parser must not silently modify values.* The materializer may apply authorized normalizations under the compatibility profile.
 
 Construction should be transactional where partial publication is dangerous. Cache images, for example, should follow:
 
@@ -263,7 +261,7 @@ decode all inert entries
 
 A failure before publication discards the temporary state without changing the live cache.
 
-## 7. Side-effectful formats
+## 7. Format constructs requiring controlled activation
 
 External links and VDS mappings are decoded as bounded strings and inert references. Validation may determine that they are syntactically and semantically valid without opening their targets. External access occurs only during an explicitly authorized activation step.
 
@@ -284,11 +282,12 @@ Each finding should include a stable code, severity, absolute file offset, recor
 
 Suggested profiles are:
 
-- Compatibility: hard safety invariants, historical semantic allowances, and generous measured limits.
-- Strict: specification-oriented semantic validation without implicit repair.
-- Forensic: strict limits, bounded finding collection, and no materialization or activation.
+- **Compatibility:** hard safety invariants, historical semantic allowances, and generous measured limits.
+- **Trusted-fast:** optimized bounded validation for provenance-trusted inputs.
+- **Strict:** specification-oriented semantic validation without implicit repair.
+- **Forensic:** strict limits, bounded finding collection, and no materialization or activation.
 
-Hard memory, arithmetic, range, and progress invariants are mandatory under every profile.
+Hard memory, arithmetic, range, and progress invariants are mandatory under every profile. Hence, these are named presets over separate dimensions—resource budgets, feature policy, compatibility policy, and analysis depth—rather than four fundamentally different safety levels.
 
 Unknown optional messages may be retained as bounded opaque records if the format and requested operation permit that. If their interpretation is required, the result is unsupported rather than silently passed to an unsafe legacy decoder.
 
@@ -331,6 +330,8 @@ Apply the conventions immediately to new code and ordinary bounds-related CVE fi
 Migrate one complete record through raw decode, validation, and materialization. An explicit-buffer datatype entry point is a useful pilot, though the next suitable CVE may provide a better target.
 
 The pilot must include a genuine semantic invariant, not merely truncated-input handling.
+
+See Appendix A for a detailed description of the pilot’s scope, interfaces, and test requirements.
 
 ### Phase 3: Object-header continuations
 
@@ -376,7 +377,7 @@ A release may be fixed before the issue is systemically closed, but the architec
 
 ### 11.2 Triage by missing invariant
 
-Triage should classify the first incorrect security decision, not merely the eventual crash site or CWE. One issue may have more than one classification.
+Triage should classify *the first incorrect security decision*, not merely the eventual crash site or CWE. One issue may have more than one classification.
 
 | Classification | Typical missing invariant |
 |---|---|
@@ -488,7 +489,55 @@ A mode advertised as bounded must reject unsupported required records instead of
 
 The governing process principle is:
 
-> A CVE fix is not automatically an architectural migration, but every decoding CVE must receive an explicit architectural disposition.
+> An urgent CVE patch may contain the known exploit without migrating the affected decoder. Nevertheless, every decoding CVE must record whether the violated invariant is already enforced, is migrated by the same change, or requires a linked systemic follow-up.
+
+A CVE containment patch might add a narrow check to legacy code:
+
+```c
+if (member_offset + member_size > compound_size)
+    return FAIL;
+```
+
+That may safely block the known PoC and be appropriate for supported release branches. But it does not necessarily:
+
+- Decode the datatype into an inert raw representation.
+- Put the invariant in a reusable record-local validator.
+- Cover every datatype version and entry point.
+- Prevent native construction before validation.
+- Prevent fallback to another legacy decoder.
+- Audit related compound, array, or nested-type cases.
+- Add direct semantic tests and bounded-decoder fuzz coverage.
+
+It is therefore a valid CVE fix, but not automatically an architectural migration.
+
+“Explicit architectural disposition” means the CVE record must state what will happen to the missing invariant in the bounded-decoding design. The disposition should be one of:
+
+1. **Migrated by this change:** the CVE fix also enforces the invariant at the correct semantic boundary and meets the systemic-closure criteria.
+2. **Already architecturally covered:** the invariant exists in the bounded path, but the CVE exposed an alternate or legacy route; close that route and add coverage.
+3. **Contained now, migration scheduled:** the release patch blocks the exploit, while a linked development-branch task migrates the complete semantic boundary, with an owner and milestone.
+4. **Not applicable:** the issue is not a decoding-architecture problem, with a recorded explanation.
+
+For example:
+
+```text
+CVE symptom:
+    native datatype construction writes beyond an allocation
+
+Containment:
+    reject the offending member dimensions before the write
+
+Architectural disposition:
+    record-local datatype invariant is missing
+    required closure is the complete compound datatype
+    migrate through RawDatatype → ValidatedDatatype → H5T_t
+    cover all relevant entry points and versions
+    add direct semantic fixture and fuzz seed
+```
+
+The principle prevents two undesirable outcomes:
+
+- Delaying an urgent, low-risk security patch until a large rewrite is ready.
+- Shipping the narrow patch and then forgetting that the underlying invariant remains misplaced or absent.
 
 ## 12. Verification
 
@@ -513,3 +562,66 @@ The required primitive is not a particular cursor or slice type. The required ar
 > Parsing bytes may describe structure, but it does not authorize the library to act on that structure.
 
 Local decoder rewrites establish basic memory safety. Semantic validators establish whether records form a valid object. A bounded coordinator establishes whether references form a valid and affordable traversal. Only after those stages succeed may HDF5 construct or activate native state.
+
+## Appendix A
+
+Phase 2 should be the first end-to-end proof that the architecture works—not merely the first use of a bounded cursor. It should take one precisely scoped record from untrusted bytes all the way to a native object while preserving the trust boundary:
+
+```text
+bytes + exact extent
+    → Raw<T>
+    → validate semantic invariants
+    → Validated<T>
+    → materialize
+    → Native<T>
+```
+
+“Complete” means every input path within the declared pilot scope uses this sequence. A decode or validation failure must terminate that path; it cannot fall back to the legacy decoder.
+
+Select one precisely scoped record family, supported-version set, and entry point, and migrate it completely through raw decoding, semantic validation, and native materialization. An internal datatype entry point that accepts an explicit byte buffer and extent is a useful pilot, although a suitable CVE may identify a better first boundary.
+
+The pilot should establish the following interfaces:
+
+- **Raw decoding** accepts immutable bytes, their proven extent, and applicable resource limits. It performs checked arithmetic and bounded allocation and returns only inert fields, bounded child slices, references, and findings. It does not construct an H5T_t or mutate existing native state.
+- **Semantic validation** consumes the raw record and establishes the record-local invariants required for construction. Success returns an opaque validated result; compatibility handling, if needed, is represented as an explicit normalization plan.
+- **Materialization** accepts only the validated result. It constructs the native object transactionally and does not reinterpret the original unvalidated bytes.
+- **Dispatch** sends migrated inputs through the new path. Raw-decode and validation failures are terminal and never fall through to the legacy decoder. The legacy path remains reachable only for record classes or versions explicitly outside the pilot’s declared scope.
+
+For a compound datatype, the semantic test should include an invariant such as:
+
+```txt
+member_end = checked_add(member_offset, validated_member_size)
+member_end <= enclosing_compound_size
+```
+
+A fixture in which all encoded fields are present but a member extends beyond the enclosing datatype is therefore essential. It proves that the phase adds semantic validation, not just truncated-input detection.
+
+The pilot’s test set should cover:
+
+- Valid records for every class and version claimed by the pilot.
+- Zero, boundary, `N−1`, `N`, and `N+1` extents and counts.
+- Arithmetic overflow and allocation-budget exhaustion.
+- Unterminated strings and incomplete child records.
+- Nested records at and beyond the recursion limit.
+- At least one fully encoded but semantically inconsistent record.
+- Stable finding codes and byte ranges for each rejection.
+- Proof that rejection occurs before native construction or publication.
+- Differential behavior against the legacy decoder for valid inputs.
+- Explicit compatibility-normalization tests where historical behavior is retained.
+- Bounded fuzzing of the raw decoder and validator.
+- Sanitizer testing and representative 32-bit and 64-bit builds, particularly around encoded-size conversion and size_t arithmetic.
+- Performance measurements for the valid-input path.
+
+The phase is complete when:
+
+1. The declared pilot scope has no route from failed validation to legacy decoding.
+2. Native construction cannot be invoked without a validated result.
+3. Every byte access and allocation is derived from a proven extent and budget.
+4. At least one non-local field relationship is validated before construction.
+5. Failure cleanup leaves no partially published native state.
+6. Valid-input compatibility and performance have been measured.
+7. The migrated scope, unsupported cases, findings, and tests are documented.
+
+The phase should not claim a bounded file-open operation. Superblock bootstrap, object-header continuation graphs, shared messages, and aggregate dataset semantics remain outside the guarantee until their later phases are complete.
+
+The point of the vertical slice is to expose the difficult integration questions early: ownership of raw bytes, validated-result lifetime, cleanup, normalization, dispatch, findings, and prevention of legacy fallback. Migrating several parsers only through local bounds checks would defer all those architectural risks.
