@@ -71,9 +71,13 @@ stored scaled coordinates and logical element coordinates when layout chunk
 dimensions are available.
 
 Datatype message details include a nested datatype tree for compound, array,
-enum, and variable-length datatypes.  Compound members show their byte offsets,
-array nodes show dimensions, and leaf datatypes show byte order, signedness, and
-precision when available.
+enum, variable-length, and version-5 complex datatypes.  Compound members show
+their byte offsets, array nodes show dimensions, complex nodes show their form
+and floating-point base type, and leaf datatypes show byte order, signedness,
+and precision when available.  A complex datatype whose class bits are not the
+homogeneous rectangular encoding has no property layout to decode: the node is
+marked `encoding=undefined` and carries no base type, and its bytes remain
+visible in the raw payload section.
 
 Dataset preview is read-only.  It currently supports small fixed-point
 little-endian datasets stored as compact object-header data or contiguous raw
