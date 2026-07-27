@@ -1,8 +1,24 @@
 # What is bounded raw decode?
 
-“Bounded raw decode” means: parse bytes into a small, inert, explicitly bounded representation before interpreting them as HDF5 semantics or constructing `libhdf5`-native objects.
+“Bounded raw decode” means: parse bytes into a small, inert, explicitly bounded representation before interpreting them as HDF5 semantics or constructing `libhdf5`-native objects. Bounded raw decode produces inert evidence; it does not make attacker-controlled bytes native or trusted.
 
-![From Bytes in Storage to in Memory Structures](./From%20Bytes%20in%20Storage%20to%20in%20Memory%20Structures.png)
+```txt
+            Untrusted file bytes + explicit extent
+                               │
+                               ▼
+                      Bounded raw decoder         ◀── File-format grammar + Policy limits
+                               │
+                               ▼
+         Raw record + child references + findings ◀── Specification invariants
+                               │
+                               ▼
+                     Semantic validation          ◀── Policy rules
+                       │              │
+                    reject          accept
+                       │              │
+                       ▼              ▼
+            Findings/report    Optional native construction
+```
 
 The decoder’s contract should be:
 
