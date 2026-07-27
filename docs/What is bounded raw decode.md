@@ -6,13 +6,13 @@
             Untrusted file bytes + explicit extent
                                │
                                ▼
-                      Bounded raw decoder         ◀── File-format grammar + Policy limits
+                      Bounded raw decoder         ◀--- File-format grammar + Policy limits
                                │
                                ▼
-         Raw record + child references + findings ◀── Specification invariants
+         Raw record + child references + findings ◀--- Specification invariants
                                │
                                ▼
-                     Semantic validation          ◀── Policy rules
+                     Semantic validation          ◀--- Policy rules
                        │              │
                     reject          accept
                        │              │
