@@ -156,7 +156,7 @@ def main() -> int:
             for block in sections[section]
         ]
         explore = run_session(
-            poke, "explore", explore_blocks, tmp, ROOT / "file.h5"
+            poke, "explore", explore_blocks, tmp, ROOT / "examples/file.h5"
         )
         for token in (
             "oh_hdr {",
@@ -173,7 +173,7 @@ def main() -> int:
         require(explore, "4230038535U", "explore", count=2)
 
         editable = tmp / "file-edit.h5"
-        shutil.copyfile(ROOT / "file.h5", editable)
+        shutil.copyfile(ROOT / "examples/file.h5", editable)
         write = run_session(
             poke, "write", sections[6], tmp, editable
         )

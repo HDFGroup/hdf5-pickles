@@ -1,12 +1,12 @@
 # Tutorial
 
-This short tutorial shows how to explore the sample HDF5 file `file.h5` from the poke REPL using the pickles in this repository. It assumes GNU poke is installed and that you start from the repository root.
+This short tutorial shows how to explore the sample HDF5 file `examples/file.h5` from the poke REPL using the pickles in this repository. It assumes GNU poke is installed and that you start from the repository root.
 
 Start poke with the repository `pickles/` directory on the load path:
 
 ```sh
 cd <THIS DIRECTORY>
-POKE_LOAD_PATH=$PWD/pickles poke file.h5
+POKE_LOAD_PATH=$PWD/pickles poke examples/file.h5
 ```
 
 At the `(poke)` prompt, load the pickles needed for the superblock and object headers:
@@ -40,7 +40,7 @@ Expected output:
 48UL#B
 ```
 
-This tells us that `file.h5` uses a version 2 superblock and that the root object header starts at byte offset `48`.
+This tells us that `examples/file.h5` uses a version 2 superblock and that the root object header starts at byte offset `48`.
 
 ## 2. Decode the root object header
 
@@ -222,7 +222,7 @@ var bt = bt1_hdr @ 479#B
 bt
 ```
 
-Why `3UB`? `v1_btree.pk` expects the raw-chunk key width to be the dataset dimensionality plus one. `file.h5` stores a 2-dimensional dataset (`8 x 8`), so the correct setting here is `2 + 1 = 3`.
+Why `3UB`? `v1_btree.pk` expects the raw-chunk key width to be the dataset dimensionality plus one. `examples/file.h5` stores a 2-dimensional dataset (`8 x 8`), so the correct setting here is `2 + 1 = 3`.
 
 Enable tree-style pretty printing in the current session. You can also put
 these commands in poke's configuration file (`~/.pokerc`):
@@ -289,7 +289,7 @@ For a more readable dump, use the recursive printer:
 print_v1_btree (479#B, 0)
 ```
 
-This prints the four chunk records in `file.h5`. Since `node_level=0`, this root node is also a leaf, so there are no child B-tree nodes to descend into; each `child_raw` value is the file address of the chunk payload itself.
+This prints the four chunk records in `examples/file.h5`. Since `node_level=0`, this root node is also a leaf, so there are no child B-tree nodes to descend into; each `child_raw` value is the file address of the chunk payload itself.
 
 Expected output (with options for readability):
 
@@ -361,7 +361,7 @@ This is useful when extending the pickles or when you want to discover methods s
 Poke maps are writable. To avoid modifying the sample file in the repository, make a copy first:
 
 ```sh
-cp file.h5 file-edit.h5
+cp examples/file.h5 file-edit.h5
 POKE_LOAD_PATH=$PWD/pickles poke file-edit.h5
 ```
 

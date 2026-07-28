@@ -25,8 +25,8 @@ repairs.
   pages, plus a [tool relationship overview](docs/tool-overview.md).
 - [`emacs/`](emacs/) contains an Emacs front end for inspecting HDF5 files
   through GNU poke.
-- [`examples/`](examples/) contains poke scripts for generating and inspecting
-  HDF5 structures.
+- [`examples/`](examples/) contains sample HDF5 files and poke scripts for
+  generating and inspecting HDF5 structures.
 - [`.devcontainer/`](.devcontainer/README.md) provides an analysis-ready
   GitHub Codespaces and VS Code Dev Containers environment.
 - [`MARKERS.md`](docs/MARKERS.md), [`TOOLS.md`](docs/TOOLS.md), and
@@ -38,7 +38,7 @@ repairs.
 Run `h5policy` against an HDF5 file:
 
 ```sh
-./tools/h5policy --profile untrusted-strict file.h5
+./tools/h5policy --profile untrusted-strict examples/file.h5
 ```
 
 Run every regression suite through CTest:
@@ -66,7 +66,7 @@ cmake --build build --target docs
 Explore the sample file interactively:
 
 ```sh
-./tools/h5explain file.h5
+./tools/h5explain examples/file.h5
 ```
 
 See [`h5explain/README.md`](h5explain/README.md) for interactive navigation

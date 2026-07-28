@@ -284,7 +284,7 @@ build/h5markers --help
 The scanner prints one line per detected marker with the marker name and its file offset in both
 hexadecimal and decimal. Progress is reported on stderr when scanning in a terminal.
 
-For example, scanning the sample file `file.h5` in this repository produces the following output:
+For example, scanning the sample file `examples/file.h5` in this repository produces the following output:
 
 ```text
 HDF5_SIGNATURE  0x0000000000000000 (0)
@@ -307,8 +307,8 @@ TREE            0x00000000000001DF (479)
 Commands supplied with `-c`/`--command` or on a piped standard input run as a batch session that exits instead of entering the REPL:
 
 ```sh
-printf 'root\nls\n' | ./tools/h5explain file.h5
-./tools/h5explain -c root -c ls file.h5
+printf 'root\nls\n' | ./tools/h5explain examples/file.h5
+./tools/h5explain -c root -c ls examples/file.h5
 ```
 
 **Navigation commands:** `root`, `h5super`, `cd ("PATH")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`

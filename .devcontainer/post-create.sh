@@ -67,23 +67,23 @@ policy_status=0
 "${repo_dir}/tools/h5policy" \
     --profile forensic \
     --json \
-    "${repo_dir}/file.h5" \
+    "${repo_dir}/examples/file.h5" \
     >"${policy_report}" || policy_status=$?
 python3 "${script_dir}/check.py" \
     --policy-report "${policy_report}" \
     --policy-exit "${policy_status}"
 
 log "Smoke-testing h5markers"
-"${build_dir}/h5markers" "${repo_dir}/file.h5" >"${markers_report}"
+"${build_dir}/h5markers" "${repo_dir}/examples/file.h5" >"${markers_report}"
 
 log "Smoke-testing the installed HDF5 command suite"
-h5dump -pBH "${repo_dir}/file.h5" >/dev/null
+h5dump -pBH "${repo_dir}/examples/file.h5" >/dev/null
 
 log "Smoke-testing exact-build activation tracing"
 probe_status=0
 "${repo_dir}/tools/h5policy-probe" \
     --json \
-    "${repo_dir}/file.h5" \
+    "${repo_dir}/examples/file.h5" \
     >"${probe_report}" || probe_status=$?
 if ((probe_status != 0)); then
     if [[ -s "${probe_report}" ]]; then
