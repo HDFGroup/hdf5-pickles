@@ -445,11 +445,11 @@ One entry in the External Data Files slot array (`oh_msg_external`). Each record
 
 ## `oh_msg_layout`
 
-Data layout message (type 0x0008). Specifies how a dataset's raw data are stored on disk: compact (inside the object header), contiguous, chunked, or virtual. Four format versions are defined; versions 1 and 2 share the same struct.
+Data layout message (type 0x0008). Specifies how a dataset's raw data are stored on disk: compact (inside the object header), contiguous, chunked, or virtual. Five format versions are defined; versions 1 and 2 share the same struct, and so do versions 4 and 5.
 
 | Field | Description |
 |-------|-------------|
-| `version` | Format version. Valid values: 1, 2, 3, 4. |
+| `version` | Format version. Valid values: 1, 2, 3, 4, 5. |
 
 ### `v1_v2`
 
@@ -525,9 +525,9 @@ Chunked storage (layout_class == 2).
 | `idx_addr_raw` | File address of the v1 B-tree chunk index. |
 | `dim_size` | Array of `ndims` uint32 chunk dimension sizes. |
 
-### `v4`
+### `v4_v5`
 
-Layout version 4. Chunked storage gains an explicit index type field with per-type parameters; virtual storage is added.
+Layout versions 4 and 5. Chunked storage gains an explicit index type field with per-type parameters; virtual storage is added. Version 5 (libhdf5 2.x, `H5F_LIBVER_V200`) encodes this message identically to version 4: it differs only in the chunk index *records*, where the filtered-chunk size field widens to `sizeof_lengths` so a filter that grows a chunk cannot overflow it.
 
 | Field | Description |
 |-------|-------------|
