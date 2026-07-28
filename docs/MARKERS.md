@@ -3,9 +3,9 @@
 The `h5markers` tool scans the concrete on-disk identifiers defined in the
 [HDF5 file format specification](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html),
 the implementation-defined metadata cache image signature in
-[HDF5](https://github.com/HDFGroup/hdf5/blob/2.1.1/src/H5Cimage.c), and both the
+[HDF5](https://github.com/HDFGroup/hdf5/blob/develop/src/H5Cimage.c), and both the
 [Onion revision-history RFC](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/Onion_VFD_RFC_211122.pdf)
-and the [current Onion implementation](https://github.com/HDFGroup/hdf5/blob/2.1.1/src/H5FDonion_history.h).
+and the [current Onion implementation](https://github.com/HDFGroup/hdf5/blob/develop/src/H5FDonion_history.h).
 
 > Notice that there are multiple versions of the HDF5 file format specification, usually released in conjunction with major HDF5 library releases, and the set of markers grew over time. For example, the version 1 object header does not have marker, and chunk indexes like single chunk and implicit do not have markers. Depending on its modification history, an HDF5 file may contain a subset of the markers listed below. The `h5markers` tool will report all markers it finds, regardless of the version of the HDF5 file format specification they were introduced in.
 
