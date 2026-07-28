@@ -8,7 +8,7 @@ untrusted files, a conservative repair planner, and a marker scanner.
 ## What's Here
 
 | Area | Purpose |
-|---|---|
+| --- | --- |
 | [`pickles/`](pickles/) | Reusable HDF5 format definitions for GNU poke. |
 | [`h5policy/`](h5policy/) | Metadata preflight, security profiles, regression corpus, differential testing, and fuzzing. |
 | [`h5patch/`](h5patch/) | Evidence-gated repair planning, application, and audit logging. |
@@ -46,7 +46,7 @@ ctest --test-dir build --output-on-failure
 cmake --build build --target docs-check
 ```
 
-Continue with the guided [GNU poke tutorial](docs/TUTORIAL.md), or see the
+Continue with the guided [H5Lens tutorial](docs/TUTORIAL.md), or see the
 [`h5policy`](h5policy/README.md), [`h5patch`](h5patch/README.md), and
 [`h5explain`](h5explain/README.md) guides for complete command behavior.
 

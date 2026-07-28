@@ -8,6 +8,9 @@ object headers, links, B-trees, heaps, and chunk indexes.
 HDF5 user blocks are detected automatically at legal superblock boundaries;
 navigation and policy findings report physical file offsets.
 
+For a guided walk from the sample superblock through a dataset, chunk index,
+and policy finding, start with the [H5Lens tutorial](../docs/TUTORIAL.md).
+
 Run from the repository root:
 
 ```sh
