@@ -29,8 +29,8 @@ repairs.
   HDF5 structures.
 - [`.devcontainer/`](.devcontainer/README.md) provides an analysis-ready
   GitHub Codespaces and VS Code Dev Containers environment.
-- [`MARKERS.md`](MARKERS.md), [`TOOLS.md`](TOOLS.md), and
-  [`TUTORIAL.md`](TUTORIAL.md) explain the format markers, helper tools, and a
+- [`MARKERS.md`](docs/MARKERS.md), [`TOOLS.md`](docs/TOOLS.md), and
+  [`TUTORIAL.md`](docs/TUTORIAL.md) explain the format markers, helper tools, and a
   hands-on exploration path.
 
 ## Quick Start
@@ -70,7 +70,7 @@ Explore the sample file interactively:
 ```
 
 See [`h5explain/README.md`](h5explain/README.md) for interactive navigation
-commands and [`TUTORIAL.md`](TUTORIAL.md) for a guided GNU poke walkthrough.
+commands and [`TUTORIAL.md`](docs/TUTORIAL.md) for a guided GNU poke walkthrough.
 
 ## h5policy In Under A Minute
 

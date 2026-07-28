@@ -35,7 +35,7 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TUTORIAL = ROOT / "TUTORIAL.md"
+TUTORIAL = ROOT / "docs/TUTORIAL.md"
 
 
 def fail(message: str) -> None:

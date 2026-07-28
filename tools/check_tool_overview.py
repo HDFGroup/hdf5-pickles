@@ -93,7 +93,7 @@ EXPECTED_EDGES = (
 
 DOC_LINKS = {
     ROOT / "README.md": "docs/tool-overview.md",
-    ROOT / "TOOLS.md": "docs/tool-overview.md",
+    ROOT / "docs/TOOLS.md": "tool-overview.md",
     ROOT / "docs/README.md": "tool-overview.md",
 }
 

@@ -30,7 +30,7 @@ Output lands in `docs/generated/<name>.md`.
 The `--check` flag verifies that every type and field name in the sidecar
 actually appears in the corresponding pickle, catching stale documentation
 after a rename. The same target executes every GNU poke command block in
-[`TUTORIAL.md`](../TUTORIAL.md) against disposable files and checks the
+[`TUTORIAL.md`](TUTORIAL.md) against disposable files and checks the
 documented h5policy cache-image boundary against live reports from every
 profile. It also checks the root h5patch overview against the authoritative
 repair catalog, checks the documented h5explain navigation-history semantics

@@ -148,7 +148,7 @@ shared evidence source: the explorer exposes it through `check`, the repair
 workflow uses it to plan and verify changes, and the research tools compare or
 stress its decisions.
 
-[`h5cve`](../TOOLS.md#h5cve-case-orchestrator) composes those capabilities into
+[`h5cve`](TOOLS.md#h5cve-case-orchestrator) composes those capabilities into
 a case workflow. The remaining tools build the regression corpus, compare the
 independent oracle with libhdf5, generate mutations, probe selected builds, and
 record reproducible coverage measurements under [`registry/`](../registry/).
