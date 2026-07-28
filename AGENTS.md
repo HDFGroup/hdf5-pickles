@@ -1,57 +1,106 @@
 # AGENTS instructions
 
-## CVE process
+## Scope
 
-- Apply the [§11 CVE process](./docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md)
-  to the specimen(s) and produce the complete case documentation `CASE.md`, using the
-  template `./registry/cve-case.yml`, — the real artifacts, not a sketch of one. Include
-  a source audit in a separate `source-audit.md` file, and any other relevant files.
-  The goal is to produce a complete, self-contained case bundle that can be used
-  to make a CVE submission or to confirm the presence of a vulnerability.
+- The CVE workflow below applies only when a task involves a vulnerability
+  specimen, advisory, OSS-Fuzz finding, or explicit CVE-case analysis.
+- The documentation, generated-file, boundary, and verification rules apply to
+  every task.
 
-- Consider 32-bit vs. 64-bit platform differences, and any other relevant platform
-  differences, when producing the case documentation.
+## CVE case workflow
 
-- Local evidence only: no web fetches, no publishing, nothing outbound. If the
-  advisory text would have mattered, say so in the record instead of going to get it.
+Apply the [§11 CVE process](docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md)
+to each specimen. Prefer `tools/h5cve` for the workflow it supports.
 
-- I expect the oracle already rejects this. Treat "are we covered?" as something to
-  confirm in passing, not the point — the point is what a fully filled-in bundle
-  looks like when every field is measured rather than asserted.
+### Required artifacts
 
-- Do not trust any previous work at `cases/*`, most likely leftovers from previous
-  sessions, such as TODOs, plus some hand-written probe .c files worth keeping. Treat it as advisory, but not authoritative.
+Produce a complete, self-contained bundle under `cases/<id>/`:
 
-- If there's a half-finished bundle at `cases/*` from an earlier session — TODOs,
-  plus some  hand-written probe .c files worth keeping — refresh it against
-  current HEAD without losing those.
+- `case.yml` — the machine-readable record based on
+  [`registry/cve-case.yml`](registry/cve-case.yml).
+- `CASE.md` — the narrative case record, suitable for a CVE submission or for
+  confirming that no vulnerability is present.
+- `source-audit.md` — the source-level audit.
+- Reproducers, probe sources, command transcripts, reports, and other evidence
+  needed to support the conclusions.
 
-- Stop before anything tracked — no gencorpus generator, no `registry/` or
-  `h5policy/tests/` edits. List them as promotion steps and I'll decide.
+These must be real artifacts with filled, measured fields, not sketches.
+
+### Evidence requirements
+
+- Use local evidence only: no web fetches, publishing, messages, or other
+  outbound actions. If advisory text or another unavailable source would affect
+  a conclusion, record that limitation.
+- Record the current Git commit and dirty-worktree state, specimen hashes, tool
+  and library versions, exact commands, exit codes, and baseline/candidate build
+  identities.
+- Label conclusions as measured, source-derived, inferred, or unmeasured. Never
+  present an unavailable platform result as measured.
+- Consider 32-bit and 64-bit behavior and other relevant platform differences.
+  Run representative platforms when locally available; otherwise document the
+  gap and the arithmetic, ABI, or layout risks that remain.
+- Measure the oracle verdict, but do not make existing rejection the primary
+  conclusion. Identify the violated invariant, affected entry points, exact-build
+  behavior, activation boundary, sibling variants, and remaining coverage gaps.
+
+### Existing case bundles
+
+Treat existing `cases/<id>/` contents as unverified prior work. Preserve
+hand-written probes and potentially useful artifacts, but regenerate
+measurements against current HEAD and replace TODOs or unsupported assertions.
+
+### Write and promotion boundary
+
+- During case development, write only under `cases/<id>/` and temporary build
+  directories.
+- Do not modify tracked corpus, generators, `registry/`, or `h5policy/tests/`.
+  Do not use `h5policy-gencorpus` to rewrite a tracked destination.
+- List proposed tracked changes as explicit promotion steps. Stop and let the
+  user decide whether to promote them.
 
 ## Documentation
 
-- Always keep the documentation up to date. If you add a new feature, tool, or
-  API, or change an existing one, update the relevant documentation.
+- Update relevant documentation when behavior, commands, APIs, paths, tools, or
+  generated output change.
+- Make new documentation contracts testable. Add or extend a documentation test
+  when introducing behavior that can drift; do not add redundant CI wiring when
+  an existing target already covers it.
+- Run existing documentation checks, normally:
 
-- Make documentation testable and include them in the CI/CD pipeline to catch any
-  discrepancies early.
+  ```sh
+  cmake --build build --target docs-check
+  ```
 
-- If documentation tests are available, run them to ensure the documentation is 
-  accurate. Wire them into the CI/CD pipeline to catch any discrepancies early. See for example the `docs-check` target in [`CMakeLists.txt`](./CMakeLists.txt).
+- If a required check cannot run, report what was skipped and why.
+
+## Generated files
+
+- Never edit generated files directly when a generation workflow exists.
+- `docs/generated/*.md` is generated from `docs/spec/*.yml` and `pickles/*.pk`
+  with `tools/pkdoc.py`. Edit the sources, regenerate, and run `docs-check`.
 
 ## Boundaries
 
-- **Ask first**
-  - Large cross-package refactors.
-  - New dependencies with broad impact.
-  - Destructive data or migration changes.
-- **Never**
-  - Commit secrets, credentials, or tokens.
-  - Do not introduce GHSA-* IDs into comments or commit messages, as they are not
-    authoritative and can be misleading. Use OSS-Fuzz numbers instead.
-  - Edit generated files by hand when a generation workflow exists.
-  - Use destructive git operations unless explicitly requested.
+### Ask first
+
+- Refactors that move ownership or public interfaces across multiple top-level
+  packages.
+- New runtime or build dependencies.
+- Destructive data changes or migrations.
+
+### Never
+
+- Commit secrets, credentials, or tokens.
+- Introduce `GHSA-*` identifiers into comments or commit messages; they are not
+  authoritative here. Use OSS-Fuzz identifiers when applicable.
+- Use destructive Git operations unless explicitly requested.
+
+## Verification
+
+- Run tests appropriate to the changed surface, including documentation checks
+  for documentation changes.
+- Check generated artifacts against their sources when either changes.
+- Report the commands run, failures, and any skipped checks in the handoff.
 
 ## References
 
