@@ -156,7 +156,7 @@ It records the shape. A later validator decides whether the shape is acceptable.
 
 ## 3. Datatype message: recursive/nested types
 
-Datatype messages can contain nested compound, array, variable-length, string, reference, and enum structures. The bounded decoder should avoid raw recursion into attacker-controlled nesting.
+Datatype messages can contain nested compound, array, variable-length, string, reference, enum, and complex structures. The bounded decoder should avoid raw recursion into attacker-controlled nesting.
 
 **Bounded pattern:**
 
@@ -203,6 +203,22 @@ RawDatatype decode_datatype(RawSlice s, Policy p, DecodeCtx ctx) {
             finding(H5_RESOURCE_ARRAY_RANK, s.start);
 
         read array dims into small vector;
+        child_slice = bounded_child_datatype_slice(&c, s.end);
+        dt.children.push(child_slice);
+        break;
+
+    case H5T_COMPLEX:
+        if (dt.version != 5)
+            finding(H5_CORRUPT_UNSUPPORTED_DATATYPE_VERSION, s.start);
+
+        if (!homogeneous_rectangular(class_bit_fields)) {
+            // No property layout is defined for any other encoding, so there
+            // is no child slice to record: stop at the header and leave the
+            // remaining bytes raw.
+            finding(H5_CORRUPT_DATATYPE_COMPLEX_ENCODING, s.start);
+            break;
+        }
+
         child_slice = bounded_child_datatype_slice(&c, s.end);
         dt.children.push(child_slice);
         break;

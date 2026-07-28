@@ -61,11 +61,11 @@ The signature is the four ASCII bytes `OHDR`. The flags select the optional time
 
 ## `dtype_hdr`
 
-8-byte common header present at the start of every Datatype message and embedded recursively in compound, enumerated, variable-length, and array types. Encodes the datatype class, format version, and class-specific flags.
+8-byte common header present at the start of every Datatype message and embedded recursively in compound, enumerated, variable-length, array, and complex types. Encodes the datatype class, format version, and class-specific flags.
 
 | Field | Description |
 |-------|-------------|
-| `flags` | Packed 32-bit field. Bits 0–3: datatype class (0 = fixed-point, 1 = floating-point, 2 = time, 3 = string, 4 = bitfield, 5 = opaque, 6 = compound, 7 = reference, 8 = enumerated, 9 = variable-length, 10 = array). Bits 4–7: format version. Bits 8–23: class bit-fields whose meaning depends on the class. |
+| `flags` | Packed 32-bit field. Bits 0–3: datatype class (0 = fixed-point, 1 = floating-point, 2 = time, 3 = string, 4 = bitfield, 5 = opaque, 6 = compound, 7 = reference, 8 = enumerated, 9 = variable-length, 10 = array, 11 = complex). Bits 4–7: format version. Bits 8–23: class bit-fields whose meaning depends on the class. |
 | `elm_size` | Size in bytes of one element of this datatype. |
 
 
@@ -214,7 +214,7 @@ Link info message (type 0x0002). Carries addresses of the fractal heap and B-tre
 
 ## `oh_msg_dtype`
 
-Datatype message (type 0x0003). Fully describes the type of a dataset's elements or an attribute's values. The datatype class is encoded in `hdr.flags` bits 0–3; the format version in bits 4–7. Compound, enumerated, variable-length, and array types embed one or more recursive `dtype_hdr` + properties blocks.
+Datatype message (type 0x0003). Fully describes the type of a dataset's elements or an attribute's values. The datatype class is encoded in `hdr.flags` bits 0–3; the format version in bits 4–7. Compound, enumerated, variable-length, and array types embed one or more recursive `dtype_hdr` + properties blocks. Version 5 adds the recursive Complex class (11).
 
 | Field | Description |
 |-------|-------------|
@@ -327,7 +327,7 @@ Class 9. Variable-length sequence or string. The VL type (sequence vs. string) i
 
 ### `array`
 
-Class 10. Fixed-size multidimensional array of a base type. Dimension information differs between versions 2 and 3.
+Class 10. Fixed-size multidimensional array of a base type. Dimension information differs between version 2 and versions 3–5.
 
 | Field | Description |
 |-------|-------------|
@@ -341,7 +341,20 @@ Version 2 array dimensions: `array_props2` (with permutation array).
 
 #### `v3`
 
-Version 3 array dimensions: `array_props3` (without permutation array).
+Versions 3–5 array dimensions: `array_props3` (without permutation array).
+
+### `complex`
+
+Class 11, introduced with datatype message version 5. A homogeneous complex number contains two values of the recursive floating-point base type. Class bit 0 marks homogeneous encoding; bits 1–2 select rectangular (0), polar (1), or exponential (2) form. This arm decodes the only encoding the format defines — homogeneous, rectangular, reserved class bits clear — which is also the only one the library reads or writes.
+
+| Field | Description |
+|-------|-------------|
+| `base_hdr` | 8-byte `dtype_hdr` of the floating-point base type. |
+| `base_props` | Type-class properties for the floating-point base type. |
+
+### `complex_undefined`
+
+Class 11 with any other class bit field: not homogeneous, a reserved form, or a reserved bit set. No property layout is defined for those encodings, so this arm maps nothing past the 8-byte header — it reports the class bits as found and leaves the property bytes raw rather than presenting a base type that no consumer would ever read. Its constraint is the exact complement of `complex`, so a defined complex that merely fails to map (a truncated one, say) still raises instead of decoding here.
 
 
 ## `oh_msg_old_fill`

@@ -171,7 +171,9 @@ Current coverage includes:
   heap header rather than the file-space-info message, remain a coverage gap.
 - Logical dataset byte accounting kept separate from raw storage accounting, so
   datatype semantics can be compared against `libhdf5` while layout checks still
-  use on-disk storage size.
+  use on-disk storage size. Datatype validation accepts message versions 1–5,
+  including bounded recursion through homogeneous rectangular Complex class
+  (11) base types.
 
 ### Metadata cache-image hard boundary
 
