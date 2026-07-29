@@ -27,6 +27,7 @@
 type H5PolicyMsgRef = struct
 {
     uint<8> found;
+    uint<8> diagnosed;
     offset<uint<64>,B> payload_off;
     uint<64> msg_size;
     uint<8> flags;
@@ -38,6 +39,22 @@ fun h5policy_msg_ref_none = H5PolicyMsgRef:
     return H5PolicyMsgRef
     {
         found = 0UB,
+        diagnosed = 0UB,
+        payload_off = 0UL#B,
+        msg_size = 0UL,
+        flags = 0UB
+    };
+}
+
+/* "Not found" result for committed-header scans that already emitted a
+   concrete corruption finding.  Callers can then avoid layering a generic
+   coverage-gap message on top of the more specific diagnosis.  */
+fun h5policy_msg_ref_diagnosed_none = H5PolicyMsgRef:
+{
+    return H5PolicyMsgRef
+    {
+        found = 0UB,
+        diagnosed = 1UB,
         payload_off = 0UL#B,
         msg_size = 0UL,
         flags = 0UB
@@ -121,7 +138,7 @@ fun h5policy_find_message_in_chunk = (int ios,
                                         "shared-message object header message payload overruns chunk");
                     global_version = old_version;
                     global_crt_tracked = old_crt_tracked;
-                    return h5policy_msg_ref_none;
+                    return h5policy_msg_ref_diagnosed_none;
                 }
 
             if (m_type == wanted_type)
@@ -131,6 +148,7 @@ fun h5policy_find_message_in_chunk = (int ios,
                     return H5PolicyMsgRef
                     {
                         found = 1UB,
+                        diagnosed = 0UB,
                         payload_off = payload_off,
                         msg_size = m_size,
                         flags = m_flags
@@ -201,7 +219,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
     if (!h5policy_checked_addr_range(obj_addr, 4UL, file_size,
                                      "shared-message object header outside file",
                                      loc, object))
-        return h5policy_msg_ref_none;
+        return h5policy_msg_ref_diagnosed_none;
 
     var root_off = obj_addr#B;
     var sig = h5policy_msg_bytes(ios, profile, root_off, 4UL);
@@ -222,7 +240,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
                     h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
                                         "corrupt", root_off, object,
                                         "shared-message object header has an unsupported version byte");
-                    return h5policy_msg_ref_none;
+                    return h5policy_msg_ref_diagnosed_none;
                 }
 
             var cursor = root_off + 6#B;
@@ -252,7 +270,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
             if (!h5policy_checked_addr_range(obj_addr, total_size, file_size,
                                              "shared-message object header outside file",
                                              root_off, object))
-                return h5policy_msg_ref_none;
+                return h5policy_msg_ref_diagnosed_none;
 
             var crt_order_tracked = ((flags & 4U) != 0U);
             var prefix_bytes = crt_order_tracked ? (V2_PREFIX_BYTES + 2) : V2_PREFIX_BYTES;
@@ -276,7 +294,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
             h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
                                 "corrupt", root_off, object,
                                 "shared-message object header is neither v1 nor v2");
-            return h5policy_msg_ref_none;
+            return h5policy_msg_ref_diagnosed_none;
         }
 
     var chunk_size1 = h5policy_msg_u64_at(ios, profile,
@@ -290,7 +308,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
     if (!h5policy_checked_addr_range(obj_addr, total_size1, file_size,
                                      "shared-message object header outside file",
                                      root_off, object))
-        return h5policy_msg_ref_none;
+        return h5policy_msg_ref_diagnosed_none;
 
     return h5policy_find_message_in_chunk(ios, profile, version1,
                                           V1_PREFIX_BYTES, 0,
@@ -370,7 +388,8 @@ fun h5policy_resolve_shared_message = (int ios,
                                         "SOHM heap-backed shared message could not be resolved");
                     return h5policy_msg_ref_none;
                 }
-            return H5PolicyMsgRef { found = 1UB, payload_off = sr.payload_off,
+            return H5PolicyMsgRef { found = 1UB, diagnosed = 0UB,
+                                    payload_off = sr.payload_off,
                                     msg_size = sr.msg_size, flags = 0UB };
         }
 
@@ -394,9 +413,12 @@ fun h5policy_resolve_shared_message = (int ios,
     var ref = h5policy_find_message_in_ohdr(ios, profile, obj_addr,
                                             m_type, payload_off, object);
     if (ref.found == 0UB)
-        h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
-                            "unsupported", payload_off, object,
-                            "shared committed object header does not expose the requested message");
+        {
+            if (ref.diagnosed == 0UB)
+                h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                    "unsupported", payload_off, object,
+                                    "shared committed object header does not expose the requested message");
+        }
     else if ((ref.flags & 0x02UB) != 0UB)
         {
             /* A shared target that is itself shared would require nested shared
