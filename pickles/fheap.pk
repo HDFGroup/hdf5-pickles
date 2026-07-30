@@ -636,16 +636,39 @@ type fheap_hdr = struct {
     }
 };
 
+/* Lazily-created in-memory IO space used to materialize 'tiny' fractal
+ * heap objects (H5HF__tiny_insert): their payload is encoded inline in
+ * the 8-byte heap ID itself, so there is no file address to point at.
+ * frhp_id_to_addr copies the inline bytes here and switches the current
+ * IO space to it, so that a plain `TYPE @ 0#B` mapping right after the
+ * call reads the tiny payload instead of the file. Callers that keep
+ * parsing the original file afterwards must save/restore `get_ios` /
+ * `set_ios` around the map, since this leaves the scratch IOS current. */
+var global_frhp_tiny_ios = -1;
+
+fun frhp_tiny_scratch_ios = int<32>:
+{
+    if (global_frhp_tiny_ios == -1)
+        global_frhp_tiny_ios = open ("*frhp-tiny*");
+    return global_frhp_tiny_ios;
+};
+
 /* ----------------------------------------------------------------------- *
  * frhp_id_to_addr -- resolve a fractal heap ID (8 bytes, as embedded in a
  * SOHM shared-message reference -- H5O_FHEAP_ID_LEN in H5Oprivate.h -- or
  * a SOHM list/B-tree entry's fheap_id) to a file byte address.
  *
  * Maps fheap_hdr at heap_hdr_addr (sets all global_frhp_* state for that
- * heap), then decodes and resolves a managed ID the same way frhp_heap_id's
- * _print method does. Only managed IDs are supported -- SOHM only ever
- * inserts shared messages via H5HF_insert(), never the huge/tiny paths, so
- * a non-managed ID here indicates a malformed shared-message reference.
+ * heap), then decodes and resolves the ID the same way frhp_heap_id's
+ * _print method does.
+ *
+ * Managed IDs resolve to a real file address, returned directly. Tiny IDs
+ * (H5HF__tiny_insert -- e.g. a shared fill-value message small enough to
+ * be encoded inline) have no file address: their bytes are copied into
+ * an in-memory scratch IO space (see frhp_tiny_scratch_ios above), which
+ * becomes the current IO space, and offset 0 is returned. Huge IDs
+ * (H5HF__huge_insert, for messages over H5O_FHEAP_MAX_MAN_SIZE) are not
+ * yet supported here.
  *
  * Usage:
  *   var addr = frhp_id_to_addr(heap_hdr_addr#B, id_bytes);
@@ -656,8 +679,33 @@ fun frhp_id_to_addr = (offset<uint<64>,B> heap_hdr_addr, byte[8] id_bytes) uint<
     var h = fheap_hdr @ heap_hdr_addr;
 
     var type_bits = id_bytes[0] & 0x30UB;
+
+    if (type_bits == 0x20UB) {
+        /* ---- Tiny ------------------------------------------------- */
+        var obj_size = 0UL;
+        var data_off = 0UL;
+        if (global_frhp_tiny_len_extended != 0UB) {
+            obj_size = (((id_bytes[0] & 0x0FUB) as uint<64>) <<. 8UL)
+                       | (id_bytes[1] as uint<64>);
+            obj_size = obj_size + 1UL;
+            data_off = 2UL;
+        } else {
+            obj_size = ((id_bytes[0] & 0x0FUB) as uint<64>) + 1UL;
+            data_off = 1UL;
+        }
+
+        var tiny_ios = frhp_tiny_scratch_ios;
+        set_ios (tiny_ios);
+        var k = 0UL;
+        while (k < obj_size) {
+            byte @ k#B = id_bytes[data_off + k];
+            k = k + 1UL;
+        }
+        return 0UL;
+    }
+
     if (type_bits != 0x00UB) {
-        printf("frhp_id_to_addr: heap id at %v is not a managed id (type_bits=0x%u8x)\n",
+        printf("frhp_id_to_addr: heap id at %v is not a managed or tiny id (type_bits=0x%u8x)\n",
                heap_hdr_addr / 1#B, type_bits);
         raise E_inval;
         return 0xFFFFFFFFFFFFFFFFUL;
