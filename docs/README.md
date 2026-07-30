@@ -5,6 +5,11 @@ The generated format reference starts at the
 For the repository entry points and the dependencies between them, see the
 [tool overview](tool-overview.md).
 
+Start with the [H5Lens tutorial](TUTORIAL.md) for guided exploration through
+`h5explain`. The [low-level GNU poke tutorial](POKE_TUTORIAL.md) exposes the
+underlying mappings, and [Writing HDF5 with GNU poke](POKE_CONSTRUCTION.md)
+keeps write-through and construction exercises in an explicitly advanced path.
+
 Specification Markdown is generated from two sources of truth:
 
 - **`pickles/*.pk`** — the executable format definitions (shared constants,
@@ -29,17 +34,17 @@ Output lands in `docs/generated/<name>.md`.
 
 The `--check` flag verifies that every type and field name in the sidecar
 actually appears in the corresponding pickle, catching stale documentation
-after a rename. The same target executes every GNU poke command block in
-[`TUTORIAL.md`](../TUTORIAL.md) against disposable files and checks the
-documented h5policy cache-image boundary against live reports from every
-profile. It also checks the root h5patch overview against the authoritative
-repair catalog, checks the documented h5explain navigation-history semantics
-against the implementation, and derives the documented lazy-validation ratios
-from the tracked measurement before reproducing its deterministic fields. The
-Mermaid tool overview is checked for its required nodes, relationships, styles,
-and documentation entry points. The same target checks that the Codespaces
-configuration retains its required packages, tools, editor support, startup
-check, and documentation:
+after a rename. The same target executes the `h5explain` commands in
+[`TUTORIAL.md`](TUTORIAL.md), the direct mappings in
+[`POKE_TUTORIAL.md`](POKE_TUTORIAL.md), and the disposable write and
+construction sessions in [`POKE_CONSTRUCTION.md`](POKE_CONSTRUCTION.md). It
+also checks the documented h5policy cache-image boundary against live reports
+from every profile, the root h5patch entry points against the authoritative
+repair catalog, and the documented h5explain navigation-history semantics
+against the implementation. The lazy-validation ratios are derived from the
+tracked measurement before its deterministic fields are reproduced. The
+Mermaid tool overview and Codespaces configuration retain their own structural
+checks:
 
 ```sh
 cmake --build build --target docs-check

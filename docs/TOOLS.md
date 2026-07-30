@@ -2,7 +2,7 @@
 
 For a visual map of the executable format layer, primary commands, supporting
 harnesses, and generated artifacts, see the
-[tool relationship overview](docs/tool-overview.md).
+[tool relationship overview](tool-overview.md).
 
 ## Command Entry Points
 
@@ -35,10 +35,10 @@ case workflow described below.
 ## h5cve Case Orchestrator
 
 `tools/h5cve` chains the existing tools into one provenance-stamped CVE case
-bundle and auto-populates the [`registry/cve-case.yml`](registry/cve-case.yml)
+bundle and auto-populates the [`registry/cve-case.yml`](../registry/cve-case.yml)
 schema.  It duplicates no tool logic — it shells out to `h5policy`, `h5markers`,
 `h5explain`, and the exact-build probe, and maps the primary finding to its
-invariant through [`registry/findings/`](registry/findings/).
+invariant through [`registry/findings/`](../registry/findings/).
 
 ```text
 h5cve init  <id> --poc FILE                 # bundle: PoC, sha256, skeleton case.yml
@@ -85,7 +85,7 @@ declares an `h5cve` contract, and reports one row per fixture/family:
 | `violation` | a forbidden activation occurred, or the build diverged from the oracle where the fixture requires alignment |
 | `coverage_gap` | no canary exists for that family, or the fixture declares no contract |
 
-[`registry/h5cve-matrix-policy.yml`](registry/h5cve-matrix-policy.yml) pins which
+[`registry/h5cve-matrix-policy.yml`](../registry/h5cve-matrix-policy.yml) pins which
 statuses each fixture may report; the matrix exits non-zero on anything else. A
 fixture must state its family and permitted statuses explicitly, so a new canary
 or a changed traversal surface cannot silently inherit a passing outcome.
@@ -103,7 +103,7 @@ have such a specimen.
 
 `h5cve evidence` turns a matrix run into a per-family verdict on the selected
 build (`enforced`, `partial`, `diverges`, `unmeasured`) and writes
-[`registry/libhdf5-evidence.yml`](registry/libhdf5-evidence.yml). That file is
+[`registry/libhdf5-evidence.yml`](../registry/libhdf5-evidence.yml). That file is
 the **measurement**; `validation-coverage.yml`'s `validators.hdf5` is the
 hand-maintained **claim**, and `tools/check_registry.py` fails on any
 disagreement — so a claim about libhdf5 cannot drift from what was observed.
@@ -115,7 +115,7 @@ tools/h5cve evidence --libhdf5-version 2.2.0    # ~8s, runs the matrix itself
 
 `h5cve verification` scores each family against the eleven §12 verification
 requirements and writes
-[`registry/verification-coverage.yml`](registry/verification-coverage.yml).
+[`registry/verification-coverage.yml`](../registry/verification-coverage.yml).
 Statuses are `met`, `partial`, `absent` or `not_assessed` — the last is not a
 soft `met`, and requirements that would need fixtures classified by hand are
 marked that way rather than inferred. `check_registry.py` enforces that every
@@ -144,7 +144,7 @@ metadata-dense head). A sampled sweep is not an exhaustive one and does not
 satisfy §12. `run.sh` runs a bounded subset as a regression check; the full
 corpus sweep is on-demand, like the fuzzer.
 
-Results land in [`registry/truncation-sweep.json`](registry/truncation-sweep.json),
+Results land in [`registry/truncation-sweep.json`](../registry/truncation-sweep.json),
 which `h5cve verification` reads to score the §12 truncation requirement.
 
 ## Lazy-Validation Measurement
@@ -181,7 +181,7 @@ ladder remains at 463 metadata bytes while operations move only 229 → 233
 across 1,061× physical growth. The sensitivity control rises
 375 → 987 → 7,107 operations. These ratios are derived from the
 `physical_bytes` endpoints in
-[`registry/lazy-validation.json`](registry/lazy-validation.json), not from the
+[`registry/lazy-validation.json`](../registry/lazy-validation.json), not from the
 nominal element-count ratio.
 
 ## In-Process Seam Self-Check
@@ -219,7 +219,7 @@ few analyses and both orders then agree. Neither check subsumes the other.
 ## h5mutate Semantic Mutation Engine
 
 `tools/h5mutate` applies **typed** mutations that each target one named invariant
-in [`registry/validation-coverage.yml`](registry/validation-coverage.yml), reseal
+in [`registry/validation-coverage.yml`](../registry/validation-coverage.yml), reseal
 the enclosing checksums, and emit a recipe sidecar (parent hash, intended
 invariant/finding, changed byte ranges, reseals).  Each mutant is
 self-validating — `family --verify` asserts h5policy emits the intended finding.
@@ -242,7 +242,7 @@ what lands tracked artifacts in `h5policy/tests/` and `registry/`.  The exact-
 build probe (`tools/h5policy-probe`, and `h5policy/tools/probe/`) runs a selected
 libhdf5 build under an `LD_PRELOAD` activation interposer inside a sandbox and
 reports whether rejection preceded any OS-observable activation; see
-[`h5policy/tools/probe/README.md`](h5policy/tools/probe/README.md).
+[`h5policy/tools/probe/README.md`](../h5policy/tools/probe/README.md).
 
 ## Marker Scanner
 
@@ -284,7 +284,7 @@ build/h5markers --help
 The scanner prints one line per detected marker with the marker name and its file offset in both
 hexadecimal and decimal. Progress is reported on stderr when scanning in a terminal.
 
-For example, scanning the sample file `file.h5` in this repository produces the following output:
+For example, scanning the sample file `examples/file.h5` in this repository produces the following output:
 
 ```text
 HDF5_SIGNATURE  0x0000000000000000 (0)
@@ -307,8 +307,8 @@ TREE            0x00000000000001DF (479)
 Commands supplied with `-c`/`--command` or on a piped standard input run as a batch session that exits instead of entering the REPL:
 
 ```sh
-printf 'root\nls\n' | ./tools/h5explain file.h5
-./tools/h5explain -c root -c ls file.h5
+printf 'root\nls\n' | ./tools/h5explain examples/file.h5
+./tools/h5explain -c root -c ls examples/file.h5
 ```
 
 **Navigation commands:** `root`, `h5super`, `cd ("PATH")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
@@ -324,7 +324,7 @@ Version 1 object headers have no signature, so `go`/`gos` infer them from the ve
 
 **Policy commands:** `check`, `check_all`, `profile`, `profile ("NAME")`
 
-`check` runs the h5policy oracle over the open file and reports the findings that bear on the cursor — matched by byte extent or by object path, since h5policy anchors findings both ways. When nothing bears on the cursor it distinguishes *reached*, *not reached*, *not recorded for this kind*, and *walk stopped early*, so silence is never mistaken for a clean bill of health. See [`h5explain/README.md`](h5explain/README.md#policy-checks).
+`check` runs the h5policy oracle over the open file and reports the findings that bear on the cursor — matched by byte extent or by object path, since h5policy anchors findings both ways. When nothing bears on the cursor it distinguishes *reached*, *not reached*, *not recorded for this kind*, and *walk stopped early*, so silence is never mistaken for a clean bill of health. See [`h5explain/README.md`](../h5explain/README.md#policy-checks).
 
 Use `msgs` to list object-header messages, then `explain (N)` or `explain_msg (N)` to explain message `N` in the current object header. Type `help` at the prompt for a full description of each command.
 

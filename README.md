@@ -1,111 +1,54 @@
 # H5Lens: HDF5 Pickles and Policy Workbench
 
-`H5Lens` is a machine-readable description of HDF5 on-disk metadata using
-[GNU poke](https://www.jemarch.net/poke/) pickles. It is both a format
-exploration kit and the home of `h5policy`, an independent metadata preflight
-oracle for hostile or untrusted HDF5 files.  It also includes the early
-`h5patch` repair planner for proposing and applying conservative metadata
-repairs.
+H5Lens describes HDF5 on-disk metadata with
+[GNU poke](https://www.jemarch.net/poke/) pickles. It combines reusable format
+definitions with an interactive explorer, an independent preflight oracle for
+untrusted files, a conservative repair planner, and a marker scanner.
 
 ## What's Here
 
-- [`pickles/`](pickles/) contains the reusable HDF5 format definitions loaded by
-  GNU poke. Its `h5_format_constants.pk` module is the canonical source for
-  literals shared by declarative mappings and independent validators.
-- [`h5policy/`](h5policy/) contains the policy oracle, focused validators,
-  security profiles, regression corpus, differential harness, and fuzzing tools.
-- [`h5patch/`](h5patch/) contains the experimental metadata repair planner,
-  JSON patch-plan format, apply workflow, and repair tests.
-- [`h5explain/`](h5explain/) contains the interactive GNU poke explorer for
-  byte-level HDF5 metadata navigation.
-- [`src/`](src/) contains the marker scanner implementation.
-- [`tools/`](tools/) collects top-level command symlinks and repository helper
-  scripts such as the documentation generator.
-- [`docs/`](docs/) contains YAML format notes and generated Markdown reference
-  pages, plus a [tool relationship overview](docs/tool-overview.md).
-- [`emacs/`](emacs/) contains an Emacs front end for inspecting HDF5 files
-  through GNU poke.
-- [`examples/`](examples/) contains poke scripts for generating and inspecting
-  HDF5 structures.
-- [`.devcontainer/`](.devcontainer/README.md) provides an analysis-ready
-  GitHub Codespaces and VS Code Dev Containers environment.
-- [`MARKERS.md`](MARKERS.md), [`TOOLS.md`](TOOLS.md), and
-  [`TUTORIAL.md`](TUTORIAL.md) explain the format markers, helper tools, and a
-  hands-on exploration path.
+| Area | Purpose |
+| --- | --- |
+| [`pickles/`](pickles/) | Reusable HDF5 format definitions for GNU poke. |
+| [`h5policy/`](h5policy/) | Metadata preflight, security profiles, regression corpus, differential testing, and fuzzing. |
+| [`h5patch/`](h5patch/) | Evidence-gated repair planning, application, and audit logging. |
+| [`h5explain/`](h5explain/) | Interactive byte-level metadata navigation. |
+| [`src/`](src/) | The `h5markers` scanner implementation. |
+| [`tools/`](tools/) | Command entry points and repository helper scripts. |
+| [`docs/`](docs/) | The [tutorial](docs/TUTORIAL.md), [tool guide](docs/TOOLS.md), [marker reference](docs/MARKERS.md), generated format reference, and [tool map](docs/tool-overview.md). |
+| [`examples/`](examples/) | Sample HDF5 files and GNU poke scripts. |
+| [`emacs/`](emacs/) | An Emacs front end for inspecting HDF5 files. |
+| [`.devcontainer/`](.devcontainer/README.md) | A ready-to-use Codespaces and VS Code Dev Containers environment. |
 
 ## Quick Start
 
-Run `h5policy` against an HDF5 file:
+The [development container](.devcontainer/README.md) provides the complete
+toolchain. Run these commands from the repository root.
 
 ```sh
-./tools/h5policy --profile untrusted-strict file.h5
-```
+# Preflight an untrusted HDF5 file.
+./tools/h5policy --profile untrusted-strict examples/file.h5
 
-Run every regression suite through CTest:
+# Explore the sample's metadata interactively.
+./tools/h5explain examples/file.h5
 
-```sh
-cmake -S . -B build
-ctest --test-dir build --output-on-failure -j4
-```
-
-Create a what-if metadata repair plan:
-
-```sh
+# Create and inspect a repair plan without modifying the input.
 ./tools/h5patch plan damaged.h5 -o repair.plan.json
 ./tools/h5patch explain repair.plan.json
 ```
 
-Build the marker scanner and generated format docs:
+Build the marker scanner, run the regression suite, and check the documentation:
 
 ```sh
 cmake -S . -B build
-cmake --build build
-cmake --build build --target docs
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+cmake --build build --target docs-check
 ```
 
-Explore the sample file interactively:
-
-```sh
-./tools/h5explain file.h5
-```
-
-See [`h5explain/README.md`](h5explain/README.md) for interactive navigation
-commands and [`TUTORIAL.md`](TUTORIAL.md) for a guided GNU poke walkthrough.
-
-## h5policy In Under A Minute
-
-`h5policy` maps HDF5 metadata with GNU poke, validates the metadata it can reach,
-applies a selected security profile, and emits a JSON decision with stable exit
-codes. It is intentionally metadata-only: it does not call `libhdf5`, load
-plugins, decompress data, open external files, repair inputs, write files, or
-deserialize application payloads.
-
-Use [`h5policy/README.md`](h5policy/README.md) for profile behavior, exit codes,
-coverage, checksum notes, and CLI examples. Use
-[`h5policy/tests/README.md`](h5policy/tests/README.md) for the corpus,
-differential harness, and fuzzing workflow.
-
-## h5patch In Under A Minute
-
-`h5patch` plans byte-level repairs for damaged HDF5 metadata, applies only an
-approved JSON plan, writes an audit log, and verifies the result with
-`h5policy`. Planning is a what-if operation: it does not modify the input file.
-
-The current catalog contains `12` evidence-gated repair classes. At a glance,
-they cover:
-
-- file bootstrap and superblock repairs: signature, base address, consistency
-  flags, and checksums;
-- reachable object-header repairs: v1 message counts, v2 checksums, v4
-  chunk-layout element size, and typed scale-offset/N-bit filter parameters;
-- counted or indexed metadata repairs: free-space section totals, symbol-table
-  node counts, and depth-0 v2 B-tree total-record counts; and
-- trailing-checksum repairs for reached free-space, v2 B-tree,
-  extensible-array, and shared-message metadata.
-
-This overview is intentionally non-exhaustive. The authoritative and exhaustive
-[repair catalog](h5patch/README.md#repair-catalog) documents each repair,
-its evidence requirements, atomic checksum handling, and fail-closed cases.
+Continue with the guided [H5Lens tutorial](docs/TUTORIAL.md), or see the
+[`h5policy`](h5policy/README.md), [`h5patch`](h5patch/README.md), and
+[`h5explain`](h5explain/README.md) guides for complete command behavior.
 
 ## Acknowledgments
 

@@ -26,7 +26,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 PICKLE = ROOT / "h5explain/pickles/h5explain.pk"
 README = ROOT / "h5explain/README.md"
-TOOLS = ROOT / "TOOLS.md"
+TOOLS = ROOT / "docs/TOOLS.md"
 TESTS = ROOT / "h5explain/tests/test_h5explain.py"
 
 

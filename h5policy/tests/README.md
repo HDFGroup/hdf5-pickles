@@ -66,7 +66,7 @@ This regenerates the fixtures and runs every gate in one pass:
 The truncation sweep and lazy-validation ladders are strategy-doc §12
 measurements, and the mutation family feeds its fuzz-target requirement; the
 seam self-check is not a §12 item but the gate that makes batching analyses
-safe. See [`TOOLS.md`](../../TOOLS.md) for running any of them standalone, and
+safe. See [`TOOLS.md`](../../docs/TOOLS.md) for running any of them standalone, and
 [`registry/verification-coverage.yml`](../../registry/verification-coverage.yml)
 for what §12 currently scores.
 

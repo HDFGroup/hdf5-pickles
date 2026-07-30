@@ -1,12 +1,17 @@
-# Tutorial
+# Low-Level GNU poke Tutorial
 
-This short tutorial shows how to explore the sample HDF5 file `file.h5` from the poke REPL using the pickles in this repository. It assumes GNU poke is installed and that you start from the repository root.
+This advanced tutorial shows how to explore the sample HDF5 file
+`examples/file.h5` directly from the GNU poke REPL using the repository's
+pickles. Start with the [H5Lens tutorial](TUTORIAL.md) if you want the supported
+`h5explain` workflow; continue here to see the mappings, address conversions,
+and checksum operations underneath it.
+
+It assumes GNU poke is installed and that you start from the repository root.
 
 Start poke with the repository `pickles/` directory on the load path:
 
 ```sh
-cd <THIS DIRECTORY>
-POKE_LOAD_PATH=$PWD/pickles poke file.h5
+POKE_LOAD_PATH=$PWD/pickles poke examples/file.h5
 ```
 
 At the `(poke)` prompt, load the pickles needed for the superblock and object headers:
@@ -40,7 +45,7 @@ Expected output:
 48UL#B
 ```
 
-This tells us that `file.h5` uses a version 2 superblock and that the root object header starts at byte offset `48`.
+This tells us that `examples/file.h5` uses a version 2 superblock and that the root object header starts at byte offset `48`.
 
 ## 2. Decode the root object header
 
@@ -222,7 +227,7 @@ var bt = bt1_hdr @ 479#B
 bt
 ```
 
-Why `3UB`? `v1_btree.pk` expects the raw-chunk key width to be the dataset dimensionality plus one. `file.h5` stores a 2-dimensional dataset (`8 x 8`), so the correct setting here is `2 + 1 = 3`.
+Why `3UB`? `v1_btree.pk` expects the raw-chunk key width to be the dataset dimensionality plus one. `examples/file.h5` stores a 2-dimensional dataset (`8 x 8`), so the correct setting here is `2 + 1 = 3`.
 
 Enable tree-style pretty printing in the current session. You can also put
 these commands in poke's configuration file (`~/.pokerc`):
@@ -289,7 +294,7 @@ For a more readable dump, use the recursive printer:
 print_v1_btree (479#B, 0)
 ```
 
-This prints the four chunk records in `file.h5`. Since `node_level=0`, this root node is also a leaf, so there are no child B-tree nodes to descend into; each `child_raw` value is the file address of the chunk payload itself.
+This prints the four chunk records in `examples/file.h5`. Since `node_level=0`, this root node is also a leaf, so there are no child B-tree nodes to descend into; each `child_raw` value is the file address of the chunk payload itself.
 
 Expected output (with options for readability):
 
@@ -354,135 +359,8 @@ You can also ask poke what each pickle defines:
 .info type oh_hdr
 ```
 
-This is useful when extending the pickles or when you want to discover methods such as `get_messages ()` directly from the REPL.
+This is useful when extending the pickles or when you want to discover methods
+such as `get_messages ()` directly from the REPL.
 
-## 6. Try a write on a disposable copy
-
-Poke maps are writable. To avoid modifying the sample file in the repository, make a copy first:
-
-```sh
-cp file.h5 file-edit.h5
-POKE_LOAD_PATH=$PWD/pickles poke file-edit.h5
-```
-
-Then edit a scalar field through the mapped object header:
-
-```poke
-load common
-load ohdr_msgs
-var root = oh_hdr @ 48#B
-root._ohdr.v2.timestamps.birth
-root._ohdr.v2.timestamps.birth = 0U
-root._ohdr.v2.timestamps.birth
-```
-
-Expected output:
-
-```text
-(poke) root._ohdr.v2.timestamps.birth
-1773447782U
-(poke) root._ohdr.v2.timestamps.birth = 0U
-(poke) root._ohdr.v2.timestamps.birth
-0U
-```
-
-This demonstrates byte-level write-through via the mapped pickle types. It does not automatically update higher-level HDF5 consistency metadata, so for real edits you may also need to recompute dependent fields such as checksums.
-
-## 7. Creating an "empty" HDF5 file
-
-We can also build a minimal HDF5 file from scratch: a version 2 superblock followed by a version 2 root object header for the root group. This time we construct the metadata in a memory-backed IOS first, and only save it to disk at the end.
-
-Start poke from the repository root without opening a file yet:
-
-```sh
-cd <THIS DIRECTORY>
-POKE_LOAD_PATH=$PWD/pickles poke
-```
-
-At the `(poke)` prompt, load the helper pickle and create a fresh memory IOS:
-
-```poke
-load construct
-load lookup3
-.mem image
-```
-
-First construct the version 2 superblock value. The root object header will start at offset `48#B`, and the final image size will be `179#B`:
-
-```poke
-fun undef_addr = uint<8>[8]: { return uint<8>[8] (255); }
-
-var sb = superblock_v2 { sizeof_offsets = 8UB, sizeof_lengths = 8UB, ext_addr_raw = undef_addr, eof_addr_raw = u64_to_bytes_le (179UL, 8), root_obj_addr_raw = u64_to_bytes_le (48UL, 8) }
-```
-
-Now stage the root-group messages in the memory IOS at offset `1024#B`. That offset is arbitrary; we just use it as scratch space while building the object header chunk. The memory IOS starts zero-filled, so the `88` data bytes of the NIL message do not need any explicit initialization.
-
-```poke
-msg_prefix_v2 @ 1024#B = msg_prefix_v2 { msg_type = 2UB, msg_size = 18UH, msg_flags = 0UB }
-oh_msg_linfo @ 1028#B = oh_msg_linfo { version = 0UB, flags = 0UB, fheap_addr_raw = undef_addr, name_bt2_addr_raw = undef_addr }
-
-msg_prefix_v2 @ 1046#B = msg_prefix_v2 { msg_type = 10UB, msg_size = 2UH, msg_flags = 1UB }
-oh_msg_ginfo @ 1050#B = oh_msg_ginfo { version = 0UB, flags = 0UB }
-
-msg_prefix_v2 @ 1052#B = msg_prefix_v2 { msg_type = 0UB, msg_size = 88UH, msg_flags = 0UB }
-
-var root = ohdr_v2 { flags = 0UB, chunk0_size = [120UB], msg_chunk = byte[120] @ 1024#B }
-```
-
-Serialize the typed values into the first `179` bytes of the memory IOS, compute the checksums, and save the result to disk:
-
-```poke
-superblock_v2 @ 0#B = sb
-var sb_map = superblock_v2 @ 0#B
-sb_map.chksum = lookup3_hashlittle(byte[44] @ 0#B, 0)
-
-ohdr_v2 @ 48#B = root
-var root_map = ohdr_v2 @ 48#B
-root_map.chksum = lookup3_hashlittle(byte[127] @ 48#B, 0)
-
-save :file "empty.h5" :size 179#B
-```
-
-Finally, map the image back using the parser pickles and verify it:
-
-```poke
-var sb2 = superblock @ 0#B
-var root2 = oh_hdr @ 48#B
-
-sb2.super_vers
-bytes_to_off (sb2.super.v2_v3.root_obj_addr_raw)
-lookup3_hashlittle(byte[44] @ 0#B, 0)
-lookup3_u32_le(root2._ohdr.v2.chksum)
-lookup3_hashlittle(byte[root2'size as offset<uint<64>,B> - 4UL#B] @ 48#B, 0)
-root2.get_messages ()
-```
-
-Expected output snippet:
-
-```text
-(poke) sb2.super_vers
-2UB
-(poke) bytes_to_off (sb2.super.v2_v3.root_obj_addr_raw)
-48UL#B
-(poke) lookup3_hashlittle(byte[44] @ 0#B, 0)
-673867655U
-(poke) lookup3_u32_le(root2._ohdr.v2.chksum)
-2898835909U
-(poke) lookup3_hashlittle(byte[root2'size as offset<uint<64>,B> - 4UL#B] @ 48#B, 0)
-2898835909U
-
-Message 0...
-oh_msg_linfo { ... }
-
-Message 1...
-oh_msg_ginfo {
-  version=0UB,
-  flags=0UB
-}
-
-Message 2...
-oh_msg_nil {
-}
-```
-
-At this point `empty.h5` is a valid HDF5 file containing only the root group. For an external check, `h5dump -pBH empty.h5` reports `SUPERBLOCK_VERSION 2` and `GROUP "/" {}`.
+Continue with [Writing HDF5 with GNU poke](POKE_CONSTRUCTION.md) only when you
+are ready to work with write-through mappings and dependent checksums.

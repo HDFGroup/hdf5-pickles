@@ -27,11 +27,11 @@ or payload decoders get a chance to run.
 Run from the repository root:
 
 ```sh
-./h5policy/tools/h5policy --profile untrusted-strict file.h5
-./h5policy/tools/h5policy --profile trusted-fast file.h5
-./h5policy/tools/h5policy --profile legacy file.h5
-./h5policy/tools/h5policy --profile forensic --continue-after-rejection file.h5
-./h5policy/tools/h5policy --profile trusted-fast --max-walk-seconds 60 file.h5
+./h5policy/tools/h5policy --profile untrusted-strict examples/file.h5
+./h5policy/tools/h5policy --profile trusted-fast examples/file.h5
+./h5policy/tools/h5policy --profile legacy examples/file.h5
+./h5policy/tools/h5policy --profile forensic --continue-after-rejection examples/file.h5
+./h5policy/tools/h5policy --profile trusted-fast --max-walk-seconds 60 examples/file.h5
 ```
 
 Output is JSON (the machine-readable result); it is the only format, so no flag

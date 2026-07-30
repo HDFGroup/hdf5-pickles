@@ -27,6 +27,7 @@
 type H5PolicyMsgRef = struct
 {
     uint<8> found;
+    uint<8> diagnosed;
     offset<uint<64>,B> payload_off;
     uint<64> msg_size;
     uint<8> flags;
@@ -38,6 +39,22 @@ fun h5policy_msg_ref_none = H5PolicyMsgRef:
     return H5PolicyMsgRef
     {
         found = 0UB,
+        diagnosed = 0UB,
+        payload_off = 0UL#B,
+        msg_size = 0UL,
+        flags = 0UB
+    };
+}
+
+/* "Not found" result for committed-header scans that already emitted a
+   concrete corruption finding.  Callers can then avoid layering a generic
+   coverage-gap message on top of the more specific diagnosis.  */
+fun h5policy_msg_ref_diagnosed_none = H5PolicyMsgRef:
+{
+    return H5PolicyMsgRef
+    {
+        found = 0UB,
+        diagnosed = 1UB,
         payload_off = 0UL#B,
         msg_size = 0UL,
         flags = 0UB
@@ -50,6 +67,11 @@ fun h5policy_msg_ref_none = H5PolicyMsgRef:
    into unbounded work, while the main walk still enforces the full budget when
    it validates the same object independently.  */
 var H5POLICY_SHARED_CONT_DEPTH = 32;
+
+/* Bound on nested shared-message indirections.  Cycle detection makes the
+   common corrupt case concrete, while this cap keeps long acyclic chains from
+   turning one payload lookup into unbounded recursive work.  */
+var H5POLICY_SHARED_NESTED_DEPTH = 32;
 
 /* Search one object-header chunk for a message type without fully validating
    the chunk.  Shared-message resolution needs this lightweight scan to find the
@@ -121,7 +143,7 @@ fun h5policy_find_message_in_chunk = (int ios,
                                         "shared-message object header message payload overruns chunk");
                     global_version = old_version;
                     global_crt_tracked = old_crt_tracked;
-                    return h5policy_msg_ref_none;
+                    return h5policy_msg_ref_diagnosed_none;
                 }
 
             if (m_type == wanted_type)
@@ -131,6 +153,7 @@ fun h5policy_find_message_in_chunk = (int ios,
                     return H5PolicyMsgRef
                     {
                         found = 1UB,
+                        diagnosed = 0UB,
                         payload_off = payload_off,
                         msg_size = m_size,
                         flags = m_flags
@@ -201,7 +224,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
     if (!h5policy_checked_addr_range(obj_addr, 4UL, file_size,
                                      "shared-message object header outside file",
                                      loc, object))
-        return h5policy_msg_ref_none;
+        return h5policy_msg_ref_diagnosed_none;
 
     var root_off = obj_addr#B;
     var sig = h5policy_msg_bytes(ios, profile, root_off, 4UL);
@@ -222,7 +245,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
                     h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
                                         "corrupt", root_off, object,
                                         "shared-message object header has an unsupported version byte");
-                    return h5policy_msg_ref_none;
+                    return h5policy_msg_ref_diagnosed_none;
                 }
 
             var cursor = root_off + 6#B;
@@ -252,7 +275,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
             if (!h5policy_checked_addr_range(obj_addr, total_size, file_size,
                                              "shared-message object header outside file",
                                              root_off, object))
-                return h5policy_msg_ref_none;
+                return h5policy_msg_ref_diagnosed_none;
 
             var crt_order_tracked = ((flags & 4U) != 0U);
             var prefix_bytes = crt_order_tracked ? (V2_PREFIX_BYTES + 2) : V2_PREFIX_BYTES;
@@ -276,7 +299,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
             h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_OBJECT_HEADER_VERSION",
                                 "corrupt", root_off, object,
                                 "shared-message object header is neither v1 nor v2");
-            return h5policy_msg_ref_none;
+            return h5policy_msg_ref_diagnosed_none;
         }
 
     var chunk_size1 = h5policy_msg_u64_at(ios, profile,
@@ -290,7 +313,7 @@ fun h5policy_find_message_in_ohdr = (int ios,
     if (!h5policy_checked_addr_range(obj_addr, total_size1, file_size,
                                      "shared-message object header outside file",
                                      root_off, object))
-        return h5policy_msg_ref_none;
+        return h5policy_msg_ref_diagnosed_none;
 
     return h5policy_find_message_in_chunk(ios, profile, version1,
                                           V1_PREFIX_BYTES, 0,
@@ -299,16 +322,19 @@ fun h5policy_find_message_in_ohdr = (int ios,
                                           loc, object);
 }
 
-/* Resolve an object-header message marked "shared".  h5policy currently covers
-   the committed-object-header representation; heap/table shared-message
-   storage is reported as a coverage gap so the decision is conservative rather
-   than silently accepting an unvalidated indirection.  */
-fun h5policy_resolve_shared_message = (int ios,
-                                       H5PolicyProfile profile,
-                                       uint<64> m_type,
-                                       offset<uint<64>,B> payload_off,
-                                       uint<64> msg_size,
-                                       string object) H5PolicyMsgRef:
+/* Resolve an object-header message marked "shared".  Committed-object-header
+   targets may themselves contain shared wrappers, so this helper follows that
+   indirection with a visited-address set and a recursion cap.  Heap/table
+   shared-message storage still routes through the SOHM resolver and remains a
+   conservative coverage gap when the payload cannot be recovered.  */
+fun h5policy_resolve_shared_message_inner = (int ios,
+                                             H5PolicyProfile profile,
+                                             uint<64> m_type,
+                                             offset<uint<64>,B> payload_off,
+                                             uint<64> msg_size,
+                                             string object,
+                                             uint<64>[] seen_addrs,
+                                             uint<64> depth) H5PolicyMsgRef:
 {
     var o = global_sizeof_offsets as uint<64>;
     var l = global_sizeof_lengths as uint<64>;
@@ -370,15 +396,16 @@ fun h5policy_resolve_shared_message = (int ios,
                                         "SOHM heap-backed shared message could not be resolved");
                     return h5policy_msg_ref_none;
                 }
-            return H5PolicyMsgRef { found = 1UB, payload_off = sr.payload_off,
+            return H5PolicyMsgRef { found = 1UB, diagnosed = 0UB,
+                                    payload_off = sr.payload_off,
                                     msg_size = sr.msg_size, flags = 0UB };
         }
 
     if (share_type != 2UL)
         {
-            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
-                                "unsupported", payload_off, object,
-                                "shared object-header message is not stored in a committed object header");
+            h5policy_emit_error("H5_CORRUPT_SHARED_MESSAGE_LOCATION",
+                                "corrupt", payload_off, object,
+                                "shared-message storage location is invalid");
             return h5policy_msg_ref_none;
         }
 
@@ -391,22 +418,53 @@ fun h5policy_resolve_shared_message = (int ios,
         }
 
     var obj_addr = h5policy_msg_addr_at(ios, profile, payload_off + loc_rel#B, o);
+    if (h5policy_seen_u64(seen_addrs, obj_addr))
+        {
+            h5policy_emit_error("H5_CORRUPT_SHARED_MESSAGE_CYCLE",
+                                "corrupt", payload_off, object,
+                                "nested shared object-header message resolution contains a cycle");
+            return h5policy_msg_ref_diagnosed_none;
+        }
+    seen_addrs += [obj_addr];
     var ref = h5policy_find_message_in_ohdr(ios, profile, obj_addr,
                                             m_type, payload_off, object);
     if (ref.found == 0UB)
-        h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
-                            "unsupported", payload_off, object,
-                            "shared committed object header does not expose the requested message");
+        {
+            if (ref.diagnosed == 0UB)
+                h5policy_emit_error("H5_CORRUPT_SHARED_MESSAGE_TARGET_TYPE",
+                                    "corrupt", payload_off, object,
+                                    "shared committed object header does not expose the requested message type");
+        }
     else if ((ref.flags & 0x02UB) != 0UB)
         {
-            /* A shared target that is itself shared would require nested shared
-               message resolution and cycle detection; report the gap instead of
-               following an unbounded indirection chain.  */
-            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
-                                "unsupported", ref.payload_off, object,
-                                "nested shared object-header message resolution is not covered yet");
-            return h5policy_msg_ref_none;
+            if (depth == 0UL)
+                {
+                    h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                        "unsupported", ref.payload_off, object,
+                                        "nested shared object-header message resolution exceeded bounded depth");
+                    return h5policy_msg_ref_none;
+                }
+            return h5policy_resolve_shared_message_inner(ios, profile,
+                                                         m_type,
+                                                         ref.payload_off,
+                                                         ref.msg_size,
+                                                         object,
+                                                         seen_addrs,
+                                                         depth - 1UL);
         }
 
     return ref;
+}
+
+fun h5policy_resolve_shared_message = (int ios,
+                                       H5PolicyProfile profile,
+                                       uint<64> m_type,
+                                       offset<uint<64>,B> payload_off,
+                                       uint<64> msg_size,
+                                       string object) H5PolicyMsgRef:
+{
+    return h5policy_resolve_shared_message_inner(ios, profile, m_type,
+                                                 payload_off, msg_size,
+                                                 object, uint<64>[](),
+                                                 H5POLICY_SHARED_NESTED_DEPTH);
 }

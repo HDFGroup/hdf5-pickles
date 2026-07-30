@@ -753,20 +753,30 @@ data are handled separately: deflate, szip, n-bit, and scale-offset produce
 An object-header message ID outside the recognized range is always counted in
 `features.unknown_messages`.
 
-When this field is zero, h5policy emits:
+When the on-disk prefix flags are available, an out-of-range object-header
+message ID with the skip-if-unknown bit clear is treated as malformed envelope
+encoding, not as a policy or coverage choice. h5policy emits:
+
+```text
+H5_CORRUPT_OBJECT_HEADER_MESSAGE_TYPE_RANGE (corrupt)
+```
+
+When the skip-if-unknown bit is set and this field is zero, h5policy emits:
 
 ```text
 H5_POLICY_UNKNOWN_MESSAGE (policy)
 ```
 
-When it is nonzero, h5policy instead emits:
+When the skip-if-unknown bit is set and this field is nonzero, h5policy instead
+emits:
 
 ```text
 H5_UNSUPPORTED_PICKLE_COVERAGE_GAP (unsupported)
 ```
 
-Thus, nonzero does not make an unknown message an unconditional accept; it
-changes the classification from denied-by-policy to not-covered-by-validator.
+Thus, nonzero does not make an unknown message an unconditional accept; it only
+reclassifies a prefix-valid, skippable unknown message from denied-by-policy to
+not-covered-by-validator.
 
 ### `allow_legacy_dangerous_messages`
 
