@@ -253,6 +253,92 @@
       (when (get-buffer buffer-name) (kill-buffer buffer-name))
       (when (buffer-live-p session) (kill-buffer session)))))
 
+(ert-deftest hdf5-poke-renders-complex-datatype-tree ()
+  (let ((session (generate-new-buffer " *hdf5-poke-test-session*"))
+        (buffer-name "*hdf5-poke-message:file.h5:Datatype@872*"))
+    (unwind-protect
+        (with-current-buffer session
+          (hdf5-poke-mode)
+          (setq-local hdf5-poke--target-file "/tmp/file.h5")
+          (setq-local hdf5-poke--process-buffer (current-buffer))
+          (hdf5-poke--render-message-detail
+           3 872
+           '((:record message-detail :type 3 :name "Datatype"
+                      :payload-offset 872 :size 28)
+             (:record datatype :version 5 :class 11 :class-name "complex"
+                      :element-size 8 :flags 347)
+             (:record datatype-node :path "$" :depth 0 :offset 872
+                      :version 5 :class 11 :class-name "complex"
+                      :element-size 8 :flags 347
+                      :homogeneous t :form "rectangular")
+             (:record datatype-base :parent-path "$"
+                      :child-path "$<base>" :depth 1
+                      :role "complex-base")
+             (:record datatype-node :path "$<base>" :depth 1 :offset 880
+                      :version 1 :class 1 :class-name "floating-point"
+                      :element-size 4 :flags 2039825
+                      :byte-order "little-endian"
+                      :bit-offset 0 :bit-precision 32
+                      :exponent-location 23 :exponent-size 8
+                      :mantissa-location 0 :mantissa-size 23
+                      :exponent-bias 127))
+           '("H5O_msg_dtype {...}")
+           nil
+           "Datatype")
+          (with-current-buffer buffer-name
+            (should (derived-mode-p 'hdf5-poke-message-detail-mode))
+            (should (save-excursion
+                      (goto-char (point-min))
+                      (search-forward "$: complex" nil t)))
+            (should (save-excursion
+                      (goto-char (point-min))
+                      (search-forward "homogeneous" nil t)))
+            (should (save-excursion
+                      (goto-char (point-min))
+                      (search-forward "form=rectangular" nil t)))
+            (should (save-excursion
+                      (goto-char (point-min))
+                      (search-forward
+                       "complex-base: floating-point" nil t)))))
+      (when (get-buffer buffer-name) (kill-buffer buffer-name))
+      (when (buffer-live-p session) (kill-buffer session)))))
+
+(ert-deftest hdf5-poke-renders-complex-datatype-undefined-encoding ()
+  "A complex node with no defined property layout has no base child to show."
+  (let ((session (generate-new-buffer " *hdf5-poke-test-session*"))
+        (buffer-name "*hdf5-poke-message:file.h5:Datatype@872*"))
+    (unwind-protect
+        (with-current-buffer session
+          (hdf5-poke-mode)
+          (setq-local hdf5-poke--target-file "/tmp/file.h5")
+          (setq-local hdf5-poke--process-buffer (current-buffer))
+          (hdf5-poke--render-message-detail
+           3 872
+           '((:record message-detail :type 3 :name "Datatype"
+                      :payload-offset 872 :size 28)
+             (:record datatype :version 5 :class 11 :class-name "complex"
+                      :element-size 8 :flags 91)
+             (:record datatype-node :path "$" :depth 0 :offset 872
+                      :version 5 :class 11 :class-name "complex"
+                      :element-size 8 :flags 91
+                      :homogeneous nil :form "rectangular"
+                      :encoding "undefined"))
+           '("H5O_msg_dtype {...}")
+           nil
+           "Datatype")
+          (with-current-buffer buffer-name
+            (should (save-excursion
+                      (goto-char (point-min))
+                      (search-forward "heterogeneous" nil t)))
+            (should (save-excursion
+                      (goto-char (point-min))
+                      (search-forward "encoding=undefined" nil t)))
+            (should-not (save-excursion
+                          (goto-char (point-min))
+                          (search-forward "complex-base" nil t)))))
+      (when (get-buffer buffer-name) (kill-buffer buffer-name))
+      (when (buffer-live-p session) (kill-buffer session)))))
+
 (ert-deftest hdf5-poke-renders-dataset-preview-values ()
   (let ((session (generate-new-buffer " *hdf5-poke-test-session*"))
         (buffer-name "*hdf5-poke-data:file.h5@1832*"))

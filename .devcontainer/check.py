@@ -20,13 +20,17 @@ DEVCONTAINER = ROOT / ".devcontainer"
 DOCKERFILE = DEVCONTAINER / "Dockerfile"
 CONFIG = DEVCONTAINER / "devcontainer.json"
 POST_CREATE = DEVCONTAINER / "post-create.sh"
+BUILD_HDF5 = DEVCONTAINER / "build-hdf5.sh"
 README = DEVCONTAINER / "README.md"
 H5POLICY = ROOT / "tools" / "h5policy"
 
 HDF5_REPOSITORY = "https://github.com/HDFGroup/hdf5.git"
 HDF5_SOURCE_DIR = Path("/opt/hdf5")
+HDF5_RELEASE_PREFIX = Path("/opt/hdf5-release")
+HDF5_32_PREFIX = Path("/opt/hdf5-32")
 HDF5_ASAN_PREFIX = Path("/opt/hdf5-asan")
 MINIMUM_HDF5_CMAKE = (3, 26)
+MINIMUM_CLAUDE_NODE = (22, 0)
 
 REQUIRED_ASAN_HEADERS = (
     Path("/usr/include/szlib.h"),
@@ -49,12 +53,16 @@ REQUIRED_PACKAGES = {
     "curl",
     "emacs-nox",
     "gdb",
+    "gcc-multilib",
     "git",
     "github-cli",
     "hdf5",
     "jq",
     "libaec",
     "libasan",
+    "lib32-gcc-libs",
+    "nodejs",
+    "npm",
     "openssh",
     "poke",
     "procps-ng",
@@ -76,7 +84,9 @@ REQUIRED_COMMANDS = (
     "cc",
     "c++",
     "cmake",
+    "codex",
     "ctest",
+    "claude",
     "emacs",
     "gdb",
     "git",
@@ -89,6 +99,7 @@ REQUIRED_COMMANDS = (
     "h5repack",
     "h5stat",
     "jq",
+    "node",
     "poke",
     "python3",
     "rg",
@@ -143,15 +154,30 @@ def check_configuration() -> None:
         fail("Dockerfile does not select the non-root development user")
     if "NOPASSWD:ALL" not in dockerfile:
         fail("Dockerfile does not configure development-user sudo")
+    if "npm install --global @openai/codex" not in dockerfile:
+        fail("Dockerfile does not install the Codex CLI globally")
+    claude_install = (
+        "npm install --global \\\n"
+        "        --allow-scripts=@anthropic-ai/claude-code \\\n"
+        "        @anthropic-ai/claude-code"
+    )
+    if claude_install not in dockerfile:
+        fail("Dockerfile does not install Claude Code with its scoped postinstall")
 
     if f"ARG HDF5_REPOSITORY={HDF5_REPOSITORY}" not in dockerfile:
         fail("Dockerfile does not declare the canonical HDF5 repository")
     if f"ENV HDF5_SOURCE_DIR={HDF5_SOURCE_DIR}" not in dockerfile:
         fail("Dockerfile does not expose the HDF5 checkout location")
-    if f"HDF5_ASAN_PREFIX={HDF5_ASAN_PREFIX}" not in dockerfile:
-        fail("Dockerfile does not expose the HDF5 ASan install prefix")
-    if f"\n        {HDF5_ASAN_PREFIX} \\\n" not in dockerfile:
-        fail("Dockerfile does not create the HDF5 ASan install prefix")
+    for variable, prefix, label in (
+        ("HDF5_RELEASE_PREFIX", HDF5_RELEASE_PREFIX, "release"),
+        ("HDF5_32_PREFIX", HDF5_32_PREFIX, "32-bit"),
+        ("HDF5_ASAN_PREFIX", HDF5_ASAN_PREFIX, "ASan"),
+    ):
+        if f"{variable}={prefix}" not in dockerfile:
+            fail(f"Dockerfile does not expose the HDF5 {label} install prefix")
+    for prefix in (HDF5_RELEASE_PREFIX, HDF5_32_PREFIX, HDF5_ASAN_PREFIX):
+        if f"\n        {prefix} \\\n" not in dockerfile:
+            fail(f"Dockerfile does not create the HDF5 install prefix {prefix}")
 
     clone_match = re.search(
         r'RUN git clone \\\n'
@@ -214,9 +240,39 @@ def check_configuration() -> None:
     for argument in ("--policy-report", "--policy-exit"):
         if argument not in post_create:
             fail(f"post-create policy verdict validation is missing {argument}")
-    for path in (HDF5_SOURCE_DIR, HDF5_ASAN_PREFIX):
+    for path in (
+        HDF5_SOURCE_DIR,
+        HDF5_RELEASE_PREFIX,
+        HDF5_32_PREFIX,
+        HDF5_ASAN_PREFIX,
+    ):
         if str(path) not in post_create:
             fail(f"post-create does not account for ownership of {path}")
+    if not BUILD_HDF5.is_file():
+        fail(".devcontainer/build-hdf5.sh is missing")
+    if not os.access(BUILD_HDF5, os.X_OK):
+        fail(".devcontainer/build-hdf5.sh is not executable")
+    build_hdf5 = BUILD_HDF5.read_text()
+    for fragment in (
+        "RelWithDebInfo",
+        "-fsanitize=address",
+        "-m32",
+        "HDF5_ENABLE_ZLIB_SUPPORT=OFF",
+        "ELF32",
+    ):
+        if fragment not in build_hdf5:
+            fail(f"build-hdf5.sh lacks the expected variant setting: {fragment}")
+    try:
+        subprocess.run(
+            ["bash", "-n", str(BUILD_HDF5)],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+    except subprocess.SubprocessError as exc:
+        fail(f"build-hdf5.sh has invalid shell syntax: {exc}")
     if not README.is_file():
         fail(".devcontainer/README.md is missing")
     readme = README.read_text()
@@ -227,7 +283,20 @@ def check_configuration() -> None:
         "full-history",
         f"`{HDF5_ASAN_PREFIX}`",
         "`$HDF5_ASAN_PREFIX`",
-        "-fsanitize=address",
+        f"`{HDF5_RELEASE_PREFIX}`",
+        "`$HDF5_RELEASE_PREFIX`",
+        f"`{HDF5_32_PREFIX}`",
+        "`$HDF5_32_PREFIX`",
+        "build-hdf5.sh",
+        "`--test`",
+        "## HDF5 variant builds",
+        "AddressSanitizer",
+        "`-m32`",
+        "gcc-multilib",
+        "ELF32",
+        "Codex CLI (installed as `codex`)",
+        "Claude Code (installed as `claude`)",
+        "`--allow-scripts=@anthropic-ai/claude-code`",
     ):
         if fragment not in readme:
             fail(f"devcontainer guide does not document HDF5 checkout: {fragment}")
@@ -356,6 +425,41 @@ int main(void) {
     print("DEVCONTAINER ASAN OK: compiler, linker, and runtime passed")
 
 
+def check_multilib_runtime() -> None:
+    source = "int main(void) { return 0; }\n"
+    with tempfile.TemporaryDirectory(prefix="h5lens-multilib-") as temp_dir:
+        executable = Path(temp_dir) / "multilib-smoke"
+        compile_result = subprocess.run(
+            ["cc", "-m32", "-x", "c", "-", "-o", str(executable)],
+            input=source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        if compile_result.returncode != 0:
+            fail(
+                "cannot compile and link a 32-bit executable with -m32:\n"
+                + compile_result.stdout
+            )
+        if executable.read_bytes()[:5] != b"\x7fELF\x01":
+            fail("-m32 compiler smoke executable is not ELF32")
+
+        run_result = subprocess.run(
+            [str(executable)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+        if run_result.returncode != 0:
+            fail(
+                "32-bit compiler smoke executable failed:\n" + run_result.stdout
+            )
+
+    print("DEVCONTAINER MULTILIB OK: 32-bit compiler, linker, and runtime passed")
+
+
 def check_runtime() -> None:
     missing_commands = [
         command for command in REQUIRED_COMMANDS if shutil.which(command) is None
@@ -380,6 +484,17 @@ def check_runtime() -> None:
             f"{minimum} minimum"
         )
 
+    node_match = re.search(r"v?([0-9]+)\.([0-9]+)", version(["node", "--version"]))
+    if (
+        node_match is None
+        or tuple(map(int, node_match.groups())) < MINIMUM_CLAUDE_NODE
+    ):
+        minimum = ".".join(map(str, MINIMUM_CLAUDE_NODE))
+        fail(
+            "Node.js is older than Claude Code's "
+            f"{minimum} minimum"
+        )
+
     emacs_major = version(
         [
             "emacs",
@@ -394,6 +509,7 @@ def check_runtime() -> None:
 
     check_hdf5_checkout()
     check_asan_runtime()
+    check_multilib_runtime()
 
     print(
         "DEVCONTAINER RUNTIME OK: "

@@ -13,8 +13,27 @@ The image includes:
 - Python with h5py, NumPy, PyYAML, and pip;
 - Emacs 30+ for the inspector front end and its ERT tests;
 - GDB and ptrace permissions for crash-fuzzer backtraces;
-- Git, GitHub CLI, OpenSSH, ripgrep, jq, and ShellCheck; and
+- Codex CLI (installed as `codex`), Claude Code (installed as `claude`), Git,
+  GitHub CLI, OpenSSH, ripgrep, jq, and ShellCheck; and
 - VS Code support for CMake, C/C++, Python, YAML, and HDF5 viewing.
+
+Codex and Claude Code are installed globally while the image builds, so they
+are immediately available in every Codespaces terminal:
+
+```sh
+codex --version
+codex
+claude --version
+claude
+```
+
+Arch's npm allowlists installation scripts. The image permits only Claude
+Code's required native-binary installer with
+`--allow-scripts=@anthropic-ai/claude-code`; it does not enable lifecycle
+scripts globally.
+
+Sign in to each tool with the account or API-key flow appropriate for your
+organization; authentication is not stored in the image or repository.
 
 Image creation also makes a full-history clone of the official
 [`HDFGroup/hdf5`](https://github.com/HDFGroup/hdf5) repository. The writable
@@ -37,54 +56,52 @@ container is rebuilt; commit or export analysis changes before rebuilding.
 Rebuilding may reuse Docker's cached clone layer, so run `git fetch` in the
 checkout when an analysis specifically requires newer upstream commits.
 
-## AddressSanitizer build of HDF5
+## HDF5 variant builds
 
-The image has GCC's AddressSanitizer compiler and runtime support, plus the zlib
-and libaec/SZIP development files. The startup check compiles, links, and runs a
-small ASan executable so a missing sanitizer runtime is detected before an
-analysis begins.
+[`build-hdf5.sh`](build-hdf5.sh) configures, builds, and installs the HDF5
+variants used for analysis. It uses separate build trees inside
+`$HDF5_SOURCE_DIR` and installs to writable prefixes outside the system HDF5
+package:
 
-Use a dedicated build tree and install into `/opt/hdf5-asan`, exposed as
-`$HDF5_ASAN_PREFIX`. This keeps the instrumented libraries and tools separate
-from Arch's HDF5 installation under `/usr`:
+- `release`: a `RelWithDebInfo` build with zlib and SZIP filters, installed to
+  `/opt/hdf5-release` (`$HDF5_RELEASE_PREFIX`);
+- `asan`: a `RelWithDebInfo` AddressSanitizer build with zlib and SZIP filters,
+  installed to `/opt/hdf5-asan` (`$HDF5_ASAN_PREFIX`); and
+- `32`: a `RelWithDebInfo`, `-m32` build without external filters, installed to
+  `/opt/hdf5-32` (`$HDF5_32_PREFIX`).
+
+The 32-bit build supports analyses that must reproduce 32-bit integer sizes or
+address-space limits. The image includes `gcc-multilib` and `lib32-gcc-libs` by
+default. zlib and SZIP are deliberately disabled for that variant because the
+image does not include matching 32-bit filter libraries. The script verifies
+the installed `h5dump` is `ELF32`.
+
+Run all variants, or name one or more variants to limit the work. Builds skip
+the HDF5 CTest suite by default; add `--test` when validation is required:
 
 ```sh
-cd "$HDF5_SOURCE_DIR"
-
-cmake -S . -B build-asan \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_C_FLAGS_RELWITHDEBINFO="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address" \
-  -DCMAKE_MODULE_LINKER_FLAGS="-fsanitize=address" \
-  -DCMAKE_INSTALL_PREFIX="$HDF5_ASAN_PREFIX" \
-  -DHDF5_ENABLE_ZLIB_SUPPORT=ON \
-  -DHDF5_ENABLE_SZIP_SUPPORT=ON
-
-cmake --build build-asan --parallel
-ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
-  ctest --test-dir build-asan --output-on-failure -j"$(nproc)"
-cmake --install build-asan
+.devcontainer/build-hdf5.sh
+.devcontainer/build-hdf5.sh release asan
+.devcontainer/build-hdf5.sh 32
+.devcontainer/build-hdf5.sh --test asan
 ```
 
-This recipe covers the default serial C library, high-level library, tools,
-examples, and tests, with zlib and SZIP filters enabled. MPI, Fortran, Java,
-and C++ bindings remain disabled to keep the build focused. The existing
-toolchain can also build the optional C++ bindings; MPI, Fortran, and Java
-require additional packages. To run an installed ASan tool against the
-instrumented shared libraries:
+Run an installed ASan or 32-bit tool against the matching libraries:
 
 ```sh
 LD_LIBRARY_PATH="$HDF5_ASAN_PREFIX/lib" \
   "$HDF5_ASAN_PREFIX/bin/h5dump" -pBH suspect.h5
+LD_LIBRARY_PATH="$HDF5_32_PREFIX/lib" \
+  "$HDF5_32_PREFIX/bin/h5dump" -pBH suspect.h5
 ```
 
 ## Creation check
 
 [`post-create.sh`](post-create.sh) validates every required command and Python
 module, confirms that the image-provided HDF5 checkout has the canonical
-origin, full history, and writable source files, configures a Debug CMake build,
-builds `h5markers`, and smoke-tests `h5policy`, `h5markers`, `h5dump`, and the
+origin, full history, and writable source files, smoke-tests the 32-bit
+compiler, linker, and runtime, configures a Debug CMake build, builds
+`h5markers`, and smoke-tests `h5policy`, `h5markers`, `h5dump`, and the
 exact-build activation probe against the sample file. Codespaces waits for
 these checks before attaching the editor. A successful creation ends with:
 

@@ -14,6 +14,7 @@ RUN pacman -Syu --noconfirm --needed \
         curl \
         emacs-nox \
         gdb \
+        gcc-multilib \
         git \
         github-cli \
         hdf5 \
@@ -21,7 +22,10 @@ RUN pacman -Syu --noconfirm --needed \
         less \
         libaec \
         libasan \
+        lib32-gcc-libs \
         man-db \
+        nodejs \
+        npm \
         openssh \
         poke \
         procps-ng \
@@ -41,6 +45,15 @@ RUN pacman -Syu --noconfirm --needed \
         zlib \
     && pacman -Scc --noconfirm
 
+# Install Codex and Claude Code in the image so they are available as soon as a
+# Codespace starts, without user-scoped installs or post-create network requests.
+RUN npm install --global @openai/codex \
+    && codex --version \
+    && npm install --global \
+        --allow-scripts=@anthropic-ai/claude-code \
+        @anthropic-ai/claude-code \
+    && claude --version
+
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
@@ -50,6 +63,8 @@ ARG USER_GID=1000
 ARG HDF5_REPOSITORY=https://github.com/HDFGroup/hdf5.git
 
 ENV HDF5_SOURCE_DIR=/opt/hdf5 \
+    HDF5_RELEASE_PREFIX=/opt/hdf5-release \
+    HDF5_32_PREFIX=/opt/hdf5-32 \
     HDF5_ASAN_PREFIX=/opt/hdf5-asan
 
 RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
@@ -64,6 +79,8 @@ RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
     && chmod 0440 "/etc/sudoers.d/90-${USERNAME}" \
     && install -d -o "${USERNAME}" -g "${USERNAME}" \
         /opt/hdf5 \
+        /opt/hdf5-release \
+        /opt/hdf5-32 \
         /opt/hdf5-asan \
         /workspaces
 

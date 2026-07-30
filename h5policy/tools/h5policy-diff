@@ -38,7 +38,9 @@ Cross-invariants (a hard failure exits non-zero; a warning is informational):
      "tools" includes h5dump reading data (no -H), which unlike the header-only
      probe exercises filter/decompression rejections
   A' libhdf5 rejects           => h5policy explicitly refuses the file (no false -)
-     a non-corrupt refusal (policy/resource/coverage) is retained as a warning
+     a non-corrupt refusal (policy/resource/coverage) is retained as a warning,
+     and a refusal that is only the reference library predating a defined
+     message version is retained as a warning too (A'~)
   B  (h5py sees an external link)  <=>  (h5policy external_links > 0)
   C  h5policy max logical dataset bytes  <=  h5py's                (no overcount)
   D  h5policy max rank seen  <=  h5py's                            (no overcount)
@@ -132,10 +134,11 @@ def introspect(path):
     reading corrupt metadata, e.g. an out-of-file address) counts as not
     opened -- that is the "libhdf5 rejects it" signal for invariant A'.
     """
-    facts = dict(opens=False, ext_links=0, max_logical=0, max_rank=0)
+    facts = dict(opens=False, ext_links=0, max_logical=0, max_rank=0, error="")
     try:
         f = h5py.File(path, "r")
-    except Exception:
+    except Exception as exc:
+        facts["error"] = _err(exc)
         return facts
     try:
       stack, seen = [f], set()
@@ -164,8 +167,9 @@ def introspect(path):
                 facts["max_logical"] = max(facts["max_logical"], n * elm)
                 facts["max_rank"] = max(facts["max_rank"], len(obj.shape))
       facts["opens"] = True            # fully traversed
-    except Exception:
+    except Exception as exc:
         facts["opens"] = False         # opened but unreadable: libhdf5 rejects
+        facts["error"] = _err(exc)
     finally:
         try:
             f.close()
@@ -182,7 +186,8 @@ def introspect_isolated(path):
     libhdf5 could not accept the bytes -- read as opens=False, the same signal
     as a clean rejection (the strongest form of "libhdf5 rejects").
     """
-    hard_reject = dict(opens=False, ext_links=0, max_logical=0, max_rank=0)
+    hard_reject = dict(opens=False, ext_links=0, max_logical=0, max_rank=0,
+                       error="child process crashed or timed out")
     try:
         proc = subprocess.run(
             [sys.executable, os.path.realpath(__file__), "--introspect", path],
@@ -462,6 +467,38 @@ def fill_value_size_mismatch_only(report):
         for f in findings)
 
 
+# libhdf5's wording when a decoder meets a message version it does not know.
+# It is emitted both for a genuinely corrupt version byte and for a version the
+# running library simply predates; only the second reading survives the guard in
+# reference_predates_message_version below.
+_VERSION_REFUSAL_MARKERS = ("bad version number for",
+                            "unknown version of",
+                            "unsupported version")
+
+
+def reference_predates_message_version(ref, decision):
+    """Whether the reference libhdf5 refused a message version h5policy accepts.
+
+    The in-process reference is whatever libhdf5 h5py links, and h5py releases
+    trail the library: a file written by a newer libhdf5 can carry a perfectly
+    legal message version (data layout v5, say, introduced with the 2.x
+    H5F_LIBVER_V200 bound) that the reference refuses to decode.  Reading that
+    refusal as "libhdf5 rejects it" would make invariant A' demand h5policy
+    reject a valid file -- the exact false positive this repo is meant to avoid.
+
+    The guard is the decision: h5policy only accepts a layout/message version
+    that the format defines, so an accepting decision paired with a
+    version-shaped refusal means the reference is behind, not that the file is
+    malformed.  A corrupt version byte instead makes h5policy reject, so this
+    never fires for one.  Kept as narrow as the other A~ exemptions: any other
+    refusal from the reference stays a hard A' failure.
+    """
+    if decision not in ("accept", "accept_with_warnings"):
+        return False
+    error = str(ref.get("error", "")).lower()
+    return any(marker in error for marker in _VERSION_REFUSAL_MARKERS)
+
+
 def check(path):
     """Return (hard_failures, warnings, lines) for one file."""
     fails, warns, lines = [], [], []
@@ -524,8 +561,15 @@ def check(path):
             "reject_resource",
             "unsupported_coverage_gap",
         }
-        hard(decision in safe_rejections,
-             f"A' libhdf5 rejects => explicit rejection (got {decision})")
+        if reference_predates_message_version(ref, decision):
+            soft(False,
+                 "A'~ the reference libhdf5 "
+                 f"({getattr(h5py.version, 'hdf5_version', '?')}) refuses a "
+                 "message version this file legally uses "
+                 f"({ref.get('error', '')}); h5policy decodes it and accepts")
+        else:
+            hard(decision in safe_rejections,
+                 f"A' libhdf5 rejects => explicit rejection (got {decision})")
         if decision in safe_rejections and decision != "reject_corrupt":
             soft(False,
                  "A' libhdf5 rejects as corrupt; h5policy safely refuses "

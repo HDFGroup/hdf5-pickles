@@ -11,9 +11,9 @@ An encoded buffer is a two-byte prefix — a Datatype Message type ID
 Datatype Message payload (Section IV.A.2.d). That payload begins with an
 8-byte header (class, version, class bit fields, and element size)
 followed by class-specific properties. The class-specific decoding,
-including recursive compound, enumeration, variable-length, and array
-types, is handled by the `oh_msg_dtype` type from `ohdr_msgs.pk`; this
-pickle types only the two-byte prefix.
+including recursive compound, enumeration, variable-length, array, and
+complex types, is handled by the `oh_msg_dtype` type from `ohdr_msgs.pk`;
+this pickle types only the two-byte prefix.
 
 All fields are stored in little-endian byte order.
 

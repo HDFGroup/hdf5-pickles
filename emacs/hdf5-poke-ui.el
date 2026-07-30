@@ -642,6 +642,17 @@ MODE controls the sibling action: `messages' inserts an Open links action;
                       (format "dims=%s" (hdf5-poke--field node :dims)))
                  (and (plist-member node :vlen-type)
                       (format "vlen=%s" (hdf5-poke--field node :vlen-type)))
+                 (and (plist-member node :homogeneous)
+                      (if (plist-get node :homogeneous)
+                          "homogeneous"
+                        "heterogeneous"))
+                 (and (plist-member node :form)
+                      (format "form=%s" (hdf5-poke--field node :form)))
+                 ;; A complex datatype whose class bits are not the homogeneous
+                 ;; rectangular encoding has no decoded base type: say so rather
+                 ;; than leave the node looking complete.
+                 (and (plist-member node :encoding)
+                      (format "encoding=%s" (hdf5-poke--field node :encoding)))
                  (and (plist-member node :padding)
                       (format "padding=%s" (hdf5-poke--field node :padding)))
                  (and (plist-member node :charset)

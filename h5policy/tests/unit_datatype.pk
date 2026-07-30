@@ -114,6 +114,23 @@ fun has_code = (string code) int:
     return 0;
 }
 
+/* A code can be emitted by more than one check with a different message (the
+   version ceiling and the complex-class version check both report an unsupported
+   datatype version), so a case that must pin down *which* one fired matches the
+   code and message together. */
+fun has_code_message = (string code, string message) int:
+{
+    var i = 0UL;
+    while (i < h5policy_finding_codes'length)
+        {
+            if (h5policy_finding_codes[i] == code
+                && h5policy_finding_messages[i] == message)
+                return 1;
+            i = i + 1UL;
+        }
+    return 0;
+}
+
 fun has_u64_evidence = (string code, string field,
                         uint<64> actual, uint<64> expected,
                         string comparison) int:
@@ -539,6 +556,96 @@ run_message(0x0dUL, 0UL);
 expect("name_message_empty_rejected", has_code("H5_CORRUPT_NAME_MESSAGE_EMPTY"));
 run_message(0x0dUL, 14UL);
 expect("name_message_nonempty_accepted", !has_code("H5_CORRUPT_NAME_MESSAGE_EMPTY"));
+
+/* 13. Complex numbers (class 11, datatype message version 5).  A homogeneous
+   rectangular complex is an 8-byte header followed by its inline floating-point
+   base type, and its element size is twice the base size.  These blobs are the
+   bytes HDF5 2.x writes for H5T_COMPLEX_IEEE_F32LE (class bit 0 = homogeneous,
+   bits 1-2 = form 0 = rectangular): the fixture corpus cannot cover the class at
+   all, because its files are generated with h5py against libhdf5 1.14, which has
+   no complex datatype.  Each defect has its own code, so each case also asserts
+   that its siblings stayed quiet.  */
+var f32le = dt_hdr(1UL, 1UL, 0x1f20UL, 4UL)
+            + [0UB, 0UB, 32UB, 0UB, 23UB, 8UB, 0UB, 23UB, 127UB, 0UB, 0UB, 0UB];
+var complex_f32 = dt_hdr(5UL, 11UL, 0x01UL, 8UL) + f32le;
+var c13 = run_blob(complex_f32);
+expect("complex_v5_homogeneous_rectangular",
+       c13 == 28UL && h5policy_finding_codes'length == 0UL);
+
+/* 13a. Only the homogeneous encoding is defined: a cleared class bit 0 means the
+   two parts have different types, which the library cannot construct.  The
+   version is 5 here, so the version check must stay quiet.  */
+expect("complex_heterogeneous_rejected",
+       run_blob(dt_hdr(5UL, 11UL, 0x00UL, 8UL) + f32le) != 0UL
+       && has_code("H5_CORRUPT_DATATYPE_COMPLEX_ENCODING")
+       && !has_code("H5_CORRUPT_UNSUPPORTED_DATATYPE_VERSION"));
+
+/* 13b. Form 1 (polar) and form 2 (exponential) are reserved in the format spec
+   but not written or read by any library version.  */
+expect("complex_polar_form_rejected",
+       run_blob(dt_hdr(5UL, 11UL, 0x03UL, 8UL) + f32le) != 0UL
+       && has_code("H5_CORRUPT_DATATYPE_COMPLEX_ENCODING"));
+
+/* 13c. Class bits above the form field are reserved and must be zero, so an
+   otherwise homogeneous rectangular complex with bit 3 set is still rejected. */
+expect("complex_reserved_class_bits_rejected",
+       run_blob(dt_hdr(5UL, 11UL, 0x09UL, 8UL) + f32le) != 0UL
+       && has_code("H5_CORRUPT_DATATYPE_COMPLEX_ENCODING"));
+
+/* 13d. The class arrived with version 5, so a class-11 message claiming an
+   earlier version is a VERSION defect, not an encoding one: its class bits are a
+   valid homogeneous rectangular encoding.  Version 4 clears the version ceiling
+   at the top of the validator, so the complex-specific message is the one that
+   distinguishes this case.  */
+var c13d = run_blob(dt_hdr(4UL, 11UL, 0x01UL, 8UL) + f32le);
+expect("complex_version4_rejected",
+       c13d != 0UL
+       && has_code_message("H5_CORRUPT_UNSUPPORTED_DATATYPE_VERSION",
+                           "complex datatype version is unsupported")
+       && !has_code("H5_CORRUPT_DATATYPE_COMPLEX_ENCODING"));
+
+/* 13e. The base type must be floating-point.  `simple` is a 4-byte fixed-point
+   type, so the size relation still holds and only the class check fires.  */
+var c13e = run_blob(dt_hdr(5UL, 11UL, 0x01UL, 8UL) + simple);
+expect("complex_base_not_float_rejected",
+       c13e != 0UL
+       && has_code("H5_CORRUPT_DATATYPE_COMPLEX_BASE_CLASS")
+       && !has_code("H5_CORRUPT_DATATYPE_COMPLEX_SIZE"));
+
+/* 13f. Storage size must be exactly twice the base size: 12 bytes over a 4-byte
+   float would leave a consumer reading two 6-byte parts.  */
+var c13f = run_blob(dt_hdr(5UL, 11UL, 0x01UL, 12UL) + f32le);
+expect("complex_size_not_twice_base_rejected",
+       c13f != 0UL
+       && has_code("H5_CORRUPT_DATATYPE_COMPLEX_SIZE")
+       && !has_code("H5_CORRUPT_DATATYPE_COMPLEX_BASE_CLASS"));
+
+/* 13g. A complex whose base type header runs off the end of the message is
+   bounded like any other nested type: report and stop, read nothing past it.  */
+var c13g = run_blob(dt_hdr(5UL, 11UL, 0x01UL, 8UL) + [0UB, 0UB]);
+expect("complex_truncated_base_bounded",
+       c13g == 0UL && has_code("H5_CORRUPT_DATATYPE_MESSAGE_TOO_SMALL"));
+
+/* 13h. Complex as the child of a composite: a version-5 array of two complex
+   values keeps the compact version-3 dimension layout, and the array size
+   relation is satisfied by the complex element size (2 * 8 = 16).  */
+var c13h = run_blob(dt_hdr(5UL, 10UL, 0UL, 16UL)
+                    + [1UB]                        /* rank 1 */
+                    + [2UB, 0UB, 0UB, 0UB]         /* dim 2 */
+                    + complex_f32);
+expect("array_of_complex_accepted",
+       c13h == 41UL && h5policy_finding_codes'length == 0UL);
+
+/* 13i. The linear-depth preflight follows a complex chain through its inline
+   base type, so a pathologically nested one is rejected from the prefix alone
+   (same guarantee as the deep compound chain in case 3c).  */
+var pf_complex = f32le;
+var pfc = 0UL;
+while (pfc < 200UL)
+    { pf_complex = dt_hdr(5UL, 11UL, 0x01UL, 8UL) + pf_complex; pfc = pfc + 1UL; }
+expect("preflight_deep_complex_rejected",
+       run_preflight(pf_complex) == 0
+       && has_code("H5_RESOURCE_DATATYPE_RECURSION_DEPTH"));
 
 if (unit_failures != 0)
     {

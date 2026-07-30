@@ -27,9 +27,15 @@ on_error() {
 trap 'on_error "${LINENO}"' ERR
 
 readonly hdf5_source_dir="/opt/hdf5"
+readonly hdf5_release_prefix="/opt/hdf5-release"
+readonly hdf5_32_prefix="/opt/hdf5-32"
 readonly hdf5_asan_prefix="/opt/hdf5-asan"
 log "Checking the image-provided HDF5 source checkout"
-for writable_dir in "${hdf5_source_dir}" "${hdf5_asan_prefix}"; do
+for writable_dir in \
+    "${hdf5_source_dir}" \
+    "${hdf5_release_prefix}" \
+    "${hdf5_32_prefix}" \
+    "${hdf5_asan_prefix}"; do
     if [[ -d "${writable_dir}" && ! -w "${writable_dir}" ]]; then
         sudo chown -R -- "$(id -u):$(id -g)" "${writable_dir}"
     fi

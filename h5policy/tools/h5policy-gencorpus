@@ -527,6 +527,16 @@ def _gen_resource(root):
         h5py.h5d.create(h.id, b"d", h5py.h5t.NATIVE_INT32, spid, dcpl=dcpl)
     _write(f"{root}/valid/chunk_implicit.h5", _implicit)
 
+    # Data layout message version 5 (libhdf5 2.x / H5F_LIBVER_V200).  Both
+    # fixtures are legal files that h5policy must accept: the version gate used
+    # to stop at 4 and reject them outright.  The first is the plain chunked
+    # form, the second the filtered single-chunk form -- the class v5 exists
+    # for, since v5 is what lets a filter grow a chunk past the v4 size field.
+    _make_layout_version(f"{root}/valid/layout_v5_chunked.h5",
+                         _layout_v5_unfiltered, 5)
+    _make_layout_version(f"{root}/valid/layout_v5_single_filtered.h5",
+                         _layout_v5_single_filtered, 5)
+
     # Deep dense links: a group large enough that its dense-link name v2 B-tree
     # is several levels deep, exercising the recursive internal-node descent
     # (including the records stored in internal nodes, not just the leaves).
@@ -679,6 +689,19 @@ def _gen_malformed(root):
         f"{root}/malformed/scaleoffset_size_mismatch.h5")
     _make_chunk_size_uint32_wrap(
         f"{root}/malformed/chunk_size_uint32_wrap.h5")
+    # Layout version 6 does not exist: H5O_LAYOUT_VERSION_LATEST is 5.  Guards
+    # the upper end of the version gate that was widened to admit v5.
+    _make_layout_version(f"{root}/malformed/layout_unsupported_version.h5",
+                         _layout_v5_unfiltered, 6)
+    # A v5 chunked layout claiming zero dimensions.  libhdf5's v4-and-later
+    # layout decoder bounds dimensionality only from above (H5Olayout.c), so it
+    # decodes this message and only refuses the dataset later, when
+    # H5D__chunk_init finds a zero chunk size.  h5policy refuses at decode.
+    # While layout versions above 4 were rejected outright, the version gate was
+    # what stopped this file; admitting v5 means the dimensionality rule has to,
+    # and this fixture is what proves it does.
+    _make_layout_version(f"{root}/malformed/layout_v5_zero_ndims.h5",
+                         _layout_v5_unfiltered, 5, _layout_zero_ndims)
     _make_multifault_scaleoffset(
         f"{root}/malformed/multifault_scaleoffset.h5")
     _make_bad_reference_datatype_version(
@@ -1189,6 +1212,100 @@ def _make_scaleoffset_size_mismatch(path):
     driving the same out-of-bounds write.  h5policy rejects it because the
     declared element size disagrees with the dataset's datatype size."""
     _scaleoffset_cd_patch(path, 4, 131073)
+
+
+def _v4_layout_message(raw):
+    """Locate the first version-4 data-layout message in a v2 object header.
+
+    Returns ``(ohdr_off, mbody)`` so a caller can patch the message bytes and
+    then repair the header checksum with ``_fix_v2_ohdr_checksum``.
+    """
+    for o in range(len(raw) - 4):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        p = cur + size_w
+        end = cur + size_w + chunk0
+        while p < end - 3:
+            mtype = raw[p]
+            msize = struct.unpack_from("<H", raw, p + 1)[0]
+            mbody = p + 4 + (2 if flags & 0x04 else 0)
+            if mtype == 0x08 and raw[mbody] == 4:
+                return o, mbody
+            p = mbody + msize
+    raise RuntimeError("could not locate a v4 data-layout message")
+
+
+def _make_layout_version(path, build, version, mutate=None):
+    """Write ``build``'s dataset and stamp its layout message with ``version``.
+
+    Layout message versions 4 and 5 have the *same* on-disk encoding: v5
+    (libhdf5 2.x, H5F_LIBVER_V200) only widens the filtered-chunk size field
+    stored in fixed-array / extensible-array / v2-B-tree chunk index *records*
+    to the file's size of lengths.  Callers therefore pick a dataset whose index
+    records are unaffected -- unfiltered chunks (no size field at all) or the
+    single-chunk index, which keeps the filtered size in the layout message
+    itself at size-of-lengths width in both versions -- so bumping the version
+    byte yields a file a 2.x library reads exactly as it reads the v4 original.
+
+    h5py links libhdf5 1.14, which cannot write (or read) a v5 layout message,
+    so this byte patch is how the corpus gets one without pinning the whole
+    generator to a 2.x build.  ``mutate(raw, mbody)`` may then corrupt the
+    message for the malformed fixtures.
+    """
+    raw = _base_bytes(build)
+    ohdr, mbody = _v4_layout_message(raw)
+    raw[mbody] = version
+    if mutate is not None:
+        mutate(raw, mbody)
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _layout_zero_ndims(raw, mbody):
+    """Rewrite a v4/v5 chunked layout message to declare zero dimensions.
+
+    Dropping the dimensionality byte alone would leave the index type and
+    address at the wrong offsets, so the defect would arrive mixed with a
+    message-shape complaint.  Re-emitting the message without its dimension
+    vector -- version, class, flags, ndims = 0, encoded width, then the index
+    type, its parameters and its address -- isolates the dimensionality rule:
+    everything else still decodes.  The freed tail is zero-filled, inside the
+    original message size, so the object header needs no restructuring.
+    """
+    ndims, enc = raw[mbody + 3], raw[mbody + 4]
+    dims_end = mbody + 5 + ndims * enc
+    tail = bytes(raw[dims_end:dims_end + 10])   # index type + parameters + address
+    rewritten = bytes(raw[mbody:mbody + 3]) + bytes([0, enc]) + tail
+    raw[mbody:mbody + len(rewritten)] = rewritten
+    raw[mbody + len(rewritten):dims_end + 10] = bytes(ndims * enc)
+
+
+def _layout_v5_unfiltered(h):
+    """A fixed-shape chunked dataset: four chunks, fixed-array index, no filter.
+
+    Unfiltered chunk index records carry no chunk-size field, so this dataset's
+    bytes are identical under layout v4 and v5.
+    """
+    h.create_dataset("d", data=np.arange(100, dtype="i4").reshape(10, 10),
+                     chunks=(5, 5))
+
+
+def _layout_v5_single_filtered(h):
+    """One shuffled chunk covering the whole dataset.
+
+    A single-chunk index with a filter sets H5O_LAYOUT_CHUNK_SINGLE_INDEX_WITH_
+    FILTER and stores the chunk's filtered byte count in the layout message, at
+    size-of-lengths width in both v4 and v5, so this dataset's bytes are also
+    version-independent -- while still exercising the filtered-chunk path the v5
+    encoding exists for.  Shuffle rather than deflate: it is always built in, so
+    the fixture stays readable end to end by any libhdf5 build.
+    """
+    h.create_dataset("d", data=np.arange(64, dtype="i4").reshape(8, 8),
+                     chunks=(8, 8), shuffle=True)
 
 
 def _make_chunk_size_uint32_wrap(path):
