@@ -160,6 +160,10 @@ tools/h5policy-lazy                                  # human-readable
 tools/h5policy-lazy --output registry/lazy-validation.json
 ```
 
+Fixture creation uses `libver=latest` with root-group and dataset timestamp
+tracking explicitly disabled. This keeps object-header sizes independent of
+h5py/HDF5 defaults.
+
 Three ladders, and the third is what makes the first two mean anything:
 
 | ladder | varies | expectation |
@@ -176,8 +180,8 @@ Counters are bounded by ratio, not equality — decoding a larger stored-size
 field can cost a few operations without any payload being touched, while a
 validator that read payload would grow with `n`. In the current tracked
 measurement, the unfiltered ladder's `metadata_bytes_seen`/`walk_operations`
-remain exactly 463/212 across the 3,031× physical-file increase. The filtered
-ladder remains at 463 metadata bytes while operations move only 229 → 233
+remain exactly 447/212 across the 3,031× physical-file increase. The filtered
+ladder remains at 447 metadata bytes while operations move only 229 → 233
 across 1,061× physical growth. The sensitivity control rises
 375 → 987 → 7,107 operations. These ratios are derived from the
 `physical_bytes` endpoints in

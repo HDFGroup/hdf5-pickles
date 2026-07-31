@@ -43,6 +43,11 @@ DETERMINISTIC_FIELDS = (
     "walk_operations",
     "chunk_index_refs",
 )
+FIXTURE_POLICY = {
+    "libver": "latest",
+    "root_group_track_times": False,
+    "dataset_track_times": False,
+}
 
 
 def fail(message: str) -> None:
@@ -110,6 +115,14 @@ def deterministic(report: dict) -> dict:
     }
 
 
+def check_fixture_policy(report: dict, label: str) -> None:
+    if report.get("fixture_policy") != FIXTURE_POLICY:
+        fail(
+            f"{label} fixture policy {report.get('fixture_policy')!r} "
+            f"!= {FIXTURE_POLICY!r}"
+        )
+
+
 def check_narrative(report: dict) -> None:
     data = ladder(report, "data")
     filtered = ladder(report, "filtered")
@@ -141,6 +154,8 @@ def check_narrative(report: dict) -> None:
         f"{filtered[0]['walk_operations']} → "
         f"{filtered[-1]['walk_operations']}",
         " → ".join(comma(row["walk_operations"]) for row in chunks),
+        "`libver=latest` with root-group and dataset timestamp tracking "
+        "explicitly disabled",
         "[`registry/lazy-validation.json`](../registry/lazy-validation.json)",
     )
     missing = [item for item in requirements if item not in narrative]
@@ -156,6 +171,8 @@ def check_narrative(report: dict) -> None:
         f"element count growing {comma(data_points)}x",
         f"physical files grow {comma(data_growth)}x",
         f"physical files grow {comma(filtered_growth)}x",
+        "libver=latest with root-group and dataset timestamp tracking "
+        "explicitly disabled",
     )
     missing = [item for item in help_requirements if item not in tool_help]
     if missing:
@@ -215,6 +232,7 @@ def check_live_measurement(tracked: dict) -> None:
 
     if live.get("total_violations") != 0:
         fail(f"live measurement has {live.get('total_violations')} violation(s)")
+    check_fixture_policy(live, "live")
     if deterministic(live) != deterministic(tracked):
         fail("live deterministic ladder fields differ from the tracked artifact")
 
@@ -225,6 +243,7 @@ def main() -> int:
         fail(f"unsupported lazy artifact schema {tracked.get('schema_version')!r}")
     if tracked.get("total_violations") != 0 or tracked.get("violations") != []:
         fail("tracked lazy-validation artifact contains violations")
+    check_fixture_policy(tracked, "tracked")
 
     check_narrative(tracked)
     check_live_measurement(tracked)
