@@ -21,7 +21,7 @@ Registry files plus a case directory, one schema version:
 | [`truncation-sweep.json`](truncation-sweep.json) | **Generated.** Result of the §12 truncation sweep: every prefix of each seed, and whether coverage was exhaustive or sampled. |
 | [`verification-coverage.yml`](verification-coverage.yml) | **Generated.** Which of the [§12](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) verification requirements each record family demonstrably meets. |
 | [`cve-case.yml`](cve-case.yml) | The annotated **template** for a per-case record. Its fields are the §11.5 containment/systemic tracking block. |
-| [`cases/`](cases/) | Real per-case records: one proactive hardening case and four libhdf5 divergence records, including one open backlog of uninvestigated items. |
+| [`cases/`](cases/) | Real per-case records: one proactive hardening case and five libhdf5 divergence records, including one open backlog of uninvestigated items. |
 
 [`../tools/check_registry.py`](../tools/check_registry.py) derives the production
 emit inventory from the pickle validators and the wrapper-generated timeout
