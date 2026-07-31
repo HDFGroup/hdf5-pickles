@@ -29,11 +29,11 @@ decompress dataset payloads, open external files, repair the input, write to it,
 or perform application deserialization.
 
 ```sh
-./h5policy/tools/h5policy --profile untrusted-strict file.h5
+./h5policy/tools/h5policy --profile untrusted-strict examples/file.h5
 ./h5policy/tools/h5policy --profile forensic \
-    --continue-after-rejection file.h5
+    --continue-after-rejection examples/file.h5
 ./h5policy/tools/h5policy --profile trusted-fast \
-    --max-walk-seconds 60 file.h5
+    --max-walk-seconds 60 examples/file.h5
 ```
 
 The four profiles are:
@@ -108,7 +108,7 @@ field-offset, version-selection, datatype-size, and dataspace-decoding mistakes
 that fixtures written for known cases can miss.
 
 ```sh
-./h5policy/tools/h5policy-diff file.h5 another.h5
+./h5policy/tools/h5policy-diff examples/file.h5 another.h5
 ./h5policy/tools/h5policy-diff --dir h5policy/tests
 ```
 

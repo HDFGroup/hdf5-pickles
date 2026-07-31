@@ -295,10 +295,20 @@ fun h5policy_known_message_id = (uint<64> m_type) int:
     return 0;
 }
 
+/* Unknown message IDs are only forward-compatible when the prefix explicitly
+   says an older reader may skip them.  Otherwise an out-of-range ID is a
+   malformed object-header envelope, not a coverage gap or policy toggle.  */
+fun h5policy_unknown_message_may_be_skipped = (uint<8> m_flags) int:
+{
+    return (m_flags & 0x08UB) != 0UB;
+}
+
 /* Apply profile-level policy to a message class before payload validation.
    This is where "feature seen" counters are updated so the JSON report can
    explain why a file was rejected or accepted with warnings.  */
 fun h5policy_validate_message_policy_at = (uint<64> m_type,
+                                           uint<8> m_flags,
+                                           uint<8> have_flags,
                                            H5PolicyProfile profile,
                                            off64 loc,
                                            uint<64> type_width,
@@ -322,7 +332,33 @@ fun h5policy_validate_message_policy_at = (uint<64> m_type,
     if (!h5policy_known_message_id(m_type))
         {
             h5policy_note_unknown_message;
-            if (profile.features.allow_unknown_messages == 0UB)
+            if (have_flags != 0UB
+                && !h5policy_unknown_message_may_be_skipped(m_flags))
+                {
+                    if (type_width != 0UL)
+                        h5policy_emit_error_ev(
+                            "H5_CORRUPT_OBJECT_HEADER_MESSAGE_TYPE_RANGE",
+                            "corrupt", loc, object,
+                            "object-header message type is out of range and is not marked skippable if unknown",
+                            H5Evidence {
+                                field = "object_header.message_type",
+                                actual = m_type, expected = 0x18UL,
+                                comparison = "less_than_or_equal",
+                                has_loc1 = 1, loc1_role = "actual",
+                                loc1 = loc, loc1_len = type_width,
+                            });
+                    else
+                        h5policy_emit_error_ev(
+                            "H5_CORRUPT_OBJECT_HEADER_MESSAGE_TYPE_RANGE",
+                            "corrupt", loc, object,
+                            "object-header message type is out of range and is not marked skippable if unknown",
+                            H5Evidence {
+                                field = "object_header.message_type",
+                                actual = m_type, expected = 0x18UL,
+                                comparison = "less_than_or_equal",
+                            });
+                }
+            else if (profile.features.allow_unknown_messages == 0UB)
                 {
                     if (type_width != 0UL)
                         h5policy_emit_error_ev(
@@ -374,13 +410,17 @@ fun h5policy_validate_message_policy_at = (uint<64> m_type,
 }
 
 /* Compatibility seam for synthetic policy tests and in-process callers that
-   have a decoded message type but no corresponding byte width.  */
+   have a decoded message type but no corresponding prefix flags or byte width.
+   Without the flags this seam cannot distinguish a malformed envelope from a
+   forward-compatible unknown-message slot, so it preserves the legacy
+   policy/coverage classification.  */
 fun h5policy_validate_message_policy = (uint<64> m_type,
                                         H5PolicyProfile profile,
                                         off64 loc,
                                         string object) void:
 {
-    h5policy_validate_message_policy_at(m_type, profile, loc, 0UL, object);
+    h5policy_validate_message_policy_at(m_type, 0UB, 0UB,
+                                        profile, loc, 0UL, object);
 }
 
 /* Object-header flags can be corrupt independently of the message payload.
@@ -514,7 +554,7 @@ fun h5policy_validate_msg_chunk = (int ios,
                                     "object header version does not support reference count messages");
 
             h5policy_validate_message_policy_at(
-                m_type, profile, chunk_off + i#B,
+                m_type, m_flags, 1UB, profile, chunk_off + i#B,
                 version == 1UB ? 2UL : 1UL, object);
             h5policy_validate_message_flags(m_type, m_flags,
                                             chunk_off + i#B, object);

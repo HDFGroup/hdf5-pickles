@@ -32,7 +32,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT = ROOT / "registry/lazy-validation.json"
-TOOLS_DOC = ROOT / "TOOLS.md"
+TOOLS_DOC = ROOT / "docs/TOOLS.md"
 LAZY_TOOL = ROOT / "h5policy/tools/h5policy-lazy"
 VERIFICATION = ROOT / "registry/verification-coverage.yml"
 
@@ -141,7 +141,7 @@ def check_narrative(report: dict) -> None:
         f"{filtered[0]['walk_operations']} → "
         f"{filtered[-1]['walk_operations']}",
         " → ".join(comma(row["walk_operations"]) for row in chunks),
-        "[`registry/lazy-validation.json`](registry/lazy-validation.json)",
+        "[`registry/lazy-validation.json`](../registry/lazy-validation.json)",
     )
     missing = [item for item in requirements if item not in narrative]
     if missing:

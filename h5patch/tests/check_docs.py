@@ -14,12 +14,11 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Check the root h5patch summary against the authoritative repair catalog."""
+"""Check the h5patch catalog and the root README entry points."""
 
 from __future__ import annotations
 
 from pathlib import Path
-import re
 import sys
 
 
@@ -42,19 +41,13 @@ CATALOG_CLASSES = (
     "trailing Jenkins checksums",
 )
 
-ROOT_SUMMARY_REQUIREMENTS = (
-    "file bootstrap and superblock repairs",
-    "signature, base address, consistency flags, and checksums",
-    "reachable object-header repairs",
-    "v1 message counts, v2 checksums, v4 chunk-layout element size",
-    "typed scale-offset/N-bit filter parameters",
-    "counted or indexed metadata repairs",
-    "free-space section totals, symbol-table node counts",
-    "depth-0 v2 B-tree total-record counts",
-    "trailing-checksum repairs for reached free-space, v2 B-tree, "
-    "extensible-array, and shared-message metadata",
-    "overview is intentionally non-exhaustive",
-    "[repair catalog](h5patch/README.md#repair-catalog)",
+ROOT_ENTRY_REQUIREMENTS = (
+    "| [`h5patch/`](h5patch/) | Evidence-gated repair planning, application, "
+    "and audit logging. |",
+    "Create and inspect a repair plan without modifying the input.",
+    "./tools/h5patch plan damaged.h5 -o repair.plan.json",
+    "./tools/h5patch explain repair.plan.json",
+    "[`h5patch`](h5patch/README.md)",
 )
 
 
@@ -129,37 +122,24 @@ def main() -> int:
                 f"{len(matches)} time(s), expected once"
             )
 
-    summary = normalized(
-        section(ROOT_README, "## h5patch In Under A Minute")
-    )
-    count_match = re.search(
-        r"catalog contains `([0-9]+)` evidence-gated repair classes", summary
-    )
-    if count_match is None:
-        fail("root summary does not declare the current catalog size")
-    declared_count = int(count_match.group(1))
-    if declared_count != len(bullets):
-        fail(
-            f"root summary declares {declared_count} repair classes, "
-            f"canonical catalog has {len(bullets)}"
-        )
-
+    root_readme = normalized(ROOT_README.read_text())
     missing = [
         requirement
-        for requirement in ROOT_SUMMARY_REQUIREMENTS
-        if requirement not in summary
+        for requirement in ROOT_ENTRY_REQUIREMENTS
+        if requirement not in root_readme
     ]
     if missing:
         fail(
-            "root summary lacks "
+            "root README lacks "
             + ", ".join(repr(requirement) for requirement in missing)
         )
 
-    if "The first repair catalog" in summary:
-        fail("root summary still contains the obsolete first-catalog wording")
+    if "## h5patch In Under A Minute" in ROOT_README.read_text():
+        fail("root README still contains the retired h5patch summary")
 
     print(
-        f"H5PATCH DOC CHECK OK: root summarizes {len(bullets)} repair classes"
+        f"H5PATCH DOC CHECK OK: {len(bullets)} catalog classes and root entry "
+        "points checked"
     )
     return 0
 

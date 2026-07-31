@@ -8,6 +8,9 @@ object headers, links, B-trees, heaps, and chunk indexes.
 HDF5 user blocks are detected automatically at legal superblock boundaries;
 navigation and policy findings report physical file offsets.
 
+For a guided walk from the sample superblock through a dataset, chunk index,
+and policy finding, start with the [H5Lens tutorial](../docs/TUTORIAL.md).
+
 Run from the repository root:
 
 ```sh
@@ -25,8 +28,8 @@ or, when none are given, from a piped standard input.  Either source suppresses
 the banner and exits instead of entering the REPL, so sessions stay diffable:
 
 ```sh
-printf 'root\nls\n' | ./tools/h5explain file.h5
-./tools/h5explain -c root -c 'cd ("group_a")' -c msgs file.h5
+printf 'root\nls\n' | ./tools/h5explain examples/file.h5
+./tools/h5explain -c root -c 'cd ("DirectChunkData")' -c msgs examples/file.h5
 ```
 
 Batch mode exits with poke's status.  poke reports an unhandled exception on
@@ -127,10 +130,10 @@ prompt. A batch session has all of its commands up front, and reaching a policy
 command means naming it, so the commands decide:
 
 ```sh
-h5explain -c root -c ls file.h5        # no policy command -> not loaded, ~0.35s
-h5explain -c root -c check file.h5     # names check -> loaded, ~0.59s
-h5explain --no-policy -c ls file.h5    # never load
-h5explain --policy -c 'load "mine.pk"' file.h5   # force, e.g. when a script
+h5explain -c root -c ls examples/file.h5        # no policy command -> not loaded, ~0.35s
+h5explain -c root -c check examples/file.h5     # names check -> loaded, ~0.59s
+h5explain --no-policy -c ls examples/file.h5    # never load
+h5explain --policy -c 'load "mine.pk"' examples/file.h5   # force, e.g. when a script
                                                  # reaches check indirectly
 ```
 
