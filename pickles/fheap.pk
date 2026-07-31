@@ -26,6 +26,7 @@
  * Load order:
  *   common.pk        <- bytes_to_u64_le, bytes_to_u64_le_at, bytes_to_off, sizeof_offsets/lengths
  *   superblock.pk    <- sets global_sizeof_offsets, global_sizeof_lengths
+ *   v2_btree.pk      <- huge-object B-tree record decoding
  *   fheap.pk
  *   [fsm.pk]         <- optional; load it to call print_fsm(free_space_mgr_addr#B)
  *
@@ -90,6 +91,8 @@
  *   bits [3:0] = reserved (managed/huge) or encoded length low bits (tiny)
  */
 
+load "v2_btree.pk";
+
 /* ----------------------------------------------------------------------- *
  * Global fractal heap parameters
  * Set automatically when fheap_hdr is mapped via constraint side-effects.
@@ -124,6 +127,7 @@ var global_frhp_dblock_data_size = 0UL;
 /* Root block location -- set automatically when fheap_hdr is mapped */
 var global_frhp_root_addr      = 0UL;   /* Root block file address (bytes)    */
 var global_frhp_curr_root_rows = 0UL;   /* 0 = root direct; >0 = root indirect */
+var FRHP_ADDR_UNRESOLVED       = 0xFFFFFFFFFFFFFFFFUL;
 
 /* ----------------------------------------------------------------------- *
  * Helper: decode n little-endian bytes starting at byte offset 'off'
@@ -321,11 +325,10 @@ type fheap_iblock = struct {
  *
  * Handles:
  *   - root is a direct block (curr_root_rows == 0)
- *   - root is an indirect block; object is in a direct block child
+ *   - root and nested indirect blocks; follows the child containing the ID
  *
- * Returns 0xFFFF...FF (HADDR_UNDEF) if the target direct block entry is
- * unallocated or if heap_off falls inside an indirect-block child subtree
- * (deeper traversal not yet implemented).
+ * Returns FRHP_ADDR_UNRESOLVED if the target child is unallocated or the
+ * heap offset is not represented by the doubling table.
  *
  * Usage:
  *   var id       = frhp_heap_id @ <id_addr>#B;
@@ -334,20 +337,13 @@ type fheap_iblock = struct {
  *   var addr     = frhp_managed_id_to_addr(heap_off);
  * ----------------------------------------------------------------------- */
 
-fun frhp_managed_id_to_addr = (uint<64> heap_off) uint<64>:
+fun frhp_managed_id_to_addr_in_iblock = (uint<64> ib_addr,
+                                         uint<64> nrows,
+                                         uint<64> heap_off) uint<64>:
 {
-    var root_addr = global_frhp_root_addr;
-    var root_rows = global_frhp_curr_root_rows;
-
-    if (root_rows == 0UL) {
-        /* Root is a direct block; its block_off is 0 */
-        return root_addr + heap_off;
-    }
-
-    /* Root is an indirect block -- find which direct block child contains heap_off */
-    set_frhp_iblock(root_rows);
-    var ib     = fheap_iblock @ (root_addr#B);
-    var ib_off = bytes_to_u64_le(ib.block_off_raw);   /* 0 for root */
+    set_frhp_iblock(nrows);
+    var ib     = fheap_iblock @ (ib_addr#B);
+    var ib_off = bytes_to_u64_le(ib.block_off_raw);
     var tw     = global_frhp_table_width as uint<64>;
     var ndir   = global_frhp_iblock_ndir_entries;
 
@@ -363,21 +359,49 @@ fun frhp_managed_id_to_addr = (uint<64> heap_off) uint<64>:
             if (global_frhp_filter_len > 0UH) {
                 var e = frhp_dir_entry_filt @ entry_off;
                 if (is_undef_bytes(e.addr_raw))
-                    return 0xFFFFFFFFFFFFFFFFUL;
+                    return FRHP_ADDR_UNRESOLVED;
                 return bytes_to_u64_le(e.addr_raw) + (heap_off - blk_start);
             } else {
                 var e = frhp_dir_entry @ entry_off;
                 if (is_undef_bytes(e.addr_raw))
-                    return 0xFFFFFFFFFFFFFFFFUL;
+                    return FRHP_ADDR_UNRESOLVED;
                 return bytes_to_u64_le(e.addr_raw) + (heap_off - blk_start);
             }
         }
         i = i + 1UL;
     }
 
-    printf("frhp_managed_id_to_addr: heap_off=%u64d not in a direct child of root iblock\n",
+    /* Indirect children cover the remaining table rows.  A child entered in
+     * row r spans one row-r block and therefore has r rows of its own. */
+    var j = 0UL;
+    while (j < global_frhp_iblock_nindir_entries) {
+        var row = global_frhp_max_direct_rows + j / tw;
+        var col = j % tw;
+        var child_size = frhp_row_block_size(row);
+        var child_start = ib_off + frhp_row_block_off(row) + col * child_size;
+        if (heap_off >= child_start && heap_off < child_start + child_size) {
+            var child_raw = ib.indir_addrs[j];
+            if (is_undef_bytes(child_raw))
+                return FRHP_ADDR_UNRESOLVED;
+            return frhp_managed_id_to_addr_in_iblock(bytes_to_u64_le(child_raw),
+                                                      row, heap_off);
+        }
+        j = j + 1UL;
+    }
+
+    printf("frhp_managed_id_to_addr: heap_off=%u64d is outside indirect block at %u64d\n",
+           heap_off, ib_addr);
+    return FRHP_ADDR_UNRESOLVED;
+};
+
+fun frhp_managed_id_to_addr = (uint<64> heap_off) uint<64>:
+{
+    if (global_frhp_curr_root_rows == 0UL)
+        return global_frhp_root_addr + heap_off;
+
+    return frhp_managed_id_to_addr_in_iblock(global_frhp_root_addr,
+                                              global_frhp_curr_root_rows,
            heap_off);
-    return 0xFFFFFFFFFFFFFFFFUL;
 };
 
 /* ----------------------------------------------------------------------- *
@@ -634,6 +658,144 @@ type fheap_hdr = struct {
         printf("  [derived] tiny_max_len=%u64d\n",       global_frhp_tiny_max_len);
         printf("}\n");
     }
+};
+
+/* Find an indirectly addressed, non-filtered huge object by its unique ID.
+ * The heap ID carries that key; the FRHP header names a v2 B-tree whose type-1
+ * records supply the object's file address.  The traversal visits every
+ * child because the generic v2 B-tree pickle intentionally does not encode a
+ * comparator for every record family. */
+fun frhp_find_huge_bt2_node = (uint<64> node_addr, uint<16> depth, uint<16> nrec,
+                               uint<64> wanted_id) uint<64>:
+{
+    set_bt2_depth(depth);
+    set_bt2_nrec(nrec);
+
+    if (depth == 0UH) {
+        var leaf = bt2_leaf @ (node_addr#B);
+        var i = 0UL;
+        while (i < (nrec as uint<64>)) {
+            var rec = bt2_rec_type1 @ (leaf.records[i]'offset as offset<uint<64>,B>);
+            if (bytes_to_u64_le(rec.huge_obj_id_raw) == wanted_id)
+                return bytes_to_u64_le(rec.huge_obj_addr_raw);
+            i = i + 1UL;
+        }
+        return FRHP_ADDR_UNRESOLVED;
+    }
+
+    var inode = bt2_internal @ (node_addr#B);
+    var child_depth = depth - 1UH;
+    var i = 0UL;
+    while (i < (nrec as uint<64>) + 1UL) {
+        var child_addr = 0UL;
+        var child_nrec = 0UH;
+        if (depth == 1UH) {
+            child_addr = bytes_to_u64_le(inode.children.d1[i].child_addr_raw);
+            child_nrec = bytes_to_u64_le(inode.children.d1[i].nrec_in_child_raw) as uint<16>;
+        } else {
+            child_addr = bytes_to_u64_le(inode.children.dn[i].child_addr_raw);
+            child_nrec = bytes_to_u64_le(inode.children.dn[i].nrec_in_child_raw) as uint<16>;
+        }
+        var found = frhp_find_huge_bt2_node(child_addr, child_depth, child_nrec, wanted_id);
+        if (found != FRHP_ADDR_UNRESOLVED)
+            return found;
+        i = i + 1UL;
+    }
+    return FRHP_ADDR_UNRESOLVED;
+};
+
+fun frhp_find_huge_object = (uint<64> btree_addr, uint<64> wanted_id) uint<64>:
+{
+    var hdr = bt2_hdr @ (btree_addr#B);
+    if (hdr.record_type != 1UB) {
+        printf("frhp_id_to_addr: huge-object B-tree at %u64d has record type %u8d, not unfiltered huge-object type 1\n",
+               btree_addr, hdr.record_type);
+        return FRHP_ADDR_UNRESOLVED;
+    }
+    set_bt2_nrec_size_from_hdr(hdr.node_size, hdr.record_size);
+    set_bt2_nrec_subtree_size_from_hdr(hdr.node_size, hdr.record_size, hdr.depth);
+    return frhp_find_huge_bt2_node(bytes_to_u64_le(hdr.root_addr_raw), hdr.depth,
+                                   hdr.num_root_records, wanted_id);
+};
+
+/* ----------------------------------------------------------------------- *
+ * frhp_id_to_addr -- resolve a fractal heap ID (8 bytes, as embedded in a
+ * SOHM shared-message reference -- H5O_FHEAP_ID_LEN in H5Oprivate.h -- or
+ * a SOHM list/B-tree entry's fheap_id) to a file byte address.
+ *
+ * Maps fheap_hdr at heap_hdr_addr (sets all global_frhp_* state for that
+ * heap), then decodes the ID the same way frhp_heap_id's _print method does.
+ * All three ID types occur in practice -- the heap picks the encoding by
+ * object size, so a short shared message (a 2-byte fill value, say) lands in
+ * a tiny ID even though SOHM inserted it via H5HF_insert():
+ *
+ *   managed (0x00)  the object lives in a direct block; resolved through
+ *                   frhp_managed_id_to_addr().
+ *   tiny    (0x20)  the object is stored inline in the ID itself, so its
+ *                   "file address" is that of the ID's data area. Needs
+ *                   id_bytes to be mapped (it always is -- callers read it
+ *                   with `byte[8] @ ...`), since the address is the ID's own.
+ *   huge    (0x10)  unfiltered and stored directly, the ID carries the file
+ *                   address of the object. Filtered huge objects hold bytes
+ *                   no message type can be mapped over, and indirectly
+ *                   stored ones name a v2 B-tree key rather than an address;
+ *                   both return FRHP_ADDR_UNRESOLVED.
+ *
+ * Returns FRHP_ADDR_UNRESOLVED (never raises) when the ID cannot be reduced
+ * to a readable address.
+ *
+ * Usage:
+ *   var addr = frhp_id_to_addr(heap_hdr_addr#B, id_bytes);
+ *   if (addr != FRHP_ADDR_UNRESOLVED) ...
+ * ----------------------------------------------------------------------- */
+
+fun frhp_id_to_addr = (offset<uint<64>,B> heap_hdr_addr, byte[8] id_bytes) uint<64>:
+{
+    var h = fheap_hdr @ heap_hdr_addr;
+
+    var type_bits = id_bytes[0] & 0x30UB;
+
+    if (type_bits == 0x00UB) {
+        /* ---- Managed ------------------------------------------------- */
+        var off_sz   = global_frhp_heap_off_size as uint<64>;
+        var heap_off = bytes_to_u64_le_at(id_bytes, 1UL, off_sz);
+        return frhp_managed_id_to_addr(heap_off);
+    }
+
+    if (type_bits == 0x20UB) {
+        /* ---- Tiny: the object data is the tail of the ID itself ------ */
+        var data_off = (global_frhp_tiny_len_extended != 0UB) ? 2UL : 1UL;
+        return (id_bytes'offset / 1#B) + data_off;
+    }
+
+    if (type_bits == 0x10UB) {
+        /* ---- Huge ---------------------------------------------------- */
+        if (global_frhp_huge_ids_direct == 0UB) {
+            if (global_frhp_filter_len > 0UH) {
+                printf("frhp_id_to_addr: indirectly stored huge object of the heap at %v is filtered and cannot be decoded in place\n",
+                       heap_hdr_addr / 1#B);
+                return FRHP_ADDR_UNRESOLVED;
+            }
+            if (is_undef_bytes(h.huge_btree_addr_raw)) {
+                printf("frhp_id_to_addr: huge id is indirect but heap at %v has no huge-object B-tree\n",
+                       heap_hdr_addr / 1#B);
+                return FRHP_ADDR_UNRESOLVED;
+            }
+            var key = bytes_to_u64_le_at(id_bytes, 1UL,
+                                         global_frhp_huge_id_size as uint<64>);
+            return frhp_find_huge_object(bytes_to_u64_le(h.huge_btree_addr_raw), key);
+        }
+        if (global_frhp_filter_len > 0UH) {
+            printf("frhp_id_to_addr: huge object of the heap at %v is filtered; its bytes are filter-encoded and cannot be decoded in place\n",
+                   heap_hdr_addr / 1#B);
+            return FRHP_ADDR_UNRESOLVED;
+        }
+        return bytes_to_u64_le_at(id_bytes, 1UL, global_sizeof_offsets as uint<64>);
+    }
+
+    printf("frhp_id_to_addr: heap id of the heap at %v uses the reserved id type 0x%u8x\n",
+           heap_hdr_addr / 1#B, type_bits);
+    return FRHP_ADDR_UNRESOLVED;
 };
 
 /* ----------------------------------------------------------------------- *

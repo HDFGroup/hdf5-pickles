@@ -371,6 +371,108 @@ expect_ohdr_msg("dtype_v5_array_of_complex",
                 && array_complex.types.array.base_props'length == 20);
 close(array_complex_ios);
 
+/* A version-3 fill value whose bytes leave the version-1/2 arm's
+   fill_defined at zero. That arm's optional fill_size is then absent, so
+   testing it without first testing fill_defined raises E_elem -- which a
+   union does not recover from, unlike the E_constraint that rejects the arm.
+   The payload below is what a shared fill value resolves to out of a tiny
+   fractal-heap ID, where the bytes past the message are the ID's zero
+   padding. */
+var fill_v3_blob = [3UB, 10UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+var fill_v3_ios = open("*unit-ohdr-fill-v3-zero-tail*");
+byte[fill_v3_blob'length] @ fill_v3_ios : 0#B = fill_v3_blob;
+var fill_v3 = oh_msg_fill @ fill_v3_ios : 0#B;
+expect_ohdr_msg("fill_v3_absent_fill_size",
+                fill_v3'size/#B == 2
+                && fill_v3.version == 3UB
+                && fill_v3.space.v3.flags == 10UB);
+close(fill_v3_ios);
+
+/* An unresolvable shared message must report the sentinel rather than raise,
+   so that one unreachable reference does not abort a whole object header.
+   A version-3 SOHM reference is unresolvable while no Shared Message Table
+   has been decoded. */
+var sohm_ref_blob = [3UB, OH_SHARE_TYPE_SOHM,
+                     0x21UB, 3UB, 10UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+var sohm_ref_ios = open("*unit-ohdr-shared-sohm-unresolved*");
+byte[sohm_ref_blob'length] @ sohm_ref_ios : 0#B = sohm_ref_blob;
+
+/* shared_msg_payload_offset() maps in the current IOS, so make the synthetic
+   reference current for the call. It reports the reason on stdout; the point
+   of the case is that it returns instead of raising. */
+var saved_ios = get_ios();
+var saved_table_known = global_sohm_table_known;
+set_ios(sohm_ref_ios);
+global_sohm_table_known = 0UB;
+expect_ohdr_msg("shared_sohm_unresolved_is_not_fatal",
+                shared_msg_payload_offset(0#B, 0x05UB) == SHARED_MSG_UNRESOLVED);
+global_sohm_table_known = saved_table_known;
+set_ios(saved_ios);
+close(sohm_ref_ios);
+
+/* Exercise the complete version-3 SOHM path with a tiny fractal-heap ID:
+ *
+ *   shared-message reference -> SMTB index -> FRHP header -> tiny-ID bytes
+ *   -> fill-value payload.
+ *
+ * The one-index SMTB at byte 0 owns fill-value messages and names the FRHP at
+ * byte 64.  The eight-byte tiny ID starts at byte 202; its two inline bytes
+ * are a version-3 fill-value message.  Keeping the header real (rather than
+ * setting the derived heap globals directly) pins the map-time state that
+ * distinguishes a tiny ID from a managed one. */
+var shared_tiny_ios = open("*unit-ohdr-shared-sohm-tiny*");
+var smtb_blob =
+    [0x53UB, 0x4dUB, 0x54UB, 0x42UB,       /* SMTB */
+     0UB, 0UB, 0x20UB, 0UB,                /* v0, list, fill-value bit */
+     0UB, 0UB, 0UB, 0UB,                   /* min message size */
+     0UB, 0UB, 0UB, 0UB, 0UB, 0UB,         /* list/btree/message counts */
+     0UB, 0UB, 0UB, 0UB,                   /* index address */
+     64UB, 0UB, 0UB, 0UB,                  /* fractal-heap address */
+     0UB, 0UB, 0UB, 0UB];                  /* checksum */
+byte[smtb_blob'length] @ shared_tiny_ios : 0#B = smtb_blob;
+
+/* A 4-byte-width, unfiltered fractal heap with an 8-byte ID.  The fields
+ * unused by tiny IDs are zero, but the doubling table is well-formed so
+ * fheap_hdr computes tiny_len_extended from the on-disk header. */
+var frhp_unused_fields = byte[]();
+var frhp_zero_i = 0UL;
+while (frhp_zero_i < 48UL) {
+    frhp_unused_fields += [0UB];
+    frhp_zero_i = frhp_zero_i + 1UL;
+}
+var frhp_blob =
+    [0x46UB, 0x52UB, 0x48UB, 0x50UB,       /* FRHP */
+     0UB, 8UB, 0UB, 0UB, 0UB, 0UB,         /* version, ID/filter lengths, flags */
+     16UB, 0UB, 0UB, 0UB]                  /* max managed object size */
+    + frhp_unused_fields
+    + [2UB, 0UB,                            /* doubling-table width */
+       16UB, 0UB, 0UB, 0UB,                /* starting block size */
+       16UB, 0UB, 0UB, 0UB,                /* maximum direct-block size */
+       8UB, 0UB, 0UB, 0UB,                 /* max heap bits, starting rows */
+       0UB, 0UB, 0UB, 0UB,                 /* root address */
+       0UB, 0UB]                           /* current root rows */
+    + [0UB, 0UB, 0UB, 0UB];                /* checksum */
+byte[frhp_blob'length] @ shared_tiny_ios : 64#B = frhp_blob;
+
+/* v3/SOHM, then a short tiny ID: type 0x20 and length 2, followed by the
+ * payload [fill-message version 3, flags 10]. */
+var shared_tiny_ref = [3UB, OH_SHARE_TYPE_SOHM,
+                       0x22UB, 3UB, 10UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+byte[shared_tiny_ref'length] @ shared_tiny_ios : 200#B = shared_tiny_ref;
+
+saved_ios = get_ios();
+set_ios(shared_tiny_ios);
+set_sohm_master_table(0UL, 1UL);
+var shared_tiny_payload = shared_msg_payload_offset(200#B, 0x05UB);
+var shared_tiny_fill = oh_msg_fill @ shared_tiny_payload;
+expect_ohdr_msg("shared_sohm_tiny_fill_payload",
+                shared_tiny_payload == 203#B
+                && shared_tiny_fill.version == 3UB
+                && shared_tiny_fill.space.v3.flags == 10UB
+                && shared_tiny_fill'size / #B == 2);
+set_ios(saved_ios);
+close(shared_tiny_ios);
+
 if (ohdr_msg_failures != 0)
     {
         printf("UNIT OHDR MESSAGES: %i32d failure(s)\n", ohdr_msg_failures);
