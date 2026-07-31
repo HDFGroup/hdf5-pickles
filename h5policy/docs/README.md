@@ -173,8 +173,10 @@ Two narrowly defined cases demote an apparent A failure to a warning:
 - **A~** means all corruption findings are confined to active metadata that
   current read-only `libhdf5` paths deliberately leave unopened: file-global
   SOHM search or free-space-manager metadata, or dense secondary
-  creation-order indexes. h5policy validates these structures eagerly even
-  when `libhdf5` can enumerate through another index.
+  creation-order indexes; it also covers the generated wide-length controls
+  where `libhdf5` reports a scalar dataset without checking that its declared
+  contiguous-data extent can exist in the physical file. h5policy validates
+  these structures and extents eagerly.
 
 Both variants remain visible as warnings but do not make the harness exit
 non-zero.

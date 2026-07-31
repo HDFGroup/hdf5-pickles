@@ -49,10 +49,13 @@ controlled outcome; a change that alters any decision is surfaced for review.
 ./run.sh
 ```
 
-This regenerates the fixtures and runs every gate in one pass:
+This regenerates the git-ignored fixtures before checking registry ownership, so
+the same command works in a fresh clone as well as an existing build tree, and
+then runs every gate in one pass:
 
 | gate | asserts |
 |---|---|
+| corpus generation | every fixture referenced by the tracked expectations is created before consistency checks inspect it |
 | registry consistency | the cross-file constraints, including that the manifest's claim about libhdf5 matches what was measured |
 | unit checks | datatype, message, file-space-info, profile limits, reachability, consumer API, `h5policy_analyze` seam, timeout report |
 | corpus cases | every `expected/*.yml`: decision, exit code, required findings, evidence locations, forbidden outcomes |
@@ -186,9 +189,11 @@ inspecting attributes, reading small datasets, or running optional `libhdf5`
 tools; those eager catches are security-useful, not hard false positives. The
 similarly narrow `A~` warning covers file-global SOHM/free-space metadata that
 read-only libhdf5 paths leave unopened, and findings confined to dense
-secondary creation-order indexes. Current libhdf5 can enumerate the primary
-name index without authenticating every type-6/type-9 block; h5policy
-intentionally validates both active indexes.
+secondary creation-order indexes. It also covers the generated wide-length
+controls whose impossible contiguous-data extents libhdf5 leaves lazy. Current
+libhdf5 can enumerate the primary name index without authenticating every
+type-6/type-9 block, and can report those controls' scalar datasets without
+checking their physical extents; h5policy intentionally validates both.
 
 The logical-**bytes** comparison is warning-level rather than a hard failure:
 h5policy now tracks logical dataset bytes separately from raw storage bytes, so

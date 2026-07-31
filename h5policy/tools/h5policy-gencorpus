@@ -177,6 +177,18 @@ def _gen_valid(root):
         "00000000ffffffffffffffffffffffffffffffff0a0200000000060f00000100"
         "0464736574300000000000000096c06e3f")
     _patch(f"{root}/cve/sizeof_size_uninit_length.h5", wide_length_cve)
+    # Direct variants isolate the 16-byte contiguous length from the original
+    # specimen's earlier out-of-file address.  Keep them in the generated
+    # corpus rather than an ignored case-work directory so a fresh clone can
+    # reproduce every tracked expectation.
+    _make_wide_length_variant(
+        f"{root}/valid/wide_length_one.h5", wide_length_cve, 1)
+    _make_wide_length_variant(
+        f"{root}/malformed/wide_length_u64_max.h5", wide_length_cve,
+        (1 << 64) - 1)
+    _make_wide_length_variant(
+        f"{root}/malformed/wide_length_2pow64_plus_one.h5", wide_length_cve,
+        (1 << 64) + 1)
 
     # MDCI entry body claims 226 bytes after an 18-byte image header and a
     # 30-byte entry header, but the complete cache image is only 256 bytes.
@@ -665,6 +677,44 @@ def _make_nul_compact_link_name(path):
     _patch(path, bytes(raw))
 
 
+def _make_unsupported_superblock_offset_width(path):
+    """A v2/v3 superblock advertising a nonsensical 100-byte offset width.
+
+    The validator must reject this from the fixed superblock prefix before it
+    attempts to map any dynamic-width address fields.
+    """
+    raw = _base_bytes(lambda h: None)
+    if raw[8] not in (2, 3) or raw[9] != 8:
+        raise RuntimeError("expected a v2/v3 superblock with 8-byte offsets")
+    _pin_ohdr_times(raw)
+    raw[9] = 0x64
+    _patch(path, bytes(raw))
+
+
+def _make_root_object_not_group(path):
+    """An earliest-format file whose root symbol-table entry names a dataset.
+
+    The dataset is valid in isolation; corruption is the root object's role.
+    Version-0 superblocks have no checksum, so repointing the root entry is the
+    only byte edit required.
+    """
+    dataset = {}
+
+    def build(h):
+        dset = h.create_dataset(
+            "d", data=np.arange(4, dtype="i4"), track_times=False)
+        dataset["address"] = h5py.h5o.get_info(dset.id).addr
+
+    raw = _base_bytes(build, libver="earliest")
+    if raw[8] != 0 or raw[13] != 8 or raw[14] != 8:
+        raise RuntimeError("expected a v0 superblock with 8-byte widths")
+    # v0 prefix, four file addresses, then the symbol-table entry's link-name
+    # offset and object-header address.
+    root_object_address = 24 + 4 * raw[13] + raw[14]
+    struct.pack_into("<Q", raw, root_object_address, dataset["address"])
+    _patch(path, bytes(raw))
+
+
 def _gen_malformed(root):
     # ---- malformed/ : expected `reject_corrupt`, byte-patched from a base --
     base = f"{root}/valid/empty.h5"
@@ -674,6 +724,10 @@ def _gen_malformed(root):
     _patch(f"{root}/malformed/truncated.h5", raw[:32])
     _patch(f"{root}/malformed/bad_superblock_version.h5",
            raw[:8] + b"\xff" + raw[9:])
+    _make_unsupported_superblock_offset_width(
+        f"{root}/malformed/superblock_offset_width.h5")
+    _make_root_object_not_group(
+        f"{root}/malformed/root_object_not_group.h5")
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
     _make_nul_compact_link_name(
         f"{root}/malformed/nul_compact_link_name.h5")
@@ -1638,6 +1692,18 @@ def _fix_v2_ohdr_checksum(raw, ohdr_off):
     chksum_off = cursor + size_width + chunk_size
     struct.pack_into("<I", raw, chksum_off,
                      _jenkins_lookup3()(bytes(raw[ohdr_off:chksum_off])))
+
+
+def _make_wide_length_variant(path, base, length):
+    """Write a direct 16-byte contiguous-length variant of ``base``."""
+    raw = bytearray(base)
+    if len(raw) != 177 or raw[10] != 16:
+        raise RuntimeError("wide-length fixture base geometry changed")
+    last_file_byte = len(raw) - 1
+    raw[91:99] = last_file_byte.to_bytes(8, "little")
+    raw[99:115] = length.to_bytes(16, "little")
+    _fix_v2_ohdr_checksum(raw, 48)
+    _patch(path, bytes(raw))
 
 
 def _pin_ohdr_times(raw):

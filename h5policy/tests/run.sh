@@ -18,9 +18,9 @@
 # h5policy regression runner.
 #
 # Oracle correctness:
-#   1. registry consistency (tools/check_registry.py), including the gate
+#   1. (re)generates the corpus fixtures with h5policy-gencorpus,
+#   2. registry consistency (tools/check_registry.py), including the gate
 #      between the claimed and the measured libhdf5 verdicts,
-#   2. (re)generates the corpus fixtures with h5policy-gencorpus,
 #   3. synthetic datatype, assigned-message, file-space-info and profile-limit
 #      checks; reachability records; the read-only consumer API; the
 #      h5policy_analyze seam; the wrapper-generated wall-timeout report,
@@ -47,11 +47,11 @@ overlay_dir="$(cd -- "$tests_dir/.." && pwd)"
 repo_dir="$(cd -- "$overlay_dir/.." && pwd)"
 export POKE_LOAD_PATH="$overlay_dir/pickles:$repo_dir/pickles${POKE_LOAD_PATH:+:$POKE_LOAD_PATH}"
 
-echo "== registry consistency =="
-python3 "$repo_dir/tools/check_registry.py" || exit 1
-
 echo "== generating corpus =="
 "$overlay_dir/tools/h5policy-gencorpus" "$tests_dir" || exit 1
+
+echo "== registry consistency =="
+python3 "$repo_dir/tools/check_registry.py" || exit 1
 
 echo "== datatype validator unit checks =="
 poke --quiet -L "$tests_dir/unit_datatype.pk"
