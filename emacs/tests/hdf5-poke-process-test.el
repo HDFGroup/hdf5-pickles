@@ -318,6 +318,66 @@
                    (goto-char (point-min))
                    (search-forward "GNU poke datatype view" nil t))))))))
 
+(ert-deftest hdf5-poke-process-resolves-shared-datatype-message ()
+  "A shared datatype message decodes as the type it references.
+
+The dataset's datatype message body is an H5O_shared_t reference to the
+committed header, not a datatype: decoded in place it reads as class 2
+\"time\" with element size 0.  Resolved, it is the committed 4-byte
+fixed-point type."
+  (hdf5-poke-process-test--with-session
+   "committed_datatype.h5"
+   (lambda (session)
+     (with-current-buffer session
+       (hdf5-poke-open-path "/data"))
+     (hdf5-poke-process-test--wait session)
+     (let* ((message-buffer
+             (cl-find-if
+              (lambda (buffer)
+                (string-prefix-p
+                 "*hdf5-poke-messages:committed_datatype.h5@"
+                 (buffer-name buffer)))
+              (buffer-list)))
+            (datatype-row nil)
+            payload size name flags)
+       (should message-buffer)
+       (with-current-buffer message-buffer
+         (setq datatype-row
+               (cl-find-if
+                (lambda (row) (= (plist-get row :type) 3))
+                (mapcar #'car tabulated-list-entries)))
+         (should datatype-row)
+         ;; The message list reports the reference and where it leads.
+         (should (equal "committed" (plist-get datatype-row :shared)))
+         (should (integerp (plist-get datatype-row :shared-payload-offset)))
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (search-forward "committed" nil t)))
+         (setq payload (plist-get datatype-row :payload-offset)
+               size (plist-get datatype-row :size)
+               name (plist-get datatype-row :name)
+               flags (plist-get datatype-row :flags)))
+       (with-current-buffer session
+         (hdf5-poke-message-detail-at 3 payload size name flags))
+       (hdf5-poke-process-test--wait session)
+       (with-current-buffer
+           (format "*hdf5-poke-message:committed_datatype.h5:Datatype@%s*"
+                   payload)
+         (should (derived-mode-p 'hdf5-poke-message-detail-mode))
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (search-forward "Shared" nil t)))
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (search-forward "fixed-point" nil t)))
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (re-search-forward "^element-size +4$" nil t)))
+         ;; What the unresolved decode used to claim.
+         (should-not (save-excursion
+                       (goto-char (point-min))
+                       (search-forward "\"time\"" nil t))))))))
+
 (ert-deftest hdf5-poke-process-translates-userblock-addresses ()
   (let ((hdf5-poke-default-superblock-offset "512#B"))
     (hdf5-poke-process-test--with-session

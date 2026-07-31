@@ -125,6 +125,20 @@
       (when (get-buffer table-name) (kill-buffer table-name))
       (when (buffer-live-p session) (kill-buffer session)))))
 
+(ert-deftest hdf5-poke-labels-shared-messages-in-message-table ()
+  "The Shared column names the share type and flags a dead reference."
+  (should (equal "" (hdf5-poke--message-shared-label
+                     '(:record message :type 8 :shared nil
+                               :shared-payload-offset nil))))
+  (should (equal "committed" (hdf5-poke--message-shared-label
+                              '(:record message :type 3 :shared "committed"
+                                        :shared-payload-offset 824))))
+  ;; A reference that could not be followed still says what kind it is; the
+  ;; payload behind it is what is missing.
+  (should (equal "sohm?" (hdf5-poke--message-shared-label
+                          '(:record message :type 1 :shared "sohm"
+                                    :shared-payload-offset nil)))))
+
 (ert-deftest hdf5-poke-infers-object-kind-from-message-records ()
   (should (eq (hdf5-poke--records-object-kind
                '((:record object-header :offset 48)

@@ -120,6 +120,7 @@ See `hdf5-poke-mode-keys' for the entry format.")
          ("Payload" 10 t)
          ("Size" 8 t)
          ("Flags" 8 t)
+         ("Shared" 11 t)
          ("Crt" 8 t)])
   (setq tabulated-list-padding 2)
   (tabulated-list-init-header))
@@ -302,6 +303,17 @@ MODE controls the sibling action: `messages' inserts an Open links action;
     (hdf5-poke--render-errors errors)
     (goto-char (point-min))))
 
+(defun hdf5-poke--message-shared-label (message)
+  "Return the Shared column for MESSAGE.
+A shared message stores a reference to a committed object header or to the
+shared-message heap instead of its own content, so the column names the
+share type and marks a reference that could not be followed."
+  (let ((shared (plist-get message :shared)))
+    (cond
+     ((null shared) "")
+     ((plist-get message :shared-payload-offset) shared)
+     (t (concat shared "?")))))
+
 (defun hdf5-poke--render-message-list (offset records errors &optional path stack)
   "Render object-header message RECORDS for OFFSET."
   (let* ((file (file-name-nondirectory hdf5-poke--target-file))
@@ -334,6 +346,7 @@ MODE controls the sibling action: `messages' inserts an Open links action;
                               (hdf5-poke--field message :payload-offset)
                               (hdf5-poke--field message :size)
                               (hdf5-poke--field message :flags)
+                              (hdf5-poke--message-shared-label message)
                               (hdf5-poke--field message :creation-order)))))
                    messages))
       (setq-local header-line-format
@@ -1571,10 +1584,14 @@ SIZE is used only when KIND is \"bytes\"."
      (plist-get record :type)
      (plist-get record :payload-offset)
      (plist-get record :size)
-     (plist-get record :name))))
+     (plist-get record :name)
+     (plist-get record :flags))))
 
-(defun hdf5-poke-message-detail-at (type payload-offset size &optional name)
-  "Request and render a raw detail view for a message payload."
+(defun hdf5-poke-message-detail-at (type payload-offset size &optional name flags)
+  "Request and render a raw detail view for a message payload.
+FLAGS is the message prefix's flag byte.  It is what tells the decoder that
+the payload is a shared-message reference rather than the message content,
+so pass it whenever the message record supplies it."
   (hdf5-poke--send-request
    "Message Detail"
    "hdf5_poke_emacs_message"
@@ -1582,7 +1599,8 @@ SIZE is used only when KIND is \"bytes\"."
     (format "%dUB" type)
     (hdf5-poke--offset-expression payload-offset)
     (format "%dUH" size)
-    (hdf5-poke--superblock-offset-expression))
+    (hdf5-poke--superblock-offset-expression)
+    (format "%dUL" (or flags 0)))
    (lambda (records raws errors)
      (hdf5-poke--render-message-detail
       type payload-offset records raws errors name))))
