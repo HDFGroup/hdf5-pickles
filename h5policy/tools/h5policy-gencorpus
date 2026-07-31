@@ -1211,11 +1211,16 @@ def _scaleoffset_cd_patch(path, cd_index, value):
 
     The pipeline payload is: version(1) nfilters(1); then the descriptor id(2)
     flags(2) cd_nelmts(2), followed by the 32-bit client-data words, so
-    cd_values[i] lives at mbody + 8 + 4*i."""
+    cd_values[i] lives at mbody + 8 + 4*i.
+
+    Pinned to the 1.10 bound rather than "latest": a filtered chunk gets a
+    version-5 layout message under a 2.x-linked h5py's default "latest"
+    bound, but h5patch's matching repair fixture wants the plain version-4
+    form this filter pipeline has always needed."""
     def _build(h):
         h.create_dataset("d", data=np.arange(8, dtype="i4"),
                          chunks=(4,), scaleoffset=0, track_times=False)
-    raw = _base_bytes(_build)
+    raw = _base_bytes(_build, libver=("v110", "v110"))
 
     for o in range(len(raw) - 4):
         if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
@@ -1269,7 +1274,14 @@ def _make_scaleoffset_size_mismatch(path):
 
 
 def _v4_layout_message(raw):
-    """Locate the first version-4 data-layout message in a v2 object header.
+    """Locate the first version-4-or-5 data-layout message in a v2 object header.
+
+    Filtered single-chunk datasets already come out of libhdf5 2.x as a
+    version-5 message (the encoding a filter needs to grow a chunk past the
+    v4 size field); unfiltered ones still come out as version 4, needing the
+    byte patch described on ``_make_layout_version``.  Either starting point
+    is accepted here so the caller can stamp the byte to whatever version it
+    actually wants.
 
     Returns ``(ohdr_off, mbody)`` so a caller can patch the message bytes and
     then repair the header checksum with ``_fix_v2_ohdr_checksum``.
@@ -1287,10 +1299,10 @@ def _v4_layout_message(raw):
             mtype = raw[p]
             msize = struct.unpack_from("<H", raw, p + 1)[0]
             mbody = p + 4 + (2 if flags & 0x04 else 0)
-            if mtype == 0x08 and raw[mbody] == 4:
+            if mtype == 0x08 and raw[mbody] in (4, 5):
                 return o, mbody
             p = mbody + msize
-    raise RuntimeError("could not locate a v4 data-layout message")
+    raise RuntimeError("could not locate a v4 or v5 data-layout message")
 
 
 def _make_layout_version(path, build, version, mutate=None):
@@ -1305,10 +1317,15 @@ def _make_layout_version(path, build, version, mutate=None):
     itself at size-of-lengths width in both versions -- so bumping the version
     byte yields a file a 2.x library reads exactly as it reads the v4 original.
 
-    h5py links libhdf5 1.14, which cannot write (or read) a v5 layout message,
-    so this byte patch is how the corpus gets one without pinning the whole
-    generator to a 2.x build.  ``mutate(raw, mbody)`` may then corrupt the
-    message for the malformed fixtures.
+    Whichever libhdf5 h5py links determines the starting version: builds
+    linked against 1.14 cannot write (or read) a v5 layout message at all, so
+    every dataset here comes out as v4 and needs the byte patch below; builds
+    linked against a 2.x library already write single-chunk-filtered layouts
+    as v5 natively (that's the case the class exists for), so the "patch" is
+    a no-op stamp of the version that's already there.  Either way this is
+    how the corpus gets the requested version without pinning the whole
+    generator to a specific libhdf5 build.  ``mutate(raw, mbody)`` may then
+    corrupt the message for the malformed fixtures.
     """
     raw = _base_bytes(build)
     ohdr, mbody = _v4_layout_message(raw)

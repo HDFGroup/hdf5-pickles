@@ -95,10 +95,10 @@
    "dense_group.h5"
    (lambda (session)
      (with-current-buffer session
-       (hdf5-poke-links-at 195))
+       (hdf5-poke-links-at 179))
      (hdf5-poke-process-test--wait session)
      (let* ((rows (hdf5-poke-process-test--row-ids
-                   "*hdf5-poke-links:dense_group.h5@195*"))
+                   "*hdf5-poke-links:dense_group.h5@179*"))
             (links (cl-remove-if-not
                     (lambda (row) (eq (plist-get row :record) 'link))
                     rows))
@@ -224,11 +224,11 @@
   (hdf5-poke-process-test--assert-chunk-index
    "chunk_v1_btree.h5" 1400 3 "v1-btree" 4)
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_fixed_array.h5" 463 2 "fixed-array" 4)
+   "chunk_fixed_array.h5" 447 2 "fixed-array" 4)
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_extensible_array.h5" 463 2 "extensible-array" 3)
+   "chunk_extensible_array.h5" 447 2 "extensible-array" 3)
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_v2_btree.h5" 463 3 "v2-btree" 4 '(1 1) 2))
+   "chunk_v2_btree.h5" 447 3 "v2-btree" 4 '(1 1) 2))
 
 (ert-deftest hdf5-poke-process-previews-small-contiguous-dataset ()
   (hdf5-poke-process-test--with-session
