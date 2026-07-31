@@ -237,6 +237,13 @@ if(POKE_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0)
     # 300s on an unloaded host and exceeds it under parallel CTest load, so the
     # ceiling is generous rather than tight.
     set_tests_properties(h5policy_regression PROPERTIES TIMEOUT 600)
+    # cache_image_docs_regression reads h5policy/tests/valid/cache_image.h5,
+    # which only exists once h5policy_regression's run.sh has (re)generated the
+    # corpus; on a clean checkout, running it in registration order (before
+    # h5policy_regression) hits a missing file. Anchor it after the corpus
+    # exists instead.
+    set_tests_properties(cache_image_docs_regression PROPERTIES
+        DEPENDS h5policy_regression)
     add_test(
         NAME h5patch_regression
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/run.sh"
