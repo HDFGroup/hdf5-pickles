@@ -256,11 +256,29 @@ Each file receives one aggregate status:
 
 - `[PASS]`: no hard failures or warnings.
 - `[WARN]`: at least one informational disagreement and no hard failure.
-- `[FAIL]`: at least one hard invariant failed.
+- `[TRACKED]`: every hard failure is a registered, known divergence (see
+  below); no untracked hard failure.
+- `[FAIL]`: at least one untracked hard invariant failure.
 
-Warnings do not affect the process exit code. The command exits `1` when any
-file has a hard failure and `0` otherwise. Missing `h5dump` or `h5debug` is
-reported and that optional oracle is skipped.
+Warnings and tracked divergences do not affect the process exit code. The
+command exits `1` when any file has an untracked hard failure, and `0`
+otherwise. Missing `h5dump` or `h5debug` is reported and that optional oracle
+is skipped.
+
+### Known reference-library divergences
+
+The A+/A~/A'~ exceptions above are code-scoped: each is a predicate over
+h5policy's own finding codes, so it generalizes to any fixture that happens to
+hit the same code path. A small number of divergences do not fit that shape --
+the disagreement is specific to one fixture, already triaged and traced to a
+`libhdf5` defect rather than an h5policy one, and documented in
+`registry/cases/`. `registry/h5policy-diff-tolerances.yml` lists these by
+exact fixture path and invariant letter; a hard failure that matches an entry
+still prints (`FAIL ... (tracked: <case id>)`) but is excluded from
+`total_fail`, so it does not fail `h5policy_regression`. It is deliberately
+not a general "known-flaky" mechanism: a different fixture, a different
+invariant, or the same fixture producing a new/different failure is not
+matched, and reports as a normal hard `[FAIL]`.
 
 ## `h5policy-fuzz`
 

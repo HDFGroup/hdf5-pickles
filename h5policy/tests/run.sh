@@ -94,7 +94,7 @@ corpus_status=$?
 
 echo "== differential vs libhdf5 (h5py / h5dump / h5debug) =="
 "$overlay_dir/tools/h5policy-diff" --dir "$tests_dir" | \
-    grep -E '\[(PASS|FAIL|WARN)\]|FAIL |differential:'
+    grep -E '\[(PASS|FAIL|WARN|TRACKED)\]|FAIL |differential:'
 diff_status=${PIPESTATUS[0]}
 
 # Exact-build probe smoke check (roadmap change #3, OS-level layer).  Needs a C

@@ -45,6 +45,11 @@ Cross-invariants (a hard failure exits non-zero; a warning is informational):
   C  h5policy max logical dataset bytes  <=  h5py's                (no overcount)
   D  h5policy max rank seen  <=  h5py's                            (no overcount)
 
+A hard failure for one (fixture, invariant) pair registered in
+registry/h5policy-diff-tolerances.yml -- an already-triaged, fixture-specific
+reference-library defect, see registry/cases/ -- still prints but is excluded
+from total_fail ("tracked", not silenced).  See load_tolerances() below.
+
 Usage: h5policy-diff FILE [FILE ...]
        h5policy-diff --dir DIR        # every *.h5 under DIR
 """
@@ -56,15 +61,65 @@ import shutil
 import subprocess
 import sys
 
+import yaml
+
 try:
     import h5py
 except ImportError:  # pragma: no cover
     sys.exit("h5policy-diff: h5py is required (it is the reference implementation)")
 
 HERE = os.path.dirname(os.path.realpath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
 H5POLICY = os.path.join(HERE, "h5policy")
+TESTS_DIR = os.path.join(REPO, "h5policy", "tests")
+TOLERANCES_FILE = os.path.join(REPO, "registry", "h5policy-diff-tolerances.yml")
 KNOWN_EXITS = {0, 1, 2, 3, 4, 5, 70}
 READ_PROBE_MAX_BYTES = 16 * 1024 * 1024
+KNOWN_INVARIANTS = {"A", "A'", "B", "D"}
+
+
+def load_tolerances():
+    """Per-fixture, per-invariant exemptions from a hard-failure exit status.
+
+    Unlike the A+/A~/A'~ exceptions below -- narrow, code-scoped predicates
+    keyed to h5policy's OWN finding codes, so they generalize across any
+    fixture that happens to hit the same code path -- an entry here excuses
+    one specific fixture's one specific invariant letter, because of an
+    already-triaged REFERENCE-library defect recorded in registry/cases/. It
+    never broadens silently: a different fixture, a different invariant
+    letter, or the same fixture producing a different failure no longer
+    matches, and h5policy-diff reports the hard failure as before.
+
+    A tolerated failure still prints as FAIL in this tool's output -- tracked,
+    not silenced -- but is excluded from total_fail, so it does not fail the
+    regression suite. See registry/h5policy-diff-tolerances.yml.
+    """
+    if not os.path.exists(TOLERANCES_FILE):
+        return {}
+    data = yaml.safe_load(open(TOLERANCES_FILE)) or {}
+    table = {}
+    for entry in data.get("tolerances", []):
+        fixture, invariant = entry["fixture"], entry["invariant"]
+        if invariant not in KNOWN_INVARIANTS:
+            sys.exit(f"h5policy-diff: {TOLERANCES_FILE}: unknown invariant "
+                     f"{invariant!r} for fixture {fixture!r}")
+        case_path = os.path.join(REPO, "registry", "cases", f"{entry['case']}.yml")
+        if not os.path.exists(case_path):
+            sys.exit(f"h5policy-diff: {TOLERANCES_FILE}: fixture {fixture!r} "
+                     f"references missing case registry/cases/{entry['case']}.yml")
+        table[(fixture, invariant)] = entry
+    return table
+
+
+TOLERANCES = load_tolerances()
+
+
+def tolerance_key(path):
+    """The fixture identity tolerances are keyed on: path relative to tests/."""
+    try:
+        return os.path.relpath(os.path.realpath(path), TESTS_DIR)
+    except ValueError:
+        return None
 
 
 class ToolError(RuntimeError):
@@ -548,17 +603,25 @@ def reference_predates_message_version(ref, decision):
 
 
 def check(path):
-    """Return (hard_failures, warnings, lines) for one file."""
-    fails, warns, lines = [], [], []
+    """Return (hard_failures, warnings, lines, tracked) for one file."""
+    fails, warns, lines, tracked = [], [], [], []
     report, _ = run_h5policy(path)
     decision = report["decision"]
     feat = report.get("features", {})
     ref = introspect_isolated(path)
     h5dump_rc = reference_rc("h5dump", path)
     h5debug_rc = reference_rc("h5debug", path)
+    tol_key = tolerance_key(path)
 
-    def hard(ok, msg):
-        (lines if ok else fails).append(("PASS " if ok else "FAIL ") + msg)
+    def hard(ok, msg, invariant=None):
+        if ok:
+            lines.append("PASS " + msg)
+            return
+        entry = TOLERANCES.get((tol_key, invariant)) if invariant else None
+        if entry:
+            tracked.append((("FAIL " + msg), entry))
+        else:
+            fails.append("FAIL " + msg)
 
     def soft(ok, msg):
         (lines if ok else warns).append(("ok   " if ok else "WARN ") + msg)
@@ -609,10 +672,12 @@ def check(path):
                      "overflow from the layout message alone")
             else:
                 hard(False,
-                     f"A  libhdf5 opens => not reject_corrupt (got {decision})")
+                     f"A  libhdf5 opens => not reject_corrupt (got {decision})",
+                     invariant="A")
         else:
             hard(True,
-                 f"A  libhdf5 opens => not reject_corrupt (got {decision})")
+                 f"A  libhdf5 opens => not reject_corrupt (got {decision})",
+                 invariant="A")
     else:
         safe_rejections = {
             "reject_corrupt",
@@ -628,7 +693,8 @@ def check(path):
                  f"({ref.get('error', '')}); h5policy decodes it and accepts")
         else:
             hard(decision in safe_rejections,
-                 f"A' libhdf5 rejects => explicit rejection (got {decision})")
+                 f"A' libhdf5 rejects => explicit rejection (got {decision})",
+                 invariant="A'")
         if decision in safe_rejections and decision != "reject_corrupt":
             soft(False,
                  "A' libhdf5 rejects as corrupt; h5policy safely refuses "
@@ -644,7 +710,8 @@ def check(path):
         # B: external-reference detection.
         hard((feat.get("external_links", 0) > 0) == (ref["ext_links"] > 0),
              f"B  external links: h5policy={feat.get('external_links',0)} "
-             f"h5py={ref['ext_links']}")
+             f"h5py={ref['ext_links']}",
+             invariant="B")
 
         # C: logical dataset bytes -- ADVISORY, not a hard invariant.  h5policy
         # reads the DECLARED on-disk element size; libhdf5's H5Tget_size reports
@@ -661,11 +728,12 @@ def check(path):
         # D: rank must never exceed the reference.
         prank, rrank = feat.get("max_rank_seen", 0), ref["max_rank"]
         hard(prank <= rrank,
-             f"D  max rank: h5policy={prank} h5py={rrank}")
+             f"D  max rank: h5policy={prank} h5py={rrank}",
+             invariant="D")
         if prank < rrank:
             soft(False, f"D  rank undercount: h5policy={prank} < h5py={rrank}")
 
-    return fails, warns, lines
+    return fails, warns, lines, tracked
 
 
 def main():
@@ -719,11 +787,12 @@ def main():
 
     total_fail = 0
     total_tool_error = 0
+    total_tracked = 0
     records = []
     for path in files:
         rel = os.path.relpath(path)
         try:
-            fails, warns, lines = check(path)
+            fails, warns, lines, tracked = check(path)
         except ToolError as exc:
             # Counted and reported SEPARATELY from differential failures: the
             # tool misbehaved, it did not disagree with libhdf5.
@@ -739,30 +808,53 @@ def main():
             records.append({"file": rel, "status": "ERROR", "error": str(exc)})
             total_fail += 1
             continue
-        status = "FAIL" if fails else ("WARN" if warns else "PASS")
-        records.append({"file": rel, "status": status,
-                        "checks": lines, "warnings": warns, "failures": fails})
+        # TRACKED ranks above WARN: it says a hard invariant failed, just not
+        # newly -- registry/cases/ already has a triaged explanation, and the
+        # fixture keeps failing that invariant every run, on purpose, until the
+        # reference defect is fixed or the tolerance is withdrawn.
+        if fails:
+            status = "FAIL"
+        elif tracked:
+            status = "TRACKED"
+        elif warns:
+            status = "WARN"
+        else:
+            status = "PASS"
+        tracked_lines = [f"{ln}  (tracked: {entry['case']})"
+                         for ln, entry in tracked]
+        records.append({"file": rel, "status": status, "checks": lines,
+                        "warnings": warns, "failures": fails,
+                        "tracked": [{"check": ln, "case": entry["case"],
+                                    "reason": entry.get("reason")}
+                                   for ln, entry in tracked]})
         if not args.json:
             print(f"\n{rel}  [{status}]")
-            for ln in lines + warns + fails:
+            for ln in lines + warns + tracked_lines + fails:
                 print(f"  {ln}")
         total_fail += len(fails)
+        total_tracked += len(tracked)
 
     if args.json:
         print(json.dumps({"tool": "h5policy-diff", "provenance": provenance,
                           "hard_failures": total_fail,
+                          "tracked_divergences": total_tracked,
                           "tool_errors": total_tool_error,
                           "files": len(files),
                           "results": records}, indent=2))
     else:
         summary = (f"\ndifferential: {total_fail} hard failure(s) across "
                    f"{len(files)} file(s)")
+        if total_tracked:
+            summary += (f"; {total_tracked} tracked (known, "
+                        f"registry-documented) divergence(s)")
         if total_tool_error:
             summary += (f"; {total_tool_error} file(s) produced NO h5policy "
                         f"verdict (tool error, not a differential result)")
         print(summary)
     # Both are non-zero exits -- a tool that cannot answer still has to stop the
     # suite -- but the counts stay distinct so the cause is never guessed at.
+    # Tracked divergences are deliberately NOT part of this: they are a known
+    # reference-library defect, not an open question about h5policy.
     return 1 if (total_fail or total_tool_error) else 0
 
 
