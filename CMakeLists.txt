@@ -59,6 +59,8 @@ set(PKDOC_SPECS
 set(PKDOC_GENERATED_FILES)
 set(PKDOC_SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/tools/pkdoc.py")
 set(PKDOC_CHECK_COMMANDS)
+set(PKDOC_INDEX "${CMAKE_CURRENT_SOURCE_DIR}/docs/spec/index.yml")
+set(PKDOC_INDEX_OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/docs/generated/README.md")
 
 foreach(PKDOC_SPEC IN LISTS PKDOC_SPECS)
     set(PKDOC_SIDECAR "${CMAKE_CURRENT_SOURCE_DIR}/docs/spec/${PKDOC_SPEC}.yml")
@@ -71,6 +73,7 @@ foreach(PKDOC_SPEC IN LISTS PKDOC_SPECS)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/pkdoc.py"
                 --doc "${PKDOC_SIDECAR}"
                 --check
+                --check-generated "${PKDOC_OUTPUT}"
     )
 
     add_custom_command(
@@ -87,6 +90,28 @@ foreach(PKDOC_SPEC IN LISTS PKDOC_SPECS)
         VERBATIM
     )
 endforeach()
+
+list(APPEND PKDOC_GENERATED_FILES "${PKDOC_INDEX_OUTPUT}")
+list(APPEND PKDOC_SOURCE_FILES "${PKDOC_INDEX}")
+list(APPEND PKDOC_CHECK_COMMANDS
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/pkdoc.py"
+            --index "${PKDOC_INDEX}"
+            --check
+            --check-generated "${PKDOC_INDEX_OUTPUT}"
+)
+
+add_custom_command(
+    OUTPUT "${PKDOC_INDEX_OUTPUT}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/pkdoc.py"
+            --index "${PKDOC_INDEX}"
+            --out "${PKDOC_INDEX_OUTPUT}"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/pkdoc.py"
+        "${PKDOC_INDEX}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Generating docs/generated/README.md"
+    VERBATIM
+)
 
 add_custom_target(docs
     DEPENDS ${PKDOC_GENERATED_FILES}

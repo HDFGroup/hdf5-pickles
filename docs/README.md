@@ -10,12 +10,18 @@ Start with the [H5Lens tutorial](TUTORIAL.md) for guided exploration through
 underlying mappings, and [Writing HDF5 with GNU poke](POKE_CONSTRUCTION.md)
 keeps write-through and construction exercises in an explicitly advanced path.
 
-Specification Markdown is generated from two sources of truth:
+Each specification page is generated from two sources of truth:
 
 - **`pickles/*.pk`** — the executable format definitions (shared constants,
   structure, types, and constraints)
 - **`docs/spec/*.yml`** — prose sidecars (field descriptions, introductory text,
   version notes, cross-references)
+
+The upstream section hierarchy, coverage status, and generated landing page are
+defined by **`docs/spec/index.yml`**. The manifest follows the
+[HDF5 File Format Specification Version 4.0](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html)
+and records when that hierarchy was last reviewed. It is a navigation and
+coverage contract; the pickles remain authoritative for what H5Lens decodes.
 
 The generator lives in `tools/pkdoc.py` and requires PyYAML (`pip install pyyaml`).
 
@@ -34,7 +40,10 @@ Output lands in `docs/generated/<name>.md`.
 
 The `--check` flag verifies that every type and field name in the sidecar
 actually appears in the corresponding pickle, catching stale documentation
-after a rename. The same target executes the `h5explain` commands in
+after a rename. It also checks upstream section mappings, coverage states,
+layout-to-type and layout-to-field references, and byte-compares every tracked
+generated page with freshly rendered output. The same target executes the
+`h5explain` commands in
 [`TUTORIAL.md`](TUTORIAL.md), the direct mappings in
 [`POKE_TUTORIAL.md`](POKE_TUTORIAL.md), and the disposable write and
 construction sessions in [`POKE_CONSTRUCTION.md`](POKE_CONSTRUCTION.md). It
@@ -56,32 +65,43 @@ poke is unavailable.
 ## Adding a new pickle
 
 1. Write `docs/spec/<pickle-stem>.yml` using the schema below.
-2. Add `<pickle-stem>` to `PKDOC_SPECS` in `CMakeLists.txt`.
-3. Run `cmake --build build --target docs-check` to confirm all names resolve.
-4. Run `cmake --build build --target docs` to generate the Markdown.
-5. Commit both the sidecar and the generated file together.
+2. Map its upstream sections and coverage in `docs/spec/index.yml`.
+3. Add `<pickle-stem>` to `PKDOC_SPECS` in `CMakeLists.txt`.
+4. Run `cmake --build build --target docs` to generate the Markdown and landing
+   page.
+5. Run `cmake --build build --target docs-check` to confirm mappings, names,
+   links, and generated output.
+6. Commit the sidecar, manifest, and generated files together.
 
 ## Sidecar schema
 
 ```yaml
 pickle: foo.pk          # which pickle this documents (required)
 section: "V.B. Title"  # becomes the H1 heading
+upstream:               # canonical v4.0 mapping (required)
+  version: "4.0"
+  sections: [V.B]
+  anchor: subsec_fmt4_example
+coverage: partial       # covered, partial, or not-covered
+type_order: [TypeName]  # optional specification-facing render order
 intro: |               # introductory prose (plain Markdown)
   …
 
 types:
   TypeName:
+    title: "Specification-facing type name"
     desc: "One-sentence description of the type."
     layouts:           # optional four-byte-wide format diagrams
       - title: "TypeName"
         rows:          # every row must total exactly four columns
-          - [{label: "Signature", span: 4}]
+          - [{field: signature, label: "Signature", span: 4}]
           - ["Version", "Flags", {label: "Reserved", span: 2}]
           - [{label: "Object Address", span: 4, width: O}]
           - [{label: "Object Length", span: 4, width: L}]
         note: "`O` is the size of offsets; `L` is the size of lengths."
     fields:             # top-level fields of the struct, in order
       field_name:
+        label: "Specification-facing field name"
         desc: "What this field means."
         note: "Optional italicised note (version caveat, units, etc.)."
     variants:           # union arms (named after the arm identifier in the pickle)
@@ -93,4 +113,24 @@ types:
 ```
 
 Fields and variants may be nested to any depth by adding a `variants:` key
-inside a variant entry.
+inside a variant entry. `title` and `label` are optional; the generator derives
+a readable fallback while retaining the exact pickle identifier in a separate
+column. A layout `field:` must name a documented field in its bound type. A
+page-level layout can use `type: TypeName` to place it beside that type's
+fields table. When `type_order` is present it must list every documented type
+exactly once.
+
+## Coverage manifest
+
+`docs/spec/index.yml` contains the complete upstream I–VIII hierarchy. Every
+section has one of three statuses:
+
+- `covered`: an executable pickle definition and field documentation exist
+- `partial`: only part of the section or its variants is documented
+- `not-covered`: there is no first-class H5Lens format page
+
+Use `doc: <pickle-stem>` to link covered or partial sections to a generated
+page. A sidecar can declare multiple upstream sections when one executable
+definition spans the upstream organization. CI does not fetch the website;
+upstream review is deliberate, and the checked-in version and review date make
+changes auditable.

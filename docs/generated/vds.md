@@ -1,4 +1,8 @@
-# III.F. Disk Format: Level 1F - Virtual Dataset (VDS) Global Heap Block
+# III.F. Disk Format: Level 1F - Global Heap Block for Virtual Datasets
+
+<a id="subsec_fmt4_infra_globalheapvds"></a>
+
+Upstream: [HDF5 File Format Specification 4.0, section III.F](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsec_fmt4_infra_globalheapvds) · Coverage: **Covered**
 
 A virtual dataset maps regions of one or more source datasets onto a
 single virtual dataset. The source-to-virtual mapping table is stored as
@@ -22,6 +26,12 @@ has no per-entry flags byte; version 1 adds one.
 
 All fields are stored in little-endian byte order.
 
+## Global Heap Block for Virtual Dataset
+
+Pickle type: `vds_block`.
+
+Virtual Dataset global heap block. Only the fixed prefix is mapped as typed fields; the per-mapping entries and trailing checksum are decoded on the fly by `_print` because each entry's length depends on its name-sharing flags and its serialized dataspace selections.
+
 **Layout: Virtual Dataset Global Heap Block**
 
 <table class="format-layout">
@@ -36,11 +46,9 @@ All fields are stored in little-endian byte order.
 
 The first row is schematic because `L` may exceed three bytes. `L` is the size of lengths.
 
-## `vds_block`
+**Fields: Global Heap Block for Virtual Dataset**
 
-Virtual Dataset global heap block. Only the fixed prefix is mapped as typed fields; the per-mapping entries and trailing checksum are decoded on the fly by `_print` because each entry's length depends on its name-sharing flags and its serialized dataspace selections.
-
-| Field | Description |
-|-------|-------------|
-| `version` | Block encoding version. 0 has no per-entry flags byte; 1 adds a flags byte to each mapping entry (source-file-shared, source-dataset-shared, source-same-file). |
-| `num_mappings_raw` | Number of source→virtual mapping entries that follow (`sizeof_lengths` bytes). |
+| Field | Pickle identifier | Description |
+|-------|-------------------|-------------|
+| Version | `version` | Block encoding version. 0 has no per-entry flags byte; 1 adds a flags byte to each mapping entry (source-file-shared, source-dataset-shared, source-same-file). |
+| Num Mappings Raw | `num_mappings_raw` | Number of source→virtual mapping entries that follow (`sizeof_lengths` bytes). |

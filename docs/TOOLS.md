@@ -32,6 +32,11 @@ scripts (not symlinks). They generate and test documentation, load and check
 the sharded finding registry and its message routes, and orchestrate the CVE
 case workflow described below.
 
+`pkdoc.py` generates the format pages and landing page from executable pickles,
+prose sidecars, and the checked Version 4.0 hierarchy in `docs/spec/index.yml`.
+Its check mode also rejects stale generated Markdown and invalid section,
+coverage, layout, or anchor mappings.
+
 ## h5cve Case Orchestrator
 
 `tools/h5cve` chains the existing tools into one provenance-stamped CVE case
