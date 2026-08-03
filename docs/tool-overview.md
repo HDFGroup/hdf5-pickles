@@ -65,7 +65,7 @@ flowchart TB
 
   subgraph documentation["Documentation, registry, and automation"]
     direction LR
-    sidecars["docs/spec/*.yml<br/>prose sidecars"]:::artifact
+    sidecars["docs/spec/index.yml and sidecars<br/>upstream map and prose"]:::artifact
     pkdoc["pkdoc.py<br/>format-reference generator"]:::automation
     generated["docs/generated/*.md"]:::artifact
     registry["registry/<br/>findings, coverage, and measurements"]:::artifact

@@ -49,6 +49,7 @@ EXPECTED_NODES = {
     "truncate": "h5policy-truncate",
     "lazy": "h5policy-lazy",
     "pkdoc": "pkdoc.py",
+    "sidecars": "docs/spec/index.yml",
     "finding_registry": "finding_registry.py",
     "registry_checks": "check_registry.py",
     "doc_checks": "check_tutorial.py",
