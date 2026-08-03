@@ -944,6 +944,10 @@ def _gen_malformed(root):
         f"{root}/malformed/fill_value_size_mismatch.h5")
     _make_nbit_member_offset_wrap(
         f"{root}/malformed/nbit_member_offset_wrap.h5")
+    _make_attr_reference_size_under(
+        f"{root}/malformed/attr_reference_size_under.h5")
+    _make_attr_vlen_size_under(
+        f"{root}/malformed/attr_vlen_size_under.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -2635,6 +2639,89 @@ def _make_cache_image_shadowed_btree(path, helper_source):
     struct.pack_into("<H", raw, bthd + 16 + bt["off_size"], nrec)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bthd:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _patch_dtype_size(raw, header_byte, expect_size, new_size, what):
+    """Rewrite the element size of the one datatype message matching a shape.
+
+    A version-1 datatype message payload starts with the class-and-version byte,
+    three class-flag bytes, and a 4-byte element size.  Matching on the header
+    byte plus the size libhdf5 actually wrote locates the message without
+    parsing the whole object header, and requiring exactly one hit means a
+    layout change from a different h5py fails loudly instead of silently
+    patching the wrong bytes.
+    """
+    hits = [i for i in range(len(raw) - 8)
+            if raw[i] == header_byte
+            and struct.unpack_from("<I", raw, i + 4)[0] == expect_size]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected exactly one {what} datatype message of "
+                           f"size {expect_size}, found {len(hits)}")
+    struct.pack_into("<I", raw, hits[0] + 4, new_size)
+    return hits[0]
+
+
+def _make_attr_reference_size_under(path):
+    """An attribute whose reference datatype declares a smaller element than
+    the file's addresses actually occupy.
+
+    A class-7 datatype's on-disk width is a property of the FILE, not of the
+    message: H5T__ref_set_loc assigns H5F_SIZEOF_ADDR(f) for an object
+    reference (H5Tref.c:256) when the type is attached, and never compares that
+    with the encoded size.  H5O__attr_decode has meanwhile already sized
+    attr->shared->data as nelmts * the ENCODED size (H5Oattr.c:273) -- so
+    H5A__read then copies nelmts * the NEW size out of that allocation
+    (H5Aint.c:769) and over-reads by the difference.
+
+    Datasets are immune and attributes are not, for a structural reason: a
+    dataset's extent lives in the layout message, an independent record sized
+    with the same value set_loc restores, so the two can be cross-checked.  An
+    attribute's extent is COMPUTED from the field that changes, so the corrupt
+    file is self-consistent and the only defence is pinning the datatype size at
+    decode time.
+
+    Declared 1 against a file address size of 8: stock h5dump -A prints seven
+    bytes of adjacent heap, and the ASAN build reports
+    `heap-buffer-overflow READ of size 8` at H5Aint.c:769.  Written at the
+    earliest bound so the attribute sits in a version-1 object header, which
+    carries no checksum to repair.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("ref", d.ref,
+                       dtype=h5py.special_dtype(ref=h5py.Reference))
+
+    raw = _base_bytes(build, libver="earliest")
+    # 0x17: version 1, class 7 (reference).  libhdf5 writes sizeof_addr (8).
+    _patch_dtype_size(raw, 0x17, 8, 1, "reference")
+    _patch(path, bytes(raw))
+
+
+def _make_attr_vlen_size_under(path):
+    """The class-9 sibling of _make_attr_reference_size_under.
+
+    H5T__vlen_set_loc (H5Tvlen.c:300) assigns 4 + blob_id_size on disk, again
+    without consulting the encoded size, so an under-declared variable-length
+    element desynchronizes the attribute's raw-data extent exactly as the
+    reference case does and faults at the same H5Aint.c:769.
+
+    Kept as a separate fixture rather than a second attribute on the first: the
+    two sizes are restored by different functions, so a fix that covers only one
+    class must still fail a test.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.zeros(1, dtype="i4"),
+                             track_times=False)
+        arr = np.empty(1, dtype=object)
+        arr[0] = np.arange(3, dtype="i4")
+        d.attrs.create("vl", arr, dtype=h5py.special_dtype(vlen=np.dtype("i4")))
+
+    raw = _base_bytes(build, libver="earliest")
+    # 0x19: version 1, class 9 (variable-length).  The disk sequence size is
+    # 4 + blob_id_size == sizeof_addr + 8 == 16.
+    _patch_dtype_size(raw, 0x19, 16, 1, "variable-length")
     _patch(path, bytes(raw))
 
 
