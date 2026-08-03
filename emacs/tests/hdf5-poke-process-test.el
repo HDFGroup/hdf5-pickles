@@ -90,21 +90,33 @@
   (with-current-buffer buffer-name
     (mapcar #'car tabulated-list-entries)))
 
+(defun hdf5-poke-process-test--buffer-with-prefix (prefix)
+  "Return the first live buffer whose name starts with PREFIX."
+  (cl-find-if
+   (lambda (buffer)
+     (string-prefix-p prefix (buffer-name buffer)))
+   (buffer-list)))
+
 (ert-deftest hdf5-poke-process-expands-dense-group-links ()
   (hdf5-poke-process-test--with-session
    "dense_group.h5"
    (lambda (session)
      (with-current-buffer session
-       (hdf5-poke-links-at 179))
+       (hdf5-poke-links-path "/group"))
      (hdf5-poke-process-test--wait session)
-     (let* ((rows (hdf5-poke-process-test--row-ids
-                   "*hdf5-poke-links:dense_group.h5@179*"))
+     (let* ((link-buffer
+             (hdf5-poke-process-test--buffer-with-prefix
+              "*hdf5-poke-links:dense_group.h5@"))
+            (_ (should link-buffer))
+            (rows (hdf5-poke-process-test--row-ids link-buffer))
             (links (cl-remove-if-not
                     (lambda (row) (eq (plist-get row :record) 'link))
                     rows))
             (storage (cl-find-if
                       (lambda (row) (eq (plist-get row :record) 'link-storage))
                       rows)))
+       (with-current-buffer link-buffer
+         (should (equal hdf5-poke--object-path "/group")))
        (should (= 32 (length links)))
        (should (equal "dense" (plist-get storage :kind)))
        (should (equal "expanded" (plist-get storage :status)))
@@ -190,22 +202,35 @@
                  (search-forward "[dataset] dset_00" nil t)))))))
 
 (defun hdf5-poke-process-test--assert-chunk-index
-    (fixture-name offset ndims expected-kind expected-count
+    (fixture-name expected-kind expected-count
                   &optional expected-last-scaled-offsets expected-coord-ndims)
   "Assert chunk-index smoke behavior for FIXTURE-NAME."
   (hdf5-poke-process-test--with-session
    fixture-name
    (lambda (session)
      (with-current-buffer session
-       (hdf5-poke-chunk-index-at offset ndims))
+       (hdf5-poke-open-path "/data"))
      (hdf5-poke-process-test--wait session)
-     (let* ((buffer-name (format "*hdf5-poke-chunks:%s@%s*"
-                                 fixture-name offset))
-            (rows (hdf5-poke-process-test--row-ids buffer-name))
+     (let ((message-buffer
+            (hdf5-poke-process-test--buffer-with-prefix
+             (format "*hdf5-poke-messages:%s@" fixture-name))))
+       (should message-buffer)
+       (with-current-buffer message-buffer
+         (goto-char (point-min))
+         (should (search-forward "Open chunk index" nil t))
+         (let ((button (button-at (1- (point)))))
+           (should button)
+           (button-activate button))))
+     (hdf5-poke-process-test--wait session)
+     (let* ((chunk-buffer
+             (hdf5-poke-process-test--buffer-with-prefix
+              (format "*hdf5-poke-chunks:%s@" fixture-name)))
+            (_ (should chunk-buffer))
+            (rows (hdf5-poke-process-test--row-ids chunk-buffer))
             (chunks (cl-remove-if-not
                      (lambda (row) (eq (plist-get row :record) 'chunk))
                      rows)))
-       (with-current-buffer buffer-name
+       (with-current-buffer chunk-buffer
          (should (equal expected-kind
                         (plist-get hdf5-poke--chunk-index-record :kind)))
          (when expected-coord-ndims
@@ -222,13 +247,13 @@
 
 (ert-deftest hdf5-poke-process-decodes-chunk-index-families ()
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_v1_btree.h5" 1400 3 "v1-btree" 4)
+   "chunk_v1_btree.h5" "v1-btree" 4)
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_fixed_array.h5" 447 2 "fixed-array" 4)
+   "chunk_fixed_array.h5" "fixed-array" 4)
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_extensible_array.h5" 447 2 "extensible-array" 3)
+   "chunk_extensible_array.h5" "extensible-array" 3)
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_v2_btree.h5" 447 3 "v2-btree" 4 '(1 1) 2))
+   "chunk_v2_btree.h5" "v2-btree" 4 '(1 1) 2))
 
 (ert-deftest hdf5-poke-process-previews-small-contiguous-dataset ()
   (hdf5-poke-process-test--with-session
