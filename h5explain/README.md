@@ -11,6 +11,17 @@ navigation and policy findings report physical file offsets.
 For a guided walk from the sample superblock through a dataset, chunk index,
 and policy finding, start with the [H5Lens tutorial](../docs/TUTORIAL.md).
 
+## Demo
+
+Play the short [asciinema recording](../docs/demos/h5explain.cast) locally. It
+surveys the command-line options, jumps directly to a file offset, retrieves a
+data-layout header message, traverses its raw-chunk B-tree, and checks the
+dataset against policy:
+
+```sh
+asciinema play docs/demos/h5explain.cast
+```
+
 Run from the repository root:
 
 ```sh
