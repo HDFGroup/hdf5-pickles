@@ -346,6 +346,54 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
                             "corrupt", blob_off, object,
                             "unsupported reference datatype version");
 
+    /* A reference's on-disk width is a property of the FILE, not of this
+       message: libhdf5 overwrites dt->shared->size from the superblock's
+       size-of-offsets when the type is attached to a file (H5Tref.c:256/284/312),
+       and never compares it with what was encoded here.  Any consumer that
+       already sized a buffer from the encoded value is then wrong by the
+       difference -- an attribute's raw-data extent (H5Oattr.c:273) is exactly
+       such a consumer, and reads it back at the post-fixup size
+       (H5Aint.c:769).  Pin the encoded size to the width the file dictates so
+       the size is final before anything derives from it.
+
+       The width comes from the superblock, so the size checks are gated on
+       having decoded one: global_sizeof_offsets is 0 until then, and a finding
+       derived from an unset global would be a fabricated one.  The reference
+       TYPE needs no such gate -- it is self-contained in this message -- so it
+       is checked either way.  Reaching a datatype before the superblock does
+       not happen in a file walk; the gate exists so the synthetic-blob unit
+       harness, and any future caller that validates a bare datatype record,
+       stay honest about what they can actually establish.  */
+    if (ctype == 7UL)
+        {
+            var o = global_sizeof_offsets as uint<64>;
+            var rtype = flags .>> 8;
+            rtype = rtype & 0xfUL;
+
+            if (rtype > 4UL)
+                h5policy_emit_error("H5_CORRUPT_DATATYPE_REFERENCE_TYPE",
+                                    "corrupt", blob_off, object,
+                                    "unknown reference type");
+            else if (o == 0UL)
+                ;                        /* no superblock decoded; see above */
+            else if (rtype == 0UL && elm_size != o)
+                h5policy_emit_error("H5_CORRUPT_DATATYPE_REFERENCE_SIZE",
+                                    "corrupt", blob_off, object,
+                                    "object reference size does not match the file address size");
+            else if (rtype == 1UL && elm_size != o + 4UL)
+                h5policy_emit_error("H5_CORRUPT_DATATYPE_REFERENCE_SIZE",
+                                    "corrupt", blob_off, object,
+                                    "region reference size does not match the file heap identifier size");
+            /* Revised references (2/3/4) take MAX(sizeof_offsets + 10,
+               encode_size), so sizeof_offsets + 10 is a lower bound rather
+               than an equality.  Only the under-declared direction is a memory
+               safety problem, so bound rather than pin.  */
+            else if (rtype >= 2UL && elm_size < o + 10UL)
+                h5policy_emit_error("H5_CORRUPT_DATATYPE_REFERENCE_SIZE",
+                                    "corrupt", blob_off, object,
+                                    "revised reference size is below the file minimum");
+        }
+
     if (elm_size == 0UL)
         h5policy_emit_error("H5_CORRUPT_DATATYPE_ZERO_SIZE",
                             "corrupt", blob_off, object,
@@ -377,6 +425,16 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
     /* ---- class 9: Variable-Length (single inline base type) ---- */
     if (ctype == 9UL)
         {
+            /* Same defect class as class 7: H5T__vlen_set_loc (H5Tvlen.c:300)
+               assigns 4 + blob_id_size == sizeof_offsets + 8 on disk without
+               consulting the encoded size.  Gated on a decoded superblock for
+               the same reason the class-7 size checks are.  */
+            var vo = global_sizeof_offsets as uint<64>;
+            if (vo != 0UL && elm_size != vo + 8UL)
+                h5policy_emit_error("H5_CORRUPT_DATATYPE_VLEN_SIZE",
+                                    "corrupt", blob_off, object,
+                                    "variable-length datatype size does not match the file sequence size");
+
             var child = h5policy_dtype_check(ios, profile, blob_off + used#B,
                                              avail - used, object, depth + 1UL);
             if (child == 0UL)
