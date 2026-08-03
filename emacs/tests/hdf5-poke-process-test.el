@@ -90,21 +90,33 @@
   (with-current-buffer buffer-name
     (mapcar #'car tabulated-list-entries)))
 
+(defun hdf5-poke-process-test--buffer-with-prefix (prefix)
+  "Return the first live buffer whose name starts with PREFIX."
+  (cl-find-if
+   (lambda (buffer)
+     (string-prefix-p prefix (buffer-name buffer)))
+   (buffer-list)))
+
 (ert-deftest hdf5-poke-process-expands-dense-group-links ()
   (hdf5-poke-process-test--with-session
    "dense_group.h5"
    (lambda (session)
      (with-current-buffer session
-       (hdf5-poke-links-at 195))
+       (hdf5-poke-links-path "/group"))
      (hdf5-poke-process-test--wait session)
-     (let* ((rows (hdf5-poke-process-test--row-ids
-                   "*hdf5-poke-links:dense_group.h5@195*"))
+     (let* ((link-buffer
+             (hdf5-poke-process-test--buffer-with-prefix
+              "*hdf5-poke-links:dense_group.h5@"))
+            (_ (should link-buffer))
+            (rows (hdf5-poke-process-test--row-ids link-buffer))
             (links (cl-remove-if-not
                     (lambda (row) (eq (plist-get row :record) 'link))
                     rows))
             (storage (cl-find-if
                       (lambda (row) (eq (plist-get row :record) 'link-storage))
                       rows)))
+       (with-current-buffer link-buffer
+         (should (equal hdf5-poke--object-path "/group")))
        (should (= 32 (length links)))
        (should (equal "dense" (plist-get storage :kind)))
        (should (equal "expanded" (plist-get storage :status)))
@@ -190,22 +202,35 @@
                  (search-forward "[dataset] dset_00" nil t)))))))
 
 (defun hdf5-poke-process-test--assert-chunk-index
-    (fixture-name offset ndims expected-kind expected-count
+    (fixture-name expected-kind expected-count
                   &optional expected-last-scaled-offsets expected-coord-ndims)
   "Assert chunk-index smoke behavior for FIXTURE-NAME."
   (hdf5-poke-process-test--with-session
    fixture-name
    (lambda (session)
      (with-current-buffer session
-       (hdf5-poke-chunk-index-at offset ndims))
+       (hdf5-poke-open-path "/data"))
      (hdf5-poke-process-test--wait session)
-     (let* ((buffer-name (format "*hdf5-poke-chunks:%s@%s*"
-                                 fixture-name offset))
-            (rows (hdf5-poke-process-test--row-ids buffer-name))
+     (let ((message-buffer
+            (hdf5-poke-process-test--buffer-with-prefix
+             (format "*hdf5-poke-messages:%s@" fixture-name))))
+       (should message-buffer)
+       (with-current-buffer message-buffer
+         (goto-char (point-min))
+         (should (search-forward "Open chunk index" nil t))
+         (let ((button (button-at (1- (point)))))
+           (should button)
+           (button-activate button))))
+     (hdf5-poke-process-test--wait session)
+     (let* ((chunk-buffer
+             (hdf5-poke-process-test--buffer-with-prefix
+              (format "*hdf5-poke-chunks:%s@" fixture-name)))
+            (_ (should chunk-buffer))
+            (rows (hdf5-poke-process-test--row-ids chunk-buffer))
             (chunks (cl-remove-if-not
                      (lambda (row) (eq (plist-get row :record) 'chunk))
                      rows)))
-       (with-current-buffer buffer-name
+       (with-current-buffer chunk-buffer
          (should (equal expected-kind
                         (plist-get hdf5-poke--chunk-index-record :kind)))
          (when expected-coord-ndims
@@ -222,13 +247,13 @@
 
 (ert-deftest hdf5-poke-process-decodes-chunk-index-families ()
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_v1_btree.h5" 1400 3 "v1-btree" 4)
+   "chunk_v1_btree.h5" "v1-btree" 4)
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_fixed_array.h5" 463 2 "fixed-array" 4)
+   "chunk_fixed_array.h5" "fixed-array" 4)
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_extensible_array.h5" 463 2 "extensible-array" 3)
+   "chunk_extensible_array.h5" "extensible-array" 3)
   (hdf5-poke-process-test--assert-chunk-index
-   "chunk_v2_btree.h5" 463 3 "v2-btree" 4 '(1 1) 2))
+   "chunk_v2_btree.h5" "v2-btree" 4 '(1 1) 2))
 
 (ert-deftest hdf5-poke-process-previews-small-contiguous-dataset ()
   (hdf5-poke-process-test--with-session
@@ -317,6 +342,66 @@
          (should (save-excursion
                    (goto-char (point-min))
                    (search-forward "GNU poke datatype view" nil t))))))))
+
+(ert-deftest hdf5-poke-process-resolves-shared-datatype-message ()
+  "A shared datatype message decodes as the type it references.
+
+The dataset's datatype message body is an H5O_shared_t reference to the
+committed header, not a datatype: decoded in place it reads as class 2
+\"time\" with element size 0.  Resolved, it is the committed 4-byte
+fixed-point type."
+  (hdf5-poke-process-test--with-session
+   "committed_datatype.h5"
+   (lambda (session)
+     (with-current-buffer session
+       (hdf5-poke-open-path "/data"))
+     (hdf5-poke-process-test--wait session)
+     (let* ((message-buffer
+             (cl-find-if
+              (lambda (buffer)
+                (string-prefix-p
+                 "*hdf5-poke-messages:committed_datatype.h5@"
+                 (buffer-name buffer)))
+              (buffer-list)))
+            (datatype-row nil)
+            payload size name flags)
+       (should message-buffer)
+       (with-current-buffer message-buffer
+         (setq datatype-row
+               (cl-find-if
+                (lambda (row) (= (plist-get row :type) 3))
+                (mapcar #'car tabulated-list-entries)))
+         (should datatype-row)
+         ;; The message list reports the reference and where it leads.
+         (should (equal "committed" (plist-get datatype-row :shared)))
+         (should (integerp (plist-get datatype-row :shared-payload-offset)))
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (search-forward "committed" nil t)))
+         (setq payload (plist-get datatype-row :payload-offset)
+               size (plist-get datatype-row :size)
+               name (plist-get datatype-row :name)
+               flags (plist-get datatype-row :flags)))
+       (with-current-buffer session
+         (hdf5-poke-message-detail-at 3 payload size name flags))
+       (hdf5-poke-process-test--wait session)
+       (with-current-buffer
+           (format "*hdf5-poke-message:committed_datatype.h5:Datatype@%s*"
+                   payload)
+         (should (derived-mode-p 'hdf5-poke-message-detail-mode))
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (search-forward "Shared" nil t)))
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (search-forward "fixed-point" nil t)))
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (re-search-forward "^element-size +4$" nil t)))
+         ;; What the unresolved decode used to claim.
+         (should-not (save-excursion
+                       (goto-char (point-min))
+                       (search-forward "\"time\"" nil t))))))))
 
 (ert-deftest hdf5-poke-process-translates-userblock-addresses ()
   (let ((hdf5-poke-default-superblock-offset "512#B"))

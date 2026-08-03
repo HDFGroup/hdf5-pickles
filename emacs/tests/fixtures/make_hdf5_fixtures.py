@@ -111,6 +111,20 @@ def nested_datatypes(path: Path) -> None:
         h5.create_dataset("compound", data=data)
 
 
+def committed_datatype(path: Path) -> None:
+    """Create a dataset whose datatype message is a shared reference.
+
+    Committing the type and building the dataset on it makes the dataset's
+    datatype message carry OH_MSG_FLAG_SHARED: its body is an H5O_shared_t
+    reference to the committed object header rather than a datatype.
+    """
+    with h5py.File(path, "w") as h5:
+        h5["committed"] = np.dtype("<i4")
+        h5.create_dataset(
+            "data", data=np.arange(8, dtype="<i4"), dtype=h5["committed"]
+        )
+
+
 def userblock_latest(path: Path) -> None:
     """Create a modern file whose superblock starts after a 512-byte user block."""
     with h5py.File(path, "w", libver="latest", userblock_size=512) as h5:
@@ -131,6 +145,7 @@ def main() -> None:
         "chunk_extensible_array.h5": chunk_extensible_array,
         "chunk_v2_btree.h5": chunk_v2_btree,
         "nested_datatypes.h5": nested_datatypes,
+        "committed_datatype.h5": committed_datatype,
         "userblock_latest.h5": userblock_latest,
     }
 

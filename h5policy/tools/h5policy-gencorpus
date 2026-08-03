@@ -22,8 +22,11 @@ h5py; malformed fixtures are byte-patched from a valid base so no assumption is
 made about libhdf5 accepting them. The ``integration`` group contains compact
 valid files reused across full-walk profile-semantics cases.
 
-The generated ``*.h5`` files are build artifacts (git-ignored); the tracked
+Most generated ``*.h5`` files are untracked build artifacts; the tracked
 specification lives in ``tests/expected/*.yml`` and is checked by ``run.sh``.
+The exceptions are ``tests/cve/*.h5`` and ``tests/CORPUS-WRITER.txt``, which ARE
+tracked -- so regenerating them must reproduce the committed bytes exactly, and
+``run.sh`` fails when it does not.
 
 Requires: h5py.  Usage: h5policy-gencorpus [TARGET_DIR]
 """
@@ -177,6 +180,18 @@ def _gen_valid(root):
         "00000000ffffffffffffffffffffffffffffffff0a0200000000060f00000100"
         "0464736574300000000000000096c06e3f")
     _patch(f"{root}/cve/sizeof_size_uninit_length.h5", wide_length_cve)
+    # Direct variants isolate the 16-byte contiguous length from the original
+    # specimen's earlier out-of-file address.  Keep them in the generated
+    # corpus rather than an ignored case-work directory so a fresh clone can
+    # reproduce every tracked expectation.
+    _make_wide_length_variant(
+        f"{root}/valid/wide_length_one.h5", wide_length_cve, 1)
+    _make_wide_length_variant(
+        f"{root}/malformed/wide_length_u64_max.h5", wide_length_cve,
+        (1 << 64) - 1)
+    _make_wide_length_variant(
+        f"{root}/malformed/wide_length_2pow64_plus_one.h5", wide_length_cve,
+        (1 << 64) + 1)
 
     # MDCI entry body claims 226 bytes after an 18-byte image header and a
     # 30-byte entry header, but the complete cache image is only 256 bytes.
@@ -665,6 +680,44 @@ def _make_nul_compact_link_name(path):
     _patch(path, bytes(raw))
 
 
+def _make_unsupported_superblock_offset_width(path):
+    """A v2/v3 superblock advertising a nonsensical 100-byte offset width.
+
+    The validator must reject this from the fixed superblock prefix before it
+    attempts to map any dynamic-width address fields.
+    """
+    raw = _base_bytes(lambda h: None)
+    if raw[8] not in (2, 3) or raw[9] != 8:
+        raise RuntimeError("expected a v2/v3 superblock with 8-byte offsets")
+    _pin_ohdr_times(raw)
+    raw[9] = 0x64
+    _patch(path, bytes(raw))
+
+
+def _make_root_object_not_group(path):
+    """An earliest-format file whose root symbol-table entry names a dataset.
+
+    The dataset is valid in isolation; corruption is the root object's role.
+    Version-0 superblocks have no checksum, so repointing the root entry is the
+    only byte edit required.
+    """
+    dataset = {}
+
+    def build(h):
+        dset = h.create_dataset(
+            "d", data=np.arange(4, dtype="i4"), track_times=False)
+        dataset["address"] = h5py.h5o.get_info(dset.id).addr
+
+    raw = _base_bytes(build, libver="earliest")
+    if raw[8] != 0 or raw[13] != 8 or raw[14] != 8:
+        raise RuntimeError("expected a v0 superblock with 8-byte widths")
+    # v0 prefix, four file addresses, then the symbol-table entry's link-name
+    # offset and object-header address.
+    root_object_address = 24 + 4 * raw[13] + raw[14]
+    struct.pack_into("<Q", raw, root_object_address, dataset["address"])
+    _patch(path, bytes(raw))
+
+
 def _gen_malformed(root):
     # ---- malformed/ : expected `reject_corrupt`, byte-patched from a base --
     base = f"{root}/valid/empty.h5"
@@ -674,6 +727,10 @@ def _gen_malformed(root):
     _patch(f"{root}/malformed/truncated.h5", raw[:32])
     _patch(f"{root}/malformed/bad_superblock_version.h5",
            raw[:8] + b"\xff" + raw[9:])
+    _make_unsupported_superblock_offset_width(
+        f"{root}/malformed/superblock_offset_width.h5")
+    _make_root_object_not_group(
+        f"{root}/malformed/root_object_not_group.h5")
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
     _make_nul_compact_link_name(
         f"{root}/malformed/nul_compact_link_name.h5")
@@ -887,6 +944,10 @@ def _gen_malformed(root):
         f"{root}/malformed/fill_value_size_mismatch.h5")
     _make_nbit_member_offset_wrap(
         f"{root}/malformed/nbit_member_offset_wrap.h5")
+    _make_attr_reference_size_under(
+        f"{root}/malformed/attr_reference_size_under.h5")
+    _make_attr_vlen_size_under(
+        f"{root}/malformed/attr_vlen_size_under.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -917,6 +978,79 @@ def _gen_malformed(root):
                              "BTIN")
 
 
+WRITER_RECORD = "CORPUS-WRITER.txt"
+
+
+def _writer_identity():
+    """What this host's writer does, measured rather than assumed.
+
+    Every valid/ fixture is written by h5py and every malformed/ and cve/ one is
+    byte-patched from one, so the whole corpus inherits whatever the linked
+    libhdf5 emits.  Two properties of that writer have already moved underneath
+    the corpus:
+
+      * the format-version bound, because ``_write`` asks for ``libver="latest"``
+        -- whatever the LINKED library calls newest.  A 2.x-linked h5py writes a
+        version-5 layout message where a 1.14-linked one writes version 4, which
+        is why ``_scaleoffset_cd_patch`` pins its own base to the 1.10 bound.
+
+      * whether the ROOT GROUP's object header carries the 16-byte timestamp
+        block.  No libver bound controls this and h5py cannot set track_times on
+        the root group, so it is not something this generator can pin.  When it
+        differs, every object header runs 16 bytes short and every address after
+        it shifts -- which is exactly how tests/cve/vds_nentries_mult_overflow.h5
+        came to be committed in a form no writer here reproduces.
+
+    Recording them turns "some byte moved" into a named cause.  Nothing here may
+    vary between runs on one host: no timestamps, no paths, no ordering.
+    """
+    fd, probe = tempfile.mkstemp(suffix=".h5")
+    os.close(fd)
+    try:
+        with h5py.File(probe, "w", libver="latest") as h:
+            h.create_dataset("d", data=np.arange(2, dtype="i4"), track_times=False)
+        raw = open(probe, "rb").read()
+    finally:
+        os.unlink(probe)
+
+    root_times = "unknown"
+    layout_version = "unknown"
+    if raw[8] in (2, 3):
+        soff = raw[9]
+        ohdr = int.from_bytes(raw[12 + 3 * soff:12 + 4 * soff], "little")
+        if raw[ohdr:ohdr + 4] == b"OHDR" and raw[ohdr + 4] == 2:
+            root_times = str(bool(raw[ohdr + 5] & (1 << 5)))
+    try:
+        _, mbody = _v4_layout_message(bytearray(raw))
+        layout_version = str(raw[mbody])
+    except RuntimeError:
+        layout_version = "not-v4-or-v5"
+
+    return [
+        ("h5py", h5py.__version__),
+        ("libhdf5", h5py.version.hdf5_version),
+        ("superblock_version", str(raw[8])),
+        ("root_ohdr_times", root_times),
+        ("contiguous_layout_version", layout_version),
+    ]
+
+
+def _write_writer_identity(root):
+    lines = [
+        "# GENERATED by h5policy-gencorpus -- do not hand-edit.",
+        "#",
+        "# The identity of the writer that produced this corpus, measured from a",
+        "# file it just wrote.  It is TRACKED so that a corpus generated by a",
+        "# different writer shows up as a diff on this file, naming the cause,",
+        "# instead of as unexplained byte movement in a fixture.  run.sh gates on",
+        "# it.  See _writer_identity() for why these particular fields.",
+        "",
+    ]
+    lines += [f"{k:<26} {v}" for k, v in _writer_identity()]
+    with open(os.path.join(root, WRITER_RECORD), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def generate(root):
     """Regenerate the full corpus.  Order matters: valid/ and policy/ fixtures
     are the bases the byte-patched malformed/ and cve/ fixtures build on."""
@@ -926,6 +1060,7 @@ def generate(root):
     _gen_integration(root)
     _gen_coverage(root)
     _gen_malformed(root)
+    _write_writer_identity(root)
 
 
 def _make_bad_ext_address(path):
@@ -1157,11 +1292,16 @@ def _scaleoffset_cd_patch(path, cd_index, value):
 
     The pipeline payload is: version(1) nfilters(1); then the descriptor id(2)
     flags(2) cd_nelmts(2), followed by the 32-bit client-data words, so
-    cd_values[i] lives at mbody + 8 + 4*i."""
+    cd_values[i] lives at mbody + 8 + 4*i.
+
+    Pinned to the 1.10 bound rather than "latest": a filtered chunk gets a
+    version-5 layout message under a 2.x-linked h5py's default "latest"
+    bound, but h5patch's matching repair fixture wants the plain version-4
+    form this filter pipeline has always needed."""
     def _build(h):
         h.create_dataset("d", data=np.arange(8, dtype="i4"),
                          chunks=(4,), scaleoffset=0, track_times=False)
-    raw = _base_bytes(_build)
+    raw = _base_bytes(_build, libver=("v110", "v110"))
 
     for o in range(len(raw) - 4):
         if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
@@ -1215,7 +1355,14 @@ def _make_scaleoffset_size_mismatch(path):
 
 
 def _v4_layout_message(raw):
-    """Locate the first version-4 data-layout message in a v2 object header.
+    """Locate the first version-4-or-5 data-layout message in a v2 object header.
+
+    Filtered single-chunk datasets already come out of libhdf5 2.x as a
+    version-5 message (the encoding a filter needs to grow a chunk past the
+    v4 size field); unfiltered ones still come out as version 4, needing the
+    byte patch described on ``_make_layout_version``.  Either starting point
+    is accepted here so the caller can stamp the byte to whatever version it
+    actually wants.
 
     Returns ``(ohdr_off, mbody)`` so a caller can patch the message bytes and
     then repair the header checksum with ``_fix_v2_ohdr_checksum``.
@@ -1233,10 +1380,10 @@ def _v4_layout_message(raw):
             mtype = raw[p]
             msize = struct.unpack_from("<H", raw, p + 1)[0]
             mbody = p + 4 + (2 if flags & 0x04 else 0)
-            if mtype == 0x08 and raw[mbody] == 4:
+            if mtype == 0x08 and raw[mbody] in (4, 5):
                 return o, mbody
             p = mbody + msize
-    raise RuntimeError("could not locate a v4 data-layout message")
+    raise RuntimeError("could not locate a v4 or v5 data-layout message")
 
 
 def _make_layout_version(path, build, version, mutate=None):
@@ -1251,10 +1398,15 @@ def _make_layout_version(path, build, version, mutate=None):
     itself at size-of-lengths width in both versions -- so bumping the version
     byte yields a file a 2.x library reads exactly as it reads the v4 original.
 
-    h5py links libhdf5 1.14, which cannot write (or read) a v5 layout message,
-    so this byte patch is how the corpus gets one without pinning the whole
-    generator to a 2.x build.  ``mutate(raw, mbody)`` may then corrupt the
-    message for the malformed fixtures.
+    Whichever libhdf5 h5py links determines the starting version: builds
+    linked against 1.14 cannot write (or read) a v5 layout message at all, so
+    every dataset here comes out as v4 and needs the byte patch below; builds
+    linked against a 2.x library already write single-chunk-filtered layouts
+    as v5 natively (that's the case the class exists for), so the "patch" is
+    a no-op stamp of the version that's already there.  Either way this is
+    how the corpus gets the requested version without pinning the whole
+    generator to a specific libhdf5 build.  ``mutate(raw, mbody)`` may then
+    corrupt the message for the malformed fixtures.
     """
     raw = _base_bytes(build)
     ohdr, mbody = _v4_layout_message(raw)
@@ -1638,6 +1790,18 @@ def _fix_v2_ohdr_checksum(raw, ohdr_off):
     chksum_off = cursor + size_width + chunk_size
     struct.pack_into("<I", raw, chksum_off,
                      _jenkins_lookup3()(bytes(raw[ohdr_off:chksum_off])))
+
+
+def _make_wide_length_variant(path, base, length):
+    """Write a direct 16-byte contiguous-length variant of ``base``."""
+    raw = bytearray(base)
+    if len(raw) != 177 or raw[10] != 16:
+        raise RuntimeError("wide-length fixture base geometry changed")
+    last_file_byte = len(raw) - 1
+    raw[91:99] = last_file_byte.to_bytes(8, "little")
+    raw[99:115] = length.to_bytes(16, "little")
+    _fix_v2_ohdr_checksum(raw, 48)
+    _patch(path, bytes(raw))
 
 
 def _pin_ohdr_times(raw):
@@ -2475,6 +2639,89 @@ def _make_cache_image_shadowed_btree(path, helper_source):
     struct.pack_into("<H", raw, bthd + 16 + bt["off_size"], nrec)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bthd:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _patch_dtype_size(raw, header_byte, expect_size, new_size, what):
+    """Rewrite the element size of the one datatype message matching a shape.
+
+    A version-1 datatype message payload starts with the class-and-version byte,
+    three class-flag bytes, and a 4-byte element size.  Matching on the header
+    byte plus the size libhdf5 actually wrote locates the message without
+    parsing the whole object header, and requiring exactly one hit means a
+    layout change from a different h5py fails loudly instead of silently
+    patching the wrong bytes.
+    """
+    hits = [i for i in range(len(raw) - 8)
+            if raw[i] == header_byte
+            and struct.unpack_from("<I", raw, i + 4)[0] == expect_size]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected exactly one {what} datatype message of "
+                           f"size {expect_size}, found {len(hits)}")
+    struct.pack_into("<I", raw, hits[0] + 4, new_size)
+    return hits[0]
+
+
+def _make_attr_reference_size_under(path):
+    """An attribute whose reference datatype declares a smaller element than
+    the file's addresses actually occupy.
+
+    A class-7 datatype's on-disk width is a property of the FILE, not of the
+    message: H5T__ref_set_loc assigns H5F_SIZEOF_ADDR(f) for an object
+    reference (H5Tref.c:256) when the type is attached, and never compares that
+    with the encoded size.  H5O__attr_decode has meanwhile already sized
+    attr->shared->data as nelmts * the ENCODED size (H5Oattr.c:273) -- so
+    H5A__read then copies nelmts * the NEW size out of that allocation
+    (H5Aint.c:769) and over-reads by the difference.
+
+    Datasets are immune and attributes are not, for a structural reason: a
+    dataset's extent lives in the layout message, an independent record sized
+    with the same value set_loc restores, so the two can be cross-checked.  An
+    attribute's extent is COMPUTED from the field that changes, so the corrupt
+    file is self-consistent and the only defence is pinning the datatype size at
+    decode time.
+
+    Declared 1 against a file address size of 8: stock h5dump -A prints seven
+    bytes of adjacent heap, and the ASAN build reports
+    `heap-buffer-overflow READ of size 8` at H5Aint.c:769.  Written at the
+    earliest bound so the attribute sits in a version-1 object header, which
+    carries no checksum to repair.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("ref", d.ref,
+                       dtype=h5py.special_dtype(ref=h5py.Reference))
+
+    raw = _base_bytes(build, libver="earliest")
+    # 0x17: version 1, class 7 (reference).  libhdf5 writes sizeof_addr (8).
+    _patch_dtype_size(raw, 0x17, 8, 1, "reference")
+    _patch(path, bytes(raw))
+
+
+def _make_attr_vlen_size_under(path):
+    """The class-9 sibling of _make_attr_reference_size_under.
+
+    H5T__vlen_set_loc (H5Tvlen.c:300) assigns 4 + blob_id_size on disk, again
+    without consulting the encoded size, so an under-declared variable-length
+    element desynchronizes the attribute's raw-data extent exactly as the
+    reference case does and faults at the same H5Aint.c:769.
+
+    Kept as a separate fixture rather than a second attribute on the first: the
+    two sizes are restored by different functions, so a fix that covers only one
+    class must still fail a test.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.zeros(1, dtype="i4"),
+                             track_times=False)
+        arr = np.empty(1, dtype=object)
+        arr[0] = np.arange(3, dtype="i4")
+        d.attrs.create("vl", arr, dtype=h5py.special_dtype(vlen=np.dtype("i4")))
+
+    raw = _base_bytes(build, libver="earliest")
+    # 0x19: version 1, class 9 (variable-length).  The disk sequence size is
+    # 4 + blob_id_size == sizeof_addr + 8 == 16.
+    _patch_dtype_size(raw, 0x19, 16, 1, "variable-length")
     _patch(path, bytes(raw))
 
 

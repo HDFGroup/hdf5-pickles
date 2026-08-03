@@ -32,7 +32,9 @@ var HPE_LINK_ID = 0x06UL;
 var HPE_LINFO_ID = 0x02UL;
 var HPE_STAB_ID = 0x11UL;
 var HPE_LAYOUT_ID = 0x08UL;
+var HPE_SHMESG_ID = 0x0fUL;
 
+var hpe_ctx_super_off = 0UL#B;
 var hpe_ctx_version = 0UB;
 var hpe_ctx_prefix_bytes = 0;
 var hpe_ctx_chunk_off = 0UL#B;
@@ -216,6 +218,101 @@ fun hpe_load_ohdr_ctx = (offset<uint<64>,B> off) void:
     }
 }
 
+/* Shared messages -----------------------------------------------------------
+ *
+ * A message whose prefix carries OH_MSG_FLAG_SHARED stores an H5O_shared_t
+ * reference where its own layout would otherwise be: a committed
+ * object-header address, or a fractal-heap ID into a shared object header
+ * message (SOHM) heap.  Decoding the message type over those bytes yields
+ * nonsense, so every payload this protocol decodes is put through
+ * hpe_shared_payload_off() first.  The message prefix's size still measures
+ * the on-disk reference, which is what the raw view and the record's
+ * :payload-offset / :size keep describing.
+ * ------------------------------------------------------------------------- */
+
+fun hpe_shared_is_flagged = (uint<64> flags) int:
+{
+    return (flags & (OH_MSG_FLAG_SHARED as uint<64>)) != 0UL;
+}
+
+/* Share type of a reference, as it appears in the protocol records.
+   Versions below 3 have no type byte and always name a committed header. */
+fun hpe_shared_type_name = (offset<uint<64>,B> ref_off) string:
+{
+    try {
+        var version = byte @ ref_off;
+        var share_type = version < 3UB ? OH_SHARE_TYPE_COMMITTED
+                                       : (byte @ (ref_off + 1#B));
+
+        if (share_type == OH_SHARE_TYPE_COMMITTED) return "committed";
+        if (share_type == OH_SHARE_TYPE_SOHM)      return "sohm";
+        if (share_type == OH_SHARE_TYPE_HERE)      return "here";
+        return "unshared";
+    } catch (Exception e) {
+        return "unknown";
+    }
+}
+
+/* Decode the superblock extension's Shared Message Table, without which a
+   SOHM reference names a heap nothing has located yet.  Deliberately lazy:
+   only a reference that turns out to be a SOHM one pays for this, and a file
+   with no extension, no such message, or an unreadable table just leaves
+   those references unresolved. */
+fun hpe_ensure_sohm_table = (offset<uint<64>,B> super_off) void:
+{
+    if (global_sohm_table_known != 0UB)
+        return;
+
+    try {
+        var sb = superblock @ super_off;
+
+        if (sb.super_vers < 2UB)
+            return;                    /* no superblock extension exists */
+
+        var ext_raw = sb.super.v2_v3.ext_addr_raw;
+        if (hpe_addr_is_undef(ext_raw))
+            return;
+
+        var tbl_off = msg_payload_offset_in_ohdr(bytes_to_off(ext_raw),
+                                                 HPE_SHMESG_ID as uint<8>,
+                                                 0UH, 0);
+        if (tbl_off == SHARED_MSG_UNRESOLVED)
+            return;
+
+        /* Mapping the message registers the table: oh_msg_shmesg_table's
+           nindexes constraint calls set_sohm_master_table(). */
+        var smtb = oh_msg_shmesg_table @ tbl_off;
+    } catch (Exception e) {
+        /* global_sohm_table_known stays clear; SOHM refs report unresolved */
+    }
+}
+
+/* Offset of the payload a message should be decoded at.  Returns ref_off
+   unchanged for an ordinary message, the referenced payload for a shared
+   one, and SHARED_MSG_UNRESOLVED when the reference cannot be followed.
+   Never raises -- an unreachable target has to degrade to "shared,
+   unresolved" in the protocol rather than fail the whole request. */
+fun hpe_shared_payload_off = (uint<64> m_type, uint<64> flags,
+                              offset<uint<64>,B> ref_off,
+                              offset<uint<64>,B> super_off) off64:
+{
+    if (!hpe_shared_is_flagged(flags))
+        return ref_off;
+
+    try {
+        var version = byte @ ref_off;
+        var share_type = version < 3UB ? OH_SHARE_TYPE_COMMITTED
+                                       : (byte @ (ref_off + 1#B));
+
+        if (share_type == OH_SHARE_TYPE_SOHM)
+            hpe_ensure_sohm_table(super_off);
+
+        return shared_msg_payload_offset(ref_off, m_type as uint<8>);
+    } catch (Exception e) {
+        return SHARED_MSG_UNRESOLVED;
+    }
+}
+
 /* Emit a summary record for one object-header message prefix. */
 fun hpe_print_message_record = (uint<64> idx, uint<64> m_type,
                                 uint<64> m_size, uint<64> flags,
@@ -223,11 +320,36 @@ fun hpe_print_message_record = (uint<64> idx, uint<64> m_type,
                                 offset<uint<64>,B> payload_off,
                                 int has_crt, uint<64> crt) void:
 {
+    /* Resolve before a single byte of the record is printed: the resolution
+       helpers report unreachable references on stdout, and a diagnostic
+       emitted mid-record would split the line the client parses. */
+    var shared = hpe_shared_is_flagged(flags);
+    var resolved = SHARED_MSG_UNRESOLVED;
+    var share_type = "";
+
+    if (shared) {
+        resolved = hpe_shared_payload_off(m_type, flags, payload_off,
+                                          hpe_ctx_super_off);
+        share_type = hpe_shared_type_name(payload_off);
+    }
+
     printf("(:record message :index %u64d :type %u64d :name ",
            idx, m_type);
     hpe_print_string(hpe_message_name(m_type));
-    printf(" :prefix-offset %u64d :payload-offset %u64d :size %u64d :flags %u64d :creation-order ",
+    printf(" :prefix-offset %u64d :payload-offset %u64d :size %u64d :flags %u64d",
            prefix_off/#B, payload_off/#B, m_size, flags);
+
+    if (shared) {
+        printf(" :shared ");
+        hpe_print_string(share_type);
+        if (resolved == SHARED_MSG_UNRESOLVED)
+            printf(" :shared-payload-offset nil");
+        else
+            printf(" :shared-payload-offset %u64d", (resolved/#B) as uint<64>);
+    } else
+        printf(" :shared nil :shared-payload-offset nil");
+
+    printf(" :creation-order ");
     if (has_crt)
         printf("%u64d", crt);
     else
@@ -948,6 +1070,7 @@ fun hdf5_poke_emacs_object_header = (int req, offset<uint<64>,B> off,
                                      offset<uint<64>,B> super_off = 0UL#B) void:
 {
     var hpe_sb_init = superblock @ super_off;
+    hpe_ctx_super_off = super_off;
     hpe_load_ohdr_ctx(off);
 
     hpe_begin(req);
@@ -1563,44 +1686,91 @@ fun hpe_emit_message_detail_records = (uint<8> m_type,
         hpe_emit_refcount_detail(payload_off);
 }
 
-/* Emit raw payload bytes plus a GNU poke typed rendering for a message. */
+/* Emit raw payload bytes plus a GNU poke typed rendering for a message.
+   payload_off/m_size always describe the bytes stored in the object header;
+   decode_off is where the message's content actually lives, which differs
+   for a shared message and is SHARED_MSG_UNRESOLVED when its reference
+   could not be followed. */
 fun hpe_emit_message_raw = (uint<8> m_type,
                             offset<uint<64>,B> payload_off,
-                            uint<16> m_size) void:
+                            uint<16> m_size,
+                            off64 decode_off) void:
 {
     printf("Payload bytes @ %u64d (%u64d bytes)\n",
            payload_off/#B, m_size as uint<64>);
     hpe_print_bytes_at(payload_off, m_size as uint<64>);
     printf("\n\n");
 
+    if (decode_off == SHARED_MSG_UNRESOLVED) {
+        /* Mapping the message type over an H5O_shared_t record would print
+           exactly the garbage the resolution exists to avoid. */
+        printf("Shared message\n");
+        printf("--------------\n");
+        printf("The bytes above are a shared-message reference, not the\n");
+        printf("message content, and the reference could not be followed.\n");
+        return;
+    }
+
+    var view_off = decode_off as offset<uint<64>,B>;
+
+    if (view_off != payload_off)
+        printf("Shared message: content resolved at %u64d\n\n", view_off/#B);
+
     if (m_type == 0x03UB) {
-        var dtype = oh_msg_dtype @ payload_off;
+        var dtype = oh_msg_dtype @ view_off;
         printf("GNU poke datatype view\n");
         printf("----------------------\n");
         print_recurse_dtype(dtype, 0);
     } else {
         printf("GNU poke typed view\n");
         printf("-------------------\n");
-        printf("%Tv\n", message_factory(m_type, m_size, payload_off));
+        printf("%Tv\n", message_factory(m_type, m_size, view_off));
     }
 }
 
-/* Entry point: emit parsed and raw details for one message payload. */
+/* Entry point: emit parsed and raw details for one message payload.
+   flags is the message prefix's flag byte, which the message list already
+   reports; passing it lets a shared message be decoded at the payload it
+   references instead of over the reference itself.  It defaults to 0 so
+   that a caller that does not track flags keeps the previous behaviour. */
 fun hdf5_poke_emacs_message = (int req, uint<8> m_type,
                                offset<uint<64>,B> payload_off,
                                uint<16> m_size,
-                               offset<uint<64>,B> super_off = 0UL#B) void:
+                               offset<uint<64>,B> super_off = 0UL#B,
+                               uint<64> flags = 0UL) void:
 {
     var hpe_sb_init = superblock @ super_off;
+    hpe_ctx_super_off = super_off;
+
+    /* Resolve before the response starts: the resolution helpers report
+       unreachable references on stdout, and the structured section drops
+       what it does not recognise while the raw section shows it verbatim. */
+    var shared = hpe_shared_is_flagged(flags);
+    var decode_off = hpe_shared_payload_off(m_type as uint<64>, flags,
+                                            payload_off, super_off);
+
     hpe_begin(req);
     printf("(:record message-detail :type %u64d :name ",
            m_type as uint<64>);
     hpe_print_string(hpe_message_name(m_type as uint<64>));
     printf(" :payload-offset %u64d :size %u64d)\n",
            payload_off/#B, m_size as uint<64>);
-    hpe_emit_message_detail_records(m_type, payload_off);
+
+    if (shared) {
+        printf("(:record shared :share-type ");
+        hpe_print_string(hpe_shared_type_name(payload_off));
+        printf(" :reference-offset %u64d :payload-offset ", payload_off/#B);
+        if (decode_off == SHARED_MSG_UNRESOLVED)
+            printf("nil)\n");
+        else
+            printf("%u64d)\n", (decode_off/#B) as uint<64>);
+    }
+
+    if (decode_off != SHARED_MSG_UNRESOLVED)
+        hpe_emit_message_detail_records(m_type,
+                                        decode_off as offset<uint<64>,B>);
     hpe_raw_begin(req);
-    hpe_emit_message_raw(m_type, payload_off, m_size);
+    hpe_emit_message_raw(m_type, payload_off, m_size, decode_off);
     hpe_raw_end(req);
     hpe_end(req);
 }
@@ -1733,24 +1903,37 @@ fun hpe_preview_scan_chunk = (uint<8> version, int prefix_bytes,
     while ((i + (prefix_bytes as uint<64>)) < chunk_size) {
         var m_type = 0UL;
         var m_size = 0UL;
+        var flags = 0UL;
         var prefix_off = chunk_off + i#B;
         var prefix = msg_prefix @ prefix_off;
 
         if (version == 1UB) {
             m_type = prefix.v1_msg_prefix.msg_type as uint<64>;
             m_size = prefix.v1_msg_prefix.msg_size as uint<64>;
+            flags = prefix.v1_msg_prefix.msg_flags as uint<64>;
         } else {
             m_type = prefix.v2_msg_prefix.msg_type as uint<64>;
             m_size = prefix.v2_msg_prefix.msg_size as uint<64>;
+            flags = prefix.v2_msg_prefix.msg_flags as uint<64>;
         }
 
         var payload_off = chunk_off + i#B + prefix_bytes#B;
 
-        if (m_type == 0x01UL)
-            hpe_preview_record_dataspace(payload_off);
-        else if (m_type == 0x03UL)
-            hpe_preview_record_datatype(payload_off);
-        else if (m_type == 0x08UL)
+        /* A dataset built on a committed datatype carries a shared datatype
+           message; the element size the preview needs lives in the type it
+           references.  An unresolved reference leaves the preview without
+           that fact, which hpe_emit_preview_result reports as unsupported. */
+        var decode_off = hpe_shared_payload_off(m_type, flags, payload_off,
+                                                hpe_ctx_super_off);
+        var usable = decode_off != SHARED_MSG_UNRESOLVED;
+
+        if (m_type == 0x01UL) {
+            if (usable)
+                hpe_preview_record_dataspace(decode_off as offset<uint<64>,B>);
+        } else if (m_type == 0x03UL) {
+            if (usable)
+                hpe_preview_record_datatype(decode_off as offset<uint<64>,B>);
+        } else if (m_type == 0x08UL)
             hpe_preview_record_layout(payload_off);
         else if (m_type == HPE_CONT_ID) {
             var cont = oh_msg_cont @ payload_off;
@@ -1838,6 +2021,7 @@ fun hdf5_poke_emacs_dataset_preview = (int req,
                                        offset<uint<64>,B> super_off = 0UL#B) void:
 {
     var hpe_sb_init = superblock @ super_off;
+    hpe_ctx_super_off = super_off;
     hpe_load_ohdr_ctx(off);
     hpe_preview_reset();
 

@@ -88,8 +88,34 @@ PROFILE_OVERRIDE_FIELDS = {
 }
 
 
-def _location_matches(location, expected, fixture_bytes):
-    """Match a location subset and, optionally, its little-endian bytes."""
+#: `little_endian_value` may name the finding's own reported value instead of a
+#: literal.  See _location_matches.
+EVIDENCE_ACTUAL = "from_evidence_actual"
+
+
+def _location_matches(location, expected, fixture_bytes, evidence=None):
+    """Match a location subset and, optionally, its little-endian bytes.
+
+    `little_endian_value` accepts either an integer literal or the string
+    `from_evidence_actual`.
+
+    A literal is right only when the GENERATOR chooses the value -- the
+    continuation fixture's `52` is `root_off + 4`, written by
+    `_make_continuation_overlaps_source` itself, so it is a real assertion about
+    a real decision.  It is wrong when the bytes come from the h5py-written base
+    fixture: `_write` builds those with `libver="latest"`, which means whatever
+    the LINKED libhdf5 calls newest, so the bytes move when that library
+    changes.  `bad_dense_attr_btree_deep` pinned exactly such a value -- with the
+    B-tree depth forced to 120 the walk reads the node's record area as child
+    pointers, so the reported "address" is really record #2's 8-byte fractal
+    heap ID, and h5py/1.14.5, libhdf5 2.3.0 and the previously pinned literal
+    each produce a different one.
+
+    `from_evidence_actual` asserts the property that was actually meant: the
+    bytes at the location the finding points at decode to the value the finding
+    reports.  That is a statement about the oracle's own self-consistency, so it
+    holds whatever the base fixture looks like.
+    """
     for key, value in expected.items():
         if key == "little_endian_value":
             continue
@@ -97,6 +123,15 @@ def _location_matches(location, expected, fixture_bytes):
             return False
     if "little_endian_value" not in expected:
         return True
+    wanted = expected["little_endian_value"]
+    if wanted == EVIDENCE_ACTUAL:
+        wanted = (evidence or {}).get("actual")
+        if isinstance(wanted, bool) or not isinstance(wanted, int):
+            return False
+    elif isinstance(wanted, str):
+        raise ValueError(
+            f"little_endian_value must be an integer or {EVIDENCE_ACTUAL!r}, "
+            f"got {wanted!r}")
     offset = location.get("offset")
     length = location.get("length")
     if (fixture_bytes is None or isinstance(offset, bool)
@@ -105,7 +140,7 @@ def _location_matches(location, expected, fixture_bytes):
             or offset + length > len(fixture_bytes)):
         return False
     encoded = int.from_bytes(fixture_bytes[offset:offset + length], "little")
-    return encoded == expected["little_endian_value"]
+    return encoded == wanted
 
 
 def _poke_string(value):
@@ -405,7 +440,7 @@ def run_case(spec):
                 for index, location in enumerate(locations):
                     if (index not in used and isinstance(location, dict)
                             and _location_matches(location, expected_location,
-                                                  fixture_bytes)):
+                                                  fixture_bytes, evidence)):
                         found_index = index
                         break
                 if found_index is None:

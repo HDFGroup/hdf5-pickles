@@ -18,9 +18,9 @@
 # h5policy regression runner.
 #
 # Oracle correctness:
-#   1. registry consistency (tools/check_registry.py), including the gate
+#   1. (re)generates the corpus fixtures with h5policy-gencorpus,
+#   2. registry consistency (tools/check_registry.py), including the gate
 #      between the claimed and the measured libhdf5 verdicts,
-#   2. (re)generates the corpus fixtures with h5policy-gencorpus,
 #   3. synthetic datatype, assigned-message, file-space-info and profile-limit
 #      checks; reachability records; the read-only consumer API; the
 #      h5policy_analyze seam; the wrapper-generated wall-timeout report,
@@ -47,11 +47,63 @@ overlay_dir="$(cd -- "$tests_dir/.." && pwd)"
 repo_dir="$(cd -- "$overlay_dir/.." && pwd)"
 export POKE_LOAD_PATH="$overlay_dir/pickles:$repo_dir/pickles${POKE_LOAD_PATH:+:$POKE_LOAD_PATH}"
 
-echo "== registry consistency =="
-python3 "$repo_dir/tools/check_registry.py" || exit 1
-
 echo "== generating corpus =="
 "$overlay_dir/tools/h5policy-gencorpus" "$tests_dir" || exit 1
+
+# Every fixture under tests/cve/ is generated, and every one of them is also
+# TRACKED, so regenerating must reproduce the committed bytes exactly.  When it
+# does not, the committed copy was produced by a different writer and the tree
+# is left dirty after an ordinary test run -- which is easy to miss and easy to
+# commit by accident.  It has happened: vds_nentries_mult_overflow.h5 was
+# committed from an environment whose libhdf5 did not stamp the root group's
+# object header, so its headers ran 16 bytes short of what every other writer
+# produces, and every run.sh since rewrote it.
+#
+# Fail loudly instead.  Skipped outside a git checkout so a tarball still runs.
+reproducibility_status=0
+if git -C "$repo_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "== tracked-fixture reproducibility =="
+    # Against HEAD, not the index: staging a drifted fixture must not silence
+    # this, because the committed bytes are what the next checkout gets.
+    if drifted=$(git -C "$repo_dir" diff HEAD --name-only -- \
+                     h5policy/tests/cve h5policy/tests/CORPUS-WRITER.txt 2>/dev/null); then
+        if [ -n "$drifted" ]; then
+            echo "  regeneration changed tracked generated file(s):"
+            printf '    %s\n' $drifted
+            # The writer record exists to name the cause, so show it rather than
+            # leaving someone to diff fixture bytes by hand.
+            if printf '%s\n' $drifted | grep -q CORPUS-WRITER; then
+                if git -C "$repo_dir" cat-file -e HEAD:h5policy/tests/CORPUS-WRITER.txt 2>/dev/null; then
+                    echo "  the writer itself differs from the one that produced the"
+                    echo "  committed corpus (-committed / +this host):"
+                else
+                    # First run after the record was introduced: HEAD has no
+                    # writer to compare against, so this is a baseline, not drift.
+                    echo "  no writer record is committed yet, so this run establishes the"
+                    echo "  baseline rather than reporting drift (+this host):"
+                fi
+                git -C "$repo_dir" diff HEAD --no-color -U0 -- h5policy/tests/CORPUS-WRITER.txt \
+                    | grep -E '^[-+][a-z]' | sed 's/^/    /'
+                echo "  Fixture bytes follow the writer; regenerating here is expected to"
+                echo "  move them.  Decide whether this host or the committed corpus is"
+                echo "  authoritative before committing."
+            else
+                echo "  the writer record matches, so this is not writer drift --"
+                echo "  a generator change is the likely cause."
+            fi
+            echo "  Either way: confirm the fixtures still assert what they should,"
+            echo "  then commit -- do not leave them dirty."
+            reproducibility_status=1
+        else
+            echo "  tracked cve/ fixtures and the writer record reproduce byte-for-byte"
+        fi
+    else
+        echo "  skipped: could not diff against HEAD"
+    fi
+fi
+
+echo "== registry consistency =="
+python3 "$repo_dir/tools/check_registry.py" || exit 1
 
 echo "== datatype validator unit checks =="
 poke --quiet -L "$tests_dir/unit_datatype.pk"
@@ -94,7 +146,7 @@ corpus_status=$?
 
 echo "== differential vs libhdf5 (h5py / h5dump / h5debug) =="
 "$overlay_dir/tools/h5policy-diff" --dir "$tests_dir" | \
-    grep -E '\[(PASS|FAIL|WARN)\]|FAIL |differential:'
+    grep -E '\[(PASS|FAIL|WARN|TRACKED)\]|FAIL |differential:'
 diff_status=${PIPESTATUS[0]}
 
 # Exact-build probe smoke check (roadmap change #3, OS-level layer).  Needs a C
@@ -199,9 +251,10 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
       && $matrix_status -eq 0 && $mut_status -eq 0 \
       && $trunc_status -eq 0 && $lazy_status -eq 0 \
-      && $seam_check_status -eq 0 ]]; then
+      && $seam_check_status -eq 0 \
+      && $reproducibility_status -eq 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
 exit 1

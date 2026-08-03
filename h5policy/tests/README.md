@@ -49,10 +49,13 @@ controlled outcome; a change that alters any decision is surfaced for review.
 ./run.sh
 ```
 
-This regenerates the fixtures and runs every gate in one pass:
+This regenerates the git-ignored fixtures before checking registry ownership, so
+the same command works in a fresh clone as well as an existing build tree, and
+then runs every gate in one pass:
 
 | gate | asserts |
 |---|---|
+| corpus generation | every fixture referenced by the tracked expectations is created before consistency checks inspect it |
 | registry consistency | the cross-file constraints, including that the manifest's claim about libhdf5 matches what was measured |
 | unit checks | datatype, message, file-space-info, profile limits, reachability, consumer API, `h5policy_analyze` seam, timeout report |
 | corpus cases | every `expected/*.yml`: decision, exit code, required findings, evidence locations, forbidden outcomes |
@@ -125,6 +128,59 @@ also match role/length and decode the cited fixture bytes as a little-endian
 integer, so tests verify the reported range rather than pinning generator-
 version-dependent absolute offsets.
 
+`little_endian_value` takes either an integer literal or the string
+`from_evidence_actual`. Choose by asking who decides the value:
+
+- A **literal** is right when the generator writes it. The continuation
+  self-overlap fixture's `52` is `root_off + 4`, chosen by
+  `_make_continuation_overlaps_source`, so pinning it asserts a real decision.
+- **`from_evidence_actual`** is right when the bytes come from the h5py-written
+  base fixture. `_write` builds those with `libver="latest"` — whatever the
+  *linked* libhdf5 calls newest — so their content moves with the writing
+  library and no literal stays correct. The sentinel asserts instead that the
+  bytes at the location the finding cites decode to the value that same finding
+  reports, which is a statement about the oracle's self-consistency and holds
+  under any writer.
+
+The same reasoning applies to a location's `length`: pin it when the generator
+fixes it, and omit it when it is base-fixture geometry, as the continuation
+fixture's `actual_source` extent is. A misspelled sentinel raises rather than
+silently passing.
+
+## Who wrote the corpus
+
+Every valid fixture is written by h5py and every malformed and CVE fixture is
+byte-patched from one, so the whole corpus inherits whatever the linked libhdf5
+emits. Two properties of that writer have already moved underneath it:
+
+- the **format-version bound**, because fixtures ask for `libver="latest"` —
+  whatever the *linked* library calls newest. A 2.x-linked h5py writes a
+  version-5 layout message where a 1.14-linked one writes version 4.
+- whether the **root group's object header carries the 16-byte timestamp
+  block**. No libver bound controls this and h5py cannot set `track_times` on
+  the root group, so the generator cannot pin it. When it differs, every object
+  header runs 16 bytes short and every address after it shifts.
+
+`h5policy-gencorpus` therefore measures both from a file it has just written and
+records them in the tracked `CORPUS-WRITER.txt`. `run.sh` diffs that file, and
+`cve/`, against `HEAD` after regenerating: a corpus produced by a different
+writer then surfaces as a named cause rather than as unexplained byte movement.
+
+```
+== tracked-fixture reproducibility ==
+  regeneration changed tracked generated file(s):
+    h5policy/tests/CORPUS-WRITER.txt
+    h5policy/tests/cve/vds_nentries_mult_overflow.h5
+  the writer itself differs from the one that produced the committed
+  corpus (-committed / +this host):
+    -root_ohdr_times            False
+    +root_ohdr_times            True
+```
+
+The check compares against `HEAD`, not the index, because the committed bytes
+are what the next checkout gets — staging a drifted fixture must not silence it.
+It is skipped outside a git checkout so a tarball still runs.
+
 The reduced-boundary layer also reuses valid nested datatypes, multi-level
 dense-link B-trees, and continuation-heavy object headers to distinguish
 resource ceilings from structural corruption. A focused
@@ -186,9 +242,11 @@ inspecting attributes, reading small datasets, or running optional `libhdf5`
 tools; those eager catches are security-useful, not hard false positives. The
 similarly narrow `A~` warning covers file-global SOHM/free-space metadata that
 read-only libhdf5 paths leave unopened, and findings confined to dense
-secondary creation-order indexes. Current libhdf5 can enumerate the primary
-name index without authenticating every type-6/type-9 block; h5policy
-intentionally validates both active indexes.
+secondary creation-order indexes. It also covers the generated wide-length
+controls whose impossible contiguous-data extents libhdf5 leaves lazy. Current
+libhdf5 can enumerate the primary name index without authenticating every
+type-6/type-9 block, and can report those controls' scalar datasets without
+checking their physical extents; h5policy intentionally validates both.
 
 The logical-**bytes** comparison is warning-level rather than a hard failure:
 h5policy now tracks logical dataset bytes separately from raw storage bytes, so

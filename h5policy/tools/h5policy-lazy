@@ -38,6 +38,10 @@ Three ladders:
             could equally mean the counter is simply broken.
 
 The control is the part that makes the other two mean anything.
+
+Fixture creation uses libver=latest with root-group and dataset timestamp
+tracking explicitly disabled, so object-header size does not depend on
+h5py/HDF5 defaults.
 """
 import argparse
 import json
@@ -53,6 +57,34 @@ REPO = os.path.dirname(OVERLAY)
 H5POLICY = os.path.join(HERE, "h5policy")
 
 INVARIANT_COUNTERS = ("metadata_bytes_seen", "walk_operations")
+FIXTURE_POLICY = {
+    "libver": "latest",
+    "root_group_track_times": False,
+    "dataset_track_times": False,
+}
+
+
+def create_ladder_file(path, h5py):
+    """Create a latest-format file with root timestamps explicitly disabled.
+
+    The high-level ``h5py.File`` API does not expose the root group's object
+    creation properties.  Set them on the file-creation property list before
+    HDF5 creates the root group, then wrap the resulting low-level file ID for
+    ordinary high-level dataset construction.
+    """
+    fcpl = h5py.h5p.create(h5py.h5p.FILE_CREATE)
+    fcpl.set_obj_track_times(FIXTURE_POLICY["root_group_track_times"])
+    fapl = h5py.h5p.create(h5py.h5p.FILE_ACCESS)
+    fapl.set_libver_bounds(h5py.h5f.LIBVER_LATEST,
+                           h5py.h5f.LIBVER_LATEST)
+    file_id = h5py.h5f.create(os.fsencode(path), h5py.h5f.ACC_TRUNC,
+                              fcpl=fcpl, fapl=fapl)
+    h = h5py.File(file_id)
+    actual = bool(h["/"].id.get_create_plist().get_obj_track_times())
+    if actual != FIXTURE_POLICY["root_group_track_times"]:
+        h.close()
+        raise RuntimeError("root-group timestamp policy was not applied")
+    return h
 
 
 def build_ladders(outdir):
@@ -62,8 +94,10 @@ def build_ladders(outdir):
     ladders = {"data": [], "filtered": [], "chunks": []}
     for n in (16, 1_600, 160_000, 1_600_000):
         p = os.path.join(outdir, f"data_{n}.h5")
-        with h5py.File(p, "w", libver="latest") as h:
-            h.create_dataset("d", data=np.arange(n, dtype="i4"), track_times=False)
+        with create_ladder_file(p, h5py) as h:
+            h.create_dataset(
+                "d", data=np.arange(n, dtype="i4"),
+                track_times=FIXTURE_POLICY["dataset_track_times"])
         ladders["data"].append((n, p))
 
     # ONE chunk at every point: the chunk count is metadata, so letting it vary
@@ -71,18 +105,18 @@ def build_ladders(outdir):
     # the very thing this ladder isolates.
     for n in (16, 1_600, 160_000, 1_600_000):
         p = os.path.join(outdir, f"filt_{n}.h5")
-        with h5py.File(p, "w", libver="latest") as h:
+        with create_ladder_file(p, h5py) as h:
             h.create_dataset("d", data=np.arange(n, dtype="i4"),
                              chunks=(n,), compression="gzip",
-                             track_times=False)
+                             track_times=FIXTURE_POLICY["dataset_track_times"])
         ladders["filtered"].append((n, p))
 
     for nch in (4, 40, 400):
         p = os.path.join(outdir, f"chunks_{nch}.h5")
-        with h5py.File(p, "w", libver="latest") as h:
+        with create_ladder_file(p, h5py) as h:
             h.create_dataset("d", shape=(nch * 10,), chunks=(10,),
                              data=np.arange(nch * 10, dtype="i4"),
-                             track_times=False)
+                             track_times=FIXTURE_POLICY["dataset_track_times"])
         ladders["chunks"].append((nch, p))
     return ladders
 
@@ -177,7 +211,8 @@ def main():
                 violations.append({"ladder": name, "kind": "wall_time_scaled_with_data",
                                    "ratio": round(ratio, 2), "seconds": times})
 
-    report = {"schema_version": 1, "ladders": results,
+    report = {"schema_version": 1, "fixture_policy": FIXTURE_POLICY,
+              "ladders": results,
               "violations": violations, "total_violations": len(violations)}
 
     if args.json or args.output:

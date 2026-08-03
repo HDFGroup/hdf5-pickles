@@ -31,6 +31,16 @@
  */
 load "drv_info.pk";
 
+/* NOTE:
+ * Needed to resolve OH_MSG_FLAG_SHARED (SOHM) messages in get_all_messages():
+ *   sohm.pk  -- master SMTB table / per-index mesg_types+heap_addr lookup
+ *   fheap.pk -- frhp_id_to_addr() resolves a fractal heap ID to a file address
+ * Do NOT load common.pk here -- see stab.pk's explanation of the shadowing
+ * hazard; only entry-point pickles (h5explain.pk/construct.pk) load it.
+ */
+load "sohm.pk";
+load "fheap.pk";
+
 /*
  * Covers:
  *   - Object Header Prefix, version 1 (no signature) and version 2
@@ -492,10 +502,10 @@ var OH_SHARE_TYPE_SOHM      = 1UB;
 var OH_SHARE_TYPE_COMMITTED = 2UB;
 var OH_SHARE_TYPE_HERE      = 3UB;
 
-//fun oh_u16_at = (off64 off) uint<64>:
-//{
- //   return bytes_to_u64_le(byte[2] @ off);
-//}
+/* Object header continuation message ID -- declared here (rather than
+   alongside DTYPE_ID/LAYOUT_ID below) because msg_payload_offset_in_ohdr()
+   references it and Poke resolves top-level var bindings in file order. */
+var CONT_ID = 0x0010;
 
 fun is_v2_ohdr_at = (off64 off) int:
 {
@@ -505,81 +515,120 @@ fun is_v2_ohdr_at = (off64 off) int:
             && ((byte @ (off + 3#B)) == 'R'));
 }
 
+/* SHARED_MSG_UNRESOLVED -- sentinel offset returned when a shared message
+ * cannot be followed to its real payload. A negative offset can never name a
+ * position in the file, so it is unambiguous.
+ *
+ * Resolution failures are reported and returned, not raised: a shared message
+ * whose target is unreachable (an undecoded SOHM table, a filtered huge heap
+ * object, a truncated file) must not abort the decoding of every message that
+ * follows it. Callers test for the sentinel and fall back to reporting the
+ * raw shared reference. */
+var SHARED_MSG_UNRESOLVED = (-1L)#B;
+
 fun shared_msg_error = (string msg) off64:
 {
     printf("shared_msg_payload_offset: %s\n", msg);
-    raise E_inval;
-    return 0UL#B;
+    return SHARED_MSG_UNRESOLVED;
 }
 
 fun msg_payload_offset_in_ohdr = (off64 obj_off, uint<8> wanted_type,
                                       uint<16> wanted_index, int use_index) off64:
 {
-    var cur = 0UL#B;
-    var chunk_end = 0UL#B;
-    var msg_no = 0UL;
+    var is_v2 = is_v2_ohdr_at(obj_off);
+    var prefix_bytes = 8UL;
+    var crt_order_tracked = 0;
+    var chunk_off = obj_off + 16#B;
+    var chunk_size = 0UL;
 
-    if (is_v2_ohdr_at(obj_off)) {
+    if (is_v2) {
         var ohdr_flags = byte @ (obj_off + 5#B);
-        var crt_order_tracked = (ohdr_flags & 4U) != 0;
         var chunk0_size_len = 1UL <<. (ohdr_flags & 3U);
-        var prefix_bytes = crt_order_tracked ? 6UL : 4UL;
-        var chunk0_size = 0UL;
+        var cur0 = obj_off + 6#B;
 
-        cur = obj_off + 6#B;
+        crt_order_tracked = (ohdr_flags & 4U) != 0;
+        prefix_bytes = crt_order_tracked ? 6UL : 4UL;
+
         if ((ohdr_flags & 32U) != 0)
-            cur = cur + 16#B;
+            cur0 = cur0 + 16#B;
         if ((ohdr_flags & 16U) != 0)
-            cur = cur + 4#B;
+            cur0 = cur0 + 4#B;
 
-        chunk0_size = bytes_to_u64_le(byte[chunk0_size_len] @ cur);
-        cur = cur + chunk0_size_len#B;
-        chunk_end = cur + chunk0_size#B;
+        chunk_size = bytes_to_u64_le(byte[chunk0_size_len] @ cur0);
+        chunk_off = cur0 + chunk0_size_len#B;
+    } else {
+        chunk_size = bytes_to_u64_le(byte[4] @ (obj_off + 8#B));
+    }
+
+    /* Object header continuation messages (0x0010) seen while scanning
+     * the current chunk get queued here and scanned afterwards -- the
+     * wanted message may live in a later chunk, as it does whenever the
+     * first chunk holds nothing but a continuation pointer (mirrors
+     * get_all_messages()/get_cont_messages()'s chunk-walking). */
+    var cont_addrs = off64[]();
+    var cont_sizes = uint64[]();
+    var qi = 0;
+
+    while (1) {
+        var cur = chunk_off;
+        var chunk_end = chunk_off + chunk_size#B;
+        var msg_no = 0UL;
 
         while ((cur + prefix_bytes#B) <= chunk_end) {
-            var m_type = byte @ cur;
-            var m_size = bytes_u16_at(cur + 1#B);
+            var m_type = 0UL;
+            var m_size = 0UL;
             var match_index = 0;
+
+            if (is_v2) {
+                m_type = byte @ cur;
+                m_size = bytes_u16_at(cur + 1#B);
+            } else {
+                m_type = bytes_u16_at(cur);
+                m_size = bytes_u16_at(cur + 2#B);
+            }
 
             if (use_index == 0) {
                 match_index = 1;
-            } else if (crt_order_tracked) {
+            } else if (is_v2 && crt_order_tracked) {
                 var crt_order = bytes_u16_at(cur + 4#B);
                 match_index = crt_order == (wanted_index as uint<64>);
             } else {
                 match_index = msg_no == (wanted_index as uint<64>);
             }
 
-            if (m_type == wanted_type && match_index)
+            if (m_type == (wanted_type as uint<64>) && match_index)
                 return cur + prefix_bytes#B;
+
+            if (m_type == CONT_ID) {
+                var cont_payload = cur + prefix_bytes#B;
+                var addr_raw = byte[global_sizeof_offsets] @ cont_payload;
+                var size_raw = byte[global_sizeof_lengths] @ (cont_payload + global_sizeof_offsets#B);
+                cont_addrs += [bytes_to_off(addr_raw) as off64];
+                cont_sizes += [bytes_to_u64_le(size_raw)];
+            }
 
             cur = cur + (prefix_bytes + m_size)#B;
             msg_no = msg_no + 1;
         }
-    } else {
-        var msg_cnt = bytes_u16_at(obj_off + 2#B);
-        var obj_hdr_size = bytes_to_u64_le(byte[4] @ (obj_off + 8#B));
 
-        cur = obj_off + 16#B;
-        chunk_end = cur + obj_hdr_size#B;
+        if (qi >= cont_addrs'length)
+            break;
 
-        while (msg_no < msg_cnt && (cur + 8#B) <= chunk_end) {
-            var m_type = bytes_u16_at(cur);
-            var m_size = bytes_u16_at(cur + 2#B);
-            var match_index = use_index == 0 || msg_no == (wanted_index as uint<64>);
+        chunk_off = cont_addrs[qi];
+        chunk_size = cont_sizes[qi];
+        qi = qi + 1;
 
-            if (m_type == (wanted_type as uint<64>) && match_index)
-                return cur + 8#B;
-
-            cur = cur + (8UL + m_size)#B;
-            msg_no = msg_no + 1;
+        if (is_v2) {
+            /* Skip the 4-byte "OCHK" signature; the trailing 4 bytes are
+             * a checksum, not part of the message list. */
+            chunk_off = chunk_off + H5_FORMAT_OCHK_SIGNATURE_SIZE;
+            chunk_size = chunk_size - 4;
         }
     }
 
     printf("shared_msg_payload_offset: message type %v not found in object header at %v\n",
            wanted_type, obj_off / 1#B);
-    raise E_inval;
-    return 0UL#B;
+    return SHARED_MSG_UNRESOLVED;
 }
 
 fun shared_msg_payload_offset = (off64 shared_off, uint<8> wanted_type) off64:
@@ -589,10 +638,15 @@ fun shared_msg_payload_offset = (off64 shared_off, uint<8> wanted_type) off64:
     var loc_off = shared_off + 2#B;
 
     if (version == 1UB) {
-        /* Version 1 stores a reserved area and a legacy local-heap address
-           before the object-header address. */
+        /* Version 1 stores 2+4 reserved bytes followed by the Link Name
+           Offset field before the object-header address. The Link Name
+           Offset reuses stab_ent's field of the same name (sec. III.C) and
+           is sized by global_sizeof_lengths, not global_sizeof_offsets;
+           per the spec it is skipped over, not read, by the shared message
+           decoding code, so we only need its extent to reach Address. */
         share_type = OH_SHARE_TYPE_COMMITTED;
-        loc_off = shared_off + (8UL + (global_sizeof_lengths as uint<64>))#B;
+        var lnk_nm_off_raw = byte[global_sizeof_lengths] @ (shared_off + 8#B);
+        loc_off = lnk_nm_off_raw'offset + lnk_nm_off_raw'size;
     } else if (version == 2UB) {
         /* The second byte was historically unused; version 2 always points to
            a committed object header. */
@@ -607,10 +661,22 @@ fun shared_msg_payload_offset = (off64 shared_off, uint<8> wanted_type) off64:
     }
 
     if (share_type == OH_SHARE_TYPE_SOHM) {
-        printf("shared_msg_payload_offset: SOHM heap id %v at %v requires fractal heap decoding\n",
-               byte[8] @ loc_off, loc_off / 1#B);
-        raise E_inval;
-        return 0UL#B;
+        if (global_sohm_table_known == 0UB)
+            return shared_msg_error("SOHM shared message but the Shared Message Table (SHMESG, type 0x0f) has not been decoded yet -- walk the superblock extension's messages first");
+
+        var idx = sohm_index_for_type(wanted_type);
+        if (idx == NO_SOHM_INDEX)
+            return shared_msg_error("no SOHM index covers this message type");
+
+        var heap_addr = get_sohm_heap_addr(idx);
+        var id_bytes  = byte[8] @ loc_off;
+        var obj_addr  = frhp_id_to_addr(heap_addr#B, id_bytes);
+
+        /* frhp_id_to_addr() has already reported why it gave up. */
+        if (obj_addr == FRHP_ADDR_UNRESOLVED)
+            return SHARED_MSG_UNRESOLVED;
+
+        return obj_addr#B;
     }
 
     if (share_type == OH_SHARE_TYPE_UNSHARED)
@@ -1559,7 +1625,14 @@ type oh_msg_fill =
                 byte fill_time;
                 byte fill_defined;
                 uint<32> fill_size if (fill_defined > 0);
-                if (fill_size > 0)
+                /* fill_size is absent unless fill_defined is set, and reading
+                   an absent field raises E_elem -- which a union does not
+                   recover from, unlike the E_constraint that selects between
+                   these two arms. Guard on presence first, as the v3 arm
+                   below does, so that a version-3 message whose bytes happen
+                   to leave fill_defined zero still falls through to v3
+                   instead of aborting the whole decode. */
+                if (fill_defined > 0 && fill_size > 0)
                     byte[fill_size] fill_value;
             } v1_v2: version < 3;
 
@@ -1914,8 +1987,22 @@ type oh_msg_attr =
         /* Function to calculate data size */
         fun get_data_size = uint<64>:
         {
-            var dt = oh_msg_dtype @ dtype_msg_offset();
-            var ds = oh_msg_sdspace @ dspace_msg_offset();
+            /* An attribute's datatype/dataspace may themselves be shared. If
+             * either reference cannot be followed the element size and the
+             * dimensions are both unknown, so the extent of the data area is
+             * unknowable too -- map none of it rather than raising, which
+             * would take the rest of the object header's messages down with
+             * it. The message prefix's msg_size still bounds the message. */
+            var dt_off = dtype_msg_offset();
+            var ds_off = dspace_msg_offset();
+
+            if (dt_off == SHARED_MSG_UNRESOLVED || ds_off == SHARED_MSG_UNRESOLVED) {
+                printf("oh_msg_attr: shared datatype or dataspace is unresolved -- attribute data size unknown, showing none\n");
+                return 0UL;
+            }
+
+            var dt = oh_msg_dtype @ dt_off;
+            var ds = oh_msg_sdspace @ ds_off;
 
             if (ds.version >= 2) {
                 if (ds.space.v2.space_type == 2UB) /* H5S_NULL */
@@ -1961,11 +2048,22 @@ type oh_msg_attr =
 
             printf("  name=%v-->%v\n", name, char_array_to_string(name));
 
-            var ii = oh_msg_dtype@dtype_msg_offset();
-            print_dtype(ii, 1);
+            var dt_off = dtype_msg_offset();
+            var ds_off = dspace_msg_offset();
 
-            var jj = oh_msg_sdspace@dspace_msg_offset();
-            jj.print_dspace_indent(1);
+            if (dt_off == SHARED_MSG_UNRESOLVED)
+                printf("  dtype=<shared, unresolved> reference=%v\n", dtype);
+            else {
+                var ii = oh_msg_dtype@dt_off;
+                print_dtype(ii, 1);
+            }
+
+            if (ds_off == SHARED_MSG_UNRESOLVED)
+                printf("  dspace=<shared, unresolved> reference=%v\n", dspace);
+            else {
+                var jj = oh_msg_sdspace@ds_off;
+                jj.print_dspace_indent(1);
+            }
 
             printf("  data=%v\n", data);
 
@@ -1995,9 +2093,10 @@ type oh_msg_old_mtime =
 type oh_msg_shmesg_table =
     struct {
         byte version;
-        byte[global_sizeof_offsets] addr_raw; /* Address of the master table for 
+        byte[global_sizeof_offsets] addr_raw; /* Address of the master table for
                                                  shared object header message indexes */
-        byte nindexes;  /* The number of indices in the master table */
+        byte nindexes  /* The number of indices in the master table */
+            : set_sohm_master_table(bytes_to_u64_le(addr_raw), nindexes as uint<64>);
     };
 
 
@@ -2191,8 +2290,6 @@ type cont_chunk = struct { byte[global_cont_size] data;};
 var global_all_cont_chunks = cont_chunk[]();
 var global_all_cont_sizes = uint<64>[]();
 
-var CONT_ID = 0x0010;
-
 var global_version = 0;
 var global_crt_tracked = 0;
 /* Message prefix for v1 and v2 object header messages */
@@ -2239,21 +2336,76 @@ fun get_all_messages = (uint<8> version, int prefix_bytes, offset<uint<64>,B> ch
     while ((i + prefix_bytes) < chunk_size) {
             var m_type = 0UL;
             var m_size = 0UL;
+            var m_flags = 0UB;
 
-            //var _msg_prefix = msg_prefix@ (chunk'offset + i#B);
             var _msg_prefix = msg_prefix@ (chunk_off + i#B);
 
             if (version == 1) {
                 m_type = _msg_prefix.v1_msg_prefix.msg_type as uint<64>;
                 m_size = _msg_prefix.v1_msg_prefix.msg_size as uint<64>;
+                m_flags = _msg_prefix.v1_msg_prefix.msg_flags;
             }
             if (version == 2) {
                 m_type = _msg_prefix.v2_msg_prefix.msg_type as uint<64>;
                 m_size = _msg_prefix.v2_msg_prefix.msg_size as uint<64>;
+                m_flags = _msg_prefix.v2_msg_prefix.msg_flags;
+            }
+
+            /* A shared message (OH_MSG_FLAG_SHARED) is encoded as an
+             * H5O_shared_t reference rather than the message's native
+             * layout -- resolve it to the real payload location before
+             * handing it to message_factory().                          */
+            var ref_off = chunk_off + i#B + prefix_bytes#B;
+            var payload_off = ref_off;
+            if ((m_flags & OH_MSG_FLAG_SHARED) != 0UB) {
+                var shared_version = byte @ payload_off;
+                var shared_type = shared_version < 3UB ? OH_SHARE_TYPE_COMMITTED
+                                                        : (byte @ (payload_off + 1#B));
+                var shared_type_name = shared_type == OH_SHARE_TYPE_COMMITTED ? "Obj Hdr" :
+                                        shared_type == OH_SHARE_TYPE_SOHM      ? "SOHM" :
+                                        shared_type == OH_SHARE_TYPE_HERE      ? "Here" : "Unshared";
+
+                payload_off = shared_msg_payload_offset(payload_off, m_type as uint<8>);
+
+                /* Resolution can land on bytes that do not decode -- a stale
+                 * or corrupt reference, a truncated file. Probe the target
+                 * first so that failure degrades to the raw-reference report
+                 * below instead of aborting the listing. */
+                if (payload_off != SHARED_MSG_UNRESOLVED) {
+                    try {
+                        var probe = message_factory(m_type, m_size, payload_off);
+                    } catch (Exception e) {
+                        printf("shared_msg_payload_offset: the payload resolved at %v does not decode as message type %v\n",
+                               payload_off / 1#B, m_type);
+                        payload_off = SHARED_MSG_UNRESOLVED;
+                    }
+                }
+
+                if (payload_off == SHARED_MSG_UNRESOLVED) {
+                    /* The reference could not be followed. Decoding the
+                     * message's native layout over the H5O_shared_t record
+                     * would print the exact garbage this resolution exists to
+                     * avoid, so report the raw reference and carry on with the
+                     * next message -- the prefix's msg_size still advances the
+                     * loop correctly. */
+                    printf("\n[Message %u64d is shared (type: %s) -- unresolved; showing the raw reference]\n",
+                           msg_cnt, shared_type_name);
+                    printf("\nMessage %u64d...\n", msg_cnt);
+                    printf("%Tv\n", _msg_prefix);
+                    printf("shared reference at %v = %v\n",
+                           ref_off / 1#B, byte[m_size] @ ref_off);
+
+                    i = i + prefix_bytes + (m_size as uint<64>);
+                    ++msg_cnt;
+                    continue;
+                }
+
+                printf("\n[Message %u64d is shared (type: %s) -- resolved payload at %v]\n",
+                       msg_cnt, shared_type_name, payload_off / 1#B);
             }
 
             //var payload = oh_message_factory(m_type, m_size, chunk'offset + i#B + prefix_bytes#B);
-            var payload = message_factory(m_type, m_size, chunk_off + i#B + prefix_bytes#B);
+            var payload = message_factory(m_type, m_size, payload_off);
 
             printf("\nMessage %u64d...\n", msg_cnt);
             printf("%Tv\n", _msg_prefix);
@@ -2496,7 +2648,6 @@ type oh_hdr =
             global_version = version;
             global_crt_tracked = crt_order_tracked;
 
-            //get_all_messages(version, prefix_bytes, crt_order_tracked, msg_chunk, chunk_size);
             get_all_messages(version, prefix_bytes, msg_chunk'offset, chunk_size);
 
             if (global_all_cont_chunks'length != 0)
