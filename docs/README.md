@@ -9,6 +9,8 @@ Start with the [H5Lens tutorial](TUTORIAL.md) for guided exploration through
 `h5explain`. The [low-level GNU poke tutorial](POKE_TUTORIAL.md) exposes the
 underlying mappings, and [Writing HDF5 with GNU poke](POKE_CONSTRUCTION.md)
 keeps write-through and construction exercises in an explicitly advanced path.
+For repository-specific vocabulary used by the policy corpus and CVE workflow,
+see the [glossary](GLOSSARY.md).
 
 Each specification page is generated from two sources of truth:
 

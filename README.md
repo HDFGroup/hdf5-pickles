@@ -15,7 +15,7 @@ untrusted files, a conservative repair planner, and a marker scanner.
 | [`h5explain/`](h5explain/) | Interactive byte-level metadata navigation. |
 | [`src/`](src/) | The `h5markers` scanner implementation. |
 | [`tools/`](tools/) | Command entry points and repository helper scripts. |
-| [`docs/`](docs/) | The [tutorial](docs/TUTORIAL.md), [tool guide](docs/TOOLS.md), [marker reference](docs/MARKERS.md), generated format reference, and [tool map](docs/tool-overview.md). |
+| [`docs/`](docs/) | The [tutorial](docs/TUTORIAL.md), [tool guide](docs/TOOLS.md), [glossary](docs/GLOSSARY.md), [marker reference](docs/MARKERS.md), generated format reference, and [tool map](docs/tool-overview.md). |
 | [`examples/`](examples/) | Sample HDF5 files and GNU poke scripts. |
 | [`emacs/`](emacs/) | An Emacs front end for inspecting HDF5 files. |
 | [`.devcontainer/`](.devcontainer/README.md) | A ready-to-use Codespaces and VS Code Dev Containers environment. |

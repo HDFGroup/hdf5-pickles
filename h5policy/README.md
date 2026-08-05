@@ -319,7 +319,9 @@ workflows, and a detailed explanation of the differential cross-invariants.
   (mutation strategies, seed loading, guided corpus) imported by both fuzzers.
 - [`tools/h5policy-gencorpus`](tools/h5policy-gencorpus): regenerates the valid,
   malformed, policy, resource, coverage, integration, and CVE regression
-  fixtures.
+  fixtures. Cache-image helper executables automatically match an
+  AddressSanitizer-enabled `h5cc`; sanitizer runtime settings stay scoped to
+  those helpers rather than the Python and GNU poke test harness.
 
 See [`tests/README.md`](tests/README.md) for the corpus, differential harness,
 and fuzzing workflow.
