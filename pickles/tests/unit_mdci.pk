@@ -1,0 +1,209 @@
+/* unit_mdci.pk - Focused synthetic checks for the Metadata Cache Image
+   Block pickle.  Maps a small, hand-built block in memory and pins its
+   header fields, entry fields, flush-dependency parent list, and entry
+   image bytes.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+load "common.pk";
+load "mdci.pk";
+
+var mdci_failures = 0;
+
+fun expect_mdci = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else
+        {
+            printf("FAIL %s\n", name);
+            mdci_failures = mdci_failures + 1;
+        }
+}
+
+/* Keep the block compact while still exercising offset/length widths. */
+set_global_sizeof_offsets(4UB);
+set_global_sizeof_lengths(4UB);
+
+/* Four entries, chosen to walk every branch of mdci_entry._print /
+ * mdci_block._print, not just decode correct field values:
+ *   entry[0]: no flush-dependency parents, not on the LRU list, ring=1.
+ *   entry[1]: on the LRU list (rank 3) and a flush-dependency child of
+ *             one parent, whose address is entry[0]'s own file address.
+ *   entry[2]: dirty and a flush-dependency parent (ring=5), no parents
+ *             of its own -- exercises the DIRTY/FLUSH_DEP_PARENT flag
+ *             strings and the "superblock" ring name.
+ *   entry[3]: an unrecognized ring value -- exercises the "(unknown)"
+ *             ring branch.
+ * The block's own flags has bit 0 set, exercising the "adaptive-resize
+ * info follows" header branch (h5explain/h5policy never see this in a
+ * real file today, but the decoder must not choke on it).
+ *
+ * Block layout: 14-byte header, entries of 30+30+24+23 bytes, 4-byte
+ * checksum -- 14 + 30 + 30 + 24 + 23 + 4 = 125 bytes total.
+ */
+var entry0 =
+    [5UB, 0UB, 1UB, 0UB,                 /* type_id, flags, ring, age    */
+     0UB, 0UB,                            /* fd_child_count               */
+     0UB, 0UB,                            /* fd_dirty_child_count         */
+     0UB, 0UB,                            /* fd_parent_count              */
+     0xffUB, 0xffUB, 0xffUB, 0xffUB,      /* lru_rank: -1 (not on LRU)    */
+     0x00UB, 0x01UB, 0x00UB, 0x00UB,      /* entry_addr: 256              */
+     8UB, 0UB, 0UB, 0UB]                  /* entry_length: 8              */
+    + [0xaaUB, 0xbbUB, 0xccUB, 0xddUB,    /* entry_image (8 bytes)        */
+       0xeeUB, 0xffUB, 0x11UB, 0x22UB];
+
+var entry1 =
+    [9UB, 0x0aUB, 1UB, 2UB,               /* type_id, flags, ring, age    */
+     0UB, 0UB,                            /* fd_child_count               */
+     0UB, 0UB,                            /* fd_dirty_child_count         */
+     1UB, 0UB,                            /* fd_parent_count: 1           */
+     3UB, 0UB, 0UB, 0UB,                  /* lru_rank: 3                  */
+     0x00UB, 0x02UB, 0x00UB, 0x00UB,      /* entry_addr: 512              */
+     4UB, 0UB, 0UB, 0UB]                  /* entry_length: 4              */
+    + [0x00UB, 0x01UB, 0x00UB, 0x00UB]    /* flush_dep_parent[0]: 256     */
+    + [0x01UB, 0x02UB, 0x03UB, 0x04UB];   /* entry_image (4 bytes)        */
+
+var entry2 =
+    [7UB, 0x05UB, 5UB, 1UB,               /* type_id, flags (DIRTY|FLUSH_DEP_PARENT), ring=5, age */
+     2UB, 0UB,                            /* fd_child_count: 2            */
+     1UB, 0UB,                            /* fd_dirty_child_count: 1      */
+     0UB, 0UB,                            /* fd_parent_count: 0           */
+     0xffUB, 0xffUB, 0xffUB, 0xffUB,      /* lru_rank: -1 (not on LRU)    */
+     0x00UB, 0x03UB, 0x00UB, 0x00UB,      /* entry_addr: 768              */
+     2UB, 0UB, 0UB, 0UB]                  /* entry_length: 2              */
+    + [0x55UB, 0x66UB];                   /* entry_image (2 bytes)        */
+
+var entry3 =
+    [11UB, 0UB, 9UB, 0UB,                 /* type_id, flags, ring=9 (unknown), age */
+     0UB, 0UB,                            /* fd_child_count               */
+     0UB, 0UB,                            /* fd_dirty_child_count         */
+     0UB, 0UB,                            /* fd_parent_count              */
+     0xffUB, 0xffUB, 0xffUB, 0xffUB,      /* lru_rank: -1 (not on LRU)    */
+     0x00UB, 0x04UB, 0x00UB, 0x00UB,      /* entry_addr: 1024             */
+     1UB, 0UB, 0UB, 0UB]                  /* entry_length: 1              */
+    + [0x7fUB];                           /* entry_image (1 byte)         */
+
+var mdci_blob =
+    ['M', 'D', 'C', 'I',                  /* signature                    */
+     0UB,                                  /* version                      */
+     0x01UB,                               /* flags: bit 0 set              */
+     125UB, 0UB, 0UB, 0UB,                /* image_data_len: 125           */
+     4UB, 0UB, 0UB, 0UB]                  /* n_entries: 4                  */
+    + entry0
+    + entry1
+    + entry2
+    + entry3
+    + [0xdeUB, 0xadUB, 0xbeUB, 0xefUB];   /* chksum (opaque to this pickle)*/
+
+var mdci_ios = open("*unit-mdci-block*");
+byte[mdci_blob'length] @ mdci_ios : 0#B = mdci_blob;
+var blk = mdci_block @ mdci_ios : 0#B;
+
+expect_mdci("block_byte_extent",
+            blk'size / #B == mdci_blob'length
+            && blk'size / #B == 125);
+expect_mdci("block_header_fields",
+            blk.flags == 0x01UB
+            && bytes_to_u64_le(blk.image_data_len_raw) == 125UL
+            && blk.n_entries == 4U
+            && blk.entries'length == 4);
+
+expect_mdci("entry0_no_dependencies",
+            blk.entries[0].type_id == 5UB
+            && blk.entries[0].ring == 1UB
+            && blk.entries[0].fd_parent_count == 0UH
+            && blk.entries[0].parents'length == 0
+            && bytes_to_u64_le(blk.entries[0].entry_addr_raw) == 256UL
+            && bytes_to_u64_le(blk.entries[0].entry_length_raw) == 8UL
+            && blk.entries[0].entry_image'length == 8
+            && blk.entries[0].entry_image[0] == 0xaaUB
+            && blk.entries[0].entry_image[7] == 0x22UB);
+
+expect_mdci("entry1_on_lru_with_one_parent",
+            blk.entries[1].type_id == 9UB
+            && blk.entries[1].entry_flags == 0x0aUB
+            && blk.entries[1].age == 2UB
+            && blk.entries[1].fd_parent_count == 1UH
+            && blk.entries[1].parents'length == 1
+            && bytes_to_u64_le(blk.entries[1].parents[0].addr_raw) == 256UL
+            && blk.entries[1].lru_rank_raw == 3U
+            && bytes_to_u64_le(blk.entries[1].entry_addr_raw) == 512UL
+            && blk.entries[1].entry_image'length == 4
+            && blk.entries[1].entry_image[3] == 0x04UB);
+
+expect_mdci("entry2_dirty_and_flush_dep_parent",
+            blk.entries[2].type_id == 7UB
+            && blk.entries[2].entry_flags == 0x05UB
+            && blk.entries[2].ring == 5UB
+            && blk.entries[2].fd_child_count == 2UH
+            && blk.entries[2].fd_dirty_child_count == 1UH
+            && blk.entries[2].fd_parent_count == 0UH
+            && blk.entries[2].parents'length == 0
+            && bytes_to_u64_le(blk.entries[2].entry_addr_raw) == 768UL
+            && blk.entries[2].entry_image'length == 2
+            && blk.entries[2].entry_image[0] == 0x55UB
+            && blk.entries[2].entry_image[1] == 0x66UB);
+
+expect_mdci("entry3_unrecognized_ring",
+            blk.entries[3].type_id == 11UB
+            && blk.entries[3].entry_flags == 0UB
+            && blk.entries[3].ring == 9UB
+            && bytes_to_u64_le(blk.entries[3].entry_addr_raw) == 1024UL
+            && blk.entries[3].entry_image'length == 1
+            && blk.entries[3].entry_image[0] == 0x7fUB);
+
+expect_mdci("checksum_decoded_as_stored",
+            (blk.chksum as uint<64>) == 0xefbeaddeUL);
+
+/* _print walks every entry and branches on ring/flags; nothing above calls
+   it, so a wrong field name, a format-specifier/type mismatch, or an
+   off-by-one in the parent-list loop would pass every check above and still
+   crash here.  This proves the print paths run to completion (not that
+   their text is exactly right -- no pickle in this repo asserts on
+   printf'd text; format() exists but nothing here uses it for that). */
+var print_ok = 1;
+try {
+    blk._print;
+    blk.entries[0]._print;
+    blk.entries[1]._print;
+    blk.entries[2]._print;
+    blk.entries[3]._print;
+} catch (Exception e) {
+    print_ok = 0;
+}
+expect_mdci("print_methods_do_not_raise", print_ok);
+
+var saved_ios = get_ios();
+set_ios(mdci_ios);
+var print_mdci_ok = 1;
+try {
+    print_mdci(0#B);
+} catch (Exception e) {
+    print_mdci_ok = 0;
+}
+set_ios(saved_ios);
+expect_mdci("print_mdci_function_does_not_raise", print_mdci_ok);
+
+close(mdci_ios);
+
+if (mdci_failures != 0)
+    {
+        printf("UNIT MDCI: %i32d failure(s)\n", mdci_failures);
+        exit(1);
+    }
+printf("UNIT MDCI: all passed\n");

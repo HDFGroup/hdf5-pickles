@@ -1,0 +1,230 @@
+/* mdci.pk - HDF5 Metadata Cache Image Block (section III.J, Level 1J).  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   - Metadata Cache Image Block (signature "MDCI", Section III.J,
+ *     Level 1J of the HDF5 format spec v4.0)
+ *
+ * The metadata cache image block is a serialized snapshot of the metadata
+ * cache taken at file close, written when cache-image generation is enabled
+ * for the file.  It lets the library reconstruct the cache directly from
+ * this block on the next open instead of reparsing the file's metadata.
+ * The block is named by the "Metadata Cache Image" object header message
+ * (MDCI_MSG_ID 0x0018, see `oh_msg_mdci` in ohdr_msgs.pk), which lives in
+ * the superblock extension and stores only the block's address and size --
+ * not the block itself.
+ *
+ * This pickle decodes the block's own container: its header, its entry
+ * records, and their fixed metadata (flush-dependency graph, LRU state,
+ * flush ring, file address/length).  Each entry's "Entry Image" is the
+ * byte-for-byte serialized cache client that would otherwise sit at the
+ * entry's own file address; this pickle does not decode that nested
+ * payload, since its format is the client's own on-disk structure (an
+ * object header, B-tree node, or other cached metadata), not part of the
+ * cache-image container format itself.
+ *
+ * Load order:
+ *   common.pk     <- bytes_to_u64_le, global_sizeof_offsets,
+ *                    global_sizeof_lengths, H5_FORMAT_MDCI_SIGNATURE
+ *   superblock.pk <- sets global_sizeof_offsets, global_sizeof_lengths
+ *   mdci.pk
+ *
+ * Quick start:
+ *   print_mdci(<block_addr>#B);
+ *     Maps and prints the cache image block: header, then every entry in
+ *     the order captured in the image (object 0 first, i.e. file order).
+ *
+ *   Reaching the block from its object-header message:
+ *     var msg = oh_msg_mdci @ <msg_off>;
+ *     print_mdci(bytes_to_off(msg.image_addr_raw));
+ *
+ *   OR -- manual step-by-step:
+ *     var blk = mdci_block @ <block_addr>#B;
+ *     blk._print;
+ *     blk.entries[0]._print;
+ *
+ * On-disk layout ("Layout: Metadata Cache Image Block"):
+ *   [sig:4]["MDCI"] [ver:1][flags:1]
+ *   [image_data_len:L][n_entries:4]
+ *   [entry #0][entry #1]...[entry #(n_entries-1)]
+ *   [chksum:4]
+ * where L = sizeof_lengths.  image_data_len is the total byte length of
+ * the whole block, including this header, every entry, and the trailing
+ * checksum; it is also the value stored as "Metadata Cache Image Block
+ * Size" in the referencing object-header message.  n_entries must be > 0.
+ *
+ * Header flags: bit 0 set means adaptive-cache-resize status information
+ * follows the entries (current libhdf5 never generates this, so bit 0 is
+ * always 0 in practice); bits 1-7 are reserved.
+ *
+ * Per-entry layout ("Layout: Image Entry"):
+ *   [type_id:1][flags:1][ring:1][age:1]
+ *   [fd_child_count:2][fd_dirty_child_count:2]
+ *   [fd_parent_count:2][lru_rank:4]
+ *   [entry_addr:O][entry_length:L]
+ *   [flush_dep_parent_addr:O]*fd_parent_count
+ *   [entry_image:entry_length bytes]
+ * where O = sizeof_offsets, L = sizeof_lengths.  The parent-address list is
+ * present only when entry flags bit 3 is set (fd_parent_count > 0 then);
+ * entry_image is always present and is exactly entry_length bytes.
+ *
+ * Entry flags: bit 0 dirty (not yet written when the image was taken);
+ * bit 1 the entry was on the cache's LRU list, and lru_rank gives its
+ * position there (closer to 0 = more recently used); when clear, lru_rank
+ * is -1 (stored as the all-ones sentinel, 0xffffffff); bit 2 the entry is a
+ * flush-dependency parent (fd_child_count/fd_dirty_child_count > 0); bit 3
+ * the entry is a flush-dependency child, so fd_parent_count parent
+ * addresses follow the fixed fields; bits 4-7 reserved.
+ *
+ * Ring values (flush-dependency ring; outer rings flush before inner ones):
+ *   1 = user data (datasets and groups) -- outermost, flushed first
+ *   2 = raw-data free-space manager
+ *   3 = metadata free-space manager
+ *   4 = superblock extension
+ *   5 = superblock -- innermost, flushed last
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Flush-dependency parent address (one per entry with flags bit 3 set).
+ * ----------------------------------------------------------------------- */
+
+type mdci_parent_addr = struct {
+    byte[global_sizeof_offsets] addr_raw;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Image Entry -- one metadata cache entry captured in the image.
+ * ----------------------------------------------------------------------- */
+
+type mdci_entry = struct {
+    byte     type_id;                  /* cache-client type (library-internal) */
+    byte     entry_flags;
+    byte     ring;
+    byte     age;                      /* file opens/closes since last access  */
+    uint<16> fd_child_count;
+    uint<16> fd_dirty_child_count;
+    uint<16> fd_parent_count;
+    uint<32> lru_rank_raw;             /* -1 (0xffffffff) unless flags bit 1   */
+    byte[global_sizeof_offsets] entry_addr_raw;
+    byte[global_sizeof_lengths] entry_length_raw;
+
+    var body_len = bytes_to_u64_le(entry_length_raw);
+
+    mdci_parent_addr[fd_parent_count] parents;
+    byte[body_len] entry_image;
+
+    method _print = void:
+    {
+        printf("mdci_entry {\n");
+        printf("  type_id=%u8d\n", type_id);
+        printf("  flags=0x%u8x", entry_flags);
+        if ((entry_flags & 0x01UB) != 0UB) printf(" DIRTY");
+        if ((entry_flags & 0x02UB) != 0UB) printf(" ON_LRU");
+        if ((entry_flags & 0x04UB) != 0UB) printf(" FLUSH_DEP_PARENT");
+        if ((entry_flags & 0x08UB) != 0UB) printf(" FLUSH_DEP_CHILD");
+        printf("\n");
+        printf("  ring=%u8d", ring);
+        if      (ring == 1UB) printf(" (user data)");
+        else if (ring == 2UB) printf(" (raw-data free-space manager)");
+        else if (ring == 3UB) printf(" (metadata free-space manager)");
+        else if (ring == 4UB) printf(" (superblock extension)");
+        else if (ring == 5UB) printf(" (superblock)");
+        else                  printf(" (unknown)");
+        printf("\n");
+        printf("  age=%u8d\n", age);
+        printf("  fd_child_count=%u16d\n", fd_child_count);
+        printf("  fd_dirty_child_count=%u16d\n", fd_dirty_child_count);
+        printf("  fd_parent_count=%u16d\n", fd_parent_count);
+        if ((entry_flags & 0x02UB) != 0UB)
+            printf("  lru_rank=%u32d\n", lru_rank_raw);
+        else
+            printf("  lru_rank=(not on LRU list)\n");
+        printf("  entry_addr=%u64d\n", bytes_to_u64_le(entry_addr_raw));
+        printf("  entry_length=%u64d\n", body_len);
+        var pi = 0UL;
+        while (pi < parents'length as uint<64>) {
+            printf("  flush_dep_parent[%u64d]=%u64d\n",
+                   pi, bytes_to_u64_le(parents[pi].addr_raw));
+            pi = pi + 1UL;
+        }
+        printf("  entry_image=%v\n", entry_image);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Metadata Cache Image Block  (signature "MDCI")
+ *
+ * n_entries drives the declarative `entries` array directly, so mapping
+ * this type over a file whose declared count does not fit the available
+ * bytes raises the ordinary poke mapping exception for the entry that
+ * overruns -- callers exploring untrusted files should map it inside a
+ * `try`/`catch`, the same way h5explain guards other primitives whose
+ * declared size may be forged.  h5policy validates this block against the
+ * file's actual byte accounting independently, without using this type;
+ * see h5policy/pickles/h5_messages.pk.
+ * ----------------------------------------------------------------------- */
+
+type mdci_block = struct {
+    byte[4]  signature == H5_FORMAT_MDCI_SIGNATURE;
+    byte     version    == 0;
+    byte     flags;
+    byte[global_sizeof_lengths] image_data_len_raw;
+    uint<32> n_entries;
+
+    var entry_count = n_entries as uint<64>;
+
+    mdci_entry[entry_count] entries;
+
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("mdci_block {\n");
+        printf("  signature=%v\n", signature);
+        printf("  version=%u8d\n", version);
+        printf("  flags=0x%u8x", flags);
+        if ((flags & 0x01UB) != 0UB)
+            printf(" (adaptive-resize info follows)");
+        printf("\n");
+        printf("  image_data_len=%u64d\n", bytes_to_u64_le(image_data_len_raw));
+        printf("  n_entries=%u32d\n", n_entries);
+        var i = 0UL;
+        while (i < entries'length as uint<64>) {
+            printf("  entries[%u64d] = ", i);
+            entries[i]._print;
+            i = i + 1UL;
+        }
+        printf("  chksum=0x%u32x\n", chksum);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_mdci -- map and print the cache image block at OFF.
+ *
+ * Usage:
+ *   print_mdci(<block_addr>#B);
+ * ----------------------------------------------------------------------- */
+
+fun print_mdci = (offset<uint<64>,B> off) void:
+{
+    var blk = mdci_block @ off;
+    blk._print;
+};

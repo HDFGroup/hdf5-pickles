@@ -240,6 +240,16 @@ if(POKE_EXECUTABLE)
         TIMEOUT 30
         ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
     )
+    add_test(
+        NAME pickle_mdci_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_mdci.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(pickle_mdci_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
     message(STATUS "shared pickle regression tests enabled (poke: ${POKE_EXECUTABLE})")
 else()
     message(STATUS "shared pickle regression tests skipped (needs poke)")
