@@ -1,0 +1,180 @@
+pickle: mdci.pk
+section: "III.J. Disk Format: Level 1J - Metadata Cache Image Block"
+upstream:
+  version: "4.0"
+  sections: [III.J]
+  anchor: subsec_fmt4_infra_mdci
+coverage: covered
+intro: |
+  The metadata cache image block is a serialized snapshot of the metadata
+  cache taken at file close, written when cache-image generation is enabled
+  for the file. It lets the library reconstruct the cache directly from
+  this block the next time the file is opened, instead of reconstructing
+  it by parsing the file's metadata. The block is named by the "Metadata
+  Cache Image" object header message (signature-less; see `oh_msg_mdci` in
+  `ohdr_msgs.pk`), which lives in the superblock extension and stores only
+  the block's address and size, not the block itself.
+
+  The block begins with a signature, version, flags, image data length,
+  and entry count, followed by one record for each metadata cache entry
+  captured in the image, and ends with a checksum for the block. Each
+  entry records the cache-client type, its flush-dependency and LRU
+  bookkeeping, its file address and length, an optional list of
+  flush-dependency parent addresses, and the entry's own image: a
+  byte-for-byte copy of the cached client's on-disk serialization (an
+  object header, B-tree node, or other cached metadata) as it would
+  otherwise appear at the entry's file address.
+
+  This pickle decodes the block's own container in full: its header and
+  every entry's fixed metadata. It does not decode each entry's image,
+  since that payload's format is the client's own on-disk structure, not
+  part of the cache-image container format itself.
+
+  All fields are stored in little-endian byte order.
+
+layouts:
+  - title: "Metadata Cache Image Block"
+    type: mdci_block
+    rows:
+      - [{label: "Signature", span: 4}]
+      - ["Version", "Flags", {label: "Image Data Length", span: 2, width: L}]
+      - [{label: "Image Data Length (continued)", span: 4, width: L}]
+      - [{label: "Number of Entries", span: 4}]
+      - [{label: "Image Entry #0", span: 4}]
+      - [{label: "Image Entry #1", span: 4}]
+      - [{label: "...", span: 4}]
+      - [{label: "Image Entry #N-1", span: 4}]
+      - [{label: "Checksum", span: 4}]
+    note: "Rows containing variable-width fields are schematic. `O` is the size of offsets; `L` is the size of lengths."
+
+  - title: "Image Entry"
+    type: mdci_entry
+    rows:
+      - ["Type ID", "Flags", "Ring", "Age"]
+      - [{label: "Flush Dependency Child Count", span: 2}, {label: "Flush Dependency Dirty Child Count", span: 2}]
+      - [{label: "Flush Dependency Parent Count", span: 2}, {label: "LRU Rank", span: 2}]
+      - [{label: "LRU Rank (continued)", span: 4}]
+      - [{label: "Entry Offset", span: 4, width: O}]
+      - [{label: "Entry Length", span: 4, width: L}]
+      - [{label: "Flush Dependency Parent Addresses", span: 4, width: O}]
+      - [{label: "Entry Image", span: 4}]
+    note: "Flush Dependency Parent Addresses repeats once per Flush Dependency Parent Count and is present only when that count is nonzero; Entry Image is exactly Entry Length bytes."
+
+types:
+
+  mdci_block:
+    title: Metadata Cache Image Block
+    desc: >-
+      The metadata cache image block (signature 'MDCI'). Its `entries`
+      field is sized directly from the on-disk entry count, so mapping
+      this type over a file whose declared count does not fit the
+      available bytes raises the ordinary poke mapping exception for the
+      entry that overruns.
+    fields:
+      signature:
+        desc: "4-byte signature: 'M' 'D' 'C' 'I'. Must match exactly."
+      version:
+        desc: "Block version. Must be 0."
+      flags:
+        desc: >-
+          Header flags. Bit 0 set means adaptive-cache-resize status
+          information follows the entries; the library does not currently
+          generate that information, so this bit is always 0 in practice.
+          Bits 1-7 are reserved.
+      image_data_len_raw:
+        desc: >-
+          Total byte length of the whole block, including this header,
+          every entry, and the trailing checksum (`sizeof_lengths` bytes).
+          This is the same value stored as the block's size in the
+          referencing "Metadata Cache Image" object-header message.
+      n_entries:
+        desc: >-
+          Number of metadata cache entry records that follow the header.
+          Must be greater than 0.
+      entries:
+        desc: >-
+          The `n_entries` metadata cache entry records captured in the
+          image, one per entry resident in the metadata cache at file
+          close, in file order.
+      chksum:
+        desc: >-
+          Jenkins lookup3 checksum over the header and all entries that
+          precede it.
+
+  mdci_entry:
+    title: Image Entry
+    desc: >-
+      One metadata cache entry captured in the image: its cache-client
+      type, flush-dependency and LRU bookkeeping, file address and
+      length, an optional flush-dependency parent-address list, and the
+      entry's own cached-client image.
+    fields:
+      type_id:
+        desc: >-
+          Internal, implementation-defined identifier for the type of
+          metadata cache client (for example, superblock, object header,
+          or B-tree node) that owns this entry.
+      entry_flags:
+        desc: >-
+          Entry flags. Bit 0 set means the entry was dirty (not yet
+          written to the file) when the image was generated; bit 1 set
+          means the entry was on the cache's LRU list, with `lru_rank_raw`
+          giving its position; bit 2 set means the entry is a
+          flush-dependency parent; bit 3 set means the entry is a
+          flush-dependency child, so one or more parent addresses follow
+          the fixed fields. Bits 4-7 are reserved.
+      ring:
+        desc: >-
+          The flush-dependency "ring" the entry belongs to, constraining
+          flush order relative to entries in other rings: 1 = user data
+          (outermost, flushed first) through 5 = superblock (innermost,
+          flushed last).
+      age:
+        desc: >-
+          Number of file opens and closes since the entry was last
+          accessed by the application.
+      fd_child_count:
+        desc: >-
+          Number of flush-dependency children for which this entry is
+          the parent. Nonzero only when `entry_flags` bit 2 is set.
+      fd_dirty_child_count:
+        desc: >-
+          Number of the flush-dependency children counted in
+          `fd_child_count` that were dirty when the image was generated.
+      fd_parent_count:
+        desc: >-
+          Number of flush-dependency parents for which this entry is a
+          child. Nonzero only when `entry_flags` bit 3 is set, in which
+          case that many parent addresses follow the fixed fields.
+      lru_rank_raw:
+        desc: >-
+          Position on the cache's LRU list when `entry_flags` bit 1 is
+          set (lower values are more recently used); otherwise the
+          all-ones sentinel (-1).
+      entry_addr_raw:
+        desc: >-
+          File address at which the entry's metadata is, or will be,
+          stored (`sizeof_offsets` bytes). Base-relative like any other
+          HDF5 file address.
+      entry_length_raw:
+        desc: "Byte length of `entry_image` (`sizeof_lengths` bytes)."
+      parents:
+        desc: >-
+          File addresses of this entry's flush-dependency parents, one
+          per `fd_parent_count`. Present only when `entry_flags` bit 3 is
+          set.
+      entry_image:
+        desc: >-
+          Byte-for-byte copy of the entry's serialized on-disk image, as
+          it would otherwise appear at `entry_addr_raw` in the file (for
+          example, the disk format of an object header or B-tree node).
+          Exactly `entry_length_raw` bytes; not decoded by this pickle.
+
+  mdci_parent_addr:
+    title: Flush-Dependency Parent Address
+    desc: >-
+      One flush-dependency parent's file address, repeated once per
+      `fd_parent_count` in an entry whose `entry_flags` bit 3 is set.
+    fields:
+      addr_raw:
+        desc: "File address of a flush-dependency parent (`sizeof_offsets` bytes)."

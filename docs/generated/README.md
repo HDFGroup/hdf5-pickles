@@ -36,6 +36,7 @@ Coverage labels describe H5Lens, not the upstream specification:
   - [III.G. Disk Format: Level 1G - Fractal Heap](fheap.md#subsec_fmt4_infra_fractalheap) — Covered
   - [III.H. Disk Format: Level 1H - Free-space Index](fsm.md#subsec_fmt4_infra_freespaceindex) — Partial
   - [III.I. Disk Format: Level 1I - Shared Object Header Message (SOHM) Master Table](sohm.md#subsec_fmt4_infra_sohm) — Covered
+  - [III.J. Disk Format: Level 1J - Metadata Cache Image Block](mdci.md#subsec_fmt4_infra_mdci) — Covered
 - IV. Disk Format: Level 2 - Data Objects — Partial
   - IV.A. Disk Format: Level 2A - Data Object Headers — Partial
     - [IV.A.1. Disk Format: Level 2A1 - Data Object Header Prefix](ohdr_msgs.md#subsec_fmt4_dataobject_hdr_prefix) — Covered

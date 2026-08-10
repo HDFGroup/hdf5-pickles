@@ -46,6 +46,7 @@ set(PKDOC_SPECS
     fsm
     gheap
     lheap
+    mdci
     ohdr_msgs
     ref_enc
     sohm
