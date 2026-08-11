@@ -25,6 +25,7 @@ load "v2_btree.pk";
 load "farray.pk";
 load "earray.pk";
 load "fheap.pk";
+load "mdci.pk";
 load "lookup3.pk";
 
 var h5explain_non_strict = 0;
@@ -55,6 +56,7 @@ var H5EX_KIND_EA_DBLOCK = 13;
 var H5EX_KIND_LHEAP = 14;
 var H5EX_KIND_FSHD = 15;
 var H5EX_KIND_FSSE = 16;
+var H5EX_KIND_MDCI = 17;
 
 type h5explain_lheap = struct {
     byte[4] signature == H5_FORMAT_HEAP_SIGNATURE;
@@ -146,6 +148,7 @@ fun h5explain_kind_name = (int kind) string:
     if (kind == H5EX_KIND_LHEAP) return "local heap";
     if (kind == H5EX_KIND_FSHD) return "free-space manager header";
     if (kind == H5EX_KIND_FSSE) return "free-space section list";
+    if (kind == H5EX_KIND_MDCI) return "metadata cache image block";
     return "raw bytes";
 }
 
@@ -231,6 +234,17 @@ fun h5explain_map_fsse = (offset<uint<64>,B> off) fs_sinfo:
 {
     if (h5explain_non_strict) return fs_sinfo @! off;
     return fs_sinfo @ off;
+}
+
+/* Metadata cache image block (MDCI).  entries'length is driven directly by
+   the block's own n_entries field, so a forged count can raise the ordinary
+   poke mapping exception here -- callers on untrusted input should expect
+   that, the same way h5explain_prime_current guards other primitives whose
+   declared size may be forged. */
+fun h5explain_map_mdci = (offset<uint<64>,B> off) mdci_block:
+{
+    if (h5explain_non_strict) return mdci_block @! off;
+    return mdci_block @ off;
 }
 
 fun h5explain_map_fa_hdr = (offset<uint<64>,B> off) fa_hdr:
@@ -356,6 +370,7 @@ fun h5explain_detect_kind = (offset<uint<64>,B> off) int:
     if (sig == H5_FORMAT_HEAP_SIGNATURE) return H5EX_KIND_LHEAP;
     if (sig == H5_FORMAT_FSHD_SIGNATURE) return H5EX_KIND_FSHD;
     if (sig == H5_FORMAT_FSSE_SIGNATURE) return H5EX_KIND_FSSE;
+    if (sig == H5_FORMAT_MDCI_SIGNATURE) return H5EX_KIND_MDCI;
 
     if (h5explain_map_byte(off) == 1UB && h5explain_map_byte(off + 1#B) == 0UB) {
         var msg_count = (h5explain_map_byte(off + 2#B) as uint<64>)
@@ -681,6 +696,8 @@ fun cur = any:
         return h5explain_map_fshd(h5explain_cur_off);
     if (h5explain_cur_kind == H5EX_KIND_FSSE)
         return h5explain_map_fsse(h5explain_cur_off);
+    if (h5explain_cur_kind == H5EX_KIND_MDCI)
+        return h5explain_map_mdci(h5explain_cur_off);
     if (h5explain_cur_kind == H5EX_KIND_FA_HDR)
         return h5explain_map_fa_hdr(h5explain_cur_off);
     if (h5explain_cur_kind == H5EX_KIND_FA_DBLOCK)
@@ -1125,6 +1142,36 @@ fun h5explain_explain_fsse = void:
     printf("  cur                        inspect the raw FSSE bytes\n");
 }
 
+fun h5explain_explain_mdci = void:
+{
+    var blk = h5explain_map_mdci(h5explain_cur_off);
+
+    printf("What it is:\n");
+    printf("  A metadata cache image block. It is a serialized snapshot of the\n");
+    printf("  metadata cache taken at file close, letting libhdf5 reconstruct the\n");
+    printf("  cache directly on the next open instead of reparsing the file's\n");
+    printf("  metadata.\n\n");
+
+    printf("Decoded block:\n");
+    blk._print;
+
+    printf("\nWhy it matters:\n");
+    printf("  Each entry's image is a byte-for-byte copy of the cached client's own\n");
+    printf("  on-disk structure (an object header, B-tree node, or similar metadata)\n");
+    printf("  as it would otherwise sit at entry_addr. h5policy validates this\n");
+    printf("  block's own container -- signature, lengths, entry bounds, and\n");
+    printf("  flush-dependency consistency -- but treats decoding the entry images\n");
+    printf("  themselves as a permanent coverage boundary\n");
+    printf("  (H5_UNSUPPORTED_PICKLE_COVERAGE_GAP): a defined cache image shadows\n");
+    printf("  the ordinary bytes at the same file addresses, so those addresses\n");
+    printf("  cannot simply be parsed as live metadata either. h5explain shares\n");
+    printf("  that boundary: it decodes this container but not the nested images.\n\n");
+
+    printf("Next:\n");
+    printf("  go (<entry_addr>#B)       jump to where an entry's image would sit on disk\n");
+    printf("  cur                        inspect the raw mdci_block struct\n");
+}
+
 fun h5explain_explain_lheap = void:
 {
     var heap = h5explain_map_lheap(h5explain_cur_off);
@@ -1544,6 +1591,23 @@ fun h5explain_msg_explain_refcount = void:
     printf("  ref_count=%v\n", ref.ref_cnt);
 }
 
+fun h5explain_msg_explain_mdci = void:
+{
+    var msg = oh_msg_mdci @ h5explain_msg_payload_off;
+
+    printf("What it is:\n");
+    printf("  The metadata cache image message names the metadata cache image\n");
+    printf("  block: a serialized snapshot of the metadata cache taken at file\n");
+    printf("  close. This message only records where that block is and how big\n");
+    printf("  it is; the block itself lives elsewhere in the file.\n\n");
+    printf("Key fields:\n");
+    printf("  image_addr=%v\n", bytes_to_off(msg.image_addr_raw));
+    printf("  image_size=%u64d\n", bytes_to_u64_le(msg.image_size));
+    printf("\nNext:\n");
+    printf("  go (%v, \"cache image block\") decode the block itself\n",
+           bytes_to_off(msg.image_addr_raw));
+}
+
 fun h5explain_msg_explain_generic = void:
 {
     printf("What it is:\n");
@@ -1589,6 +1653,8 @@ fun h5explain_explain_current_msg = void:
         h5explain_msg_explain_ainfo;
     else if (h5explain_msg_type == 0x16UL)
         h5explain_msg_explain_refcount;
+    else if (h5explain_msg_type == 0x18UL)
+        h5explain_msg_explain_mdci;
     else
         h5explain_msg_explain_generic;
 }
@@ -1642,6 +1708,8 @@ fun explain = (int msg_index = -1) void:
         h5explain_explain_fshd;
     else if (h5explain_cur_kind == H5EX_KIND_FSSE)
         h5explain_explain_fsse;
+    else if (h5explain_cur_kind == H5EX_KIND_MDCI)
+        h5explain_explain_mdci;
     else if (h5explain_cur_kind == H5EX_KIND_FA_HDR)
         h5explain_explain_fa;
     else if (h5explain_cur_kind == H5EX_KIND_EA_HDR)
@@ -1705,6 +1773,10 @@ fun info = void:
         printf("Extensible array header. This does not map index/data blocks; use traverse to follow them.\n");
         var ea = value as ea_hdr;
         ea._print;
+    } else if (h5explain_cur_kind == H5EX_KIND_MDCI) {
+        printf("Metadata cache image block. Each entry's image is the cached client's own on-disk format (an object header, B-tree node, or other cached metadata); h5explain does not decode that nested payload.\n");
+        var blk = value as mdci_block;
+        blk._print;
     } else {
         printf("%Tv\n", value);
     }
