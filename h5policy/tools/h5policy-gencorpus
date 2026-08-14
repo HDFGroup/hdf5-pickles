@@ -1038,6 +1038,10 @@ def _gen_malformed(root):
         f"{root}/valid/cache_image.h5")
     _make_mdci_duplicate_entry_address(
         f"{root}/malformed/mdci_duplicate_entry_address.h5")
+    _make_mdci_entry_lru_inconsistent(
+        f"{root}/malformed/mdci_entry_lru_inconsistent.h5")
+    _make_mdci_parent_addr_unresolved(
+        f"{root}/malformed/mdci_parent_addr_unresolved.h5")
     _make_filtered_dense_link_no_dblock_checksum(
         f"{root}/malformed/filtered_dense_link_no_dblock_checksum.h5",
         f"{root}/valid/dense_links.h5")
@@ -2913,6 +2917,112 @@ def _make_mdci_duplicate_entry_address(path):
     struct.pack_into("<Q", raw, eof_off, len(raw))
     struct.pack_into("<I", raw, chksum_off, lookup3(bytes(raw[:chksum_off])))
     _patch(path, bytes(raw))
+
+
+def _mdci_assemble(path, make_entries):
+    """Assemble an HDF5 file carrying a superblock-extension MDCI message that
+    points at a checksum-valid cache image built from ``make_entries``.
+
+    ``make_entries(root_oh, oh_body) -> list[bytes]`` returns fully encoded entry
+    records (header + optional parent-address list + cached body).  Every entry
+    that shadows the root object header should carry ``oh_body`` so the image
+    stays coherent under the MDCI replay pass; witnesses that reject before replay
+    (the LRU and parent-resolvability cases below) only need the checksum and the
+    envelope to be well formed.  Shared with _make_mdci_duplicate_entry_address's
+    layout so all three MDCI witnesses agree on the container encoding.
+    """
+    lookup3 = _jenkins_lookup3()
+    with tempfile.TemporaryDirectory() as build:
+        base = os.path.join(build, "base.h5")
+        with h5py.File(base, "w", libver="latest") as h:
+            h.create_dataset("a", data=np.arange(4, dtype="i4"), track_times=False)
+        raw = bytearray(open(base, "rb").read())
+
+    o, el = raw[9], raw[10]
+    ext_off, eof_off, chksum_off = 12 + o, 12 + 2 * o, 12 + 4 * o
+    if lookup3(bytes(raw[:chksum_off])) != struct.unpack_from("<I", raw, chksum_off)[0]:
+        raise RuntimeError("mdci witness base failed the lookup3 self-check")
+
+    root_oh = int.from_bytes(raw[12 + 3 * o:12 + 4 * o], "little")
+    if raw[root_oh:root_oh + 4] != b"OHDR":
+        raise RuntimeError("expected a v2 object header at the root address")
+    oh_body = bytes(raw[root_oh:])
+
+    entries = make_entries(root_oh, oh_body)
+    payload = b"".join(entries)
+    image_size = 10 + el + len(payload) + 4
+    block = (b"MDCI" + bytes([0, 0]) + struct.pack("<Q", image_size)
+             + struct.pack("<I", len(entries)) + payload)
+    block += struct.pack("<I", lookup3(block))
+
+    raw += b"\x00" * ((-len(raw)) % 8)
+    image_addr = len(raw)
+    raw += block
+
+    raw += b"\x00" * ((-len(raw)) % 8)
+    msg_payload = struct.pack("<B", 0) + struct.pack("<Q", image_addr) + struct.pack("<Q", image_size)
+    msg_data = msg_payload + b"\x00" * ((-len(msg_payload)) % 8)
+    msg = struct.pack("<HHB", 0x18, len(msg_data), 0) + b"\x00" * 3 + msg_data
+    ohdr = struct.pack("<BBHII", 1, 0, 1, 1, len(msg)) + b"\x00" * 4 + msg
+    raw += b"\x00" * ((-len(raw)) % 8)
+    ext_addr = len(raw)
+    raw += ohdr
+
+    struct.pack_into("<Q", raw, ext_off, ext_addr)
+    struct.pack_into("<Q", raw, eof_off, len(raw))
+    struct.pack_into("<I", raw, chksum_off, lookup3(bytes(raw[:chksum_off])))
+    _patch(path, bytes(raw))
+
+
+def _mdci_entry(addr, image, flags=0x00, child=0, dirty=0, lru=-1, parents=()):
+    """Encode one MDCI entry: type_id 5, then flags/ring/age, the three
+    dependency counts, the signed lru_rank, the entry address and body length,
+    the flush-dependency parent-address list, and the cached body.  Matches the
+    cursor arithmetic in h5policy_validate_mdci_payload (h5_messages.pk)."""
+    return (bytes([5, flags, 1, 0]) + struct.pack("<HHH", child, dirty, len(parents))
+            + struct.pack("<i", lru) + struct.pack("<QQ", addr, len(image))
+            + b"".join(struct.pack("<Q", p) for p in parents) + image)
+
+
+def _make_mdci_entry_lru_inconsistent(path):
+    """A checksum-valid MDCI whose single entry has IN_LRU clear yet a non-(-1)
+    lru_rank.
+
+    Every other envelope field is well formed, so the only defect is the LRU
+    inconsistency.  libhdf5 guards this relation with an assert only
+    (H5Cimage.c:2813: (in_lru && lru_rank >= 0) || (!in_lru && lru_rank == -1)),
+    compiled out under NDEBUG, so a Release reconstruction proceeds on the
+    inconsistent LRU description.  This is exactly poc_dos.h5's entry 0 (lru_rank
+    2816 with IN_LRU clear).  h5policy must reject it in the entry loop, before
+    the replay pass and before any native cache state exists.  The entry caches
+    the ROOT object header and carries its real body so the image stays coherent.
+    """
+    _mdci_assemble(
+        path,
+        lambda root_oh, oh_body: [_mdci_entry(root_oh, oh_body, flags=0x00, lru=5)])
+
+
+def _make_mdci_parent_addr_unresolved(path):
+    """A checksum-valid MDCI whose child entry declares a flush-dependency parent
+    address that names no entry in the image.
+
+    Two well-formed entries: a normal entry caching the root object header, and a
+    flush-dependency child (IS_FD_CHILD, parent_count 1) whose single parent
+    address is a dangling value present nowhere else.  Every envelope field, flag
+    and LRU relation is valid, so the only defect is the unresolvable parent.
+    libhdf5 looks each parent up in the reconstruction index and fails with "fd
+    parent not in cache?!?" (H5Cimage.c:2533); that failure unwinds a partially
+    built, pinned dependency graph through the same unsafe cleanup as the
+    duplicate-address case (this is poc_dos.h5's 0x18000000 parent route).
+    h5policy must reject the dangling reference before any native state exists.
+    """
+    _mdci_assemble(
+        path,
+        lambda root_oh, oh_body: [
+            _mdci_entry(root_oh, oh_body, flags=0x00),
+            _mdci_entry(root_oh + 0x100000, oh_body, flags=0x08,
+                        parents=(0xDEADBEEF,)),
+        ])
 
 
 def _patch_dtype_size(raw, header_byte, expect_size, new_size, what):

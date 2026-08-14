@@ -991,6 +991,17 @@ fun h5policy_validate_mdci_payload = (int ios,
                still-referenced parent (double-free / NULL deref).  Reject the
                duplicate here, before any of that native state would exist. */
             var seen_addrs = uint<64>[]();
+            /* Every flush-dependency parent address a child declares must name an
+               entry that actually appears in this image.  libhdf5 looks each
+               parent up in the reconstruction index and fails with "fd parent not
+               in cache?!?" (H5Cimage.c:2533) when it is absent -- but that failure
+               unwinds a partially built, pinned dependency graph through the same
+               unsafe cleanup as the duplicate-address case.  Collect the declared
+               parents here and resolve them against the full address set once the
+               loop has seen every entry (a parent may be defined later than the
+               child that references it). */
+            var parent_addrs = uint<64>[]();
+            var parent_offs = uint<64>[]();
             while (i < nentries)
                 {
                     h5policy_walk_tick(1UL);
@@ -1019,6 +1030,24 @@ fun h5policy_validate_mdci_payload = (int ios,
                             h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_FLAGS",
                                                 "corrupt", eoff + 1#B, object,
                                                 "metadata cache image entry flags and dependency counts are inconsistent");
+                            return;
+                        }
+                    /* The IN_LRU flag (0x02) and the signed 32-bit lru_rank must
+                       agree: libhdf5 asserts (in_lru && lru_rank >= 0) ||
+                       (!in_lru && lru_rank == -1) (H5Cimage.c:2813) -- an assert
+                       compiled out under NDEBUG, so a Release reconstruction
+                       proceeds on an inconsistent LRU description.  lru_rank is a
+                       signed int32: -1 is 0xffffffff and "non-negative" is the
+                       sign bit (0x80000000) clear. */
+                    var lru_raw = h5policy_msg_u64_at(ios, profile,
+                                                      eoff + 10#B, 4UL);
+                    var in_lru = (eflags & 2UL) != 0UL;
+                    if (!((in_lru && (lru_raw & 0x80000000UL) == 0UL)
+                          || (in_lru == 0 && lru_raw == 0xffffffffUL)))
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT",
+                                                "corrupt", eoff + 10#B, object,
+                                                "metadata cache image entry LRU rank is inconsistent with its IN_LRU flag");
                             return;
                         }
                     var entry_addr_raw = h5policy_msg_bytes(ios, profile,
@@ -1072,6 +1101,21 @@ fun h5policy_validate_mdci_payload = (int ios,
                                                 "metadata cache image entry extends beyond the declared cache image");
                             return;
                         }
+                    /* Collect this entry's flush-dependency parent addresses.  The
+                       parent list sits between the entry header and the cached
+                       body, i.e. at eoff + entry_header; the overrun check above
+                       has already confirmed parents_size fits inside the image. */
+                    var parents_base = eoff + entry_header#B;
+                    var pi = 0UL;
+                    while (pi < parent_count)
+                        {
+                            h5policy_walk_tick(1UL);
+                            var praw = h5policy_msg_bytes(ios, profile,
+                                                          parents_base + (pi * o)#B, o);
+                            parent_addrs += [bytes_to_u64_le(praw)];
+                            parent_offs += [(parents_base / #B) + pi * o];
+                            pi = pi + 1UL;
+                        }
                     /* Record what this entry shadows.  The walk skips exactly
                        these ranges and vets everything else; see
                        h5policy_addr_is_shadowed.  Recorded only after the entry
@@ -1114,6 +1158,26 @@ fun h5policy_validate_mdci_payload = (int ios,
                                         object,
                                         "metadata cache image checksum mismatch");
                     return;
+                }
+            /* Reference-graph closure: every declared flush-dependency parent
+               must resolve to one of the entry addresses collected above.  A
+               dangling parent reaches libhdf5's H5Cimage.c:2533 failure and the
+               unsafe reconstruction cleanup; reject it before any native state
+               would be built.  seen_addrs now holds every entry address (the loop
+               returns early on the first duplicate, so reaching here means all
+               nentries were recorded). */
+            var pj = 0UL;
+            while (pj < parent_addrs'length)
+                {
+                    h5policy_walk_tick(1UL);
+                    if (!h5policy_seen_u64(seen_addrs, parent_addrs[pj]))
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_PARENT_ADDR_UNRESOLVED",
+                                                "corrupt", parent_offs[pj]#B, object,
+                                                "metadata cache image flush-dependency parent address does not name any entry in the image");
+                            return;
+                        }
+                    pj = pj + 1UL;
                 }
             if (h5policy_mdci_replay_mode == 0)
                 h5policy_mdci_replay_ready = 1;
