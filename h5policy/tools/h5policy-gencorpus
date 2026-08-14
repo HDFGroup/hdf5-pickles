@@ -1036,6 +1036,8 @@ def _gen_malformed(root):
     _make_bad_cache_image_checksum(
         f"{root}/malformed/cache_image_bad_checksum.h5",
         f"{root}/valid/cache_image.h5")
+    _make_mdci_duplicate_entry_address(
+        f"{root}/malformed/mdci_duplicate_entry_address.h5")
     _make_filtered_dense_link_no_dblock_checksum(
         f"{root}/malformed/filtered_dense_link_no_dblock_checksum.h5",
         f"{root}/valid/dense_links.h5")
@@ -2810,6 +2812,68 @@ def _make_bad_cache_image_checksum(path, base_path):
     if image_len < 4 or img + image_len > len(raw):
         raise RuntimeError("cache-image checksum fixture has invalid image extent")
     raw[img + image_len - 4] ^= 0x01
+    _patch(path, bytes(raw))
+
+
+def _make_mdci_duplicate_entry_address(path):
+    """A checksum-valid MDCI whose two entries claim the SAME file address.
+
+    Every envelope field is well formed -- correct image_data_len, a valid
+    Jenkins trailing checksum, and per-entry headers that pass the flag,
+    dependency-count and extent checks -- so the only defect is the repeated
+    address.  libhdf5 keys reconstructed entries by file address and its
+    H5C__check_for_duplicates (H5Cimage.c) fails reconstruction on the repeat,
+    but that failure unwinds a partially built, pinned flush-dependency graph
+    through a cleanup that double-frees / dereferences a still-referenced parent.
+    h5policy must reject the duplicate before any of that native state exists.
+
+    Both entries cache the ROOT object header and carry its real body, so the
+    image stays coherent under the MDCI replay pass; the duplicate is caught in
+    the entry loop before replay begins.
+    """
+    lookup3 = _jenkins_lookup3()
+    with tempfile.TemporaryDirectory() as build:
+        base = os.path.join(build, "base.h5")
+        with h5py.File(base, "w", libver="latest") as h:
+            h.create_dataset("a", data=np.arange(4, dtype="i4"), track_times=False)
+        raw = bytearray(open(base, "rb").read())
+
+    o, el = raw[9], raw[10]
+    ext_off, eof_off, chksum_off = 12 + o, 12 + 2 * o, 12 + 4 * o
+    if lookup3(bytes(raw[:chksum_off])) != struct.unpack_from("<I", raw, chksum_off)[0]:
+        raise RuntimeError("mdci duplicate-address base failed the lookup3 self-check")
+
+    root_oh = int.from_bytes(raw[12 + 3 * o:12 + 4 * o], "little")
+    if raw[root_oh:root_oh + 4] != b"OHDR":
+        raise RuntimeError("expected a v2 object header at the root address")
+    oh_body = bytes(raw[root_oh:])          # OH decode uses its own internal lengths
+
+    def entry(addr, image):
+        return (bytes([5, 0x00, 1, 0]) + struct.pack("<HHH", 0, 0, 0)
+                + struct.pack("<i", -1) + struct.pack("<QQ", addr, len(image)) + image)
+
+    entries = entry(root_oh, oh_body) + entry(root_oh, oh_body)   # duplicate address
+    image_size = 10 + el + len(entries) + 4
+    block = (b"MDCI" + bytes([0, 0]) + struct.pack("<Q", image_size)
+             + struct.pack("<I", 2) + entries)
+    block += struct.pack("<I", lookup3(block))
+
+    raw += b"\x00" * ((-len(raw)) % 8)
+    image_addr = len(raw)
+    raw += block
+
+    raw += b"\x00" * ((-len(raw)) % 8)
+    payload = struct.pack("<B", 0) + struct.pack("<Q", image_addr) + struct.pack("<Q", image_size)
+    msg_data = payload + b"\x00" * ((-len(payload)) % 8)
+    msg = struct.pack("<HHB", 0x18, len(msg_data), 0) + b"\x00" * 3 + msg_data
+    ohdr = struct.pack("<BBHII", 1, 0, 1, 1, len(msg)) + b"\x00" * 4 + msg
+    raw += b"\x00" * ((-len(raw)) % 8)
+    ext_addr = len(raw)
+    raw += ohdr
+
+    struct.pack_into("<Q", raw, ext_off, ext_addr)
+    struct.pack_into("<Q", raw, eof_off, len(raw))
+    struct.pack_into("<I", raw, chksum_off, lookup3(bytes(raw[:chksum_off])))
     _patch(path, bytes(raw))
 
 
