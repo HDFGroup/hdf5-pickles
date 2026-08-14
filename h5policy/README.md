@@ -156,7 +156,8 @@ Current coverage includes:
 - Compact hard links, dense link storage, dense attribute storage, old-style
   group metadata, and chunk-index metadata. Dense storage covers both the name
   indexes and recursive type-6/type-9 creation-order B-trees, including
-  checksums, subtree totals, heap-ID resolution, and cross-index identity;
+  checksums, subtree totals, managed fractal-heap-ID resolution, and
+  cross-index identity;
   chunk coverage includes recursive raw-data v2 B-trees and complete
   extensible-array block graphs.
 - File-global Shared Object Header Message metadata: `SMTB` directories,
@@ -254,6 +255,13 @@ crashes on them:
   not process the file. The differential harness accepts that explicit refusal
   under invariant A' while retaining a classification warning when libhdf5
   rejects the same file as corrupt.
+
+- **Non-managed dense fractal-heap IDs.** Dense link and attribute indexes are
+  resolved when their records use managed fractal-heap IDs. Huge and tiny IDs
+  are recognized but not resolved, so the validator returns
+  `unsupported_coverage_gap` rather than accepting links or attributes whose
+  record bodies it has not inspected. This remains a metadata-only decoder gap;
+  it does not require decompression.
 
 - **Vlen and reference data global heaps.** A dataset's variable-length or
   reference elements point into a global heap collection (`GCOL`) through heap
