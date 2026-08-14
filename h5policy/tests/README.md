@@ -233,7 +233,9 @@ its checksum covers one used record while metadata accounting charges all 50
 configured record slots. A separate set of 24 oversized shared compound
 datatypes forces a depth-one type-1 huge-object tree; its own checksum, child
 range, cycle, object-extent, depth, and metadata-ceiling cases cover the heap's
-second recursive index independently of wrapper-body decoding.
+second recursive index, while the accepting base resolves indirect unfiltered
+huge bodies. A second accepting fixture shares a one-byte fill value through a
+tiny ID, proving that the inline body is dispatched without heap-data access.
 
 Legacy chunk-index cases cover the subtler finite-ceiling boundary directly.
 A four-chunk v1 B-tree distinguishes equality from overflow within one leaf;

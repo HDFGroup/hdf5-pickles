@@ -161,8 +161,9 @@ Current coverage includes:
   chunk coverage includes recursive raw-data v2 B-trees and complete
   extensible-array block graphs.
 - File-global Shared Object Header Message metadata: `SMTB` directories,
-  `SMLI` record lists, recursive type-7 v2 B-trees, managed-message heap-ID
-  resolution, fractal-heap envelopes, and complete huge-object index trees.
+  `SMLI` record lists, recursive type-7 v2 B-trees, and managed, tiny, and
+  unfiltered huge-message heap-ID resolution. Fractal-heap envelopes and
+  complete huge-object index trees are validated before a body is dispatched.
   Every recursive SOHM node is independently bounded by range, checksum,
   visited-node, depth, operation/time, and accounted-metadata limits.
 - File-global free-space managers named by the file-space-info message: each
@@ -232,13 +233,11 @@ crashes on them:
   continuation can preserve findings from unshadowed metadata but cannot make
   the analysis complete.
 
-- **Encoded SOHM message bodies.** h5policy completely walks the type-7 shared
-  index and the heap's huge-object index, validating record layouts, object
-  extents, filter masks, checksums, and traversal budgets. Shared wrappers are
-  currently resolved only when their eight-byte ID names an unfiltered managed
-  heap object. A wrapper naming a huge, tiny, or filter-encoded heap object is
-  refused as unsupported because validating its message payload would require
-  an additional body decoder (and, for filtered objects, decompression).
+- **Filtered SOHM message bodies.** h5policy resolves managed, tiny, and
+  unfiltered huge heap IDs, then dispatches the recovered body through the
+  ordinary message validator. A wrapper whose heap declares an I/O filter
+  pipeline remains unsupported: recovering that body would require reversing
+  the pipeline (decompressing untrusted bytes).
 
 - **Filtered dense link/attribute fractal heaps.** When a dense group's or
   object's fractal heap declares an I/O filter pipeline, the link/attribute
