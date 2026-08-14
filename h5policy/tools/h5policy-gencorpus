@@ -533,6 +533,18 @@ def _gen_resource(root):
            lambda h: h.create_dataset(
                "d", data=np.arange(100, dtype="i4").reshape(10, 10), chunks=(5, 5)))
 
+    # Fixed-array index over a dataset that may still GROW: libhdf5 picks this
+    # index type whenever no dimension is H5S_UNLIMITED, so a bounded maxshape
+    # larger than the current shape is legitimate.  The index is pre-sized from
+    # the maximum extent (ceil(100/5) * ceil(10/5) = 40 elements, not the four
+    # chunks that hold data), which is the control for the capacity check in
+    # h5policy_finalize_ohdr_dataset: it must not read "curr != max" as corrupt.
+    def _fixed_array_maxdims(h):
+        d = h.create_dataset("d", shape=(10, 10), maxshape=(100, 10),
+                             chunks=(5, 5), dtype="i4")
+        d[...] = np.arange(100, dtype="i4").reshape(10, 10)
+    _write(f"{root}/valid/chunk_fixed_array_maxdims.h5", _fixed_array_maxdims)
+
     # Single-chunk index (v4 index type 1): chunk covers the whole dataset, so
     # the layout's address field is the chunk itself (no index structure).
     _write(f"{root}/valid/chunk_single.h5",
@@ -846,6 +858,9 @@ def _gen_malformed(root):
     _make_bad_ext_array_without_unlimited_dim(
         f"{root}/malformed/bad_ext_array_without_unlimited_dim.h5",
         f"{root}/valid/chunk_ext_array.h5")
+    _make_bad_fixed_array_extent_mismatch(
+        f"{root}/malformed/bad_fixed_array_extent_mismatch.h5",
+        f"{root}/valid/chunk_fixed_array.h5")
     _make_bad_ext_array_deep_checksum(
         f"{root}/malformed/bad_ext_array_deep_checksum.h5",
         f"{root}/valid/chunk_ext_array_deep.h5")
@@ -3236,6 +3251,42 @@ def _make_bad_duplicate_dataspace_message(path, base_path):
     if ohdr < 0:
         raise RuntimeError("could not locate containing object header")
     raw[off] = 0x01                                # layout -> dataspace
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_fixed_array_extent_mismatch(path, base_path):
+    """Fixed-array-indexed dataset whose dataspace declares a maximum extent the
+    index was never sized for.
+
+    The index's capacity is fixed at creation from the maximum extent
+    (H5D__farray_idx_create: cparam.nelmts = ceil(max/chunk) product) and never
+    grows, but nothing re-checks the two against each other when the file is
+    read back.  Inflating one `Dim Max` field leaves the FAHD header, every
+    chunk address, and the data itself untouched and internally consistent, yet
+    makes libhdf5 recompute a capacity ~10^11 chunks wide: h5repack (H5Ocopy)
+    sizes a destination data block from it and aborts the process in the
+    metadata cache.  See registry/cases/fixed-array-extent-mismatch.yml.
+
+    The same single-field mutation h5policy-crashfuzz found by chance, done
+    deterministically: the seed's `Dim Max: {10, 10}` becomes
+    {867583393802, 10}, and only the object header's checksum is repaired."""
+    raw = bytearray(open(base_path, "rb").read())
+    # v2 message prefix: type=dataspace(0x01), size=36, flags=0, then
+    # dataspace v2, rank=2, flags=max-dims-present, class=simple, followed by
+    # two 8-byte current dimensions and two 8-byte maximum dimensions.
+    pat = b"\x01\x24\x00\x00\x02\x02\x01\x01"
+    off = raw.find(pat)
+    if off < 0:
+        raise RuntimeError("could not locate the dataspace message prefix")
+    dim_max = off + 8 + 2 * 8
+    if struct.unpack_from("<QQ", raw, off + 8) != (10, 10) or \
+       struct.unpack_from("<QQ", raw, dim_max) != (10, 10):
+        raise RuntimeError("fixed-array seed no longer has 10x10 dimensions")
+    struct.pack_into("<Q", raw, dim_max, 867583393802)
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate containing object header")
     _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 

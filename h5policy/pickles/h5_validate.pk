@@ -437,6 +437,95 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
                 loc2 = ctx.datatype_size_offset#B, loc2_len = 4UL,
             });
 
+    /* A fixed-array chunk index has one, permanent capacity: libhdf5 computes
+       prod(ceil(max_dims[i] / chunk_dim[i])) over the data dimensions
+       (H5D__chunk_set_info_real, H5Dchunk.c) and stores it in the FAHD header
+       at creation (H5D__farray_idx_create: cparam.nelmts = max_nchunks).  The
+       array is pre-sized from it -- data-block image, page count, and
+       page-initialization bitmask all follow from nelmts -- and it is never
+       grown, which is what distinguishes this index type from the extensible
+       array and the v2 B-tree.
+
+       Nothing re-derives that agreement on the read path.  A dataset whose
+       dataspace declares a maximum extent the index was not sized for makes
+       libhdf5 recompute a capacity from the file's own bytes and build native
+       state from it: H5Ocopy sizes a fresh destination data block that way and
+       aborts the process inside the metadata cache
+       (assert(entry_ptr->size < H5C_MAX_ENTRY_SIZE), H5Centry.c) once the
+       recomputed bitmask alone exceeds the 32 MB per-entry ceiling.
+
+       Note the invariant is the index CAPACITY, not curr_dims == max_dims: a
+       bounded-but-growable dataset (maxshape (100,10), shape (10,10)) is
+       legitimately fixed-array indexed, with a capacity sized from the 100.
+       Only H5S_UNLIMITED sends libhdf5's writer to another index type, which
+       is why an unlimited dimension here can never be reconciled and is
+       reported through the same finding.  */
+    if (h5policy_has_fixed_array_index != 0UB
+        && ctx.has_dataspace != 0UB
+        && h5policy_dataspace_max_dims'length != 0UL
+        && h5policy_dataspace_max_dims'length
+           == h5policy_chunk_grid_dims'length)
+        {
+            var expected_nelmts = 1UL;
+            var expected_ok = 1UB;
+            var d = 0UL;
+            while (d < h5policy_dataspace_max_dims'length)
+                {
+                    var max_dim = h5policy_dataspace_max_dims[d];
+                    var chunk_dim = h5policy_chunk_grid_dims[d];
+                    if (max_dim == 0xffffffffffffffffUL)
+                        /* H5S_UNLIMITED: no finite capacity can match it, and
+                           libhdf5's own writer would never have chosen this
+                           index type.  */
+                        expected_ok = 0UB;
+                    else if (expected_ok != 0UB)
+                        {
+                            /* Ceiling division without libhdf5's (max + dim - 1)
+                               pre-addition, which wraps near the top of the
+                               range; the quotient itself cannot overflow.  */
+                            var chunks = max_dim / chunk_dim;
+                            if (max_dim % chunk_dim != 0UL)
+                                chunks = chunks + 1UL;
+                            if (chunks != 0UL
+                                && expected_nelmts > 0xffffffffffffffffUL / chunks)
+                                /* The true capacity exceeds the 64-bit field the
+                                   header stores, so no stored value can match. */
+                                expected_ok = 0UB;
+                            else
+                                expected_nelmts = expected_nelmts * chunks;
+                        }
+                    d = d + 1UL;
+                }
+            if (expected_ok == 0UB || expected_nelmts != h5policy_fixed_array_nelmts)
+                {
+                    /* Every maximum-extent field is a source of `expected`;
+                       they are all one length field wide.  */
+                    var max_dim_lengths = uint<64>[]();
+                    var s = 0UL;
+                    while (s < h5policy_dataspace_max_dim_offsets'length)
+                        {
+                            max_dim_lengths += [global_sizeof_lengths as uint<64>];
+                            s = s + 1UL;
+                        }
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_FIXED_ARRAY_EXTENT_MISMATCH", "corrupt",
+                        h5policy_fixed_array_nelmts_offset#B, object,
+                        "fixed-array chunk index capacity does not match the dataspace maximum extent",
+                        H5Evidence {
+                            field = "chunk_index.fixed_array_capacity",
+                            actual = h5policy_fixed_array_nelmts,
+                            expected = expected_ok != 0UB
+                                       ? expected_nelmts : 0xffffffffffffffffUL,
+                            comparison = "equal",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = h5policy_fixed_array_nelmts_offset#B,
+                            loc1_len = global_sizeof_lengths as uint<64>,
+                            source_offsets = h5policy_dataspace_max_dim_offsets,
+                            source_lengths = max_dim_lengths,
+                        });
+                }
+        }
+
     /* The superblock's root object is semantically a group, not an arbitrary
        object header.  h5policy does not yet track a positive "group" type bit,
        so enforce the boundary through the message classes that make an object a
@@ -500,6 +589,14 @@ fun h5policy_validate_ohdr_raw = (int ios,
     h5policy_pipeline_decode_size = 0UL;
     h5policy_pipeline_has_decode_size = 0UB;
     h5policy_pipeline_decode_size_offset = 0UL;
+    /* Fresh arrays, not truncations: assigning an existing array would alias
+       it, and the finalize cross-check must see only this object's shape.  */
+    h5policy_dataspace_max_dims = uint<64>[]();
+    h5policy_dataspace_max_dim_offsets = uint<64>[]();
+    h5policy_chunk_grid_dims = uint<64>[]();
+    h5policy_fixed_array_nelmts = 0UL;
+    h5policy_fixed_array_nelmts_offset = 0UL;
+    h5policy_has_fixed_array_index = 0UB;
 
     ctx = h5policy_count_object(ctx, profile, root_off, object);
 
