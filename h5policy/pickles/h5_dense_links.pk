@@ -458,6 +458,10 @@ fun h5policy_validate_link_payload = (int ios,
 }
 
 var h5policy_dense_checksummed_blocks = uint<64>[]();
+/* Set only after a dense-link FRHP header has passed its checksum.  The
+   link-info wrapper then follows the independent FSHD/FSSE metadata edge with
+   its H5WalkContext without duplicating diagnostics for a bad FRHP header. */
+var h5policy_dense_link_frhp_trusted = 0;
 
 /* Fractal heap blocks can be reached by both dense-link and dense-attribute
    paths.  Remember which block checksums have already been verified so shared
@@ -1780,6 +1784,7 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
                                  uint<64> corder_btree_addr,
                                  off64 loc, string object) int:
 {
+    h5policy_dense_link_frhp_trusted = 0;
     var o = global_sizeof_offsets as uint<64>;
     var el = global_sizeof_lengths as uint<64>;
     var file_size = h5policy_ceiling(ios);
@@ -1812,6 +1817,7 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
                                                  frhp_size, file_size, object,
                                                  "fractal heap header"))
         return 0;
+    h5policy_dense_link_frhp_trusted = 1;
     if (filter_len != 0UL)
         {
             var pipeline_ok = h5policy_validate_filter_pipeline_payload(
@@ -1956,15 +1962,16 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
    an unsupported coverage gap instead of silently accepting unseen links.  */
 fun h5policy_validate_linfo_payload = (int ios,
                                        H5PolicyProfile profile,
+                                       H5WalkContext ctx,
                                        offset<uint<64>,B> payload_off,
                                        uint<64> msg_size,
-                                       string object) void:
+                                       string object) H5WalkContext:
 {
     if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
                                    "H5_CORRUPT_LINK_INFO_MESSAGE_TOO_SMALL",
                                    payload_off, object,
                                    "link-info message is too small"))
-        return;
+        return ctx;
 
     var version = h5policy_msg_u64_at(ios, profile, payload_off, 1UL);
     var flags = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
@@ -1977,7 +1984,7 @@ fun h5policy_validate_linfo_payload = (int ios,
             h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_LINK_INFO_VERSION",
                                 "corrupt", payload_off, object,
                                 "unsupported link-info message version");
-            return;
+            return ctx;
         }
 
     if ((flags & ~3UL) != 0UL)
@@ -1995,7 +2002,7 @@ fun h5policy_validate_linfo_payload = (int ios,
                                            "H5_CORRUPT_LINK_INFO_MESSAGE_TOO_SMALL",
                                            payload_off + cur#B, object,
                                            "link-info max creation order is missing"))
-                return;
+                return ctx;
 
             var max_corder = h5policy_msg_u64_at(ios, profile,
                                                  payload_off + cur#B, 8UL);
@@ -2017,7 +2024,7 @@ fun h5policy_validate_linfo_payload = (int ios,
                                    "H5_CORRUPT_LINK_INFO_MESSAGE_TOO_SMALL",
                                    payload_off, object,
                                    "link-info addresses overrun the message"))
-        return;
+        return ctx;
 
     var fheap_raw = h5policy_msg_bytes(ios, profile,
                                        payload_off + cur#B,
@@ -2059,14 +2066,14 @@ fun h5policy_validate_linfo_payload = (int ios,
             h5policy_emit_error("H5_CORRUPT_LINK_INFO_ADDRESS_PAIR", "corrupt",
                                 payload_off, object,
                                 "link-info fractal-heap and name-index addresses are not both defined or both undefined");
-            return;
+            return ctx;
         }
     if ((flags & 2UL) != 0UL && !fheap_is_undef && corder_is_undef)
         {
             h5policy_emit_error("H5_CORRUPT_LINK_INFO_CORDER_ADDRESS", "corrupt",
                                 payload_off, object,
                                 "dense link-info message has an undefined creation-order index address");
-            return;
+            return ctx;
         }
     if (fheap_is_undef)
         {
@@ -2074,7 +2081,7 @@ fun h5policy_validate_linfo_payload = (int ios,
                 h5policy_emit_error("H5_CORRUPT_LINK_INFO_CORDER_ADDRESS", "corrupt",
                                     payload_off, object,
                                     "link-info creation-order index is defined without dense storage");
-            return;
+            return ctx;
         }
 
     var handled = 0;
@@ -2085,11 +2092,16 @@ fun h5policy_validate_linfo_payload = (int ios,
         handled = h5policy_walk_dense_links(ios, profile, fheap_addr,
                                             name_btree_addr, corder_btree_addr,
                                             payload_off, object);
+    if (h5policy_dense_link_frhp_trusted != 0)
+        ctx = h5policy_walk_frhp_fspace_from_header(ios, profile, ctx,
+                                                    fheap_addr, payload_off,
+                                                    object);
 
     if (!handled)
         h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
                             "unsupported", payload_off, object,
                             "dense link storage uses an unsupported fractal-heap/B-tree layout");
+    return ctx;
 }
 
 /* ---- Old-style group traversal (symbol table -> v1 B-tree -> SNOD -> heap) --

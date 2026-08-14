@@ -229,7 +229,7 @@ complete unique-extent measure. Current accounting calls cover:
 - SOHM master tables, full configured record-list allocations, fractal-heap
   headers, and each type-7 or huge-object v2 B-tree header/internal/leaf
   allocation (list/node checksums still cover only their exact used prefixes);
-- free-space manager `FSHD` headers and their full `FSSE` section-list
+- file-space and fractal-heap free-space manager `FSHD` headers and their full `FSSE` section-list
   allocations (the section-list checksum still covers only its used prefix);
 - fixed-array chunk-index headers; and
 - extensible-array headers, index blocks, secondary blocks, and complete data

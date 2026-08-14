@@ -169,8 +169,9 @@ Current coverage includes:
 - File-global free-space managers named by the file-space-info message: each
   `FSHD` header and its `FSSE` serialized section list are range-checked,
   checksummed, and metadata-accounted, and every free section's extent and
-  class type is validated.  Fractal-heap (non-file) managers, reached from a
-  heap header rather than the file-space-info message, remain a coverage gap.
+  class type is validated. Fractal-heap managers named by `FRHP` headers are
+  likewise walked as metadata; their sections are checked against the heap's
+  logical managed-space extent rather than against file offsets.
 - Logical dataset byte accounting kept separate from raw storage accounting, so
   datatype semantics can be compared against `libhdf5` while layout checks still
   use on-disk storage size. Datatype validation accepts message versions 1–5,

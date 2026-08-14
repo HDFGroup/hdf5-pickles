@@ -1,0 +1,281 @@
+/* h5_frhp_fspace.pk - Fractal-heap free-space-manager traversal.
+
+   An FRHP header can name an ordinary FSHD/FSSE serialization for the free
+   space inside its managed address space.  This is metadata, but it is not the
+   file client: a section record is [heap_offset] rather than
+   [file_address, class].  Keep that distinction explicit so a logical heap
+   offset is never mistaken for a file address. */
+
+fun h5policy_fspace_bytes_for_bits = (uint<64> nbits) uint<64>:
+{
+    return (nbits + 7UL) / 8UL;
+}
+
+fun h5policy_fspace_bytes_for_limit = (uint<64> limit) uint<64>:
+{
+    var nbytes = 1UL;
+    var max = 0xffUL;
+    while (nbytes < 8UL && limit > max)
+        {
+            nbytes = nbytes + 1UL;
+            max = (max <<. 8UL) | 0xffUL;
+        }
+    return nbytes;
+}
+
+fun h5policy_fspace_frhp_header_size = (uint<64> filter_len, off64 loc,
+                                         string object) uint<64>:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var body = 14UL + (2UL * o) + (10UL * el) + (8UL + (2UL * el) + o);
+    if (filter_len != 0UL)
+        body = h5policy_checked_add_u64(body, el + 4UL + filter_len,
+                                        0xffffffffffffffffUL,
+                                        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                        loc, object,
+                                        "fractal heap header size overflow");
+    return h5policy_checked_add_u64(body, 4UL, 0xffffffffffffffffUL,
+                                    "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                    loc, object,
+                                    "fractal heap header checksum size overflow");
+}
+
+fun h5policy_walk_frhp_fspace_sections = (
+    int ios, H5PolicyProfile profile, H5WalkContext ctx,
+    uint<64> sect_addr, uint<64> used_size, uint<64> alloc_size,
+    uint<64> hdr_addr, uint<64> serial_sect, uint<64> nclasses,
+    uint<64> max_addr_bits, uint<64> max_sect_size,
+    uint<64> managed_space, uint<64> file_size, string object) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    if (!h5policy_mark_visited_btree(sect_addr))
+        {
+            h5policy_emit_error("H5_CORRUPT_FSM_SECTION_LIST_CYCLE", "corrupt",
+                                sect_addr#B, object,
+                                "fractal-heap free-space section list is referenced twice");
+            return ctx;
+        }
+    if (!h5policy_checked_addr_range(sect_addr, alloc_size, file_size,
+                                     "fractal-heap free-space section list outside file",
+                                     hdr_addr#B, object))
+        return ctx;
+    var prefix = 5UL + o;
+    if (used_size < prefix + 4UL || used_size > alloc_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_FSM_SECTION_LIST_SIZE", "corrupt",
+                                sect_addr#B, object,
+                                "fractal-heap free-space section list used size is inconsistent with its envelope");
+            return ctx;
+        }
+    if (h5policy_msg_bytes(ios, profile, sect_addr#B, 4UL)
+        != H5_FORMAT_FSSE_SIGNATURE)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                sect_addr#B, object,
+                                "fractal-heap free-space section list signature mismatch");
+            return ctx;
+        }
+    h5policy_mark_reached(sect_addr, "FSSE");
+    var version = h5policy_msg_u64_at(ios, profile, sect_addr#B + 4#B, 1UL);
+    var back_raw = h5policy_msg_bytes(ios, profile, sect_addr#B + 5#B, o);
+    if (version != 0UL
+        || hdf5_addr_to_file_u64(bytes_to_u64_le(back_raw)) != hdr_addr)
+        {
+            h5policy_emit_error("H5_CORRUPT_FSM_SECTION_LIST_HEADER", "corrupt",
+                                sect_addr#B + 4#B, object,
+                                "fractal-heap free-space section list version or back-pointer is invalid");
+            return ctx;
+        }
+    if (!h5policy_chunkindex_verify_trailing_checksum(
+            ios, profile, sect_addr, used_size, file_size, object,
+            "fractal-heap free-space section list"))
+        return ctx;
+    var metadata_over = h5policy_chunkindex_metadata_would_exceed(
+        ctx, profile, alloc_size);
+    ctx = h5policy_account_metadata(ctx, profile, alloc_size,
+                                    sect_addr#B, object);
+    if (metadata_over)
+        return ctx;
+
+    /* H5HF records have no serialized class byte.  The header's class count
+       configures libhdf5's in-memory free-space client, while the on-disk
+       record form is solely a logical heap offset; the node supplies its size. */
+    var cnt_size = h5policy_fspace_bytes_for_limit(serial_sect);
+    var len_size = h5policy_fspace_bytes_for_limit(max_sect_size);
+    var off_size = h5policy_fspace_bytes_for_bits(max_addr_bits);
+    var cur = sect_addr + prefix;
+    var limit = sect_addr + used_size - 4UL;
+    var seen = 0UL;
+    while (seen < serial_sect)
+        {
+            h5policy_walk_tick(1UL);
+            if (cur > limit || cnt_size > limit - cur
+                || len_size > limit - cur - cnt_size)
+                {
+                    h5policy_emit_error("H5_CORRUPT_FSM_SECTION_OVERRUN", "corrupt",
+                                        cur#B, object,
+                                        "fractal-heap free-space section node header overruns the section list");
+                    return ctx;
+                }
+            var node_count = h5policy_msg_u64_at(ios, profile, cur#B, cnt_size);
+            var sect_size = h5policy_msg_u64_at(
+                ios, profile, (cur + cnt_size)#B, len_size);
+            cur = cur + cnt_size + len_size;
+            if (node_count == 0UL || sect_size == 0UL
+                || node_count > serial_sect - seen)
+                {
+                    h5policy_emit_error("H5_CORRUPT_FSM_SECTION_COUNT", "corrupt",
+                                        cur#B, object,
+                                        "fractal-heap free-space section node has an invalid size or count");
+                    return ctx;
+                }
+            if (log2_pow2(sect_size) >= log2_pow2(max_sect_size))
+                h5policy_emit_error("H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX", "corrupt",
+                                    (cur - len_size)#B, object,
+                                    "fractal-heap free-space section size selects a bin past the manager's bin array");
+            var j = 0UL;
+            while (j < node_count)
+                {
+                    if (cur > limit || off_size > limit - cur)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_FSM_SECTION_OVERRUN", "corrupt",
+                                                cur#B, object,
+                                                "fractal-heap free-space section record overruns the section list");
+                            return ctx;
+                        }
+                    var heap_off = h5policy_msg_u64_at(ios, profile, cur#B, off_size);
+                    cur = cur + off_size;
+                    if (heap_off > managed_space
+                        || sect_size > managed_space - heap_off)
+                        h5policy_emit_error("H5_CORRUPT_FSM_SECTION_EXTENT", "corrupt",
+                                            (cur - off_size)#B, object,
+                                            "fractal-heap free-space section extent escapes managed heap space");
+                    seen = seen + 1UL;
+                    j = j + 1UL;
+                }
+        }
+    return ctx;
+}
+
+/* FRHP's free-space manager is H5FS client 0.  Validate only after the FRHP
+   caller has already accepted its checksum; this routine independently owns
+   the FSHD/FSSE envelopes and their metadata accounting. */
+fun h5policy_walk_frhp_fspace_manager = (
+    int ios, H5PolicyProfile profile, H5WalkContext ctx,
+    uint<64> hdr_addr, uint<64> managed_space, off64 loc,
+    string object) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var file_size = h5policy_ceiling(ios);
+    var hdr_size = 18UL + 7UL*el + o;
+    if (ctx.metadata_count_exceeded != 0UB)
+        return ctx;
+    if (!h5policy_mark_visited_btree(hdr_addr))
+        {
+            h5policy_emit_error("H5_CORRUPT_FSM_HEADER_CYCLE", "corrupt",
+                                hdr_addr#B, object,
+                                "fractal-heap free-space manager header is referenced twice");
+            return ctx;
+        }
+    if (!h5policy_checked_addr_range(hdr_addr, hdr_size, file_size,
+                                     "fractal-heap free-space manager header outside file",
+                                     loc, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, hdr_addr#B, 4UL)
+        != H5_FORMAT_FSHD_SIGNATURE)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                hdr_addr#B, object,
+                                "fractal-heap free-space manager header signature mismatch");
+            return ctx;
+        }
+    h5policy_mark_reached(hdr_addr, "FSHD");
+    var version = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 4#B, 1UL);
+    var client = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 5#B, 1UL);
+    if (version != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_FSM_VERSION", "corrupt",
+                                hdr_addr#B + 4#B, object,
+                                "fractal-heap free-space manager header has an unsupported version");
+            return ctx;
+        }
+    if (client != 0UL)
+        {
+            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP", "unsupported",
+                                hdr_addr#B + 5#B, object,
+                                "fractal-heap header names a non-fractal free-space manager client");
+            return ctx;
+        }
+    var tot = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (6UL + el)#B, el);
+    var serial = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (6UL + 2UL*el)#B, el);
+    var ghost = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (6UL + 3UL*el)#B, el);
+    var nclasses = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (6UL + 4UL*el)#B, 2UL);
+    var max_addr_bits = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (12UL + 4UL*el)#B, 2UL);
+    var max_sect_size = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (14UL + 4UL*el)#B, el);
+    var sect_raw = h5policy_msg_bytes(ios, profile, hdr_addr#B + (14UL + 5UL*el)#B, o);
+    var sect_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(sect_raw));
+    var used = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (14UL + 5UL*el + o)#B, el);
+    var alloc = h5policy_msg_u64_at(ios, profile, hdr_addr#B + (14UL + 6UL*el + o)#B, el);
+    if (serial + ghost != tot)
+        h5policy_emit_error("H5_CORRUPT_FSM_SECTION_COUNT", "corrupt",
+                            hdr_addr#B + (6UL + el)#B, object,
+                            "fractal-heap free-space manager section counts are inconsistent");
+    if (!h5policy_chunkindex_verify_trailing_checksum(
+            ios, profile, hdr_addr, hdr_size, file_size, object,
+            "fractal-heap free-space manager header"))
+        return ctx;
+    var metadata_over = h5policy_chunkindex_metadata_would_exceed(ctx, profile,
+                                                                    hdr_size);
+    ctx = h5policy_account_metadata(ctx, profile, hdr_size, hdr_addr#B, object);
+    if (metadata_over)
+        return ctx;
+    if (h5policy_msg_addr_is_undef(sect_raw))
+        {
+            if (serial != 0UL)
+                h5policy_emit_error("H5_CORRUPT_FSM_SECTION_COUNT", "corrupt",
+                                    hdr_addr#B, object,
+                                    "fractal-heap free-space manager tracks serialized sections but stores no section list");
+            return ctx;
+        }
+    return h5policy_walk_frhp_fspace_sections(
+        ios, profile, ctx, sect_addr, used, alloc, hdr_addr, serial, nclasses,
+        max_addr_bits, max_sect_size, managed_space, file_size, object);
+}
+
+/* Extract FRHP's managed-space and free-manager fields only after independently
+   checking the header envelope.  Callers that already decoded FRHP use this to
+   keep the FSHD/FSSE edge in one place without trusting unchecked offsets. */
+fun h5policy_walk_frhp_fspace_from_header = (
+    int ios, H5PolicyProfile profile, H5WalkContext ctx,
+    uint<64> heap_addr, off64 loc, string object) H5WalkContext:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var file_size = h5policy_ceiling(ios);
+    if (!h5policy_checked_addr_range(heap_addr, 10UL, file_size,
+                                     "fractal heap header outside file", loc, object))
+        return ctx;
+    if (h5policy_msg_bytes(ios, profile, heap_addr#B, 4UL)
+        != H5_FORMAT_FRHP_SIGNATURE)
+        return ctx;
+    if (h5policy_msg_u64_at(ios, profile, heap_addr#B + 4#B, 1UL) != 0UL)
+        return ctx;
+    var filter_len = h5policy_msg_u64_at(ios, profile, heap_addr#B + 7#B, 2UL);
+    var heap_size = h5policy_fspace_frhp_header_size(filter_len, heap_addr#B,
+                                                      object);
+    if (!h5policy_chunkindex_verify_trailing_checksum(
+            ios, profile, heap_addr, heap_size, file_size, object,
+            "fractal heap header"))
+        return ctx;
+    var fsm_raw = h5policy_msg_bytes(
+        ios, profile, heap_addr#B + (14UL + 2UL*el + o)#B, o);
+    if (h5policy_msg_addr_is_undef(fsm_raw))
+        return ctx;
+    var managed_space = h5policy_msg_u64_at(
+        ios, profile, heap_addr#B + (14UL + 2UL*el + 2UL*o)#B, el);
+    return h5policy_walk_frhp_fspace_manager(
+        ios, profile, ctx, hdf5_addr_to_file_u64(bytes_to_u64_le(fsm_raw)),
+        managed_space, loc, object);
+}
