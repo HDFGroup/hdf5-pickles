@@ -2730,24 +2730,65 @@ def _make_cache_image_shadowed_btree(path, helper_source):
     # logical cache-body view rather than merely failing envelope integrity.
     root_oh = int.from_bytes(raw[12 + 3 * o:12 + 4 * o], "little")
     leaf = bt["root"]
-    # Repoint every entry that caches an OBJECT HEADER (or the B-tree header) at
-    # the B-tree leaf instead.  The walk skips shadowed object headers, and
-    # skipping one also drops everything reachable through it -- so an image
-    # caching the root and the group headers would stop the traversal before the
-    # B-tree regardless of the boundary logic, and the fixture would pass either
-    # way.  What is left shadowed is the leaf: a NON-header structure, which is
-    # exactly the specimen's shape and the case the boundary has to get right.
-    blocking = [(a, n, off) for a, n, off in shadow
-                if raw[a:a + 4] == b"OHDR" or (a <= bthd < a + n)]
-    if not blocking:
+    # DROP every entry that caches an object header or the B-tree header from the
+    # image, rather than repointing them onto one address.  Un-shadowing the root
+    # and group headers lets the walk reach the B-tree, and un-shadowing the
+    # B-tree header leaves the corruption below on the UNSHADOWED side -- the
+    # distinction this fixture exists to test.  The leaf keeps its own cache
+    # entry, so it stays shadowed (a NON-header structure, the specimen's shape).
+    # The earlier construction repointed all these entries to the leaf address,
+    # which made several entries share one file address -- a real
+    # mdci.entry_addr_unique violation (H5_CORRUPT_MDCI_DUPLICATE_ENTRY_ADDRESS)
+    # that libhdf5 also rejects.  Dropping keeps the image well formed.
+    lookup3 = _jenkins_lookup3()
+    old_size = int.from_bytes(raw[img + 6:img + 6 + el], "little")
+    entry_header = 14 + o + el
+    kept, cur = [], 10 + el
+    for _ in range(nentries):
+        e = img + cur
+        parents = struct.unpack_from("<H", raw, e + 8)[0]
+        addr = int.from_bytes(raw[e + 14:e + 14 + o], "little")
+        body_len = int.from_bytes(raw[e + 14 + o:e + 14 + o + el], "little")
+        span = entry_header + parents * o + body_len
+        if not (raw[addr:addr + 4] == b"OHDR" or (addr <= bthd < addr + body_len)):
+            kept.append(bytes(raw[e:e + span]))
+        cur += span
+    if len(kept) == nentries:
         raise RuntimeError("cache image caches no object header; the fixture's "
                            "premise no longer holds")
-    for _a, _n, addr_off in blocking:
-        raw[addr_off:addr_off + o] = leaf.to_bytes(o, "little")
+    if not kept:
+        raise RuntimeError("dropping the blocking entries would empty the image")
+
+    # Rebuild the image in place: same block address, smaller declared size.  The
+    # freed tail is left as unreferenced file bytes (the MDCI message's size field
+    # is updated below), so no later address moves.
+    new_block = bytearray(b"MDCI" + bytes([raw[img + 4], raw[img + 5]]))
+    new_size = 10 + el + sum(len(e) for e in kept) + 4
+    new_block += struct.pack("<Q", new_size)
+    new_block += struct.pack("<I", len(kept))
+    new_block += b"".join(kept)
+    new_block += b"\x00" * 4
+    assert len(new_block) == new_size, (len(new_block), new_size)
+    struct.pack_into("<I", new_block, new_size - 4, lookup3(bytes(new_block[:new_size - 4])))
+    raw[img:img + old_size] = bytes(new_block) + b"\x00" * (old_size - new_size)
+
+    # Update the MDCI superblock-extension message's image size, then repair the
+    # extension object header's checksum it invalidates.
+    msg_pat = struct.pack("<Q", img) + struct.pack("<Q", old_size)
+    hits = [i for i in range(len(raw) - len(msg_pat) + 1) if raw[i:i + len(msg_pat)] == msg_pat]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected exactly one MDCI extension message, found {len(hits)}")
+    struct.pack_into("<Q", raw, hits[0] + o, new_size)
+    ext_addr = int.from_bytes(raw[12 + o:12 + 2 * o], "little")
+    if raw[ext_addr:ext_addr + 4] != b"OHDR":
+        raise RuntimeError("superblock extension is not a v2 object header")
+    _fix_v2_ohdr_checksum(raw, ext_addr)
 
     shadow = _mdci_shadow_ranges(raw)
     if not shadow:
         raise RuntimeError("cache image shadows nothing; fixture proves nothing")
+    if len({a for a, _n, _off in shadow}) != len(shadow):
+        raise RuntimeError("rebuilt image still has duplicate entry addresses")
     if any(a <= bthd < a + n for a, n, _ in shadow):
         raise RuntimeError(
             f"dense-link B-tree header at {bthd} is shadowed by the cache image; "
@@ -2760,10 +2801,7 @@ def _make_cache_image_shadowed_btree(path, helper_source):
     nrec = min(0xFFFF, capacity + (150 // bt["record_size"]) + 1)
     struct.pack_into("<H", raw, bthd + 16 + bt["off_size"], nrec)
     struct.pack_into("<I", raw, bt["checksum"],
-                     _jenkins_lookup3()(bytes(raw[bthd:bt["checksum"]])))
-    image_end = img + int.from_bytes(raw[img + 6:img + 6 + el], "little")
-    struct.pack_into("<I", raw, image_end - 4,
-                     _jenkins_lookup3()(bytes(raw[img:image_end - 4])))
+                     lookup3(bytes(raw[bthd:bt["checksum"]])))
     _patch(path, bytes(raw))
 
 
