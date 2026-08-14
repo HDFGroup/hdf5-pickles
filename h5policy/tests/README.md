@@ -265,11 +265,11 @@ inspecting attributes, reading small datasets, or running optional `libhdf5`
 tools; those eager catches are security-useful, not hard false positives. The
 similarly narrow `A~` warning covers file-global SOHM/free-space metadata that
 read-only libhdf5 paths leave unopened, and findings confined to dense
-secondary creation-order indexes. It also covers the generated wide-length
-controls whose impossible contiguous-data extents libhdf5 leaves lazy. Current
-libhdf5 can enumerate the primary name index without authenticating every
-type-6/type-9 block, and can report those controls' scalar datasets without
-checking their physical extents; h5policy intentionally validates both.
+secondary creation-order indexes. Current libhdf5 can enumerate the primary
+name index without authenticating every type-6/type-9 block; h5policy
+intentionally validates those structures eagerly. Legal 16-byte superblock
+length fields are instead h5policy compatibility refusals: libhdf5's shared
+length decoder does not support the width, so h5policy stops at preflight.
 
 The logical-**bytes** comparison is warning-level rather than a hard failure:
 h5policy now tracks logical dataset bytes separately from raw storage bytes, so

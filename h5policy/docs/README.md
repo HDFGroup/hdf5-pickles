@@ -62,7 +62,7 @@ The process exit code mirrors the JSON `decision`:
 | 2 | `reject_corrupt` | The metadata is structurally corrupt. |
 | 3 | `reject_policy` | A structurally recognized feature violates policy. |
 | 4 | `reject_resource` | A resource or denial-of-service budget was exceeded. |
-| 5 | `unsupported_coverage_gap` | Safe validation stopped at a recognized but insufficiently covered feature. |
+| 5 | `unsupported_coverage_gap` | Safe validation stopped at a recognized coverage boundary or conservative library-compatibility guard. |
 | 70 | `internal_error` | The oracle itself failed to render a normal decision. |
 
 `unsupported_coverage_gap` is an explicit refusal, not an acceptance. See the
@@ -173,10 +173,11 @@ Two narrowly defined cases demote an apparent A failure to a warning:
 - **A~** means all corruption findings are confined to active metadata that
   current read-only `libhdf5` paths deliberately leave unopened: file-global
   SOHM search or free-space-manager metadata, or dense secondary
-  creation-order indexes; it also covers the generated wide-length controls
+  creation-order indexes. It also covers the generated wide-length controls
   where `libhdf5` reports a scalar dataset without checking that its declared
-  contiguous-data extent can exist in the physical file. h5policy validates
-  these structures and extents eagerly.
+  contiguous-data extent can exist in the physical file; h5policy's separate
+  16-byte-width compatibility guard now refuses them before that lazy extent
+  comparison is needed.
 
 Both variants remain visible as warnings but do not make the harness exit
 non-zero.

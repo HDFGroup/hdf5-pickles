@@ -1,10 +1,9 @@
 # Found while diagnosing an h5policy-diff differential mismatch on a routine
 # clean-tree test run (2026-07-31), not through fuzzing or a disclosure feed.
-# Unlike the other cases/ entries, the defect here is not something h5policy
-# missed -- h5policy correctly accepts the fixture. The defect is in the
-# reference oracle itself (libhdf5's length-field decoder), which is why the
-# `oracle` block below reads as agreement-with-libhdf5 having FAILED rather
-# than an h5policy soundness gap.
+# The defect is in the reference oracle itself (libhdf5's length-field
+# decoder), not in the file. h5policy now contains it for that target with a
+# conservative preflight refusal, so this record tracks both the library gap
+# and the target-specific containment.
 schema_version: 1
 
 id: wide-length-16-decode-gap
@@ -14,14 +13,15 @@ title: >-
   length-bearing field in a 16-byte-lengths file either aborts the process
   (assertions compiled in) or silently decodes as whatever was already in the
   destination variable (assertions compiled out)
-status: draft
+status: contained
 disclosure: "n/a — not yet reported upstream; local investigation only, 2026-07-31"
 
 # ── Triage by missing invariant (§11.2) ───────────────────────────────────────
 record: address_space_bounds
 versions: [16]   # sizeof_lengths byte width, not a message version -- see note below
 entry_points:
-  - h5policy (oracle) — untrusted-strict, correctly accepts (no finding)
+  - h5policy (library-compatibility target) — conservatively refuses at
+    superblock preflight before libhdf5 can decode a length field
   - "libhdf5 H5Dopen -> H5O__layout_decode (H5Olayout.c) -> H5F_DECODE_LENGTH
      (H5Fprivate.h:172) -> H5_DECODE_LENGTH_LEN (H5encode.h:270-284). The same
      macro pair backs H5F_ENCODE_LENGTH/H5F_DECODE_LENGTH used in 16 files:
@@ -31,14 +31,7 @@ entry_points:
      -- only H5Olayout.c's CONTIGUOUS case is confirmed reproduced here; the
      other 15 call sites are not individually exercised, see sibling_audit."
 root_cause_classification: local_decode
-violated_invariant: address.length_representable
-# The existing invariant id is a loose fit, kept for cross-reference rather
-# than precision: h5policy's check is "is this length representable in a
-# 64-bit domain" (yes, 1 fits trivially) -- there is no existing invariant id
-# for "can the REFERENCE decoder handle this byte width at all," which is the
-# actual defect. A dedicated id (something like
-# address.length_field_width_supported) would need adding to
-# validation-coverage.yml if this becomes more than a single tracked case.
+violated_invariant: address.library_compatibility
 validation_closure: >-
   the superblock's declared size_of_lengths byte alone establishes the defect;
   no other record is needed to reach it.
@@ -48,11 +41,10 @@ activation_before_validation:
 # ── Oracle behaviour ───────────────────────────────────────────────────────────
 oracle:
   profile: untrusted-strict
-  decision: accept
-  primary_finding: null   # h5policy has no finding: it decodes the 16-byte
-                           # length correctly and the file is genuinely valid
-  object_path: "/dset"
-  offset: 99   # absolute file offset of the 16-byte length field (see below)
+  decision: unsupported_coverage_gap
+  primary_finding: H5_UNSUPPORTED_PICKLE_COVERAGE_GAP
+  object_path: "/"
+  offset: 0   # superblock preflight, before any 16-byte field is decoded
 
 # ── What was actually confirmed, read out of the source tree ($HDF5_SOURCE_DIR
 #    at /opt/hdf5, commit a8161b7dc67a71ba12eaba2e9ddc0b6e8b156392) ───────────
@@ -83,11 +75,12 @@ defect: >-
       dataset -- consistent with this, not with a correct decode of the
       patched value 1. This is silent misdecoding via an uninitialized-style
       read, not merely "the file opens fine."
-  Neither behavior is a defect in the FILE: H5Pset_sizes() says 16 is legal,
-  and h5policy's independent decoder reads the field correctly. The gap is
-  that H5_DECODE_LENGTH_LEN was apparently never extended past the widths in
-  use when it was written, and the property-list validator was never brought
-  back in sync with it.
+  Neither behavior is a defect in the FILE: H5Pset_sizes() says 16 is legal.
+  The gap is that H5_DECODE_LENGTH_LEN was apparently never extended past the
+  widths in use when it was written, and the property-list validator was never
+  brought back in sync with it. h5policy's independent decoder can represent
+  narrow values, but its libhdf5-compatibility target now declines this width
+  before any affected field is read.
 write_side_note: >-
   H5_ENCODE_LENGTH_LEN has the identical missing case, so no real workflow
   through the *library's own write path* could produce a file where an actual
@@ -101,16 +94,12 @@ write_side_note: >-
 
 # ── Containment vs systemic remediation ────────────────────────────────────────
 containment:
-  status: planned
+  status: landed
   description: >-
-    Add `case 16:` to both H5_DECODE_LENGTH_LEN and H5_ENCODE_LENGTH_LEN
-    (128-bit-safe subset: decode into the low 64 bits with an overflow check
-    on the high 8 bytes, matching how h5policy already treats a wide length --
-    see valid/wide_length_one.h5 and malformed/wide_length_u64_max.h5 /
-    wide_length_2pow64_plus_one.h5 for the exact boundary h5policy enforces).
-    Until then, H5Pset_sizes() accepting 16 while the decode/encode macros
-    cannot handle it is itself worth flagging: at minimum the two should agree
-    about which widths are supported.
+    h5policy now refuses `sizeof_lengths = 16` at superblock preflight with a
+    target-specific `unsupported_coverage_gap`, before the selected libhdf5
+    target can decode any affected length field. The refusal is deliberately
+    not a corruption classification: the representation is legal on disk.
 systemic:
   semantic_boundary: the shared length-decode primitive backing all 16 call
     sites, not H5Olayout.c alone
@@ -155,50 +144,25 @@ sibling_audit: >-
   global heap, cache image, free-space sections, symbol-table entries, object
   continuation) share the exact same macro and so almost certainly share the
   exact same gap, but none has been individually triggered with a
-  16-byte-lengths fixture. h5policy's own wide-length handling
-  (malformed/wide_length_u64_max.h5, malformed/wide_length_2pow64_plus_one.h5)
-  already exercises the *value*-overflow boundary for several of these
-  records; none of those fixtures use sizeof_lengths=16, so they do not
-  currently probe this specific decode-width gap.
+  16-byte-lengths fixture. The direct generated variants now instead establish
+  that the h5policy target guard fires before every affected decoder. Preserve
+  them if the target later removes that guard, when they can again exercise the
+  independent value-overflow boundary.
 fuzz_seed: "n/a — hand-built specimen, not fuzzer-derived"
 coverage_manifest_change: >-
-  none yet. This case does not change what h5policy validates (it was already
-  correct); it documents a libhdf5 defect the differential harness surfaced.
+  Added address.library_compatibility, routed the target-specific preflight
+  finding to it, and made valid/wide_length_one.h5 its direct regression.
 compatibility_backport_risks: >-
-  A libhdf5 fix adding case 16 support would not change acceptance for any
-  file with sizeof_lengths in {2,4,8} -- the overwhelming majority of real
-  files. h5policy's own accept/reject boundary is unaffected either way,
-  since it already decodes 16-byte lengths correctly.
+  The conservative refusal affects only files whose superblock declares
+  sizeof_lengths = 16. If the selected libhdf5 target gains safe 16-byte
+  length decoding, remove the guard and restore the value-boundary controls.
 
 # ── Differential-harness handling (not part of the upstream template, but the
 #    practical consequence for this repo's own test suite) ───────────────────
 h5policy_diff_status: >-
-  h5policy_regression's differential check (h5policy-diff) reports this as a
-  hard A' failure ("libhdf5 rejects => explicit rejection, got accept") every
-  run, because introspect_isolated() reads the crashed child as "libhdf5
-  rejects it" -- the same signal a clean rejection would produce, per that
-  function's own docstring. That reading is correct for a file that really is
-  bad; here it is not, because the file is valid and the "rejection" is a
-  crash-shaped artifact of the reference decoder's own gap.
-
-  No CODE-level tolerance function was added for this in h5policy-diff (unlike
-  arithmetic-divergences-backlog.yml's chunk_size_uint32_wrap.h5, which got
-  one): a generic "trust an accept over a reference crash" predicate would be
-  too broad to add safely without more scrutiny, since a reference crash is
-  ordinarily strong evidence something IS wrong, not weak evidence to
-  discount. That call still stands -- no such predicate exists.
-
-  What changed (2026-08-01): h5policy-diff gained a separate, narrower
-  mechanism for exactly this situation -- a per-fixture, per-invariant
-  tolerance keyed by exact fixture path in
-  registry/h5policy-diff-tolerances.yml, consulted only for THIS fixture's A'
-  check, not any predicate over finding codes that could match an unrelated
-  future crash. This fixture now has an entry there. The failure still prints
-  every run (tagged "tracked: wide-length-16-decode-gap"); it is excluded from
-  h5policy-diff's total_fail and therefore from h5policy_regression's exit
-  status, since the defect is in the reference decoder, not h5policy. Removing
-  the tolerances.yml entry reverts to a hard, suite-failing FAIL with no code
-  change, e.g. if this triage later turns out to be wrong.
+  h5policy-diff now sees a normal A' safe refusal for this fixture. The
+  former per-fixture A' tolerance was removed: h5policy no longer accepts a
+  legal 16-byte-length file for the selected libhdf5 compatibility target.
 
 # ── Provenance ──────────────────────────────────────────────────────────────
 provenance:

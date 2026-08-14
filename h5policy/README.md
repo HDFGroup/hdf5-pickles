@@ -62,7 +62,8 @@ Exit codes are part of the interface:
 
 `unsupported_coverage_gap` is a bounded answer, not a silent accept. It means the
 file reached a recognized HDF5 feature that is not yet decoded deeply enough for
-the selected policy.
+the selected policy, or a legal representation the h5policy compatibility target
+conservatively declines to pass to the selected `libhdf5`.
 
 JSON output includes:
 
@@ -227,6 +228,13 @@ Checksum coverage includes the HDF5 Jenkins checksums used by:
 Some defects live strictly beyond a metadata-only boundary and are reported as
 `unsupported_coverage_gap` rather than `reject_corrupt`, even when `libhdf5`
 crashes on them:
+
+- **16-byte superblock length fields.** HDF5 permits `sizeof_lengths = 16`,
+  and h5policy can independently narrow representable values. The selected
+  `libhdf5` target's shared length decoder does not support that width, however,
+  so h5policy refuses it at superblock preflight with
+  `H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`. This target-specific compatibility
+  guard is not a claim that the file is corrupt.
 
 - **Metadata cache-image bodies.** The message, container, entry envelopes, and
   shadow ranges are validated, but each cached entry body remains opaque. This
