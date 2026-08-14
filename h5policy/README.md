@@ -148,10 +148,8 @@ Current coverage includes:
   bounds, and reachable object traversal with visited sets.
 - Dataspace, datatype, layout, filter pipeline, fill value, link, attribute,
   both modification-time forms, B-tree K override, reference-count,
-  free-space info, and metadata cache image message/container envelopes.
-  Cached metadata bodies remain outside decode coverage, as described in
-  [Metadata cache-image hard boundary](#metadata-cache-image-hard-boundary).
-  Driver-info envelopes are validated and then explicitly refused because
+  free-space info, and metadata cache image message/container envelopes and
+  replayed cached bodies. Driver-info envelopes are validated and then explicitly refused because
   their VFD bodies can name member files outside the single-file validation
   boundary.
 - Compact hard links, dense link storage, dense attribute storage, old-style
@@ -186,31 +184,25 @@ Its entries can shadow the ordinary bytes at the same logical file addresses,
 so parsing those backing bytes as if they were still live can manufacture false
 corruption findings.
 
-h5policy validates the cache-image message and the bounded container information
-needed to traverse it safely: the image extent, block signature/version/flags,
-declared length, entry count, entry envelopes, dependency counts and list
-sizes, body extents, and trailing layout. It records each validated
-`(address, length)` shadow range. It does **not** decode the cached entry bodies
-or validate their metadata semantics.
+h5policy validates the cache-image message and bounded container information:
+the image extent, block signature/version/flags, declared length, entry count,
+entry envelopes, dependency counts and list sizes, body extents, trailing
+layout, and the image checksum. It then replays all validated cached entry bodies
+through the ordinary bounded metadata decoder at its logical `(address, length)`
+range. This replaces the shadowed backing ranges through an in-memory read overlay over the original file: it never
+writes the input, opens an external file, or materializes a whole-file copy.
 
-That missing body decoder is a hard coverage boundary shared by every profile,
-not an `allow_*` feature policy:
+Consequently, a structurally valid cache image can return exit `0` and
+`accept`; `analysis.complete` and `analysis.walk_completed` are `true`. Cached
+object headers, trees, heaps, and indexes receive the same semantic and
+cross-reference checks as their ordinary on-disk counterparts. A corrupt MDCI
+envelope, checksum, or replayed body produces `reject_corrupt`.
+If an internal cache-client body cannot be reached by a type-aware decoder,
+h5policy retains an explicit `unsupported_coverage_gap` rather than approving
+the image.
 
-- a structurally valid file containing a cache image returns exit `5` with
-  decision `unsupported_coverage_gap` and finding
-  `H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`;
-- `analysis.complete` and `analysis.walk_completed` are `false`;
-- the default fail-fast profiles report `analysis.stop_reason: "rejection"`;
-- with continuation enabled (including the `forensic` default), the walk skips
-  shadowed addresses, continues checking reachable unshadowed metadata, and
-  finishes with `analysis.stop_reason: "cache_image_coverage_gap"`; and
-- `--continue-after-rejection` changes diagnostic traversal only. It never
-  decodes the cached bodies and never converts this refusal into an acceptance.
-
-Corruption found in the decoded message or container envelope can still produce
-`reject_corrupt`, which outranks the unsupported finding. In either case,
-consumers must not treat the file as preflight-approved while cached bodies
-remain unvalidated.
+`--continue-after-rejection` still controls only diagnostic traversal. It does
+not weaken cache-image validation or alter an acceptance decision.
 
 Checksum coverage includes the HDF5 Jenkins checksums used by:
 
@@ -235,12 +227,6 @@ crashes on them:
   so h5policy refuses it at superblock preflight with
   `H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`. This target-specific compatibility
   guard is not a claim that the file is corrupt.
-
-- **Metadata cache-image bodies.** The message, container, entry envelopes, and
-  shadow ranges are validated, but each cached entry body remains opaque. This
-  is the [hard boundary described above](#metadata-cache-image-hard-boundary):
-  continuation can preserve findings from unshadowed metadata but cannot make
-  the analysis complete.
 
 - **Filtered SOHM message bodies.** h5policy resolves managed, tiny, and
   unfiltered huge heap IDs, then dispatches the recovered body through the

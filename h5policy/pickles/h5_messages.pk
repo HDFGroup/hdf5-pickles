@@ -859,9 +859,9 @@ fun h5policy_validate_fsinfo_payload = (int ios,
     return ctx;
 }
 
-/* Metadata cache image messages name a cached metadata image.  h5policy bounds
-   the image extent but does not decode the cache image contents, which are a
-   separate metadata serialization format.  */
+/* Metadata cache image messages name a cached metadata image.  The first pass
+   bounds and authenticates each entry, then a second pass routes normal reads
+   at cached logical addresses to the entry bodies. */
 fun h5policy_validate_mdci_payload = (int ios,
                                       H5PolicyProfile profile,
                                       offset<uint<64>,B> payload_off,
@@ -903,7 +903,8 @@ fun h5policy_validate_mdci_payload = (int ios,
                of decoding their stale backing bytes (e.g. the root object
                header) as live metadata. Unshadowed metadata can still be
                checked when continuation is enabled. */
-            h5policy_cache_image_boundary = 1;
+            if (h5policy_mdci_replay_mode == 0)
+                h5policy_cache_image_boundary = 1;
 
             var ok = h5policy_checked_addr_range_at(image_addr, image_size,
                                                     h5policy_ceiling(ios),
@@ -995,6 +996,7 @@ fun h5policy_validate_mdci_payload = (int ios,
                             return;
                         }
                     var eoff = image_addr#B + cur#B;
+                    var type_id = h5policy_msg_u64_at(ios, profile, eoff, 1UL);
                     var eflags = h5policy_msg_u64_at(ios, profile, eoff + 1#B, 1UL);
                     var child_count = h5policy_msg_u64_at(ios, profile,
                                                           eoff + 4#B, 2UL);
@@ -1059,9 +1061,18 @@ fun h5policy_validate_mdci_payload = (int ios,
                        h5policy_addr_is_shadowed.  Recorded only after the entry
                        header has been validated above, so the range comes from
                        fields already checked. */
-                    h5policy_mdci_shadow_addrs
-                        += [bytes_to_u64_le(entry_addr_raw)];
-                    h5policy_mdci_shadow_lens += [body_len];
+                    if (h5policy_mdci_replay_mode == 0)
+                        {
+                            h5policy_mdci_shadow_addrs
+                                += [bytes_to_u64_le(entry_addr_raw)];
+                            h5policy_mdci_shadow_lens += [body_len];
+                            h5policy_mdci_body_addrs
+                                += [bytes_to_u64_le(entry_addr_raw)];
+                            h5policy_mdci_body_lens += [body_len];
+                            h5policy_mdci_body_sources
+                                += [(eoff/#B) + entry_header + parents_size];
+                            h5policy_mdci_body_types += [type_id];
+                        }
                     cur = cur + entry_span;
                     i = i + 1UL;
                 }
@@ -1074,8 +1085,21 @@ fun h5policy_validate_mdci_payload = (int ios,
                                         "metadata cache image has unclaimed trailing bytes");
                     return;
                 }
-            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
-                                "unsupported", payload_off, object,
-                                "metadata cache image contents are not decoded by Phase 2");
+            var image_checksum = lookup3_hashlittle(
+                h5policy_msg_bytes(ios, profile, image_addr#B,
+                                   image_size - 4UL), 0);
+            var stored_checksum = lookup3_u32_le(
+                h5policy_msg_bytes(ios, profile,
+                                   image_addr#B + (image_size - 4UL)#B, 4UL));
+            if (image_checksum != stored_checksum)
+                {
+                    h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM", "corrupt",
+                                        image_addr#B + (image_size - 4UL)#B,
+                                        object,
+                                        "metadata cache image checksum mismatch");
+                    return;
+                }
+            if (h5policy_mdci_replay_mode == 0)
+                h5policy_mdci_replay_ready = 1;
         }
 }

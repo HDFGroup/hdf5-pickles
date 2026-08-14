@@ -72,26 +72,27 @@ profile semantics.
 
 ### Metadata cache-image hard boundary
 
-All profiles share the same cache-image decode boundary. h5policy validates the
-`MDCI` message, bounded container and entry envelopes, and records the address
-ranges shadowed by cache entries. It does not decode the cached entry bodies.
-A structurally valid cache-image fixture therefore returns exit `5`,
-`unsupported_coverage_gap`, and
-`H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`; `analysis.complete` and
-`analysis.walk_completed` are `false`.
+All profiles validate the `MDCI` message, bounded container and entry
+envelopes, image checksum, and cached entry bodies. After the container pass,
+h5policy uses an in-memory read overlay to route each shadowed logical range to
+its validated cached body, then runs the ordinary metadata decoder. It does not
+write the input, create a whole-file copy, or open an external file.
 
-`--continue-after-rejection` is not a cache-image enable switch. With
-continuation enabled, h5policy skips only shadowed addresses and continues
-checking reachable unshadowed metadata, then reports
-`analysis.stop_reason: "cache_image_coverage_gap"`. Without continuation, the
-normal fail-fast stop reason is `"rejection"`. Neither mode accepts the file.
+A structurally valid cache-image fixture therefore returns exit `0`, `accept`,
+and `analysis.complete` / `analysis.walk_completed` are `true`. A bad envelope,
+checksum, or cached body is `reject_corrupt`.
+An internal cache-client body that cannot reach a type-aware decoder remains an
+explicit `unsupported_coverage_gap`, never an acceptance.
+
+`--continue-after-rejection` remains a diagnostic traversal control; it does
+not weaken cached-body validation or change a rejection into acceptance.
 
 For example:
 
 ```sh
 ./h5policy/tools/h5policy --profile forensic \
     --continue-after-rejection h5policy/tests/valid/cache_image.h5
-echo $?  # 5
+echo $?  # 0
 ```
 
 The complete coverage description is in the

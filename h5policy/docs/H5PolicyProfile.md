@@ -95,33 +95,25 @@ makes a fail-fast rejection distinguishable from an exhaustive diagnostic pass.
 
 ### Metadata cache-image hard boundary
 
-Metadata cache-image decode coverage is not controlled by
-`H5FeaturePolicy` and has no profile-specific `allow_*` switch. h5policy
-validates the cache-image message, bounded container and entry envelopes, then
-records the address ranges shadowed by its entries. The cached entry bodies are
-not decoded. Reading the ordinary bytes at a shadowed address would interpret
-stale backing storage as live metadata, so those ranges are never mapped as
-object headers or other live structures.
+Metadata cache-image decoding is not controlled by `H5FeaturePolicy` and has
+no profile-specific `allow_*` switch. h5policy validates the cache-image
+message, bounded container and entry envelopes, and image checksum. It then
+replays cached entry bodies through an in-memory read overlay at the shadowed entry's logical
+address, so the normal object-header, tree, heap, and index validators see the
+authoritative cached bytes rather than stale backing storage. The overlay never
+writes the input, creates a whole-file copy, or opens another file.
 
-For a structurally valid cache image, every built-in profile therefore returns
-exit `5`, decision `unsupported_coverage_gap`, and
-`H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`. `analysis.complete` and
-`analysis.walk_completed` remain `false`.
+For a structurally valid cache image, every built-in profile can return exit
+`0`, decision `accept`, with `analysis.complete` and
+`analysis.walk_completed` true. A corrupt envelope, checksum, or replayed body
+produces `reject_corrupt` under the normal decision precedence.
+An internal cache-client body that cannot reach a type-aware decoder remains an
+explicit `unsupported_coverage_gap` rather than an approval.
 
-Control flow still reflects the effective continuation setting:
-
-- without continuation, the unsupported finding triggers the normal fail-fast
-  path and `analysis.stop_reason` is `"rejection"`;
-- with continuation, shadowed addresses are skipped while reachable unshadowed
-  metadata continues to be checked, and
-  `analysis.stop_reason` is `"cache_image_coverage_gap"`.
-
-The `forensic` profile enables continuation by default, but this does not weaken
-the boundary. An explicit `--continue-after-rejection` behaves the same way:
-it can collect additional diagnostics from unshadowed metadata, but it cannot
-decode cached bodies, mark the walk complete, or convert the refusal into an
-acceptance. A corrupt cache-image envelope can instead produce
-`reject_corrupt` under the normal decision precedence.
+The `forensic` profile enables continuation by default, and an explicit
+`--continue-after-rejection` can collect additional diagnostics after a cached
+body is rejected. Neither setting weakens cached-body validation or changes a
+rejection into acceptance.
 
 ### Report schema and file geometry
 
@@ -237,8 +229,8 @@ complete unique-extent measure. Current accounting calls cover:
 
 In particular, general byte mappings do not charge this counter automatically.
 Dense fractal-heap/B-tree blocks, SOHM heap data blocks and encoded message
-bodies, VDS global-heap objects, metadata-cache image bodies, and fixed-array
-chunk-index data blocks are not uniformly included. Reaching the same
+bodies, VDS global-heap objects, and fixed-array chunk-index data blocks are
+not uniformly included. Reaching the same
 explicitly accounted structure through distinct paths is not guaranteed to be
 globally deduplicated by the accounting helper.
 

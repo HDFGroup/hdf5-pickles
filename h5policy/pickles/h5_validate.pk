@@ -173,6 +173,13 @@ fun h5policy_map_bytes = (int ios, H5PolicyProfile profile,
                           offset<uint<64>,B> off,
                           uint<64> size) byte[]:
 {
+    var source = h5policy_mdci_replay_source(off/#B, size);
+    if (source != 0xffffffffffffffffUL)
+        {
+            if (h5policy_run_options.nonstrict_mapping != 0UB)
+                return byte[size] @! ios : source#B;
+            return byte[size] @ ios : source#B;
+        }
     if (h5policy_run_options.nonstrict_mapping != 0UB)
         return byte[size] @! ios : off;
     return byte[size] @ ios : off;
@@ -375,7 +382,8 @@ fun h5policy_validate_superblock = (int ios, superblock sb,
                                             "superblock",
                                             "superblock extension address is outside the file");
 
-            var checksum_bytes = byte[(sb'size/#B) - 4UL] @ ios : super_off;
+            var checksum_bytes = h5policy_map_bytes(ios, profile, super_off,
+                                                     (sb'size/#B) - 4UL);
             var checksum = lookup3_hashlittle(checksum_bytes, 0);
             if (checksum != sb.super.v2_v3.chksum)
                 h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM",
@@ -813,6 +821,27 @@ fun h5policy_walk_reachable_metadata = (int ios,
     h5policy_enqueue_ohdr(profile, root_off/#B, 0UL, "/",
                           root_off, "/");
 
+    /* A cache image is not merely a shortcut for the root graph: every cached
+       object-header client is serialized as a body that libhdf5 can later
+       protect.  Seed those headers too, including entries not otherwise
+       reachable from the current root, so replay cannot accidentally approve
+       an opaque cached OHDR. Other client types are accounted for below by the
+       normal walk's reached-kind record. */
+    if (h5policy_mdci_replay_mode != 0)
+        {
+            var image_entry = 0UL;
+            while (image_entry < h5policy_mdci_body_addrs'length as uint<64>)
+                {
+                    if (h5policy_mdci_body_types[image_entry] == 5UL)
+                        h5policy_enqueue_ohdr(
+                            profile, h5policy_mdci_body_addrs[image_entry], 0UL,
+                            "/<cache-image-entry>",
+                            h5policy_mdci_body_addrs[image_entry]#B,
+                            "/<cache-image-entry>");
+                    image_entry = image_entry + 1UL;
+                }
+        }
+
     /* pending_index advances monotonically through the queue.  New hard links
        discovered while validating an object are appended and picked up later,
        which gives breadth-first traversal without mutating already visited
@@ -887,6 +916,30 @@ fun h5policy_walk_reachable_metadata = (int ios,
         {
             h5policy_walk_stop_reason = "cache_image_coverage_gap";
             return ctx;
+        }
+
+    /* Do not claim a completed MDCI analysis unless every serialized client
+       body was reached by a type-aware normal decoder.  This keeps unusual
+       internal cache-client IDs a safe coverage refusal rather than silently
+       treating the read overlay itself as validation. */
+    if (h5policy_mdci_replay_mode != 0)
+        {
+            var image_entry = 0UL;
+            while (image_entry < h5policy_mdci_body_addrs'length as uint<64>)
+                {
+                    if (!h5policy_was_reached(h5policy_mdci_body_addrs[image_entry]))
+                        {
+                            h5policy_emit_error(
+                                "H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                "unsupported",
+                                h5policy_mdci_body_addrs[image_entry]#B,
+                                "/<cache-image-entry>",
+                                "metadata cache image entry body was not reached by a type-aware decoder");
+                            h5policy_walk_stop_reason = "cache_image_coverage_gap";
+                            return ctx;
+                        }
+                    image_entry = image_entry + 1UL;
+                }
         }
 
     h5policy_walk_completed = 1;
