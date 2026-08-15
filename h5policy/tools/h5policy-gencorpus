@@ -804,6 +804,8 @@ def _gen_malformed(root):
         f"{root}/malformed/compound_member_array_bounds.h5")
     _make_compound_member_offset_oob(
         f"{root}/malformed/compound_member_offset_oob.h5")
+    _make_compound_member_array_off12_oob(
+        f"{root}/malformed/compound_member_array_off12_oob.h5")
     _make_scaleoffset_nelmts_mismatch(
         f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
     _make_scaleoffset_size_mismatch(
@@ -841,6 +843,8 @@ def _gen_malformed(root):
     _make_bad_snod_empty_name(f"{root}/malformed/bad_snod_empty_name.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
+    _make_heap_free_list_size_wrap(
+        f"{root}/malformed/heap_free_list_size_wrap.h5")
     _make_bad_message_flag_combination(
         f"{root}/malformed/bad_message_flag_combination.h5")
     _make_bad_link_info_max_corder(
@@ -1334,6 +1338,39 @@ def _make_compound_member_array_bounds(path):
     # A single 262144-element u8 array in a 16-byte compound element.
     dt = _v1_compound_array_member(16, (262144, 0, 0, 0), 1, 8)
     _splice_compact_datatype(path, dt, 16)
+
+
+def _make_compound_member_array_off12_oob(path):
+    """The v1 embedded-array promotion defect in its REACHABLE shape: a promoted
+    member that is small, but starts late enough to end past its element.
+
+    The sibling fixtures put an enormous or wrapped member at offset 0, which is
+    the right shape for testing the arithmetic and the wrong shape for reaching
+    the consumer: a member at offset 0 whose promoted size wraps to something
+    SMALL cannot be caught by a bounds check, because small means in bounds --
+    and equally, it cannot read out of bounds.  The dangerous geometry needs a
+    NONZERO offset, so that a modest promoted size still lands past the end.
+
+    Here the element is 16 bytes and the single member sits at offset 12 with a
+    [2] array of H5T_STD_U32LE behind it -- promoted footprint 8 bytes, ending
+    at 20.  libhdf5's guards at H5Odtype.c:507/:509 test the 4-byte BASE type
+    before H5T__array_create promotes it at :542 and never re-run, so the file
+    is accepted, and H5T__conv_struct_opt (H5Tconv_compound.c:868) then reads
+    the member at its promoted size during H5Dread: an ASAN heap-buffer-overflow
+    READ of size 8, 0 bytes after a 16-byte region.
+
+    This is the specimen that makes the family a memory-safety defect rather
+    than an acceptance divergence -- see
+    registry/cases/compound-member-array-promotion-unguarded.yml.  It is
+    deliberately width-INdependent: dims [2] give 8 bytes at both 32-bit and
+    64-bit, so unlike its wrap-driven neighbours it reproduces the same way
+    everywhere.
+    """
+    dt = bytearray(_v1_compound_array_member(16, (2, 0, 0, 0), 4, 32))
+    # _v1_compound_array_member hardwires the member byte offset to 0; the field
+    # sits at datatype byte 16 (8-byte header + 8-byte padded name "a").
+    struct.pack_into("<I", dt, 16, 12)
+    _splice_compact_datatype(path, bytes(dt), 16)
 
 
 def _v1_compound_plain_member(elem_size, member_off, base_size, base_precision):
@@ -3683,6 +3720,64 @@ def _make_bad_heap_free_list(path):
     # HEAP(4) + version(1) + reserved(3) + data-segment size(length), then the
     # free-list head offset(length).  Point it well past the small data segment.
     struct.pack_into("<Q", raw, heap + 16, 0x1000)
+    _patch(path, bytes(raw))
+
+
+def _make_heap_free_list_size_wrap(path):
+    """A local-heap free block whose SIZE wraps the bound meant to reject it.
+
+    Distinct from bad_heap_free_list.h5 next to it, and the distinction is the
+    whole point.  That fixture puts the free-list HEAD outside the data segment,
+    which libhdf5 catches.  This one keeps the head legal and makes the free
+    block's SIZE enormous, which libhdf5 does NOT catch: H5HLcache.c:258 tests
+
+        if ((fl->offset + fl->size) > heap->dblk_size)
+
+    as an ADDITION on size_t, so offset 32 plus size 2**64-1 sums to 31 -- well
+    inside any real dblk_size -- and the node is admitted into heap->freelist.
+    h5policy bounds the same relation by subtraction after an explicit
+    `offset > dblk_size` gate, so it cannot wrap and rejects the node.
+
+    Two traps for anyone editing this:
+      * H5HL_FREE_NULL is 1, NOT 0 and not all-ones.  The next-offset field must
+        be 1 to terminate the chain; the decoder rejects a literal 0 outright
+        ("free block size is zero?"), and an all-ones next-offset builds a
+        different specimen that never reaches the size check.
+      * The consequence is RDWR-ONLY.  A read-only traversal never acts on the
+        admitted node; the ASAN heap-buffer-overflow WRITEs appear in
+        H5HL__fl_serialize (H5HLcache.c:308) and H5HL_insert (H5HL.c:690) via an
+        ordinary H5Gcreate2.  So the corpus and probes, which are read-only,
+        cannot observe the defect this fixture encodes -- they can only assert
+        that h5policy rejects the file.
+
+    See registry/cases/local-heap-free-list-bound-wraps.yml.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    heap = raw.find(b"HEAP")
+    if heap < 0:
+        raise RuntimeError("could not locate the local heap")
+    # HEAP(4) + version(1) + reserved(3), then data-segment size, free-list head
+    # and data-segment address, each one `length` field wide.
+    # sizeof_lengths lives at superblock byte 14 in a VERSION 0 superblock,
+    # which is what libver="earliest" produces -- NOT byte 10, which is where it
+    # sits in v2/v3.  Assert the version so a future libver change fails loudly
+    # instead of silently reading the wrong byte.
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    if raw[14] != 8:
+        raise RuntimeError(f"expected 8-byte lengths, got {raw[14]}")
+    dblk_size = struct.unpack_from("<Q", raw, heap + 8)[0]
+    dblk_addr = struct.unpack_from("<Q", raw, heap + 24)[0]
+    off = 32                                   # free-list head, comfortably legal
+    if off + 16 > dblk_size:
+        raise RuntimeError(
+            f"data segment is {dblk_size} bytes; too small to hold a free-list "
+            f"node at offset {off}")
+    struct.pack_into("<Q", raw, heap + 16, off)                  # head -> our node
+    struct.pack_into("<Q", raw, dblk_addr + off, 1)              # next == H5HL_FREE_NULL
+    struct.pack_into("<Q", raw, dblk_addr + off + 8, 0xFFFFFFFFFFFFFFFF)  # size
     _patch(path, bytes(raw))
 
 
