@@ -1,0 +1,328 @@
+# The global-heap object loop advances by a value that is guaranteed positive
+# for every object EXCEPT the index-0 free-space sentinel, whose declared size
+# is used raw. A zero there leaves the cursor where it was, and the loop
+# condition unchanged.
+#
+# Promoted from two bundles that reach the same defect from different distances:
+#   cases/1a6d11ec3769c1a7183083db6f45b59d   orphaned collection -- inert until swept
+#   cases/crafted                            VDS mapping references it -- reachable
+# They are recorded together because the PAIR is the finding: the same
+# zero-progress object is harmless when nothing points at it and a
+# non-terminating open when something does. Either bundle alone would misstate
+# the severity, in opposite directions.
+schema_version: 1
+
+id: global-heap-zero-progress-sentinel
+title: the global-heap index-0 free-space sentinel advances the parse cursor by
+  its raw declared size, so a zero-size sentinel makes the decode loop
+  non-terminating
+status: oracle-hardened          # h5policy reports it; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: heap_structures
+versions: [1]                    # version-1 global heap collection
+root_cause_classification: local_decode
+violated_invariant:
+  - heap.global_progress
+validation_closure: >-
+  one complete version-1 global heap collection: its 16-byte header and the
+  ordered closure of object headers and payload extents through the declared
+  collection end.  Every accepted object -- INCLUDING the index-0 free-space
+  sentinel -- must advance the cursor by a positive checked extent before native
+  heap construction continues.
+activation_before_validation:
+  - native_construction
+  - cache_publication            # unverified on the orphaned specimen
+entry_points:
+  - h5policy (oracle) -- forensic reports the non-progress; see profile_note
+  - "libhdf5 H5HG__cache_heap_deserialize (src/H5HGcache.c:272-366)"
+  - "reachable route: a VDS mapping referencing the collection"
+  - "direct consumer: h5debug at the collection offset"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  The object loop is
+      while (p < (heap->chunk + heap->size)) {          /* :272 */
+  and the step it takes is computed in two branches that do NOT have the same
+  guarantee:
+      if (idx > 0) {
+          need = H5HG_SIZEOF_OBJHDR(f) + H5HG_ALIGN(heap->obj[idx].size);   /* :353 */
+          ...
+      }
+      else
+          need = heap->obj[idx].size;                                       /* :358 */
+      if (H5_IS_BUFFER_OVERFLOW(begin, need, p_end))                        /* :363 */
+          HGOTO_ERROR(... "ran off end of input buffer while decoding");
+      p = begin + need;                                                     /* :365 */
+  For any normal object the step includes H5HG_SIZEOF_OBJHDR(f), so `need` is
+  structurally positive and progress is guaranteed however small the payload.
+  For the index-0 sentinel the declared size is used RAW, with no header addend
+  and no floor.  A file declaring zero yields need == 0, p == begin, and a loop
+  condition that has not changed.  The decode does not terminate.
+  The bounds check at :363 is no help: `need` of zero passes it trivially.  This
+  is a LIVENESS failure, not a memory-safety one -- nothing is read out of
+  bounds; the parse simply never ends.
+  THE INTENDED INVARIANT IS WRITTEN DOWN AND NOT ENFORCED.  The comment
+  immediately above the branch (:348-351) says the free-space object's "size is
+  never padded and already includes the object header".  That is exactly the
+  property that would make :358 safe -- and it is an assumption about what a
+  conforming writer emits, with nothing checking it on read.
+  Note the same function DOES handle a related case carefully: the too-small
+  tail at :274-287 synthesises obj[0] from the remaining bytes and steps by that
+  remainder, which is positive by construction.  So the file contains a correct
+  treatment of the sentinel a dozen lines above the incorrect one.
+
+shape_note: >-
+  This is the second record in this directory whose defect is BRANCH ASYMMETRY
+  -- one arm of a decision lacking a property the other arms get for free.  The
+  first is registry/cases/layout-v4-ndims-lower-bound-missing.yml, where the
+  v4+ layout decoder omits a lower bound that both older decoders apply.
+  In both cases the unguarded arm is the SPECIAL CASE: the newest version there,
+  the sentinel index here.  Worth noting as a review heuristic -- when a decoder
+  special-cases one value or version, check whether the special case inherits
+  the general path's guarantees or merely its structure.
+
+# -- The two reaches, and why both are needed ---------------------------------
+triggers:
+  orphaned:
+    bundle: cases/1a6d11ec3769c1a7183083db6f45b59d
+    specimen: input_sha256
+      ccee352f0d2663c4d8badc6908bdfe74c111e29b6beb48cbd07deb615d587898
+    how: >-
+      A version-1 global heap collection carrying a zero-extent index-0
+      sentinel, with NOTHING in the file referencing it.  The 16-byte GCOL
+      header plus the first 16-byte object header at [88,120) are the whole
+      witness.
+    reach: >-
+      Not reached by a normal open.  H5Fopen, H5Ovisit3 and h5dump -H load only
+      the empty root and never touch the orphaned collection.  It is inert until
+      something sweeps unreachable metadata.
+    impact: >-
+      h5debug directed at offset 88 TIMES OUT (five seconds).  A latent
+      non-termination, reachable by forensic tooling rather than by ordinary
+      reads.
+    oracle_finding: >-
+      forensic: reject_resource, H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP @ 104.
+      untrusted-strict ACCEPTS -- see profile_note, this is deliberate.
+  referenced_via_vds:
+    bundle: cases/crafted
+    specimen: input_sha256
+      417c2f1d2cf32df0e1f0e2124fc4d336a8a2fb85bacbd50234260c8d4fc2f3e5
+    how: >-
+      The same zero-progress collection, but with a VDS mapping referencing it,
+      so an ordinary open reaches the heap.
+    reach: >-
+      Reached.  And reached EARLY: libhdf5 fails to terminate BEFORE any
+      source-file activation, so the non-termination lands ahead of the point
+      where a VDS consumer would open external sources.
+    impact: >-
+      Stock, ASan and direct-tool consumers all fail to terminate.  This is the
+      trigger that makes the defect a denial of service through a normal open
+      rather than a forensic-tool curiosity.
+    oracle_finding: >-
+      forensic: reject_policy with H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP @ 2176.
+      untrusted-strict: reject_policy at H5_POLICY_VDS @ 896 -- it stops at the
+      VDS policy boundary before loading the referenced heap.
+
+profile_note: >-
+  The two specimens produce different strict-profile verdicts and NEITHER is a
+  clean library verdict on the heap defect.  Both bundles say so themselves and
+  the distinction is worth preserving.
+  On the ORPHANED specimen untrusted-strict ACCEPTS.  That is by design: strict
+  reachability validation does not load raw data or sweep unreachable metadata,
+  so an orphaned collection is out of scope.  It must NOT be read as the oracle
+  missing the defect -- forensic, which does sweep, reports it.
+  On the VDS specimen untrusted-strict rejects, but at H5_POLICY_VDS, before the
+  referenced heap is ever loaded.  A policy control firing first is protection,
+  not detection.
+  So for this defect FORENSIC is the profile that carries the finding on both
+  specimens, and any future fixture for it should be contracted against forensic
+  unless it is built to be reachable without tripping a policy rule first.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    Everything under `measured` and `triggers` is the bundles', and was NOT
+    re-measured at promotion -- this session could not execute the oracle or the
+    probes.  The SOURCE claims in `defect` were read from the 2.3.0 tree at
+    promotion and are current.
+  libhdf5_as_recorded: >-
+    ORPHANED specimen: the exact-build probes report unverified_coverage_gap on
+    both builds -- the collection is never reached -- while the direct consumer
+    h5debug times out.  So the probe's silence is a reachability artifact, not a
+    safety result.
+    VDS specimen: stock, ASan and direct-tool consumers all fail to terminate,
+    before any source-file activation.
+    NOTHING FAULTS on either.  There is no ASan report to obtain, because
+    nothing is read out of bounds -- which is exactly why a sanitizer-first
+    methodology would miss this family entirely.
+  width: >-
+    NOT measured at 32 bits, and not expected to matter: a zero step is zero at
+    any width.  What could differ is how quickly a consumer is noticed to be
+    hung, which is not a property of the file.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_resource (orphaned, forensic) / reject_policy (VDS)
+  libhdf5: does not terminate
+  libhdf5_version: 2.3.0
+  classification: agreement-in-intent, incomparable-in-form
+  note: >-
+    There is no invariant-A disagreement to carry and no entry in
+    registry/h5policy-diff-tolerances.yml is warranted or present -- but not
+    because the two sides agree in the usual way.  h5policy reaches a verdict
+    and libhdf5 reaches no verdict at all.  A harness that compares exit codes
+    has nothing to compare against a process that never exits; the differential
+    can only record a timeout, which is why the tracked fixture is contracted as
+    a RESOURCE case rather than through the A-invariant machinery.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Minimal: reject a zero advance before reassigning the cursor.  At
+    src/H5HGcache.c:358-365, require `need > 0` -- or better, give the index-0
+    branch the same floor the general branch gets for free, since the comment at
+    :348-351 already asserts that the sentinel's size includes the object
+    header.  Enforcing the documented assumption is the whole fix.
+    Systemic, and the bundles are right that the minimal fix is not the boundary:
+    the object-list loop needs checked remaining-length arithmetic and a
+    monotonic-cursor assertion covering BOTH normal objects and the sentinel.  A
+    zero-size check blocks these two specimens; a cursor that is proven to
+    advance blocks the class.
+    Strict tightening either way -- no conforming writer emits a sentinel that
+    does not advance, because such a collection could not be re-read by the
+    writer itself.
+systemic:
+  semantic_boundary: >-
+    complete global-heap collection raw decode: decode inert object descriptors
+    under a cursor and step budget; prove every span is positive, properly
+    aligned and inside the collection; only then construct or publish
+    H5HG_heap_t.
+  status: open-followup
+  owner: unassigned
+  description: >-
+    h5policy detects the non-progress and reports it as a resource finding
+    rather than looping, so the oracle is safe -- but note this is a BUDGET
+    catching the condition, which is the right containment for a liveness defect
+    and is not the same as a structural rejection.
+    The remaining work is libhdf5's.
+  landed_changes:
+    - h5policy/pickles (heap.global_progress; H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP)
+    - h5policy/tests/resource/gheap_infinite_loop.h5 + expectation
+    - registry/findings/catalog (H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP)
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_pocs:
+    - cases/1a6d11ec3769c1a7183083db6f45b59d/input.h5     # orphaned
+    - cases/crafted/input.h5                              # referenced via VDS
+  direct_fixtures:
+    - h5policy/tests/resource/gheap_infinite_loop.h5
+  expectations:
+    - h5policy/tests/expected/resource-gheap_infinite_loop.yml
+  direct_witness: >-
+    The 16-byte GCOL header plus the first 16-byte object header at [88,120) of
+    the orphaned specimen.  No public raw-global-heap decoder API exists
+    locally, so h5debug is the available direct consumer -- and it times out,
+    which IS the measurement.
+  generator: >-
+    NEITHER specimen has a deterministic generator.  h5cve minimize is deferred
+    and the available mutator produced zero recipes, since neither seed has
+    continuations.  cases/crafted.py exists beside the crafted bundle and is the
+    nearest thing to a recipe; it was not verified at promotion.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true          # and notably true of the VDS specimen too --
+                                    # the hang precedes source-file activation
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []
+
+fuzz_seed: >-
+  Both specimens seed the global-heap object-list neighbourhood.  The productive
+  axis is narrow and obvious: the index-0 sentinel's declared size, where 0 is
+  the defect, values below H5HG_SIZEOF_OBJHDR violate the documented assumption
+  without being zero, and anything at or above it is well formed.  That middle
+  band -- nonzero but below the header size -- is unexercised by either
+  specimen and is the interesting untested region.
+
+compatibility_backport_risks: >-
+  Low.  A sentinel that does not advance the cursor describes a collection its
+  own writer could not re-read, so no conforming file depends on the current
+  behaviour.  The one thing to check per branch is the too-small-tail path at
+  :274-287, which synthesises obj[0] itself: a floor applied indiscriminately
+  must not reject the synthesised sentinel, whose size is computed rather than
+  read.
+
+sibling_audit: >-
+  Within libhdf5: H5HG__cache_heap_deserialize is the audited function, and the
+  correct handling of the synthesised tail sentinel at :274-287 sits in it,
+  twelve lines from the defective read path.  NOT audited: other cursor loops in
+  the heap code, and whether any other decoder derives a step from a raw
+  file-declared size without a structural floor.  The general shape -- a loop
+  whose step is attacker-controlled and not proven positive -- has not been
+  swept for, and it is distinct from the three bound-application shapes in
+  registry/cases/decoder-bound-shape-sweeps.yml because the failure is liveness
+  rather than extent.
+  Within h5policy: the non-progress is caught by a budget rather than by a
+  structural rule.  Whether every other cursor loop in the pickles has an
+  equivalent budget is asserted from the walk-operation accounting, not verified
+  per loop.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Both bundles measured 2.3.0 and the asymmetric step
+    at src/H5HGcache.c:353/:358 was verified present in the 2.3.0 tree at
+    promotion.  No archaeology was run.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    NO GENERATOR FOR EITHER SPECIMEN.  Both are supplied files with no
+    deterministic reducer, and the tracked resource fixture is a third file.
+    cases/crafted.py may be a recipe for the VDS one and was not verified.
+  - >-
+    THE MIDDLE BAND IS UNEXERCISED: a sentinel size that is nonzero but smaller
+    than H5HG_SIZEOF_OBJHDR violates the documented assumption at :348-351
+    without producing a zero step.  Whether that under-advances (mis-parsing
+    subsequent objects) or is harmless is untested, and it is the case a naive
+    `need > 0` fix would still admit.
+  - >-
+    NOTHING WAS RE-MEASURED AT PROMOTION (source claims excepted).
+  - >-
+    No 32-bit measurement, though none is expected to matter here.
+open_questions:
+  - >-
+    Does the non-termination consume CPU or block?  The record says "does not
+    terminate" throughout because that is what was measured (timeouts), but a
+    spinning loop and a stalled one have different operational signatures and
+    the bundles do not distinguish them.  It matters for how a consumer would
+    detect this in production.
+  - >-
+    Are there other decoders whose loop step comes from a raw file-declared size
+    with no structural floor?  This is a liveness analogue of the bound-shape
+    sweeps and no sweep exists for it.
+
+provenance:
+  found_by: >-
+    two supplied specimens, triaged through the h5cve bundle workflow in
+    cases/1a6d11ec3769c1a7183083db6f45b59d and cases/crafted; promoted jointly
+    2026-08-15.  What promotion added is the branch-asymmetry framing -- the
+    idx>0 arm gets a structurally positive step and the idx==0 arm does not --
+    and the observation that the comment at :348-351 states the missing
+    invariant explicitly.
+  hdf5_build: >-
+    HDF5 2.3.0 (source 4b1ffa68a840).  Neither specimen faults on any build;
+    both produce non-termination or timeouts.  Workstation-local installs;
+    paths not recorded.
+  poke_version: GNU poke 4.3

@@ -1,0 +1,299 @@
+# The filtered fractal-heap header hands its pipeline decoder the length of the
+# ENCLOSING cache image instead of the pipeline's own declared extent -- so the
+# decoder is told it has 182 bytes when the pipeline declares 24.
+#
+# Promoted from one working bundle:
+#   cases/9384b71d6586e2b0c1f5470f7195a26a
+#
+# Third distinct shape of one class. See shape_note: the bound here is neither
+# discarded nor computed wrongly -- it is a valid length belonging to the wrong
+# object, substituted for the right one.
+schema_version: 1
+
+id: filtered-heap-pipeline-given-enclosing-extent
+title: the filtered fractal-heap deserializer passes the cache-image length,
+  not the declared filter_len, as the pipeline decoder's bound
+status: oracle-hardened          # h5policy rejects; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  Nothing about
+  affected releases or disclosure state should be inferred from the bundle's
+  directory name.
+
+# -- Triage -------------------------------------------------------------------
+record: dense_index
+versions: [2, 3]                 # fractal heap header versions carrying a pipeline
+root_cause_classification: local_decode
+violated_invariant:
+  - dense.filter_pipeline_bounds
+validation_closure: >-
+  the filter-pipeline prefix, every descriptor extent, and the FRHP header's
+  declared filter_len -- with the descriptor spans checked against THAT extent,
+  not against whatever buffer happens to enclose it.  At the integration level,
+  the root group's dense-link index referencing the filtered heap header.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - h5policy (oracle) -- rejects the descriptor overrun at the header
+  - "libhdf5 H5Fopen -> H5Lvisit2 (dense_index canary)"
+  - "libhdf5 H5C_protect -> H5C__load_entry -> H5HF__cache_hdr_deserialize (src/H5HFcache.c:527) -> H5O_msg_decode -> H5O__pline_decode (src/H5Opline.c:232)"
+  - "public API reaching it: H5Gget_info then H5Lget_name_by_idx"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  H5HF__cache_hdr_deserialize knows the pipeline's declared extent, uses it
+  correctly immediately before the call and immediately after it, and does not
+  use it for the call:
+      hdr->heap_size += (size_t)(hdr->sizeof_size
+                                 + (unsigned)4
+                                 + hdr->filter_len);        /* :518  filter_len, correct */
+      ...
+      if (NULL == (pline = (H5O_pline_t *)H5O_msg_decode(hdr->f, NULL,
+                                          H5O_PLINE_ID, len, image)))   /* :527  len -- WRONG */
+          HGOTO_ERROR(... "can't decode I/O pipeline filters");
+      image += hdr->filter_len;                              /* :531  filter_len, correct */
+  `len` is the length of the enclosing heap-header cache image -- 182 bytes on
+  this specimen -- while `hdr->filter_len` is the pipeline's own declared extent,
+  24 bytes.  The decoder is therefore given a bound seven times too generous,
+  and a descriptor that overruns the pipeline by 8 bytes passes unnoticed
+  because it still fits inside the enclosing image.  It only faults when the
+  accumulated overrun leaves the image entirely: ASan reports a 1-byte
+  heap-buffer-overflow READ at src/H5Opline.c:232, one byte past the 182-byte
+  header image.
+  The right value is in scope, on both sides of the call, three lines apart.
+
+shape_note: >-
+  This is the THIRD distinct way a bound fails to be applied in this codebase's
+  cache clients, and the three are worth holding apart because they need
+  different detection and different fixes:
+    DISCARDED   the bound is passed and declared unused --
+                `size_t H5_ATTR_UNUSED len` in H5B2cache.c; see
+                registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml
+    UNRELATED   the bound is used, but the position checked against it is
+                computed from header constants instead --
+                src/H5HFcache.c:1596; see
+                registry/cases/fractal-heap-dblock-size-no-floor.yml
+    SUBSTITUTED the bound applied is a real, correct length -- of the wrong
+                object.  This record.
+  Note the last two are in the SAME FILE, src/H5HFcache.c, at :527 and :1596.
+  One cache client contains two different failures of the same class, which
+  suggests the class is a property of the client/framework contract rather than
+  of any one author's slip.
+  Detection consequence, recorded in
+  registry/cases/decoder-bound-shape-sweeps.yml: a grep can find the first
+  shape, struggles with the second, and cannot find the third at all -- `len` is
+  passed, spelled normally, and simply names the wrong extent.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    Everything under `measured` is the bundle's, recorded at h5policy 07ad5e7
+    against libhdf5 2.3.0, and was NOT re-measured at promotion -- this session
+    could not execute the oracle or the probes.  The SOURCE claims in `defect`
+    were read from the 2.3.0 tree at promotion and are current.  The bundle's
+    libhdf5 measurements are already 2.3.0, so there is no version skew.
+  oracle_as_recorded: >-
+    reject_corrupt, H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE @ 803 on /,
+    "dense link filtered heap filter descriptor overruns the pipeline message".
+    NOTE a second finding on the same specimen: the descriptor names filter id
+    32768, a non-core filter, so untrusted-strict also raises
+    H5_POLICY_DYNAMIC_FILTER.  The bundle's family_coverage lists only the
+    policy finding while its oracle block names the corrupt one; both are real
+    and the corrupt one is the record's subject.  A specimen using a CORE filter
+    id would isolate the extent defect from the policy finding, and none exists.
+  libhdf5_as_recorded: >-
+    Release 2.3.0: rejected_in_traversal, no forbidden activation.  Note h5ls -r
+    exits 0 on this file -- it lists only / and never reaches the heap -- while
+    h5dump -H exits 1.  A stock h5ls run is not evidence about this family.
+    ASan 2.3.0: CRASHED, heap-buffer-overflow READ of size 1 at
+    src/H5Opline.c:232, through H5O__pline_shared_decode <- H5O_msg_decode <-
+    H5HF__cache_hdr_deserialize (:527) <- H5C__load_entry <- H5C_protect.
+    Canary status `violation`; comparison recorded as inconclusive.
+  geometry: >-
+    Measured from the file (pipeline-byte-layout.md in the bundle):
+      file bytes                          823
+      fractal heap header offset          641, 182 bytes
+      filter pipeline offset              795, declared 24 bytes, version 1
+      descriptor offset                   803, filter id 32768, name length 8,
+                                          2 client-data elements
+      descriptor bytes required           24 after the prefix
+      bytes actually available            16
+      descriptor overrun                   8
+      trailing checksum offset            819
+      first offset outside the image      823
+    So the descriptor overruns its own pipeline by 8 bytes but stays inside the
+    182-byte image, which is exactly why the substituted bound does not catch
+    it -- and why the ASan fault is only 1 byte, at the image edge, rather than
+    at the pipeline edge where the defect actually is.
+  width: >-
+    NOT measured at 32 bits.  All operative sizes (24, 182, 823) fit a 32-bit
+    size_t and the arithmetic has no width-dependent overflow -- this is an
+    extent SUBSTITUTION, not a truncation, so p_size is 182 rather than 24 at
+    either width.  A portability analysis, not an observed result.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: rejected_in_traversal (Release) / crashed (ASan)
+  libhdf5_version: 2.3.0
+  classification: agreement-on-verdict, divergence-on-safety
+  note: >-
+    Both sides refuse the file, so there is no invariant-A disagreement and NO
+    entry in registry/h5policy-diff-tolerances.yml is warranted or present.
+    But the Release build's rejection happens after the over-read, not instead
+    of it -- the bundle's containment section says so directly: "the current
+    stock build rejects later during traversal, but its ASAN sibling reads one
+    byte past the 182-byte heap-header image, so that rejection is not
+    containment."  That sentence is the right template for reading any
+    Release-build rejection in this registry.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Pass the declared extent, not the enclosing one: at src/H5HFcache.c:527 give
+    H5O_msg_decode `hdr->filter_len` as p_size instead of `len`, after checking
+    that the declared pipeline range lies wholly within the header image.
+    The second half matters -- substituting filter_len alone moves the bound to
+    an attacker-controlled field, so it must first be shown to fit the image.
+    Both quantities are already in scope at that point.
+    Strict improvement: valid headers pass the same exact pipeline extent either
+    way, so no conforming file changes behaviour.  What changes for malformed
+    input is an accidental read toward the heap checksum/trailing boundary
+    becoming a bounded decode failure.
+systemic:
+  semantic_boundary: >-
+    a bounded raw filter-pipeline payload decoder at EVERY caller, with each
+    caller supplying its own encoded subrange, and validation completing before
+    H5HF_hdr_t or H5O_pline_t construction or cache publication.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 call site open
+  description: >-
+    h5policy validates descriptor spans against the pipeline's declared extent
+    and rejects at the header, with no native pipeline or heap-header
+    construction.  One pipeline validator is routed through every role that
+    carries one -- dataset PLINE, dense-link FRHP, dense-attribute FRHP and
+    SOHM FRHP -- so the coverage does not depend on which client reached it.
+    The remaining work is libhdf5's, and beyond the one-line call-site fix the
+    bundle names a deeper one: the reusable decoder allocates H5O_pline_t before
+    descriptor validation, and the heap deserializer has already allocated
+    H5HF_hdr_t.  Inert raw decode with delayed native construction is the
+    systemic form; it is not present in the inspected source.
+  landed_changes:
+    - h5policy/pickles (dense.filter_pipeline_bounds, shared across pipeline roles)
+    - h5policy/tools/h5policy-gencorpus (rewrites a valid dense-link FRHP header
+      into the filtered form and plants the overrunning descriptor)
+    - h5policy/tests/malformed/filtered_dense_link_pipeline_overrun.h5 + expectation
+    - registry/findings/catalog (H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE)
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: cases/9384b71d6586e2b0c1f5470f7195a26a/input.h5
+  direct_fixtures:
+    - h5policy/tests/malformed/filtered_dense_link_pipeline_overrun.h5
+  expectations:
+    - h5policy/tests/expected/malformed-filtered_dense_link_pipeline_overrun.yml
+  byte_witness: >-
+    pipeline-byte-layout.md in the bundle.  There is NO libhdf5 raw
+    filter-pipeline entry point, so an isolated raw-record test cannot honestly
+    be claimed and the bundle does not claim one -- the byte layout is the
+    direct evidence instead.
+  targeted_probe: >-
+    pline-targeted-probe.c in the bundle -- H5Fopen, H5Gopen2, H5Gget_info,
+    H5Lget_name_by_idx, the last of which triggers dense-link iteration and the
+    FRHP header load.  Public API only.
+  generator: >-
+    The tracked fixture is generator-produced and reproducible from this repo.
+    The bundle's specimen has NO deterministic generator -- h5cve minimize is
+    deferred and the only available mutator handles continuations, which do not
+    apply here, so it reported zero applicable mutants.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: unverified
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []
+
+fuzz_seed: >-
+  The bundle records fuzz_seed null and h5mutate produced nothing applicable.
+  The productive axis is not the specimen but the PAIR (filter_len, descriptor
+  extent): the interesting region is where the descriptor overruns filter_len
+  while staying inside the enclosing image, which is precisely the window the
+  substituted bound cannot see.  On this geometry that window is 8 bytes wide
+  and a sweep across it would be well targeted.
+
+compatibility_backport_risks: >-
+  Low.  Valid headers pass the same exact pipeline extent whichever variable is
+  used, so no legitimate file regresses.  Check all filtered FRHP writers and
+  readers and the error-stack expectations on supported branches, since the
+  failure mode changes from an accidental read to a bounded decode error.
+
+sibling_audit: >-
+  Within libhdf5: a call-site search at 4b1ffa68 found exactly ONE H5O_msg_decode
+  call for H5O_PLINE_ID -- src/H5HFcache.c:527 -- so every filtered
+  fractal-heap consumer shares this caller-side defect: dense links, dense
+  attributes and SOHM alike.  That is unusually good news for a fix (one site)
+  and unusually bad for exposure (three families).
+  No claim is made that every legacy decode entry point was audited beyond that
+  exact search.
+  Note src/H5HFcache.c ALSO contains the distinct defect recorded in
+  registry/cases/fractal-heap-dblock-size-no-floor.yml at :1596.  Two failures
+  of the same class in one file; see shape_note.
+  Within h5policy: one pipeline validator serves every role, so a regression
+  would surface across all of them at once rather than silently in one.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured live on 2.3.0 and the substituted bound at
+    src/H5HFcache.c:527 verified present in the 2.3.0 tree at promotion.  No
+    archaeology was run.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    NO CORE-FILTER SPECIMEN.  Both the bundle specimen and the tracked fixture
+    reach the extent defect through a descriptor naming filter id 32768, so
+    untrusted-strict also raises H5_POLICY_DYNAMIC_FILTER and the two findings
+    travel together.  A specimen using a CORE filter id would isolate the
+    extent defect, and would also test whether the rejection survives a profile
+    that permits dynamic filters.
+  - >-
+    NOTHING WAS RE-MEASURED AT PROMOTION (source claims excepted).
+  - >-
+    No 32-bit measurement (portability analysis only -- see measured.width).
+  - >-
+    Dense-attribute and SOHM filtered heaps share the defective call site and
+    have no specimen; only the dense-link role is exercised.
+open_questions:
+  - >-
+    Would substituting hdr->filter_len alone be safe?  It is an attacker
+    -controlled field, so the fix must bound it against the image first --
+    otherwise the defect changes shape rather than closing.  Whether any caller
+    of H5HF__cache_hdr_deserialize already establishes that relation was not
+    checked.
+  - >-
+    Does the reusable pipeline decoder have other callers that pass an enclosing
+    extent?  The search found one call site for H5O_PLINE_ID specifically, but
+    H5O_msg_decode is generic and the same substitution could exist for other
+    message ids.  Not swept.
+
+provenance:
+  found_by: >-
+    a supplied specimen, triaged through the h5cve bundle workflow in
+    cases/9384b71d6586e2b0c1f5470f7195a26a; promoted 2026-08-15.  The bundle
+    identified the call-site defect precisely; what promotion added is the
+    observation that hdr->filter_len is used correctly at :518 and :531 and only
+    the intervening call gets `len`, and the placement of this shape as the
+    third distinct member of a class.
+  input_sha256: f53ddb5adc35ae052002d41ed5255596d019f289d6018aafa345e58c8d1fc15c
+  hdf5_build: >-
+    HDF5 2.3.0; baseline Release -- rejected_in_traversal; candidate
+    RelWithDebInfo -fsanitize=address -- heap-buffer-overflow READ of size 1 at
+    src/H5Opline.c:232.  Workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3
