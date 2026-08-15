@@ -102,6 +102,33 @@ def build_block(dup_addr, body):
     return block_wo_cksum + struct.pack("<I", cksum), image_size
 
 
+def pin_v2_ohdr_times(raw, offset):
+    """Zero the root v2 object-header timestamps and reseal its checksum.
+
+    ``track_times=False`` pins the dataset header below, but h5py still writes
+    wall-clock timestamps into the root-group header.  This builder copies that
+    header into both MDCI entries, so leave no timestamp-dependent bytes for the
+    generated witness to inherit.
+    """
+    if raw[offset:offset + 4] != b"OHDR" or raw[offset + 4] != 2:
+        raise RuntimeError("expected a v2 root object header")
+    flags = raw[offset + 5]
+    if not flags & (1 << 5):
+        return
+    cursor = offset + 6 + 16 + (4 if flags & (1 << 4) else 0)
+    size_width = 1 << (flags & 3)
+    chksum_off = cursor + size_width + int.from_bytes(
+        raw[cursor:cursor + size_width], "little")
+    if chksum_off + 4 > len(raw):
+        raise RuntimeError("root object-header checksum is outside the file")
+    if struct.unpack_from("<I", raw, chksum_off)[0] != jenkins_lookup3(
+            bytes(raw[offset:chksum_off])):
+        raise RuntimeError("root object-header checksum mismatch")
+    raw[offset + 6:offset + 22] = b"\x00" * 16
+    struct.pack_into("<I", raw, chksum_off,
+                     jenkins_lookup3(bytes(raw[offset:chksum_off])))
+
+
 def build(out_path):
     with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tf:
         base = tf.name
@@ -123,7 +150,7 @@ def build(out_path):
     # and carry the real OH bytes, so replay stays coherent and only the address
     # uniqueness is violated.
     root_oh = struct.unpack_from("<Q", raw, 12 + 3 * soff)[0]
-    assert raw[root_oh:root_oh + 4] == b"OHDR", "expected a v2 object header at the root address"
+    pin_v2_ohdr_times(raw, root_oh)
     oh_body = bytes(raw[root_oh:])                          # full OH (decode uses its own internal lengths)
 
     # Place the MDCI block first so its address is known when we write the message.
