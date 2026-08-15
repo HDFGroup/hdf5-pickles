@@ -1,0 +1,188 @@
+# Two source-shape sweeps, run to completion 2026-08-15.
+#
+# Three case records had ended with the same open question -- "this looks like a
+# pattern, how many siblings are there?" -- and answering it by grep was cheaper
+# than promoting another case. Filed here so the answers are a tracked result
+# rather than something the next person re-derives blind, and so the negative
+# results are as durable as the positive one.
+#
+# HEADLINE: both sweeps came back SMALL. The patterns are real but not endemic,
+# and the earlier "endemic" wording in two records was over-stated from a
+# truncated grep. Corrections applied there; see corrections_made below.
+schema_version: 1
+
+id: decoder-bound-shape-sweeps
+title: sweeps for two decoder bound-checking shapes -- discarded image length,
+  and additive extent checks that can wrap
+status: complete                 # both sweeps run to completion; no open items
+disclosure: "n/a -- local source analysis only; no advisory consulted"
+
+# -- What was swept and why ---------------------------------------------------
+motivation: >-
+  registry/cases/external-link-value-strlen-unbounded.yml,
+  registry/cases/fill-value-size-unchecked-in-new-decoder.yml and
+  registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml each
+  independently bottomed out at a bound the code was HANDED and then did not
+  use.  Three instances suggested a class.  Separately,
+  registry/cases/local-heap-free-list-bound-wraps.yml named "fractal-heap
+  equivalents" as unaudited, which is the same question for a different shape.
+  Both are mechanical greps over the source tree, so the honest move was to run
+  them rather than keep listing them as open questions.
+method: >-
+  Read-only grep over <hdf5-source-tree>/src/*.c at the 2.3.0 tree.  No build,
+  no execution, no oracle run.  Every hit below was then opened and read; the
+  triage is source-derived and none of it is measured.
+  Sweep A: `H5_ATTR_UNUSED len` restricted to `deserialize` and `verify_chksum`
+  -- the READ-path cache-client callbacks.  The `serialize` half is excluded
+  deliberately: it is a write path where the length is library-computed, so a
+  discarded bound there is not a defect.
+  Sweep B: `if ((a + b) > c)` over the same tree -- extent checks written as an
+  addition, which wraps on unsigned types, rather than as a gated subtraction.
+
+# == SWEEP A: read-path callbacks that discard the image length ================
+sweep_a:
+  question: >-
+    How many cache clients are handed the actual allocated image length and
+    declare it H5_ATTR_UNUSED, then derive their own extent from file data?
+  result: SMALL -- confined to one file, plus one correct implementation and two stubs.
+  hits:
+    - site: src/H5B2cache.c:224 (H5B2__cache_hdr_deserialize)
+      verdict: candidate
+      note: v2 B-tree header; not separately assessed, the two below are the measured ones
+    - site: src/H5B2cache.c:553 (H5B2__cache_int_verify_chksum)
+      verdict: DEFECT -- already recorded
+    - site: src/H5B2cache.c:594 (H5B2__cache_int_deserialize)
+      verdict: DEFECT -- already recorded
+    - site: src/H5B2cache.c:954 (H5B2__cache_leaf_verify_chksum)
+      verdict: DEFECT -- already recorded, the measured OOB READ
+    - site: src/H5B2cache.c:994 (H5B2__cache_leaf_deserialize)
+      verdict: DEFECT -- already recorded, the measured OOB WRITE
+    - site: src/H5SMcache.c:477 (H5SM__cache_list_verify_chksum)
+      verdict: CORRECT -- and the most useful hit in either sweep
+      note: >-
+        Discards `len` exactly like the B-tree clients, but bounds the
+        file-controlled count against capacity BEFORE using it, with a comment
+        that reads as if written against this very failure mode:
+          /* The buffer only holds list_max messages; a corrupted header whose
+           * message count exceeds that would size the checksum region past the
+           * end of it. */
+          if (udata->header->num_messages > udata->header->list_max)
+              HGOTO_ERROR(H5E_SOHM, H5E_BADVALUE, FAIL,
+                          "number of SOHM messages exceeds list size");
+          chk_size = H5SM_LIST_SIZE(udata->f, udata->header->num_messages);
+        So discarding `len` is NOT itself the defect -- deriving the extent from
+        an unvalidated file count is.  This is the same fix the v2 B-tree
+        clients need, already written, in an analogous cache client, in the same
+        codebase.  Any upstream proposal for the B-tree case should cite it.
+    - site: src/H5Cepoch.c:132,:143
+      verdict: benign -- deliberate no-op stub client
+    - site: src/H5Cprefetched.c:138,:149
+      verdict: benign -- deliberate no-op stub client
+  conclusion: >-
+    The class is real but its membership is exactly the v2 B-tree cache client,
+    which is already fully recorded.  No new defect was found.  The valuable
+    output is the H5SMcache.c precedent, which converts the B-tree containment
+    from "here is what we think you should do" into "here is what you already do
+    elsewhere".
+
+# == SWEEP B: additive extent checks that can wrap =============================
+sweep_b:
+  question: >-
+    How many extent checks are written `(offset + size) > limit` on unsigned
+    types, where both operands come from the file?
+  result: SMALL -- one confirmed defect (already recorded), one unrecorded duplicate of it, everything else guarded or internal.
+  hits:
+    - site: src/H5HLcache.c:258 (H5HL__fl_deserialize)
+      verdict: DEFECT -- already recorded
+      record: registry/cases/local-heap-free-list-bound-wraps.yml
+    - site: src/H5HLdbg.c:82 (local heap debug dump)
+      verdict: NEW -- unrecorded duplicate of the same expression
+      note: >-
+        `if ((freelist->offset + freelist->size) > h->dblk_size)` -- character
+        for character the H5HLcache.c:258 check, in the debug/h5debug path, with
+        the same wrap.  Lower severity: it is a diagnostic path rather than the
+        library read path, so reaching it requires running h5debug on a hostile
+        file.  But it must be fixed in the SAME change, or the subtraction form
+        lands in one copy and not the other and the next reader assumes the
+        expression is correct because one instance of it is.
+    - site: src/H5HFman.c:395 and :605 (H5HF__man_op_real, H5HF__man_remove)
+      verdict: NOT AN EQUIVALENT -- and this answers the local-heap record's open item
+      note: >-
+        `(blk_off + obj_len) > dblock_size` looks identical, but `obj_len` is
+        bounded three ways immediately after it is decoded from the heap ID
+        (:326 nonzero, :328 against max_direct_size, :330 against max_man_size),
+        so it cannot approach SIZE_MAX and the addition cannot wrap on its own.
+        The residual hazard is narrower and worth stating precisely: `blk_off`
+        is computed as `(size_t)(obj_off - dblock->block_off)` at :387 under an
+        ASSERT only (:386, compiled out under NDEBUG).  If a corrupt indirect
+        structure yielded obj_off < block_off, that subtraction underflows and
+        the additive check could then wrap.  That is a two-step, assert-gated
+        path rather than the direct one-field wrap the local heap has, and it
+        was not measured.
+    - site: src/H5Znbit.c:1212
+      verdict: GUARDED -- and an example of the codebase getting it right
+      note: >-
+        The additive check is preceded by an accumulate-and-verify with an
+        explicit wrap detector:
+          used_size += member_size;
+          if (used_size > size) ...error
+          if (used_size <= prev_used_size) ...error   /* wrap detector */
+        By the time `(member_offset + member_size) > size` runs, both operands
+        are already bounded by `size`.
+    - site: src/H5Tcompound.c:420 (H5T__insert)
+      verdict: out of scope -- API insert path, not raw file decode
+      note: >-
+        Operates on values the library supplies.  Related in spirit to
+        registry/cases/compound-member-array-promotion-unguarded.yml, but that
+        record's defect is in the DECODER's guard ordering, not here.
+    - sites: [src/H5Cint.c:1895, src/H5Faccum.c:278, src/H5MFaggr.c:214, src/H5PB.c:1540]
+      verdict: benign -- internal cache/accumulator/aggregator accounting, operands not file-derived
+  conclusion: >-
+    One new item, and a modest one: the H5HLdbg.c:82 duplicate.  The fractal
+    -heap question that motivated half this sweep is answered in the NEGATIVE,
+    which is worth more than it sounds -- it closes an open item in a record
+    rather than leaving a suspicion sitting there indefinitely.
+
+# -- What changed as a result --------------------------------------------------
+corrections_made: >-
+  Two records described this shape as "endemic to metadata-cache client
+  callbacks".  That came from a grep truncated at 40 lines whose visible output
+  was dominated by `serialize` functions -- the write path, where a discarded
+  length is not a defect.  Restricted to the read path the count is five, all in
+  one file.  The wording is corrected in
+  registry/cases/external-link-value-strlen-unbounded.yml and
+  registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml, and the
+  open questions those records carried are marked answered by this file.
+
+followups:
+  - >-
+    Fix src/H5HLdbg.c:82 in the same change as src/H5HLcache.c:258.  Tracked in
+    registry/cases/local-heap-free-list-bound-wraps.yml.
+  - >-
+    Cite src/H5SMcache.c:477-495 as the model in any upstream proposal for
+    registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml.
+  - >-
+    OPTIONAL and unmeasured: whether a corrupt indirect block can drive
+    obj_off < block_off at src/H5HFman.c:387 and reach the underflow described
+    above.  Low priority -- it needs a two-step corruption and an NDEBUG build,
+    and no specimen exists.
+
+# -- Honesty notes -------------------------------------------------------------
+limitations: >-
+  Both sweeps are GREPS, and grep finds a spelling rather than a semantics.
+  A bound check written across multiple lines, using a helper macro, or with the
+  operands in the other order would not match either pattern, so neither result
+  is a proof of absence.  What they establish is that the two SPECIFIC shapes
+  that produced three case records are not widespread, which is enough to stop
+  treating them as open leads.
+  Nothing here was executed, measured, or built.  Every verdict is source-derived
+  from reading the 2.3.0 tree, and the two "already recorded" defects are the
+  only ones in this file with measured evidence behind them -- that evidence
+  lives in their own records, not here.
+
+provenance:
+  found_by: >-
+    sweeps run 2026-08-15 while closing out the Tier-2 promotion queue, to
+    answer open questions carried by three existing case records rather than to
+    investigate a new specimen
+  hdf5_source: 2.3.0 tree, read-only
