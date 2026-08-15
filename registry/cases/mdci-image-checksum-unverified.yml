@@ -127,11 +127,69 @@ systemic:
   status: planned
   description: >-
     The general question this raises is why the cache image is the exception.
-    Every other checksummed structure in the format verifies on read through its
-    cache client's deserialize callback; the cache image is loaded by bespoke
-    code in H5Cimage.c that predates/bypasses that path and simply never grew
-    the check. An audit of load paths that do NOT go through a
-    H5AC_class_t::deserialize would show whether the cache image is the only one.
+    The audit that answers it is now done -- see systemic_audit below. Two
+    corrections to what this record used to say, both of which sharpen the fix.
+    (1) The sanctioned mechanism is NOT the deserialize callback. It is a
+    SEPARATE vtable entry, H5C_class_t::verify_chksum (H5Cprivate.h:880),
+    invoked by H5C__load_entry inside its read-retry loop (H5Centry.c:1211-1218):
+    a NULL member means "this structure carries no checksum, leave now", and a
+    false return re-reads the image up to H5F_GET_READ_ATTEMPTS times before
+    failing. So the cache image forfeits the retry behaviour too, not just the
+    integrity check.
+    (2) The cache image is NOT the only checksummed structure loaded outside a
+    cache client -- but it IS the only one that fails to verify.
+  precedent_for_the_fix: >-
+    H5Dvirtual.c is the model. A VDS's serialized source list lives in a global
+    heap object, is checksummed by bespoke code on write (H5Dvirtual.c:639), and
+    is verified by bespoke code on read: decode the stored value, recompute over
+    block_size - 4, and HGOTO_ERROR "incorrect metadata checksum for global heap
+    block" on mismatch (:908-918). It is outside the cache-client machinery for
+    the same reason the cache image is, and it verifies anyway. Being outside
+    H5C__load_entry is therefore not a reason to skip the check; the cache image
+    is simply missing it.
+
+systemic_audit:
+  question: >-
+    Is the cache image genuinely the only checksummed structure loaded outside
+    the verify_chksum path? (Carried as an open question until 2026-08-15.)
+  method: >-
+    Enumerated every H5_checksum_metadata call site in src/ (12 files), then
+    parsed all 29 `const H5AC_class_t NAME[1]` vtable instances and read off the
+    7th member, verify_chksum. Cross-checked each NULL against whether that
+    structure carries a checksum in the format at all.
+  verified_via_the_callback: >-
+    v2 B-tree hdr/internal/leaf, extensible array hdr/iblock/sblock/dblock/
+    dblk_page, fixed array hdr/dblock/dblk_page, fractal heap hdr/iblock/dblock,
+    free-space hdr/sinfo, object header OHDR and OHDR_CHK, SOHM table and list,
+    and the superblock -- 22 classes, each with a real *_verify_chksum function
+    that compares and errors.
+  null_and_correctly_so: >-
+    7 classes have a NULL verify_chksum, and in every case the structure carries
+    no checksum in the format: v1 B-tree (H5AC_BT), driver info block
+    (H5AC_DRVRINFO -- H5F_DRVINFOBLOCK_HDR_SIZE is 16 with no checksum field and
+    the deserialize path decodes none), global heap collection (H5AC_GHEAP),
+    local heap prefix and data block (H5AC_LHEAP_PRFX, H5AC_LHEAP_DBLK), symbol
+    table node (H5AC_SNODE), and the purely in-memory H5AC_PROXY_ENTRY. No
+    mismatch found -- no structure is checksummed on disk yet given a NULL
+    callback.
+  outside_the_cache_clients: >-
+    Two structures are checksummed but not loaded through H5C__load_entry:
+    the VDS heap block (H5Dvirtual.c -- verifies, see precedent_for_the_fix) and
+    the metadata cache image (H5Cimage.c -- does not). That is the whole
+    population.
+  corroborating_detail: >-
+    H5AC_PREFETCHED_ENTRY does have a non-NULL verify_chksum, but
+    H5C__prefetched_entry_verify_chksum is a deliberate stub whose entire body is
+    `HERROR(H5E_CACHE, H5E_SYSTEM, "called unreachable fcn.")` returning FAIL.
+    Prefetched entries are constructed directly from the image rather than loaded,
+    so the slot is never called -- direct evidence that the cache-image path was
+    designed to bypass the verify machinery rather than having drifted out of it.
+  conclusion: >-
+    The open question is answered YES with one refinement: the cache image is the
+    unique checksummed structure that never verifies, though not the unique one
+    outside the cache clients. The systemic fix stands as scoped -- it is a
+    one-structure fix, and H5Dvirtual.c already shows what it should look like.
+  label: source-derived (exhaustive enumeration of call sites and vtables)
 
 # ── Reproducers ──────────────────────────────────────────────────────────────
 reproducers:
@@ -213,9 +271,9 @@ resolved_questions:
 
 # ── Open items ───────────────────────────────────────────────────────────────
 open_questions:
-  - >-
-    Is the cache image genuinely the only checksummed structure loaded outside a
-    deserialize callback? The systemic fix above assumes so; unaudited.
+  # (the "is the cache image the only one?" question that stood here is answered
+  #  in systemic_audit above -- YES for unverified, 2026-08-15. Note the question
+  #  itself was mis-stated: the mechanism is verify_chksum, not deserialize.)
   # (the image_len + 1 allocation question that stood here is answered in
   #  resolved_questions below -- refuted, 2026-08-15)
   - >-
