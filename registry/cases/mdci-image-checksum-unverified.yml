@@ -148,17 +148,76 @@ reproducers:
     a five-line exercise -- it is described rather than referenced so this record
     depends on nothing outside the repository.
 
+# ── Resolved ─────────────────────────────────────────────────────────────────
+resolved_questions:
+  - question: >-
+      H5C__load_cache_image mallocs cache_ptr->image_len + 1 (H5Cimage.c:644)
+      from the superblock-extension message with no EOA cross-check visible at
+      that point -- the same shape as [[lheap-dblk-unbounded-alloc]]. Is the
+      allocation unbounded, and does image_len + 1 wrap at SIZE_MAX?
+    answer: >-
+      NO to both. The bound exists, one layer up: H5O__mdci_decode
+      (H5Ocache_image.c:119-123) rejects the message before the value ever
+      reaches the cache, with `addr >= HADDR_UNDEF - size` ("address plus size
+      overflows") and `addr + size > EOA` ("address plus size exceeds file
+      eoa"). H5Fsuper.c:914 passes that validated message straight to
+      H5AC_load_cache_image_on_next_protect, so image_len is bounded by the
+      file's EOA by the time the malloc runs, and the wrap case is caught by the
+      first of the two guards -- at size == UINT64_MAX, HADDR_UNDEF - size is 0,
+      so any address fails it.
+      The `+ 1` is deliberate rather than sloppy: the decoder is handed
+      image_len + 1 as its buffer size so p_end lands one past the last valid
+      byte, which is the convention H5_IS_BUFFER_OVERFLOW expects.
+      Provenance: both guards arrived together in libhdf5 commit 26a76bafdef,
+      whose subject line in the local tree reads "Fix CVE-2025-2915 (#5746)",
+      and the commit is contained in tags 2.0.0, 2.1.0, 2.1.1 and 2.2.0. No
+      advisory was consulted -- that identifier is quoted from the local commit
+      message only, and nothing is claimed about its contents.
+    residual: >-
+      One real gap survives, and it is assert-only. Both guards sit behind
+      `if (H5_addr_defined(mesg->addr) && mesg->size)`, so a message declaring
+      size == 0 skips them entirely. image_len 0 then reaches H5C__load_cache_image,
+      where the only thing standing in front of the allocation is
+      `assert(cache_ptr->image_len > 0)` (H5Cimage.c:640). Under NDEBUG that
+      vanishes, malloc(0 + 1) returns a 1-byte buffer, and the header decode is
+      handed buf_size 1 -- p_end == buf -- so the very first
+      H5_IS_BUFFER_OVERFLOW rejects it at the signature check. The Release
+      outcome is therefore SAFE, and the divergence is confined to builds with
+      asserts enabled. Same guard-style asymmetry as
+      registry/cases/mdci-lru-rank-assert-only.yml, but with no oracle
+      consequence: h5policy already rejects the file.
+    measured: >-
+      Three variants built from valid/cache_image.h5 by rewriting the MDCI
+      message's 8-byte size field at file offset 662 and repairing the v2 object
+      -header checksum at 626: size = 0xFFFFFFFFFFFFFFFF, size = 0, and
+      size = 4 * filesize (past EOA).
+      Baseline build, h5dump -H: all three REJECT (rc 1) -- "unable to open
+      file" for the huge and past-EOA cases, an h5dump internal error for
+      size == 0. Peak RSS 0.1-0.2 MiB on every variant, identical to the valid
+      control, measured uncapped under a 4 GiB watchdog: there is no allocation
+      growth to speak of, so the unbounded-allocation hypothesis is refuted by
+      measurement and not only by reading.
+      Candidate build, size == 0: aborts at H5Cimage.c:640, exit 134 -- the
+      assert described above.
+      h5policy rejects all three (untrusted-strict, exit 2):
+      H5_CORRUPT_LENGTH_OVERFLOW @ 653 for the huge and past-EOA variants,
+      H5_CORRUPT_MDCI_HEADER_TOO_SMALL @ 2080 for size == 0. Oracle and library
+      AGREE on all three, so none of them warrants a diff tolerance.
+    label: source-derived and measured
+    follow_up: >-
+      A tracked fixture for the size == 0 variant is possible but low value:
+      both sides already reject it and the verdict is already carried by
+      mdci.block_header_complete. Worth adding only if the assert-only
+      H5Cimage.c:640 guard is ever promoted to a real check upstream, at which
+      point the fixture would pin the improved diagnostic.
+
 # ── Open items ───────────────────────────────────────────────────────────────
 open_questions:
   - >-
     Is the cache image genuinely the only checksummed structure loaded outside a
     deserialize callback? The systemic fix above assumes so; unaudited.
-  - >-
-    H5C__load_cache_image mallocs cache_ptr->image_len + 1 (H5Cimage.c:643) from
-    the superblock-extension message with no EOA cross-check visible at that
-    point. That is the same shape as [[lheap-dblk-unbounded-alloc]] and is NOT
-    covered by this case -- h5policy's mdci extent checks may already bound it,
-    but the libhdf5 side is unmeasured here.
+  # (the image_len + 1 allocation question that stood here is answered in
+  #  resolved_questions below -- refuted, 2026-08-15)
   - >-
     Whether a stale-but-valid image (checksum correct, contents describing an
     earlier state of the file) is distinguishable at all. The checksum only

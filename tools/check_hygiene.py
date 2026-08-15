@@ -26,9 +26,14 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# AGENTS.md states both rules, so it necessarily quotes the patterns they ban.
-# It is the only file that may.
-ALLOWED = {"AGENTS.md"}
+# A file that STATES a rule has to quote the pattern the rule bans, so the two
+# files defining this policy are exempt from it: AGENTS.md, which writes the
+# rules in prose, and this checker, whose HOST_PATH regex below necessarily
+# contains a literal host prefix. Nothing else may be added here -- an exemption
+# is how the next leak hides. (Encoding the patterns to dodge the check was the
+# alternative and is worse: it would make the rule unreadable at the one place a
+# reader looks to understand it.)
+ALLOWED = {"AGENTS.md", "tools/check_hygiene.py"}
 
 # Advisory identifiers are not authoritative here, in any spelling or position:
 # record fields, prose, comments, file names, directory names. The lowercase
