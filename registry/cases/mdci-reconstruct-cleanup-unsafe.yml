@@ -225,10 +225,19 @@ containment:
     free in reverse dependency order; clear owning pointers after each free
     (recon_entry->entry_ptr, and the flush_dep_parent[] slots of surviving
     children) so no freed entry stays reachable.
-    Both are backportable to every branch that decodes MDCI version 0 (1.10.1+)
-    and neither can reject a file libhdf5 itself wrote: a well-formed cache
-    image always satisfies is_fd_child<->fd_parent_count and in_lru<->lru_rank,
-    and never repeats an entry address.
+    Neither can reject a file libhdf5 itself wrote: a well-formed cache image
+    always satisfies is_fd_child<->fd_parent_count and in_lru<->lru_rank, and
+    never repeats an entry address.
+    BACKPORT SCOPE, corrected 2026-08-15 -- the two halves differ, and an earlier
+    revision of this record wrongly gave both the same reach ("every branch that
+    decodes MDCI version 0, 1.10.1+").
+    (2), the cleanup repair, is needed ONLY where the cleanup exists: 2.0.0
+    through HEAD.  The 1.14.x line has no `done:` cleanup at all and must not
+    have one grafted on as a "backport" -- doing so would import this defect into
+    a line that does not have it.  See version_range.
+    (1), promoting the assert-only guards, does apply broadly, since the asserts
+    are old; but note it is defence in depth rather than a crash fix, because on
+    1.14.x the same malformed images already fail without crashing.
 systemic:
   semantic_boundary: >-
     the cache-image dependency graph as one aggregate -- entry envelopes, entry
@@ -296,9 +305,10 @@ reproducers:
     no_user_callback: true
     no_legacy_fallback: true
 
-backports: []          # nothing to backport in h5policy; the libhdf5 branches that
-                       # would need the containment fix are every branch decoding
-                       # MDCI version 0, i.e. 1.10.1 onward -- see containment.
+backports: []          # nothing to backport in h5policy. On the libhdf5 side the
+                       # cleanup repair is needed on 2.0.0..HEAD only -- 1.14.x has
+                       # no cleanup to repair. Corrected 2026-08-15; see
+                       # version_range and containment.
 
 fuzz_seed: >-
   Both specimens and dup_addr_witness.h5 are seeds for the cache_image bounded
@@ -333,6 +343,66 @@ coverage_manifest_change: >-
   promotion; all three findings and all three invariants were already landed by
   7f928c9 and the commits that followed it.  This record documents the libhdf5
   divergence those changes were built against.
+
+# -- Affected versions --------------------------------------------------------
+# THE HEADLINE, established 2026-08-15: this is a REGRESSION, and the regressing
+# change was itself a security fix. Both crash routes exist only because a
+# failure-cleanup path was added; before it, the same specimens were rejected
+# cleanly.
+version_range:
+  introduced_by: >-
+    libhdf5 commit 18297c1923b, 2025-11-04, whose subject line in the local tree
+    reads "Fix a crash when duplicate addesses occur (related to CVE-2025-6269)
+    (#5924)".  126 insertions, 1 deletion, all in src/H5Cimage.c.  It added the
+    H5C_recon_entry_t uthash table, H5C__check_for_duplicates, AND the `done:`
+    cleanup loop at H5Cimage.c:2635-2668 that this record is about.  The
+    identifier is quoted from the local commit message only; no advisory was
+    consulted and nothing is claimed about its contents.
+  before_the_commit: >-
+    H5C__reconstruct_cache_contents had NO failure cleanup whatsoever.  Its
+    entire `done:` block was `FUNC_LEAVE_NOAPI(ret_value)`.  A FAIL therefore
+    returned the error and leaked the partially built prefetched entries -- no
+    expunge, no frees, and so no double-free and no flush-dependency teardown to
+    NULL-deref.  Leaks, but does not crash.
+  affected: >-
+    2.0.0 (2025-11-10, the first tag containing 18297c1923b) through HEAD
+    e4b6a964723 (2.3.0 develop, 2026-08-13), where both crashes are still live.
+    Tags containing the commit: 2.0.0, 2.1.0, 2.1.1, 2.2.0, 2.2.0-rc1.
+  not_affected: >-
+    The entire 1.14.x line.  1.14.5 (2024-09-30) and 1.14.6 (2025-02-04) both
+    predate 18297c1923b, and 1.14.6's H5Cimage.c contains no reference to
+    recon_table or H5C__check_for_duplicates at all.
+  fix_claim_refuted: >-
+    The originating bundles carried a claim of an upstream fix at 2.1.1 / 1.14.6.
+    That claim is now REFUTED on two independent grounds.  1.14.6 (Feb 2025)
+    predates the code the defect lives in, so it cannot contain a fix for it.
+    2.1.1 (2026-03-23) postdates the introducing commit and precedes HEAD, where
+    the defect is measured live -- so no fix landed there either.  Whatever the
+    claim referred to, it was not this defect.
+  measured: >-
+    1.14.6 built locally from the hdf5_1.14.6 tag (RelWithDebInfo, NDEBUG,
+    shared, tools on) and compared against the 2.3.0 baseline on the same
+    specimens:
+      fd-parent PoC          1.14.6 rc=1 (clean error)  | 2.3.0 rc=139 SIGSEGV
+      duplicate-address PoC  1.14.6 rc=1 (clean error)  | 2.3.0 rc=134 SIGABRT
+    So the fix turned two clean rejections into a NULL-deref and a heap
+    double-free.
+  what_the_commit_did_fix: >-
+    A real gap, and this record does not dispute it.  On 1.14.6 a duplicate entry
+    address is ACCEPTED SILENTLY: dup_addr_witness.h5 and the tracked fixture
+    malformed/mdci_duplicate_entry_address.h5 both open with rc=0, while 2.3.0
+    rejects both with rc=1.  So 18297c1923b closed a genuine
+    accepts-a-corrupt-image hole and introduced a worse primitive on the failure
+    path it added to do so.  The right conclusion is that the cleanup needs
+    repairing, NOT that the commit should be reverted.
+  cross_version_control: >-
+    malformed/mdci_parent_addr_unresolved.h5 and malformed/mdci_parent_addr_self.h5
+    reject on BOTH 1.14.6 and 2.3.0, and valid/cache_image.h5 plus
+    malformed/mdci_entry_lru_inconsistent.h5 are accepted by both -- the latter
+    consistent with the assert-only LRU finding in
+    registry/cases/mdci-lru-rank-assert-only.yml.  Those four pin that the
+    1.14.6 build is behaving normally and that only the two crash routes moved.
+  label: source-derived (git archaeology) and measured (built 1.14.6)
 
 # -- Resolved -----------------------------------------------------------------
 resolved_questions:
@@ -395,13 +465,10 @@ resolved_questions:
 # -- Open items ---------------------------------------------------------------
 coverage_gaps:
   - >-
-    AFFECTED-VERSION RANGE IS UNVERIFIED.  Everything here is measured on the
-    single local tree e4b6a964723 (2.3.0 develop).  The originating bundles
-    carried a claim of an upstream fix at 2.1.1 / 1.14.6; that claim was NOT
-    reproduced, those tags were never built here, and no advisory was consulted
-    to check it.  Treat "live on 2.3.0 develop" as the whole of the version
-    evidence.  Building an affected tag is the [[vulnerable-version-build-recipe]]
-    task.
+    RESOLVED 2026-08-15 -- see version_range below.  This item previously read
+    "AFFECTED-VERSION RANGE IS UNVERIFIED".  It now is verified, by archaeology
+    plus a built 1.14.6, and the answer inverted the case: the crashes are a
+    REGRESSION introduced by a fix, not a long-standing defect.
   - >-
     No 32-bit measurement on either specimen (see measured.width).
   - >-
