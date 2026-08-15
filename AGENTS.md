@@ -7,6 +7,24 @@
 - The documentation, generated-file, portable-provenance, boundary, and
   verification rules apply to every task.
 
+## Companion repository: hdf5-ssp-sig
+
+[`HDFGroup/hdf5-ssp-sig`](https://github.com/HDFGroup/hdf5-ssp-sig) is the
+policy and audit consumer of selected H5Policy technical evidence. Do not
+assume it is checked out at any particular local path.
+
+- Producer contract in this repository: `registry/ssp-control-evidence.yml`
+- Producer validator in this repository: `tools/check_ssp_control_evidence.py`
+- Consumer contract in the SSP repository:
+  `audit/registry/h5policy-control-evidence.json`
+
+The contract is supplementary technical evidence, never a complete SSP-control
+attestation. An SSP release-proof import must pin the producer revision and
+contract digest, retain the producer-check output, and document SSP review of
+the evidence it does not cover. When changing either contract, validate this
+repository and the SSP consumer when it is available; otherwise report the
+consumer check as skipped.
+
 ## Task modes
 
 Classify the task before writing. The rows below resolve the write boundary when

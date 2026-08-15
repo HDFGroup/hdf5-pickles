@@ -69,10 +69,12 @@ COMPOSING_HELPERS = {
         "H5_CORRUPT_BAD_CHECKSUM": [" checksum field outside block",
                                     " checksum mismatch"],
     }),
-    # h5_btree2.pk: the shared geometry check names its B-tree's role.
-    "h5policy_validate_v2_btree_geometry": (4, {
+    # h5_btree2.pk: the shared geometry check names its B-tree's role. The role
+    # is parameter 5 (node_size, record_size, file_size, loc, object, role).
+    "h5policy_validate_v2_btree_geometry": (5, {
         "H5_CORRUPT_V2_BTREE_RECORD_SIZE": [" v2 B-tree record size is zero"],
-        "H5_CORRUPT_V2_BTREE_NODE_SIZE": [" v2 B-tree node cannot hold one record"],
+        "H5_CORRUPT_V2_BTREE_NODE_SIZE": [" v2 B-tree node cannot hold one record",
+                                          " v2 B-tree node size exceeds the file"],
     }),
     # h5_chunkindex.pk: extensible-array block revisit detection.
     "h5policy_ea_mark_block": (2, {

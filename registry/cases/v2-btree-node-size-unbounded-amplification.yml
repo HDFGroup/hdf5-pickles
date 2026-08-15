@@ -1,0 +1,186 @@
+# A v2 B-tree header's node_size had no upper bound in the oracle: an encoded
+# node_size of 0xFFFFFFFF (~4 GiB) inside a kilobyte-sized file was accepted,
+# while libhdf5's H5B2__hdr_init eagerly allocates and touches node_size-scaled
+# memory before any node is read.  The shared geometry check now bounds node_size
+# by the file's effective ceiling.
+#
+# Found as a sibling of registry/cases/v2-btree-record-size-zero-assert-only.yml
+# during the node_size/rrec_size variant sweep of the rrec_size==0 SIGFPE case.
+schema_version: 1
+
+id: v2-btree-node-size-unbounded-amplification
+title: a v2 B-tree header's node_size had no oracle upper bound, so a ~4 GiB node
+  declared in a kilobyte file was accepted and drives a multi-GiB resident-memory
+  amplification in libhdf5
+status: oracle-hardened          # h5policy now rejects; libhdf5 side unfixed
+
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: dense_index
+versions: [2]                    # v2 B-tree header; the guard is shared across roles
+root_cause_classification: local_decode   # bounded-allocation / extent invariant on one field
+violated_invariant:
+  - dense.btree_node_size
+validation_closure: >-
+  the v2 B-tree header plus the file's effective ceiling (min of the declared
+  superblock EOF and the physical image size).  node_size must not exceed the
+  file that must contain the node.
+activation_before_validation:
+  - native_construction          # page memset + nat_off fill run in H5B2__hdr_init
+entry_points:
+  - h5policy (oracle) -- untrusted-strict and forensic; ACCEPTED before this fix
+  - "libhdf5 public API: H5Fopen -> H5Gopen2('/') -> H5Gget_info"
+
+defect: >-
+  H5B2__hdr_init sizes and touches memory by node_size before any node is read
+  and before any validation beyond an assert:
+    hdr->page = H5FL_BLK_MALLOC(node_page, node_size); memset(page,0,node_size);  /* H5B2hdr.c:131-133 */
+    max_nrec  = (node_size - 10) / record_size;                                   /* :140 */
+    nat_off   = H5FL_SEQ_MALLOC(size_t, max_nrec);                                /* :153 */
+    for (u=0; u<max_nrec; u++) nat_off[u] = record_size * u;                      /* :158-159 */
+  Resident memory is therefore ~= node_size * (1 + 8/record_size), reached on the
+  plain H5Fopen -> H5Gget_info path even for an empty tree.  record_size is pinned
+  to the record type's legitimate width by the record-layout check
+  (H5_CORRUPT_V2_BTREE_RECORD_LAYOUT), so node_size is the only free dimension.
+  h5policy's shared geometry check (h5policy_validate_v2_btree_geometry,
+  h5policy/pickles/h5_btree2.pk) previously checked only the LOWER geometry
+  (record_size==0, node_size<10, record_size>node_size-10) and had no upper bound,
+  so node_size up to 0xFFFFFFFF was accepted.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  oracle_before: >-
+    ACCEPT for node_size in {1 MiB .. 256 MiB} and node_size=0xFFFFFFFF, all at
+    the pinned record_size=11 (type-5 dense-link name index).
+  oracle_after: >-
+    reject_corrupt, H5_CORRUPT_V2_BTREE_NODE_SIZE, message
+    "dense link v2 B-tree node size exceeds the file", on the tracked fixture and
+    on the valid control's neighbourhood.  The valid control still accepts.
+  libhdf5_resident: >-
+    Δ resident ~= 1.73 * node_size at record_size=11 (measured 1.73-1.97 across
+    1-256 MiB via a public-API VmHWM probe), converging to 1 + 8/record_size
+    (9.0 at record_size=1, 3.68 at record_size=3).  Extrapolated worst case at
+    node_size=0xFFFFFFFF, record_size=11: ~6.91 GiB resident from a 2285-byte
+    file (~3.25 million x), plus a ~390M-iteration nat_off fill loop.  Baseline
+    libhdf5 (RelWithDebInfo, NDEBUG) allocates regardless of the oracle verdict;
+    the large allocation fails and returns -1 on an unconstrained host, and
+    aborts under a tight RLIMIT_AS -- a bounded amplification, not memory
+    unsafety.
+  width: >-
+    32-bit size_t not measured; node_size is uint32, so a ~4 GiB page alone
+    approaches the 32-bit address space and would fail allocation earlier there.
+
+# -- Divergence ---------------------------------------------------------------
+divergence:
+  oracle: reject_corrupt          # after the fix
+  libhdf5: large_allocation       # not a crash on an unconstrained host
+  libhdf5_version: 2.3.0
+  classification: oracle_stricter
+  note: >-
+    After the fix the oracle rejects a file libhdf5 still "accepts" (by
+    allocating multi-GiB and eventually failing gracefully or aborting under a
+    memory cap).  This is deliberate hardening, not an invariant-A disagreement:
+    the bounded decoder refuses a structurally impossible geometry before any
+    allocation.  No entry in registry/h5policy-diff-tolerances.yml is warranted;
+    the tracked fixture is not run against libhdf5 in the exact-build matrix
+    (no h5cve canary), because doing so would perform the amplification itself.
+
+# -- Containment vs systemic --------------------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    libhdf5: in H5B2__cache_hdr_deserialize, bound node_size against the file EOA
+    (H5F_get_eoa) before calling H5B2__hdr_init, so the page memset and nat_off
+    fill cannot be sized larger than the file.  Independent of the record_size==0
+    fix.
+systemic:
+  semantic_boundary: >-
+    v2 B-tree header geometry established before H5B2__hdr_init allocates --
+    node_size bounded by the file's effective ceiling.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 header init still open
+  description: >-
+    h5policy_validate_v2_btree_geometry now rejects node_size > file ceiling for
+    every shared v2-btree client role (dense link, dense attribute, chunk index,
+    SOHM, and both creation-order indexes), reusing H5_CORRUPT_V2_BTREE_NODE_SIZE.
+  landed_changes:
+    - h5policy/pickles/h5_btree2.pk (node_size upper-bound guard; file_size param)
+    - h5policy/pickles/{h5_dense_links,h5_dense_attrs,h5_chunkindex,h5_sohm}.pk
+      (pass h5policy_ceiling(ios) to the shared check)
+    - registry/findings/routes/H5_CORRUPT_V2_BTREE_NODE_SIZE.yml (route the new
+      "node size exceeds the file" message per role)
+    - tools/message_routing.py (role param index 4->5; new message suffix)
+    - h5policy/tools/h5policy-gencorpus (_make_oversize_v2_btree_node_size)
+    - h5policy/tests/malformed/oversize_v2_btree_node_size.h5
+    - h5policy/tests/expected/malformed-oversize_v2_btree_node_size.yml
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/oversize_v2_btree_node_size.h5
+  direct_fixtures:
+    - h5policy/tests/malformed/oversize_v2_btree_node_size.h5
+  expectations:
+    - h5policy/tests/expected/malformed-oversize_v2_btree_node_size.yml
+  control_fixture: h5policy/tests/valid/dense_links.h5
+  generators: >-
+    The tracked fixture is generator-produced and reproducible from this repo:
+    h5policy-gencorpus _make_oversize_v2_btree_node_size sets node_size to
+    0xFFFFFFFF in the valid dense-link base and reseals the header checksum.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true    # oracle rejects before any allocation
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: true
+
+backports: []          # nothing to backport in h5policy.
+
+fuzz_seed: >-
+  h5policy/tests/malformed/oversize_v2_btree_node_size.h5 seeds the node_size
+  upper-bound neighbourhood; the interesting boundary is node_size at and just
+  above the file ceiling, and per-record-type worst-case record widths (the
+  smallest legitimate record_size gives the largest 1+8/record_size ratio).
+
+compatibility_backport_risks: >-
+  Low.  A node_size larger than the file cannot describe a real on-disk node, so
+  no conforming file is affected; the valid control opens normally.  The bound is
+  the file's effective ceiling (min of declared EOF and physical size), matching
+  the same ceiling other h5policy range checks use.
+
+sibling_audit: >-
+  The guard is in the shared geometry check, so it covers all v2-btree roles at
+  once (dense link, dense attribute, chunk index, SOHM, creation-order).  Only the
+  type-5 dense-link role is measured here; other roles have their own pinned
+  record widths and are covered by the same predicate, asserted from the shared
+  implementation rather than measured per role.  libhdf5's H5B2__hdr_init has
+  further assert-only fields (node_size==0, split/merge percentages) audited in
+  registry/cases/v2-btree-record-size-zero-assert-only.yml.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED for libhdf5.  The eager node_size allocation in H5B2__hdr_init is
+    long-standing, but no older tag was built; measured live on 2.3.0 against a
+    local source tree.  The oracle gap existed until this change.
+  label: not established
+
+coverage_gaps:
+  - No 32-bit measurement (see measured.width).
+  - Per-record-type worst-case record width not enumerated (only type-5 measured).
+  - libhdf5 containment not implemented or measured against a fixed build.
+
+provenance:
+  found_by: >-
+    the node_size/record_size variant sweep of the rrec_size==0 SIGFPE case,
+    triaged through the h5cve bundle workflow; the amplification was measured with
+    a public-API VmHWM probe under a memory cap to avoid host OOM.
+  input_sha256: dc91826450bcec970b07ca190574ae51e3fb3f1adcd1bd72ff9f9bdfadca48a6
+  hdf5_build: >-
+    HDF5 2.3.0, local source tree at develop e4b6a964723; baseline Release/NDEBUG.
+    Workstation-local install; path not recorded.
+  poke_version: GNU poke 4.3

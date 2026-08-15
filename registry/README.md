@@ -20,6 +20,7 @@ Registry files plus a case directory, one schema version:
 | [`lazy-validation.json`](lazy-validation.json) | **Generated.** Measurement that validation cost tracks metadata rather than data volume, with physical-file endpoints, a sensitivity control, and the explicit latest-format/timestamps-disabled fixture policy. |
 | [`truncation-sweep.json`](truncation-sweep.json) | **Generated.** Result of the §12 truncation sweep: every prefix of each seed, and whether coverage was exhaustive or sampled. |
 | [`verification-coverage.yml`](verification-coverage.yml) | **Generated.** Which of the [§12](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) verification requirements each record family demonstrably meets. |
+| [`ssp-control-evidence.yml`](ssp-control-evidence.yml) | Checked, deliberately narrow mapping from selected HDF5 SSP controls to record/invariant/finding, fixture, canary, and exact-build measurement. It is technical evidence, not complete control attestation. |
 | [`cve-case.yml`](cve-case.yml) | The annotated **template** for a per-case record. Its fields are the §11.5 containment/systemic tracking block. |
 | [`cases/`](cases/) | Real per-case records: two oracle-hardened memory-safety cases, one proactive hardening case, and six libhdf5 divergence records, including one open backlog of uninvestigated items. |
 

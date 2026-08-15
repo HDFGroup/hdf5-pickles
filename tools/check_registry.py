@@ -347,4 +347,11 @@ print(f"records={len(records)} findings={len(findings)} "
       f"messages={sum(len(v) for v in emitted_messages.values())} "
       f"unrouted={sum(len(v) for v in measured.values())} "
       f"missing={len(missing)} errors={errors}")
-sys.exit(1 if errors else 0)
+if errors:
+    sys.exit(1)
+
+# The SSP evidence bridge consumes this registry, the exact-build canary map,
+# and the generated native-library measurement.  Keep it in the same gate so a
+# stale control mapping cannot look like audited evidence.
+import subprocess
+sys.exit(subprocess.run([sys.executable, "tools/check_ssp_control_evidence.py"]).returncode)
