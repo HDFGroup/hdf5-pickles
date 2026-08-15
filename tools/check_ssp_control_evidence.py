@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import ast
+import json
+import os
 from pathlib import Path
 import sys
 
@@ -19,10 +21,67 @@ MEASUREMENT = ROOT / "registry/libhdf5-evidence.yml"
 EXPECTATIONS = ROOT / "h5policy/tests/expected"
 H5CVE = ROOT / "tools/h5cve"
 
+# The SSP SIG consumer contract, when that repository is checked out beside this
+# one. Located by env override first, then a sibling-directory convention -- no
+# host path is recorded, matching AGENTS.md portable-provenance.
+CONSUMER_REL = "audit/registry/h5policy-control-evidence.json"
+CONSUMER_ENV = "HDF5_SSP_SIG_DIR"
+CONSUMER_SIBLINGS = ("hdf5-ssp-sig",)
+
 
 def fail(message: str) -> None:
     print(f"SSP EVIDENCE CHECK FAILED: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def locate_consumer() -> Path | None:
+    """The SSP consumer contract if the sibling repo is available, else None."""
+    bases = []
+    env = os.environ.get(CONSUMER_ENV)
+    if env:
+        bases.append(Path(env))
+    bases.extend(ROOT.parent / name for name in CONSUMER_SIBLINGS)
+    for base in bases:
+        candidate = base / CONSUMER_REL
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def check_cross_seam(producer_ids: set[str]) -> None:
+    """The two sides of the seam must import the same control set.
+
+    Each repository's own checker validates its side; nothing else compares the
+    two lists, so a control added to one contract alone would pass both checks
+    while silently drifting. This closes that gap when both repos are present,
+    and skips with a notice (never a failure) when the sibling is absent, so a
+    lone checkout still gates.
+    """
+    consumer_path = locate_consumer()
+    if consumer_path is None:
+        print(f"SSP CROSS-SEAM CHECK SKIPPED: {CONSUMER_REL} not found "
+              f"(set {CONSUMER_ENV} or check out the SSP SIG repo beside this one)")
+        return
+    try:
+        consumer = json.loads(consumer_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"cannot read consumer contract {consumer_path.name}: {exc}")
+    consumer_ids = consumer.get("controls")
+    if not isinstance(consumer_ids, list):
+        fail("consumer contract controls must be a list")
+    consumer_set = set(consumer_ids)
+    if len(consumer_ids) != len(consumer_set):
+        fail("consumer contract controls must be unique")
+    only_producer = sorted(producer_ids - consumer_set)
+    only_consumer = sorted(consumer_set - producer_ids)
+    if only_producer or only_consumer:
+        detail = []
+        if only_producer:
+            detail.append(f"only in producer: {', '.join(only_producer)}")
+        if only_consumer:
+            detail.append(f"only in consumer: {', '.join(only_consumer)}")
+        fail("producer and SSP consumer control sets disagree (" + "; ".join(detail) + ")")
+    print(f"SSP CROSS-SEAM CHECK OK: {len(consumer_set)} controls match the SSP consumer")
 
 
 def read_yaml(path: Path) -> dict:
@@ -102,7 +161,12 @@ def check_row(row: dict, records: dict[str, dict], findings: dict,
     if measurement.get("family_verdict") != observed.get("verdict"):
         fail(f"{control}: family verdict does not match libhdf5 evidence")
     outcome = measurement.get("fixture_outcome")
-    if outcome not in {"enforced", "diverges", "not_applicable"}:
+    # `crashes` lets a DoS/memory-safety fixture that makes libhdf5 abort (the
+    # exact-build matrix records it under crashes_on, separate from the
+    # rejection verdict) be first-class SSP evidence -- a divide-by-zero or an
+    # amplification is precisely the hardening a control like TEST-05 or HARD-04
+    # wants to show, and would otherwise be unrepresentable here.
+    if outcome not in {"enforced", "diverges", "crashes", "not_applicable"}:
         fail(f"{control}: unsupported fixture outcome {outcome!r}")
     if outcome != "not_applicable" and row["fixture"] not in observed.get(f"{outcome}_on", []):
         fail(f"{control}: fixture is not measured as {outcome}")
@@ -127,9 +191,14 @@ def main() -> int:
     rows = contract.get("controls")
     if not isinstance(rows, list) or not rows:
         fail("contract needs at least one control mapping")
-    ids = [row.get("id") for row in rows if isinstance(row, dict)]
-    if len(ids) != len(rows) or len(ids) != len(set(ids)):
-        fail("control mappings need unique string ids")
+    # A control is evidenced by MANY fixtures (TEST-05 covers "every fixed
+    # vulnerability class"), so rows are keyed by the (control, fixture) pair,
+    # not by control alone. The control-id SET is what the SSP consumer imports.
+    pairs = [(row.get("id"), row.get("fixture")) for row in rows if isinstance(row, dict)]
+    if len(pairs) != len(rows) or len(pairs) != len(set(pairs)):
+        fail("control mappings need a unique (id, fixture) pair per row")
+    if not all(isinstance(cid, str) and cid for cid, _ in pairs):
+        fail("every control mapping needs a string id")
     records = {entry.get("record"): entry for entry in coverage.get("records", [])
                if isinstance(entry, dict) and isinstance(entry.get("record"), str)}
     try:
@@ -141,7 +210,10 @@ def main() -> int:
         if not isinstance(row, dict):
             fail("each control mapping must be a mapping")
         check_row(row, records, findings, measurement.get("records", {}), canaries)
-    print(f"SSP EVIDENCE CHECK OK: {len(rows)} controls; libhdf5 {measurement['libhdf5_version']}")
+    control_ids = {cid for cid, _ in pairs}
+    check_cross_seam(control_ids)
+    print(f"SSP EVIDENCE CHECK OK: {len(rows)} rows over {len(control_ids)} controls; "
+          f"libhdf5 {measurement['libhdf5_version']}")
     return 0
 
 
