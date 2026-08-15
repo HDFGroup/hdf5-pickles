@@ -1,0 +1,413 @@
+# The "new" fill-value message decoder never compares the fill value's declared
+# size against the dataset datatype.  The read path then copies at the DATATYPE
+# size out of a buffer allocated at the FILL size.
+#
+# Promoted from two working bundles that describe ONE libhdf5 defect reached
+# through the two decode branches of one function:
+#   cases/7b9fb196881b412936ddffd383a2e16a   (version 3 branch; crash reproducer)
+#   cases/04e1f6d2092bd5dab2ed2b3a27c6fc8b   (version 2 branch; multi-defect specimen)
+# They are recorded together deliberately.  H5O__fill_new_decode handles fill
+# message versions 1, 2 and 3 in one function and omits the datatype comparison
+# on every branch; the two bundles differ only in which branch their specimen
+# enters.  One added check closes both, and splitting the record would hide
+# that the version-2 branch is equally unguarded while only version 3 has a
+# tracked fixture.
+schema_version: 1
+
+id: fill-value-size-unchecked-in-new-decoder
+title: the new fill-value message decoder never checks the fill size against the
+  dataset datatype, so H5Dread copies at the datatype size out of a
+  fill-sized allocation
+status: oracle-hardened          # h5policy rejects both specimens; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The version-3 specimen
+  and the version-2 specimen live in the two bundles named under `branches`
+  below, with their sha256s.  The bundles' filenames carry provenance only and
+  are not a root-cause classification.
+
+# -- Triage -------------------------------------------------------------------
+record: dataset_layout_filter_fill
+versions: [1, 2, 3]              # fill message versions handled by the decoder
+root_cause_classification: aggregate_object
+violated_invariant:
+  - layout.fill_value_size
+validation_closure: >-
+  the complete dataset object description -- fill-value message, datatype
+  message, dataspace and layout -- established before any H5O_fill_t or H5D_t
+  is constructed.  The fill message alone does not close it: the declared fill
+  extent is only meaningful against the datatype extent, which lives in a
+  different message of the same object header.
+activation_before_validation:
+  # The fill buffer is malloc'd and populated at decode time, and the dataset is
+  # materialized and handed out as a public id, all before anything compares the
+  # two extents.  The unsafe copy happens later still, in H5Dread.
+  - native_construction
+  - public_id
+  - data_read
+entry_points:
+  - h5policy (oracle) -- untrusted-strict, forensic, legacy and trusted-fast all reject
+  - "libhdf5 H5Fopen -> H5Ovisit3 -> H5Dopen2 -> H5Dread"
+  - "libhdf5 decode side: H5O__fill_new_decode (src/H5Ofill.c:189)"
+  - "shipped tools: h5dump -pH renders the malformed fill property without complaint"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0 @e4b6a964723) ---------
+defect: >-
+  There are two fill-value messages in the format -- "Fill Value (old)"
+  (H5O_FILL_ID, 0x0004) and "Fill Value" (H5O_FILL_NEW_ID, 0x0005) -- and two
+  decoders for them.  The OLD one is correct.  H5O__fill_old_decode
+  (src/H5Ofill.c:328) takes `H5F_t *f, H5O_t *open_oh`, reaches back into the
+  object header for the datatype message, and enforces the relation outright:
+    if ((exists = H5O_msg_exists_oh(open_oh, H5O_DTYPE_ID)) < 0) ...
+    if (NULL == (dt = H5O_msg_read_oh(f, open_oh, H5O_DTYPE_ID, NULL))) ...
+    if (fill->size != (ssize_t)H5T_GET_SIZE(dt))
+        HGOTO_ERROR(..., "inconsistent fill value size");   /* :370-371 */
+  The NEW one is not.  H5O__fill_new_decode (:189) is handed the same two
+  parameters and declares both of them away in its own signature:
+    H5O__fill_new_decode(H5F_t H5_ATTR_UNUSED *f, H5O_t H5_ATTR_UNUSED *open_oh,
+                         unsigned H5_ATTR_UNUSED mesg_flags, ...)
+  `open_oh` is precisely the handle the old decoder uses to fetch the datatype,
+  and marking it unused is what makes the check structurally impossible here.
+  Both of its branches then bound the payload against its own message and stop:
+    version < 3 (:213-:249):  INT32DECODE(p, fill->size) at :235,
+                              H5_IS_BUFFER_OVERFLOW against p_end at :240,
+                              H5MM_malloc(fill->size) at :243, memcpy at :245.
+    version 3   (:264-:296):  UINT32DECODE(p, fill->size) at :286,
+                              H5_IS_BUFFER_OVERFLOW at :291,
+                              H5MM_malloc(fill->size) at :294, memcpy at :296.
+  Neither branch mentions the datatype.  So `fill->buf` is an allocation of
+  exactly `fill->size` bytes, and nothing has established that `fill->size`
+  bears any relation to the type it will be used to fill.
+  The consumer completes the defect.  H5D__fill (src/H5Dfill.c) computes
+  `dst_type_size = H5T_get_size(buf_type)` (:135), takes the no-conversion path
+  where `fill_buf = (const uint8_t *)fill` (:251) -- the raw decoded buffer --
+  and calls `H5S_select_fill(fill_buf, dst_type_size, space, buf)` (:254).
+  H5S_select_fill passes that length to H5VM_array_fill (src/H5VM.c:753), whose
+  H5MM_memcpy reads `dst_type_size` bytes from a `fill->size`-byte region.
+  The size actually allocated is never carried forward to the copy, so the
+  mismatch is unrecoverable at the point it matters.
+
+silent_disclosure_note: >-
+  The headline is NOT the fault.  On a stock build there is no fault at all:
+  H5Dread returns 0 and the caller receives adjacent heap as dataset content.
+  Re-measured live at HEAD on the version-3 specimen (see measured.stock_leak),
+  the 256-byte read returns the one encoded fill byte 0xab followed by 60
+  non-zero bytes, among them an 8-byte little-endian value in the 0x55.. PIE
+  heap range -- a leaked pointer.  The value changes between runs under ASLR,
+  which is itself the proof that it is live memory rather than stable content.
+  This is why the case matters more than an ordinary crash case: nothing
+  downstream sees an error, so a metadata preflight is the only thing that can
+  see it at all.  It is also why the diff harness needs the A~ predicate
+  described under `divergence` -- "libhdf5 opens it" carries no information
+  when the defect lives in returned content.
+
+# -- The two decode branches --------------------------------------------------
+branches:
+  version_3:
+    bundle: cases/7b9fb196881b412936ddffd383a2e16a
+    specimen: 195 bytes, input_sha256
+      883211e82aa61b5f53eedd12953f5c3655aed54a5d4e9af3e6bd46e6d167416c
+    how: >-
+      /dset carries a type-0x0005 message of 7 payload bytes at offset 104:
+      version 3, flags 0x22 (alloc late, write on allocation, fill defined),
+      declared size 1, value byte 0xab.  Its datatype is an array of 64 u32le,
+      256 bytes.  Shortfall 255 bytes.  Layout is contiguous with an undefined
+      data address, so the read is served entirely from the fill value.
+    impact: >-
+      Heap over-read of 255 bytes on every H5Dread of the dataset.  On a stock
+      build this is a silent information disclosure; under ASan it is a
+      heap-buffer-overflow abort.  No write primitive: the copy reads out of
+      bounds and writes into the caller's correctly sized buffer.
+    crash_path: >-
+      memcpy (sanitizer interceptor)
+      <- H5VM_array_fill (src/H5VM.c:753)
+      <- H5S_select_fill (src/H5Sselect.c:2377)
+      <- H5D__fill (src/H5Dfill.c:254)
+      <- H5D__read (src/H5Dio.c:266)
+      <- H5VL__native_dataset_read (src/H5VLnative_dataset.c:373)
+    oracle_finding: H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH @ 104
+    tracked_fixtures:
+      - malformed/fill_value_size_mismatch.h5    # v3, 1-byte fill / 256-byte type
+  version_2:
+    bundle: cases/04e1f6d2092bd5dab2ed2b3a27c6fc8b
+    specimen: 72368 bytes, input_sha256
+      d331b83e3dd94266828180c932d8a509d63c44fa59fa22f874611decc6bb4979
+    how: >-
+      /Array_be carries a type-0x0005 message of 16 payload bytes at offset 904:
+      version 2, alloc time 2, write time 2, fill defined 1, declared size 8.
+      Its datatype message at 864 declares 1032 storage bytes.  Shortfall 1024
+      bytes.  Version 2 enters the `fill->version < H5O_FILL_VERSION_3` branch
+      at src/H5Ofill.c:213 -- a different branch of the same unguarded decoder,
+      which is the whole reason this bundle is recorded here rather than
+      separately.
+    impact: >-
+      NOT DEMONSTRATED on this specimen, and deliberately not claimed.  See
+      measured.version_2_read_path.  The branch's decoder gap is source-derived
+      and certain; the consequence of that gap on this particular file is not
+      measured, because the specimen is multi-defect and libhdf5 turns it away
+      in traversal before the question is reached.
+    oracle_finding: H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH @ 904 (and again @ 928)
+    tracked_fixtures: []          # none -- see coverage_gaps, this is the gap
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  remeasured: 2026-08-15 at h5policy 9b2bd5d, hdf5 tree e4b6a964723
+  oracle_after: >-
+    All three files reject_corrupt under untrusted-strict, at exactly the
+    offsets the bundles recorded in July -- no drift:
+    7b9fb196 input.h5 @ 104, 04e1f6d2 input.h5 @ 904 (second report @ 928),
+    malformed/fill_value_size_mismatch.h5 @ 259.  The oracle covers BOTH decode
+    branches: it detects the version-2 message and the version-3 message alike,
+    through h5policy_update_fill_value_size, and in either message order
+    (fill-before-datatype and datatype-before-fill).
+  libhdf5_stock: >-
+    ACCEPTS.  h5policy-probe --exercise dataset_layout against the baseline
+    build (2.3.0 Release, NDEBUG) reports outcome=accepted for both the
+    version-3 specimen and the tracked fixture.  This is the "unguarded"
+    explanation of invariant A, not "never loaded" and not "assert-only": the
+    comparison is genuinely absent from the code path that runs.
+  libhdf5_asan: >-
+    CRASHES.  The same probe against the ASan build reports outcome=crashed,
+    signal 6, with an ASan heap-buffer-overflow, "READ of size 256", on both the
+    version-3 specimen and the tracked fixture.  The report is a genuine
+    sanitizer diagnostic, not an assertion abort -- the stack is the memcpy
+    chain quoted in branches.version_3.crash_path.
+  stock_leak: >-
+    Re-measured live at HEAD with the bundle's fill-leak-probe.c rebuilt against
+    the baseline h5cc.  Version-3 specimen: H5Dread=0, tsize=256, 60 of bytes
+    1..255 non-zero, buffer beginning `ab 00 .. 00 61 00 00 00 00 00 00 00
+    c6 7c f5 59 05 00 00 00 ..`.  Tracked fixture: H5Dread=0, tsize=256, 64
+    non-zero, containing `00 5a 12 65 05 00 00 00`.  Both of those 8-byte
+    little-endian values are 0x55-prefixed heap addresses, and both differ from
+    the values the bundle recorded in July -- ASLR, confirming live memory.
+  version_2_read_path: >-
+    NOT MEASURED.  h5policy-probe reports rejected_in_traversal for the
+    version-2 specimen on BOTH the stock and the ASan build, and the bundle's
+    own measurement (22 datasets opened, 15 reads succeeding on stock and 16 on
+    ASan, no ASan report) agrees: this file is not a crash or disclosure
+    reproducer and must not be cited as one.  A targeted direct read of
+    /Array_be on both builds, which is what would settle whether the version-2
+    branch leaks the same way, was attempted at promotion and could not be run
+    in this session.  The version-2 branch is therefore SOURCE-DERIVED ONLY.
+    Closing this is the first item under coverage_gaps.
+  width: >-
+    NOT measured at 32 bits, on either specimen.  The operative values (1 vs
+    256; 8 vs 1032) fit comfortably in 32-bit and 64-bit size_t, so this is an
+    extent mismatch rather than a width wrap and no width dependence is
+    expected -- but allocator layout, and therefore what leaks, would differ.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: accepted
+  libhdf5_version: 2.3.0
+  classification: A~ (oracle deliberately stricter; libhdf5 acceptance is uninformative)
+  note: >-
+    This is a real invariant-A disagreement, and it is already handled -- by a
+    narrow finding-code-scoped predicate, `fill_value_size_mismatch_only` in
+    h5policy/tools/h5policy-diff:514, applied at :696.  NOT by an entry in
+    registry/h5policy-diff-tolerances.yml, and one must not be added: tolerances
+    are for reference-library defects on one specimen, whereas this is a whole
+    finding class whose evidence the harness structurally cannot see.  The
+    harness compares exit codes and structure; the defect lives in returned
+    CONTENT.  h5dump, h5debug and h5dump --data all exit 0 on these files, so
+    the A+ evidence path has nothing to corroborate with, and "libhdf5 opens it"
+    must not be read as agreement.  The predicate stays message-scoped: any
+    other finding on the same file is still a hard A failure.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Two changes, the first sufficient and the second defence in depth.
+    (1) Give H5O__fill_new_decode the check its sibling already has.  Drop the
+    H5_ATTR_UNUSED from `f` and `open_oh` at src/H5Ofill.c:189 and, on both
+    branches, apply the H5O__fill_old_decode:365-371 sequence -- exists, read
+    the H5O_DTYPE_ID message, compare fill->size to H5T_GET_SIZE(dt), and
+    HGOTO_ERROR "inconsistent fill value size" on mismatch.  The code to copy
+    already exists 130 lines further down the same file.
+    ORDERING CAVEAT, and the reason this is not purely mechanical: object-header
+    messages arrive in any order, so a decoder-local check can be evaded by a
+    file that places the fill message before the datatype message.  The old
+    decoder is exposed to the same thing and handles it only because
+    H5O_msg_exists_oh consults the partially built header.  A robust fix belongs
+    at the point the dataset object is finalized, where both messages are known
+    to have been seen, rather than inline in whichever decoder happens to run
+    first.  h5policy took exactly that route.
+    (2) Make the consumer defensive.  H5D__fill should bound its copy by the
+    fill buffer's actual extent instead of assuming dst_type_size describes it.
+    That requires carrying the allocated size alongside fill->buf to the copy
+    site, which today it is not.
+    Neither change can reject a file libhdf5 itself wrote: a fill value it
+    encodes always has size equal to the datatype size, which is why the old
+    decoder has been able to enforce the relation unconditionally for years.
+systemic:
+  semantic_boundary: >-
+    aggregate validation of each dataset's datatype and defined fill-value
+    extent together, followed by native materialization only from the validated
+    aggregate description.  Neither message closes it alone.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 decode and read paths still open
+  description: >-
+    h5policy validates the fill extent against the datatype extent with no
+    native construction and no read, so the class of defect cannot arise there:
+    there is no fill buffer to over-read.  The check is cross-message and is
+    resolved once the object's messages have all been seen, not inline in the
+    fill-message decoder, which is what makes it robust to message reordering --
+    the evasion the libhdf5 containment above has to reason about.  Both
+    decode branches and both message orders are covered.
+    The remaining work is entirely libhdf5's; the oracle rejecting the metadata
+    does not make H5D__fill's copy safe.
+  landed_changes:
+    - h5policy/pickles (h5policy_update_fill_value_size + the finalize-time
+      datatype/fill extent comparison)
+    - registry/findings/catalog/dataset_layout_filter_fill.yml
+      (H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH)
+    - registry/validation-coverage.yml (layout.fill_value_size, line 397)
+    - h5policy/tools/h5policy-gencorpus (_make_fill_value_size_mismatch)
+    - h5policy/tests/expected/malformed-fill_value_size_mismatch.yml
+    - h5policy/tools/h5policy-diff (fill_value_size_mismatch_only, the A~ predicate)
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc:
+    - cases/7b9fb196881b412936ddffd383a2e16a/input.h5        # v3, the crash/leak reproducer
+    - cases/04e1f6d2092bd5dab2ed2b3a27c6fc8b/input.h5        # v2, multi-defect, NOT a crash reproducer
+  direct_fixtures:
+    - h5policy/tests/malformed/fill_value_size_mismatch.h5
+  expectations:
+    - h5policy/tests/expected/malformed-fill_value_size_mismatch.yml
+  control_fixture: h5policy/tests/valid/simple_dataset.h5
+  leak_probe: >-
+    cases/7b9fb196881b412936ddffd383a2e16a/fill-leak-probe.c -- 20 lines, public
+    API only.  Visits every dataset, reads one element at its own datatype, and
+    prints the non-zero byte count past the declared fill extent.  Build it with
+    the h5cc of the build under test; it needs nothing from this repo.  This is
+    the only reproducer that shows the STOCK-build behaviour, since the probe
+    harness and every shipped tool report success.
+  generators: >-
+    The tracked fixture is built by h5policy-gencorpus
+    _make_fill_value_size_mismatch, which shrinks the version-3 fill message's
+    declared size from 256 to 1 and repairs the object-header checksum --
+    without that repair libhdf5 rejects the file before H5D__fill is ever
+    reached and the fixture would prove nothing.  Reproducible from this repo
+    alone.  The two bundle specimens were supplied, not generated, and have no
+    local deterministic reducer; the version-3 one is byte-for-byte preserved
+    with its sha256 recorded above.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true    # h5policy rejects while decoding the
+                                          # object header; no fill buffer is
+                                          # ever allocated
+    no_plugin_load: true
+    no_decompression: true                # v3 specimen has no filters; the v2
+                                          # specimen does, but not on /Array_be
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []          # nothing to backport in h5policy.
+
+fuzz_seed: >-
+  cases/7b9fb196881b412936ddffd383a2e16a/input.h5 is a seed for the fill-message
+  mutation neighbourhood.  Note that h5mutate produced ZERO variants for it --
+  its only recipes mutate object-header continuations, and all six were skipped
+  as not applicable.  A fill-value semantic-neighbour recipe does not exist yet
+  and is listed under coverage_gaps.
+
+compatibility_backport_risks: >-
+  Low, and bounded by an existing precedent: the old-message decoder already
+  enforces exactly this relation, so a valid file has always had to satisfy it.
+  Any fixed-size defined fill value libhdf5 writes has size equal to the
+  datatype size.  The real risk is behavioural rather than compatibility --
+  files that today read "successfully" while returning heap bytes would begin
+  failing at open or at read.  That is the intended outcome, but it will surface
+  as a new error on files some users currently consider readable, and unlike a
+  crash fix it changes the status of files nobody has noticed are broken.
+
+sibling_audit: >-
+  Within libhdf5: this record establishes the two H5O__fill_new_decode branches
+  only.  NOT established, and each needing its own specimen before an upstream
+  fix could be called complete -- the conversion path in H5D__fill (:155-:190,
+  where src_type_size and dst_type_size differ and a conversion buffer is sized
+  MAX(src,dst)); VLEN fills; fill values on attributes rather than datasets;
+  compact storage; and the encode side (:434, :473, :512), which memcpy's
+  fill->size bytes out of fill->buf on write and would carry an in-memory
+  mismatch back to disk.  The old-message decoder at :328 is the one path
+  audited and found correct.
+  Within h5policy: the oracle's check compares the fill extent to the datatype
+  extent as decoded.  Datatype sizes that are rewritten after the fact are a
+  known hazard in a neighbouring family -- see
+  registry/cases/datatype-size-not-final.yml -- and whether a reference or vlen
+  datatype under a defined fill value can produce the same
+  computed-from-a-stale-size problem here is untested.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED, and deliberately not asserted.  The defect is measured live on
+    2.3.0 @e4b6a964723 (baseline Release and ASan builds, 2026-08-15).  No git
+    archaeology was run on H5Ofill.c and no older tag was built, so no claim is
+    made about when the new decoder was introduced without the check, nor about
+    which supported branches carry it.
+  note: >-
+    The shape of the code suggests it has always been this way -- the check
+    lives only in the decoder for the OLD message and was simply not carried
+    into the new one -- but "suggests" is not a measurement.  Settling it means
+    the same treatment registry/cases/mdci-reconstruct-cleanup-unsafe.yml got:
+    find the commit that added H5O__fill_new_decode, then build one older tag
+    and run the leak probe on it.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    NO TRACKED FIXTURE FOR THE VERSION-2 BRANCH.  This is the concrete gap the
+    joint record exists to surface.  malformed/fill_value_size_mismatch.h5 is
+    version 3, and _make_fill_value_size_mismatch shrinks a version-3 message,
+    so the `fill->version < H5O_FILL_VERSION_3` branch at src/H5Ofill.c:213 has
+    oracle coverage but no corpus specimen of its own.  A
+    _make_fill_value_size_mismatch_v2 alongside the existing generator would
+    close it, and the version-2 bundle's /Array_be gives the shape to copy
+    (8-byte fill, 1032-byte type).
+  - >-
+    The version-2 read path is unmeasured on both builds -- see
+    measured.version_2_read_path.  Until a targeted direct read of /Array_be
+    runs, the version-2 branch's consequence is inferred from source, not
+    observed.  Pair this with the fixture above: a purpose-built v2 fixture
+    would settle it more cleanly than the multi-defect specimen can.
+  - >-
+    No 32-bit measurement on either specimen (see measured.width).
+  - >-
+    No semantic-neighbour variants for either specimen.  h5mutate has no
+    fill-value recipe, so the N-1/N/N+1 boundary around the size field is
+    untested; the version-3 bundle recorded zero generated variants for exactly
+    this reason.
+open_questions:
+  - >-
+    Does the version-2 branch leak identically to version 3, or does the
+    smaller shortfall relative to allocation granularity change what is
+    reachable?  8 bytes out of a 1032-byte copy leaves 1024 bytes of over-read,
+    which is larger than the version-3 case, so the expectation is that it is
+    at least as severe -- but this is unmeasured (see above).
+  - >-
+    Is the finalize-time placement of h5policy's check genuinely order-robust
+    for the ATTRIBUTE path?  Attributes are validated with a throwaway context
+    copy, and cross-message state that lives in per-object globals rather than
+    the context does not reset the same way.  Fill values on attributes are
+    listed as unaudited in sibling_audit; if that path is ever added, the
+    globals-versus-context distinction has to be settled first.
+
+provenance:
+  found_by: >-
+    two supplied specimens, triaged through the h5cve bundle workflow on
+    2026-07-24 in cases/7b9fb196881b412936ddffd383a2e16a and
+    cases/04e1f6d2092bd5dab2ed2b3a27c6fc8b (CASE.md, source-audit.md in each);
+    promoted jointly 2026-08-15 after re-measuring both on current HEAD.
+    The tracked fixture predates both bundles and came from a separate corpus
+    seed, which is why its sha256 matches neither specimen.
+  hdf5_build: >-
+    HDF5 2.3.0 @e4b6a964723; baseline Release (NDEBUG) -- accepts, and leaks;
+    candidate RelWithDebInfo -fsanitize=address -- heap-buffer-overflow READ of
+    size 256.  Both are workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3
