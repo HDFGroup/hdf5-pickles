@@ -46,7 +46,7 @@ schema.  It duplicates no tool logic — it shells out to `h5policy`, `h5markers
 invariant through [`registry/findings/`](../registry/findings/).
 
 ```text
-h5cve init  <id> --poc FILE                 # bundle: PoC, sha256, skeleton case.yml
+h5cve init  <id> --poc FILE                 # bundle: PoC, sha256, case.yml, advisory draft
 h5cve triage <case>                         # oracle + census + registry mapping
 h5cve verify <case> --baseline BINDIR [--candidate BINDIR]   # exact-build probes
 h5cve variants <case> [--seed VALID]        # typed semantic variants via h5mutate
@@ -67,6 +67,11 @@ gap, a wrong one is a wrong fix.
 Production codes that have not reached that semantic review are source-tracked
 in `registry/finding-backlog.yml`; triage deliberately leaves their mapping
 unset until they move into the finding catalog.
+
+`init` also creates `github-advisory.md`, a private handoff draft matching the
+repository-advisory form. Complete it only from measured case evidence, compare
+it with the authenticated form before submission, and treat creating or
+publishing an advisory as a separate user-authorized action.
 
 `triage` also records **every** family the file implicates, not just the
 primary's, in `family_coverage`.  The strict profile stops at the first
@@ -258,6 +263,13 @@ build probe (`tools/h5policy-probe`, and `h5policy/tools/probe/`) runs a selecte
 libhdf5 build under an `LD_PRELOAD` activation interposer inside a sandbox and
 reports whether rejection preceded any OS-observable activation; see
 [`h5policy/tools/probe/README.md`](../h5policy/tools/probe/README.md).
+
+Before handing off a case bundle, check its untracked contents for portable
+provenance and prohibited identifiers:
+
+```sh
+python3 tools/check_hygiene.py --paths cases/<id>
+```
 
 ## Marker Scanner
 

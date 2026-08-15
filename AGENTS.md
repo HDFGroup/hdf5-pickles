@@ -7,6 +7,17 @@
 - The documentation, generated-file, portable-provenance, boundary, and
   verification rules apply to every task.
 
+## Task modes
+
+Classify the task before writing. The rows below resolve the write boundary when
+the general documentation rule and the CVE workflow would otherwise overlap.
+
+| Task | Permitted writes | Completion boundary |
+| --- | --- | --- |
+| Ordinary implementation or documentation | Files required by the requested change, subject to generated-file and boundary rules | Run the checks in [Verification](#verification) for the changed surface. |
+| CVE case development | `cases/<id>/` and temporary build directories only | Complete the case bundle and its local hygiene check; do not promote tracked changes. |
+| CVE promotion | None until the user approves the explicit promotion list | After approval, make only the listed tracked changes and run their verification. |
+
 ## CVE case workflow
 
 Apply the [§11 CVE process](docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md)
@@ -21,6 +32,8 @@ Produce a complete, self-contained bundle under `cases/<id>/`:
 - `CASE.md` — the narrative case record, suitable for a CVE submission or for
   confirming that no vulnerability is present.
 - `source-audit.md` — the source-level audit.
+- `github-advisory.md` — the private repository-advisory handoff draft created
+  by `h5cve init`; it is never an authorization to submit or publish.
 - Reproducers, probe sources, command transcripts, reports, and other evidence
   needed to support the conclusions.
 
@@ -47,6 +60,25 @@ advisory.
   conclusion. Identify the violated invariant, affected entry points, exact-build
   behavior, activation boundary, sibling variants, and remaining coverage gaps.
 
+### Private repository-advisory draft
+
+For a repository security advisory, complete `cases/<id>/github-advisory.md`
+after triage and verification. Its headings mirror the private draft form:
+
+- title and whether an existing CVE identifier is supplied or one will be
+  requested later;
+- description with summary, impact, patches, workarounds, and references;
+- one affected-product block per disjoint vulnerable range, naming ecosystem,
+  package, affected and patched versions, and vulnerable functions;
+- severity and CVSS vector, weaknesses, and optional credited contributors.
+
+Use the form's version-range syntax: one lower/upper-bound range such as
+`>= lower, < upper` per affected-product block, with a separate block for each
+disjoint range. Do not create a draft, invite collaborators, request an
+identifier, or publish an advisory without explicit user authorization. The
+repository form requires appropriate repository permissions; if the user lacks
+them, hand off the completed local draft to an authorized maintainer instead.
+
 ### Existing case bundles
 
 Treat existing `cases/<id>/` contents as unverified prior work. Preserve
@@ -62,6 +94,14 @@ measurements against current HEAD and replace TODOs or unsupported assertions.
   Do not use `h5policy-gencorpus` to rewrite a tracked destination.
 - List proposed tracked changes as explicit promotion steps. Stop and let the
   user decide whether to promote them.
+- A promotion must not add a tracked reference to a case artifact, including a
+  specimen, probe, log, or report under `cases/<id>/`. Promote a reproducible
+  fixture, generator, checksum-backed provenance record, or an explicit `n/a`
+  limitation instead. Before promotion, inspect added tracked lines with
+  `git diff -- <promotion paths> | rg '^\+.*cases/[A-Za-z0-9_][A-Za-z0-9_.-]*/'`.
+- Before handing off a bundle, run `python3 tools/check_hygiene.py --paths
+  cases/<id>` and correct every reported portable-provenance or identifier
+  violation.
 
 ## Documentation
 
@@ -105,11 +145,12 @@ satisfiable at once.
   emission for this reason; the values they hold internally stay absolute,
   because `h5cc` drives the sibling-lib lookup and the probe build-cache key.
 
-`tools/check_hygiene.py` enforces both this section and the two `Never` rules
-below, over tracked files, as part of `docs-check`. It cannot gate `cases/` —
-that tree is gitignored scratch, regenerated per machine, so a failure there
-would be unfixable by any commit; the `portable_path()` calls above are what
-keep it clean.
+`tools/check_hygiene.py` enforces the portable-path and prohibited-identifier
+rules over tracked files as part of `docs-check`. Its default does not gate all
+of `cases/`: that tree is gitignored scratch, regenerated per machine, so a
+failure there would be unfixable by any commit. The explicit per-bundle command
+in [Write and promotion boundary](#write-and-promotion-boundary) closes that
+gap before handoff; `portable_path()` remains the generator-side prevention.
 
 ## Boundaries
 
@@ -133,6 +174,19 @@ keep it clean.
 - Use destructive Git operations unless explicitly requested.
 
 ## Verification
+
+Choose checks from this matrix in addition to narrow tests that exercise the
+changed behavior. If a listed command cannot run, report the omission and why.
+
+| Changed surface | Required verification |
+| --- | --- |
+| Markdown, command examples, or documentation behavior | `cmake --build build --target docs-check` |
+| `docs/spec/*.yml`, `pickles/*.pk`, or `docs/generated/*.md` | Regenerate with the documented workflow, then run `cmake --build build --target docs-check` |
+| `registry/`, `registry/findings/`, or finding routes | `python3 tools/check_registry.py`; also run `docs-check` when documentation changed |
+| `h5policy/` validators, wrappers, or corpus expectations | The focused test plus `h5policy/tests/run.sh` when the change affects shared validation behavior |
+| `tools/h5cve`, provenance emitters, or hygiene tooling | The focused test plus `python3 tools/check_quickstart.py` when its canary inventory contract is affected |
+| Repository-advisory draft generation | `python3 tools/check_advisory_draft.py` and `python3 tools/check_hygiene.py --paths cases/<id>` for the real bundle |
+| CVE bundle under `cases/<id>/` | `python3 tools/check_hygiene.py --paths cases/<id>` and the measured case commands |
 
 - Run tests appropriate to the changed surface, including documentation checks
   for documentation changes.

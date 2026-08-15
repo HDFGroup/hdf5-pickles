@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 import re
 import subprocess
@@ -59,7 +60,7 @@ def fail(message: str) -> None:
 
 
 def tracked_files() -> list[Path] | None:
-    """Tracked paths, or None when git cannot answer.
+    """Return tracked paths, or None when git cannot answer.
 
     The scan is deliberately limited to tracked files. cases/ is gitignored
     working scratch: it is regenerated constantly and differs per machine, so
@@ -76,6 +77,34 @@ def tracked_files() -> list[Path] | None:
     return [ROOT / p.decode() for p in out.split(b"\0") if p]
 
 
+def requested_files(raw_paths: list[str]) -> list[Path]:
+    """Return text-file candidates beneath explicitly named repository paths."""
+    files: list[Path] = []
+    for raw_path in raw_paths:
+        path = Path(raw_path)
+        candidate = path if path.is_absolute() else ROOT / path
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(ROOT)
+        except (OSError, ValueError):
+            fail(f"--paths entry must exist inside the repository: {raw_path}")
+
+        if resolved.is_file():
+            files.append(resolved)
+        elif resolved.is_dir():
+            for child in resolved.rglob("*"):
+                if not child.is_file():
+                    continue
+                try:
+                    child.resolve().relative_to(ROOT)
+                except (OSError, ValueError):
+                    fail(f"--paths entry contains a file outside the repository: {raw_path}")
+                files.append(child)
+        else:
+            fail(f"--paths entry is neither a file nor a directory: {raw_path}")
+    return sorted(set(files))
+
+
 def is_text(path: Path) -> bool:
     try:
         return b"\0" not in path.open("rb").read(8192)
@@ -83,18 +112,17 @@ def is_text(path: Path) -> bool:
         return False
 
 
-def main() -> int:
-    files = tracked_files()
-    if files is None:
-        print("HYGIENE CHECK SKIPPED: git ls-files unavailable; "
-              "cannot determine the tracked set", file=sys.stderr)
-        return 0
-
+def scan(files: list[Path], exempt_policy_files: bool) -> tuple[int, list[str]]:
+    """Return the number of text files scanned and any rule violations."""
     violations: list[str] = []
     scanned = 0
     for path in files:
-        rel = path.relative_to(ROOT).as_posix()
-        if rel in ALLOWED or not path.is_file() or not is_text(path):
+        try:
+            rel = path.relative_to(ROOT).as_posix()
+        except ValueError:
+            fail(f"scan target is outside the repository: {path}")
+        if ((exempt_policy_files and rel in ALLOWED)
+                or not path.is_file() or not is_text(path)):
             continue
         scanned += 1
         for pattern, what in RULES:
@@ -110,6 +138,29 @@ def main() -> int:
                     violations.append(
                         f"{rel}:{n}: {what} {m.group(0)!r} in "
                         f"{line.strip()[:70]!r}")
+    return scanned, violations
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--paths", nargs="+", metavar="PATH",
+        help="scan explicit repository-local files or directories instead of tracked files",
+    )
+    args = parser.parse_args()
+
+    if args.paths:
+        files = requested_files(args.paths)
+        exempt_policy_files = False
+    else:
+        files = tracked_files()
+        if files is None:
+            print("HYGIENE CHECK SKIPPED: git ls-files unavailable; "
+                  "cannot determine the tracked set", file=sys.stderr)
+            return 0
+        exempt_policy_files = True
+
+    scanned, violations = scan(files, exempt_policy_files)
 
     if violations:
         for v in violations[:40]:
@@ -119,7 +170,8 @@ def main() -> int:
         fail(f"{len(violations)} violation(s) of the AGENTS.md 'Never' rules; "
              "see the Portable provenance section for the substitutions to use")
 
-    print(f"HYGIENE CHECK OK: {scanned} tracked text files carry no advisory "
+    scope = "tracked" if not args.paths else "requested"
+    print(f"HYGIENE CHECK OK: {scanned} {scope} text files carry no advisory "
           "identifiers or host paths")
     return 0
 

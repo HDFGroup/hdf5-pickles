@@ -456,6 +456,34 @@ The systemic implementation places checks according to their scope:
 
 Once a class has migrated, validation failure must never fall through to its legacy decoder. Hard memory-safety and progress checks apply under every compatibility profile.
 
+#### Private repository-advisory handoff
+
+The case bundle should also contain a private repository-advisory draft. It is
+prepared after triage and verification, and it is not a substitute for the case
+record or an authorization to create or publish anything remotely.
+
+The draft must supply the repository form's current fields:
+
+- a title and the choice to supply an existing CVE identifier or request one
+  later;
+- a description covering summary, impact, patches, workarounds, and references;
+- one affected-product entry per disjoint vulnerable version range, with the
+  ecosystem, package name, affected versions, patched versions, and vulnerable
+  functions;
+- severity and CVSS vector, weaknesses, and optional credits.
+
+Use one lower/upper-bound range per affected-product entry, for example
+`>= lower, < upper`. Multiple disjoint ranges require separate entries. Before
+an authorized maintainer creates the private draft, compare the local handoff
+against the authenticated [HDF5 draft advisory form](https://github.com/HDFGroup/hdf5/security/advisories/new); the form, not this document, remains authoritative. Creation,
+inviting collaborators, identifier requests, and publication are separate
+authorization boundaries.
+
+The [`h5cve`](../TOOLS.md#h5cve-case-orchestrator) initializer creates
+`cases/<id>/github-advisory.md` with these headings. The form instructions and
+version-range guidance are maintained by [GitHub's repository-advisory
+documentation](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/fix-reported-vulnerabilities/create-repository-advisory).
+
 ### 11.6 Require invariant-focused review
 
 A decoding-related security change should receive both format and security review. Reviewers should verify:
