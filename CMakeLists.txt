@@ -133,9 +133,11 @@ add_custom_target(docs-check
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tool_overview.py"
     COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_hygiene.py"
+    COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/.devcontainer/check.py"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    COMMENT "Checking generated docs, commands, policy boundaries, summaries, tool map, and devcontainer"
+    COMMENT "Checking generated docs, commands, policy boundaries, summaries, tool map, hygiene, and devcontainer"
     VERBATIM
     USES_TERMINAL
 )

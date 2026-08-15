@@ -105,6 +105,12 @@ satisfiable at once.
   emission for this reason; the values they hold internally stay absolute,
   because `h5cc` drives the sibling-lib lookup and the probe build-cache key.
 
+`tools/check_hygiene.py` enforces both this section and the two `Never` rules
+below, over tracked files, as part of `docs-check`. It cannot gate `cases/` —
+that tree is gitignored scratch, regenerated per machine, so a failure there
+would be unfixable by any commit; the `portable_path()` calls above are what
+keep it clean.
+
 ## Boundaries
 
 ### Ask first
