@@ -12,9 +12,10 @@
 schema_version: 1
 
 id: decoder-bound-shape-sweeps
-title: sweeps for two decoder bound-checking shapes -- discarded image length,
-  and additive extent checks that can wrap
-status: complete                 # both sweeps run to completion; no open items
+title: sweeps for three decoder bound-checking shapes -- discarded image length,
+  additive extent checks that can wrap, and positions computed from header
+  constants
+status: complete                 # all three run; lead followed up; line of work closed
 disclosure: "n/a -- local source analysis only; no advisory consulted"
 
 # -- What was swept and why ---------------------------------------------------
@@ -143,6 +144,97 @@ sweep_b:
     which is worth more than it sounds -- it closes an open item in a record
     rather than leaving a suspicion sitting there indefinitely.
 
+# == SWEEP C: positions computed from header constants =========================
+sweep_c:
+  question: >-
+    How many read-path cache clients compute a position from HEADER CONSTANTS
+    (*_PREFIX_SIZE, *_OVERHEAD) and never test it against the image extent they
+    were handed?  This is the shape that produced
+    registry/cases/fractal-heap-dblock-size-no-floor.yml, and the shape neither
+    earlier sweep could see.
+  run: 2026-08-15, read-only, same method as A and B.
+  result: >-
+    NO NEW INSTANCES.  The verify_chksum half is EXHAUSTIVE and every hit is
+    already recorded; the deserialize half surfaced a different shape entirely,
+    noted below as a lead rather than a finding.
+  verify_chksum_is_exhaustive: >-
+    There are 22 verify_chksum implementations in src/*.c.  SEVENTEEN pass their
+    own `len` straight through -- `H5F_get_checksums(image, len, ...)` -- so the
+    position IS the extent and the shape cannot arise.  That is the healthy
+    pattern, and it is the large majority.
+    Only FOUR compute a position from anything else, and all four are known:
+      src/H5B2cache.c:569   chk_size from H5B2_INT_PREFIX_SIZE + nrec*rrec_size
+      src/H5B2cache.c:970   chk_size from H5B2_LEAF_PREFIX_SIZE + nrec*rrec_size
+                            -- both recorded in
+                            registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml
+      src/H5HFcache.c:1596  chk_size from H5HF_MAN_ABS_DIRECT_OVERHEAD(hdr)
+                            -- recorded in
+                            registry/cases/fractal-heap-dblock-size-no-floor.yml
+      src/H5SMcache.c:499   chk_size from H5SM_LIST_SIZE(f, num_messages)
+                            -- CORRECT: bounded by the num_messages > list_max
+                            guard at :495, the precedent cited in sweep A
+    So for checksum verification the class is closed: four sites, three defects
+    already recorded, one correct implementation.
+  adjacent_observations:
+    - id: assert-only cursor position checks
+      sites: [src/H5B2cache.c:769, src/H5B2cache.c:1143,
+              src/H5HFcache.c:1803, src/H5HFcache.c:2066]
+      verdict: low value, not pursued
+      note: >-
+        Four deserializers assert that the cursor landed exactly on the prefix
+        boundary, e.g. `assert((size_t)(image - (uint8_t *)_image) ==
+        (H5B2_LEAF_PREFIX_SIZE - H5B2_SIZEOF_CHKSUM))`.  Compiled out under
+        NDEBUG, so they are assert-only in the usual sense -- but what they
+        check is that fixed-width library decoding consumed a fixed number of
+        bytes, not that any attacker-controlled quantity is in range.  Recorded
+        so the next sweep does not re-flag them.
+    - id: file-declared count driving a load size
+      sites: [src/H5FAcache.c:559, src/H5FAcache.c:721,
+              src/H5EAcache.c:1430, src/H5EAcache.c:1596]
+      verdict: RESOLVED 2026-08-15 -- FA half already covered, EA half not equivalent
+      note: >-
+        These are get_initial_load_size callbacks setting `*image_len` from
+        H5FA_DBLOCK_SIZE / H5EA_DBLOCK_SIZE and their PREFIX_SIZE variants.
+        Not this sweep's shape (position vs extent) but the one recorded in
+        registry/cases/mdci-entry-extent-rebased-after-header.yml -- a
+        file-influenced quantity becoming the allocation size the cache
+        framework honours.  Followed up read-only and the two arrays diverge.
+        FIXED ARRAY: ALREADY COVERED, no new record needed.
+        registry/cases/fixed-array-extent-mismatch.yml does not stop at the
+        capacity/dataspace mismatch -- its `defect` section already names the
+        allocation consequence explicitly: H5FA__dblock_create derives the page
+        count and the ceil(npages/8) initialisation bitmask from
+        cparam.nelmts, and "H5FA__cache_dblock_image_len reports the result as
+        the cache entry's size", with "the stored capacity used as found and
+        never compared with the extent it was derived from".  It records a
+        measured ~10^9x storage amplification from a one-field edit, and it
+        already flags the interesting residual: the products are computed in
+        hsize_t while the cache entry size is a size_t, so whether a 32-bit
+        build WRAPS to a small plausible entry size -- and copies real bytes
+        into an undersized allocation -- rather than tripping the ceiling is
+        untested there.  The sweep reached the same mechanism from the
+        get_initial_load_size side; it is one defect, already recorded.
+        EXTENSIBLE ARRAY: NOT the same exposure.  The FA path reads a single
+        stored capacity (udata->hdr->cparam.nelmts) and uses it as found.  The
+        EA path does not: `dblock.nelmts = udata->nelmts` (src/H5EAcache.c:1419)
+        and both real callers supply that from the library's doubling schedule
+        -- `hdr->sblk_info[sblk_idx].dblk_nelmts` (src/H5EA.c:417) and
+        `sblock->dblk_nelmts` (src/H5EA.c:576) -- not from a raw capacity field.
+        So the FA defect's shape, "a stored capacity never compared with what it
+        was derived from", does not transfer.
+        WHAT REMAINS UNESTABLISHED, and it is narrower than the original lead:
+        sblk_info is itself computed in H5EA__hdr_init from cparam fields that
+        ARE file data (max_nelmts_bits, data_blk_min_elmts,
+        sup_blk_min_data_ptrs).  So the EA schedule is file-INFLUENCED through a
+        structured derivation rather than file-declared outright.  Whether those
+        cparam fields are bounded on read was not traced.  That is a different
+        and smaller question than the one this lead started as, and it is the
+        only part still open.
+        Noted in passing: src/H5EAcache.c:1424 asserts
+        `udata->nelmts == dblock.npages * hdr->dblk_page_nelmts` -- an
+        assert-only consistency check between the element count and the page
+        count, compiled out under NDEBUG.
+
 # -- What changed as a result --------------------------------------------------
 corrections_made: >-
   Two records described this shape as "endemic to metadata-cache client
@@ -167,16 +259,34 @@ followups:
     above.  Low priority -- it needs a two-step corruption and an NDEBUG build,
     and no specimen exists.
   - >-
-    A THIRD SWEEP IS NOW WARRANTED, and neither existing one covers it.  The
-    fractal-heap false negative under `limitations` shows a distinct shape:
-    a read-path cache client computing a position from HEADER constants
-    (H5HF_MAN_ABS_DIRECT_OVERHEAD and friends) and never testing it against the
-    image extent it was handed.  Sweep A looks for a DISCARDED bound and cannot
-    see this.  A starting query would be uses of the *_OVERHEAD and *_PREFIX_SIZE
-    macros inside verify_chksum and deserialize callbacks, checked for whether
-    the resulting offset is ever compared to `len`.  Expect this one to be
-    messier than the first two -- the macros are numerous and most uses are on
-    the write path, where the size is library-computed.
+    DONE 2026-08-15 -- see sweep_c.  It found no new instances: verify_chksum is
+    exhaustive at four position-computing sites, all already recorded, and the
+    other macro uses are write-path, debug, asserts, or a different shape.
+    The prediction that it would be "messier than the first two" was wrong in a
+    useful way -- restricting to verify_chksum made it the CLEANEST of the
+    three, because that callback family has one healthy idiom
+    (`H5F_get_checksums(image, len, ...)`) that 17 of 22 implementations follow,
+    so the exceptions stand out completely.
+  - >-
+    CLOSED 2026-08-15.  The FA/EA load-size lead was followed up read-only --
+    see sweep_c.adjacent_observations.  The fixed-array half is already fully
+    covered by registry/cases/fixed-array-extent-mismatch.yml, allocation
+    consequence included; the extensible-array half is not the same shape,
+    because its element count comes from the library's doubling schedule rather
+    than a stored capacity.
+    ALL THREE SWEEPS ARE NOW COMPLETE and this line of work is closed.  Across
+    them the total yield of NEW defects is ONE: the src/H5HLdbg.c:82 duplicate
+    from sweep B.  Everything else they touched was already recorded, correct,
+    or a different shape.  That is worth stating plainly -- the sweeps were
+    cheap and worth running, but the defects in this registry were found by
+    promoting specimens, not by pattern-matching source.
+  - >-
+    ONE NARROW QUESTION SURVIVES, much smaller than the lead it came from:
+    H5EA__hdr_init derives sblk_info from cparam fields that are file data
+    (max_nelmts_bits, data_blk_min_elmts, sup_blk_min_data_ptrs).  Whether
+    those are bounded on read was not traced.  Anyone picking this up should
+    note it is a HEADER-VALIDATION question, not a bound-application one, and
+    so belongs with the extensible-array family rather than with these sweeps.
 
 # -- Honesty notes -------------------------------------------------------------
 limitations: >-
