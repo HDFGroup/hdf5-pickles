@@ -1,0 +1,386 @@
+# A VDS mapping count is multiplied by the entry struct size with no overflow
+# check, so an impossible count wraps to a small allocation that the decode
+# loop then writes past -- and the failure cleanup walks the same impossible
+# count over that wrapped buffer, freeing pointers out of it.
+#
+# Promoted from one working bundle:
+#   cases/952893ae4bfff4962a6b4b2202df5078
+#
+# Like registry/cases/external-link-value-strlen-unbounded.yml, this record
+# carries a second finding about the tracked registry itself -- see
+# registry_claim_contradicted.  The two are instances of one aggregation bug.
+schema_version: 1
+
+id: vds-mapping-count-overflows-entry-allocation
+title: the VDS mapping count is multiplied into an entry allocation unchecked,
+  wrapping size_t, and the failure cleanup then iterates the unwrapped count
+  over the wrapped buffer
+status: oracle-hardened          # h5policy rejects under every profile; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The bundle's supplied
+  file name is provenance, not a root-cause classification, and is not
+  reproduced as a claim here.
+
+# -- Triage -------------------------------------------------------------------
+record: virtual_dataset
+versions: [4]                    # layout message v4; VDS global-heap mapping block v0
+root_cause_classification: record_local
+violated_invariant:
+  - vds.mapping_header_complete
+validation_closure: >-
+  the v4 layout message, its referenced global-heap object, the mapping header
+  and count, the bounded sequence of source-name/selection records, and the
+  payload checksum.  The count must be representable, affordable,
+  allocation-safe, and consistent with the bounded payload before any native
+  VDS entry is constructed.
+activation_before_validation:
+  - native_construction
+  - allocation
+entry_points:
+  - h5policy (oracle) -- untrusted-strict, forensic, legacy and trusted-fast all reject
+  - "libhdf5 H5Fopen -> H5Ovisit3 -> H5Dopen2 -> H5D__layout_oh_read -> H5D__virtual_init -> H5D__virtual_load_layout"
+  - "shipped tools: stock h5dump -pH aborts while materialising the mapping"
+  - h5policy-probe --exercise virtual_dataset
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  Three separate arithmetic failures inside fifteen lines of
+  H5D__virtual_load_layout (src/H5Dvirtual.c:704-725).
+  The count is decoded from the file as a 64-bit length:
+    H5F_DECODE_LENGTH(f, heap_block_p, tmp_hsize);            /* :707 */
+  It is then narrowed and multiplied, both unchecked:
+    if (tmp_hsize > 0) {
+        layout->storage.u.virt.list = H5MM_calloc(
+            (size_t)tmp_hsize * sizeof(H5O_storage_virtual_ent_t));  /* :711-712 */
+    }
+    layout->storage.u.virt.list_nalloc = (size_t)tmp_hsize;   /* :720 */
+    layout->storage.u.virt.list_nused  = (size_t)tmp_hsize;   /* :721 */
+  (1) NO OVERFLOW CHECK ON THE PRODUCT.  sizeof(H5O_storage_virtual_ent_t) is
+  352 on this platform, and the specimen's count of 471649706430073763
+  multiplied by 352 wraps size_t to 32.  H5MM_calloc(32) succeeds, so the
+  allocation failure branch is never taken.
+  (2) NO CHECK ON THE NARROWING.  `(size_t)tmp_hsize` casts a 64-bit hsize_t
+  with no H5_CHECK_OVERFLOW, which is what makes the 32-bit case a different
+  defect rather than the same one -- see measured.width.
+  Both omissions are conspicuous because the codebase has the tool and uses it
+  in this very function: H5_CHECK_OVERFLOW guards tmp_hsize at :776 and
+  list_nused at :580.  It is simply absent at :711.
+  (3) NO COUNT/PAYLOAD CONSISTENCY CHECK.  list_nused is set from the count
+  with nothing comparing it to the bounded heap block that must contain the
+  mappings.  The loop then indexes straight into the wrapped allocation:
+    for (size_t i = 0; i < layout->storage.u.virt.list_nused; i++) {  /* :724 */
+        H5O_storage_virtual_ent_t *ent = &layout->storage.u.virt.list[i];  /* :725 */
+  The loop does bound the PAYLOAD per iteration (avail_buffer_space <= 0 at
+  :729-732), but that never saves it: entry 0 alone is 352 bytes against a
+  32-byte allocation, so the first field written through `ent` is already out
+  of bounds.  The measured ASan report is a WRITE of size 8 at
+  H5D_VIRTUAL_FIND_OR_ADD_NAME (:795), on the first iteration.
+
+cleanup_amplification: >-
+  The more serious half, and it is NOT what the bundle recorded.
+  On failure H5D__virtual_load_layout runs:
+    done:
+        heap_block = (uint8_t *)H5MM_xfree(heap_block);
+        if (ret_value < 0)
+            if (H5D__virtual_free_layout_mappings(&layout->storage.u.virt) < 0)   /* :932-935 */
+  and that function iterates the SAME unwrapped count over the wrapped buffer:
+    for (i = 0; i < virt->list_nused; i++) {                  /* :1187 */
+        H5O_storage_virtual_ent_t *ent = &virt->list[i];      /* :1188 */
+        ...
+        if (ent->source_file_orig == SIZE_MAX)
+            (void)H5MM_xfree(ent->source_file_name);          /* :1195 */
+  So a failed decode calls H5MM_xfree on pointer-sized values read from beyond
+  a 32-byte allocation, up to 471649706430073763 times.  That is a free of
+  attacker-adjacent heap contents, a stronger primitive than the over-write.
+  Its own documentation states the precondition the wrap destroys.
+  H5D__virtual_free_layout_mappings is introduced (:1160-1164) as "safe to use
+  on incomplete structures (for recovery from failure) PROVIDED the internal
+  structures are initialized with all bytes set to 0".  H5MM_calloc zeroed only
+  the wrapped 32 bytes while list_nused claims 4.7e17 entries, so the
+  precondition is violated by construction -- the cleanup is documented safe
+  under an assumption the defect itself breaks.
+  This is the same structural shape as
+  registry/cases/mdci-reconstruct-cleanup-unsafe.yml: a failure-recovery path
+  that assumes an invariant the failure has already broken.
+  REACHABILITY IS SOURCE-DERIVED, NOT OBSERVED, and must not be reported
+  otherwise.  On the measured specimen the process dies at :795 on the first
+  entry write, before the cleanup is reached, so neither build exercised it.
+  The shape that WOULD reach it is a count whose product wraps to a
+  successfully-allocated buffer while decode fails for an unrelated reason --
+  the bundle's variant_count_2pow61 (2^61 * 352 wraps to zero) is exactly that
+  and is the specimen to build.  See coverage_gaps.
+
+# -- Registry finding (not about libhdf5) -------------------------------------
+registry_claim_contradicted: >-
+  registry/validation-coverage.yml records for the virtual_dataset family:
+      validators:
+        h5policy: enforced
+        hdf5: enforced   # measured; see libhdf5-evidence.yml
+  libhdf5 does not enforce this: the Release build ABORTS (signal 6) and the
+  ASan build reports a heap-buffer-overflow WRITE.  A family whose measured
+  behaviour is an abort is not enforcing anything.
+  The data is right and the AGGREGATION is wrong, which is sharper than the
+  equivalent finding in
+  registry/cases/external-link-value-strlen-unbounded.yml and pins the actual
+  bug.  registry/libhdf5-evidence.yml's virtual_dataset block reads:
+      verdict: enforced
+      enforced_on: [malformed-vds_nentries_overcount.yml]
+      diverges_on: []
+      crashes_on: [cve-vds_nentries_mult_overflow.yml]
+  The crash IS recorded, in its own field, against the very fixture this record
+  is about -- and `verdict` is computed as `enforced` anyway.  Whatever derives
+  the verdict consults `enforced_on` and `diverges_on` and ignores a non-empty
+  `crashes_on`.
+  That makes the two records one bug, not two: for external_link the ignored
+  signal was `activation_observed`, here it is `crashes_on`.  In both cases a
+  family is reported as enforcing an invariant while the evidence file itself
+  records libhdf5 doing something the invariant forbids.
+  NOT CORRECTED HERE, deliberately.  libhdf5-evidence.yml is generated, is a
+  2.2.0-era snapshot, and is what check_registry.py gates `validators.hdf5`
+  against; editing either side alone desynchronises them.  The fix is in the
+  verdict derivation, not in these rows.  Recorded as coverage_gaps item 1.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    IMPORTANT.  Everything under `measured` is copied from the bundle as
+    recorded (h5policy 07ad5e7, hdf5 source 4b1ffa68a840) and was NOT
+    re-measured when this record was written on 2026-08-15 -- the promoting
+    session could not execute the oracle or the probes.  Re-run before relying
+    on any offset:
+      h5policy --profile untrusted-strict --json cases/952893ae.../input.h5
+      h5policy-probe --exercise virtual_dataset --hdf5-bindir <stock|asan>/bin --json ...
+    and record superseded values rather than overwriting them.
+    The SOURCE claims above were read from the tree at promotion time and are
+    current.
+  oracle_as_recorded: >-
+    reject_corrupt under all four profiles, H5_CORRUPT_VDS_MAPPING_HEADER
+    @ 200 on /vds, with a secondary H5_POLICY_VDS @ 91 under untrusted-strict.
+    Forensic completes the walk.  Truncation sweep exhaustive over 4265
+    prefixes, zero violations.
+  specimen_bytes: >-
+    4264-byte file, superblock v2.  VDS layout message at 91 (layout version
+    4); global heap at 168; mapping block at 200, 51 bytes, mapping version 0;
+    the count field at 201 holds 471649706430073763; the VDS heap checksum at
+    247 is resealed so nothing upstream rejects the block first.
+  libhdf5_stock_as_recorded: >-
+    CRASHED, signal 6 (abort).  No external, plugin, write or network
+    activation.  h5dump -pH aborts while materialising the mapping.
+  libhdf5_asan_as_recorded: >-
+    CRASHED, signal 6, heap-buffer-overflow WRITE of size 8 at
+    src/H5Dvirtual.c:795 -- the first entry's name field, written through a
+    pointer into the 32-byte wrapped allocation.
+  semantic_neighbours: >-
+    Seven variants in the bundle (variants-matrix.json), built by
+    build-variants.py, which changes ONLY the 8-byte count at offset 201 and
+    reseals the VDS heap checksum at 247: count 0, 1 (valid), 2, 2^61,
+    input-1, input+1, u64 max.  variant_count_2.h5 is the checksum-valid
+    non-overflow control -- it reaches the same decoder and is rejected while
+    parsing the missing second mapping, with no crash.  That control is what
+    isolates the OVERFLOW as the necessary ingredient rather than merely an
+    over-large count.
+  width: >-
+    64-bit measured; 32-bit NOT measured, and the two are genuinely different.
+    sizeof(H5O_storage_virtual_ent_t) is 352 on x86_64 and a -m32 compile
+    proves 208 on i386.  On 64-bit the count multiplied in size_t wraps to 32
+    bytes.  On 32-bit the count first NARROWS to 3123612579 and its unchecked
+    product wraps to 1171354736 bytes -- a large but plausible allocation, a
+    different failure mode -- while 2^61 narrows to zero.  Host policy blocked
+    running the i386 binary, so no 32-bit outcome is claimed.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: crashed (abort on Release, ASan overflow on the candidate)
+  libhdf5_version: 2.3.0
+  classification: agreement
+  note: >-
+    Both sides refuse the file, so there is no invariant-A disagreement and NO
+    entry in registry/h5policy-diff-tolerances.yml is warranted or present.
+    h5policy rejects the count by arithmetic on the mapping header, before any
+    allocation; libhdf5 "rejects" it by aborting after allocating a wrapped
+    buffer and writing past it.  The tracked fixture is refused by both sides
+    and needs no exemption -- note its canary status is `violation`, since the
+    crash is observable on the uninstrumented build.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Three checks at src/H5Dvirtual.c:707-721, all before the H5MM_calloc.
+    (1) Bound the decoded count against the bounded heap block: each mapping
+    costs a non-zero minimum number of encoded bytes, so a count exceeding
+    (payload bytes / minimum encoded mapping size) is impossible and can be
+    rejected without any resource policy.  This is the check that makes the
+    other two unreachable in practice, and it is the one h5policy uses.
+    (2) H5_CHECK_OVERFLOW the narrowing of tmp_hsize to size_t, and use checked
+    multiplication for the product -- the file already does both elsewhere in
+    the same function (:580, :776).
+    (3) Apply an explicit allocation budget.  VDS legitimately supports large
+    mapping tables, so the bound must derive from the encoded byte count and a
+    stated resource policy, NOT an arbitrary maximum count.
+    SEPARATELY, and required even with all three: make
+    H5D__virtual_free_layout_mappings safe when its documented precondition
+    does not hold, or guarantee the precondition.  Setting list_nused only
+    AFTER the allocation and the per-entry decode both succeed would do it;
+    today it is set at :721 before any entry exists.  A fix that only rejects
+    the count leaves the cleanup depending on an assumption nothing enforces.
+systemic:
+  semantic_boundary: >-
+    the raw VDS global-heap mapping block as one object: count/payload
+    consistency, checked width conversion, checked allocation arithmetic and an
+    allocation budget, all established before any H5O_storage_virtual_ent_t is
+    materialised.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 decode and cleanup still open
+  description: >-
+    h5policy decodes the mapping block as inert bounded records and validates
+    the collection before materialising anything, so neither the wrap nor the
+    cleanup amplification can arise: no allocation is sized from the count, and
+    there is no native entry list to unwind.  All four profiles reject.
+    The remaining work is entirely libhdf5's.
+  landed_changes:
+    - h5policy/pickles/h5_vds.pk (h5policy_validate_vds_layout;
+      vds.mapping_header_complete)
+    - registry/findings/catalog (H5_CORRUPT_VDS_MAPPING_HEADER)
+    - registry/validation-coverage.yml (vds.mapping_header_complete) -- but see
+      registry_claim_contradicted for the hdf5 validator row
+    - h5policy/tests/cve/vds_nentries_mult_overflow.h5 (tracked crafted seed)
+    - h5policy/tests/expected/cve-vds_nentries_mult_overflow.yml
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: cases/952893ae4bfff4962a6b4b2202df5078/input.h5
+  direct_fixtures:
+    # ALREADY TRACKED -- this specimen was checked in as a crafted CVE seed
+    # before the record existed.  tests/cve/ is committed rather than generated
+    # (see h5policy/tests/.gitignore), so unlike a malformed/ fixture it needs
+    # no generator to be reproducible.
+    - h5policy/tests/cve/vds_nentries_mult_overflow.h5
+  expectations:
+    - h5policy/tests/expected/cve-vds_nentries_mult_overflow.yml    # profile: legacy
+  control_fixture: >-
+    h5policy/tests/malformed/vds_nentries_overcount.h5 -- an over-large but
+    NON-overflowing count, which libhdf5 rejects cleanly while parsing the
+    missing mapping.  This is the control that separates "count too big" from
+    "count overflows the allocation", and it is why the evidence file lists it
+    under enforced_on while the overflow specimen sits under crashes_on.
+  variant_engine: >-
+    build-variants.py in the bundle -- preserves input.h5 and changes only the
+    8-byte count at offset 201, then reseals the VDS heap checksum at 247.
+    Deterministic and self-contained; the source of the seven neighbours.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []          # nothing to backport in h5policy.
+
+fuzz_seed: >-
+  cases/952893ae4bfff4962a6b4b2202df5078/input.h5 plus the seven neighbours
+  seed the VDS mapping-count neighbourhood.  The count field is a clean
+  single-field mutation axis with a resealed checksum, which makes it an
+  unusually good target: the boundary is at (payload_bytes / min_mapping_bytes)
+  on one side and at the size_t wrap points on the other.  A dedicated bounded
+  raw-VDS fuzz target does not exist and is named in the bundle's own
+  promotion steps.
+
+compatibility_backport_risks: >-
+  A pre-allocation count/payload guard rejects only impossible mapping headers
+  -- a count that cannot fit in the bounded payload cannot describe a real
+  file -- so no conforming VDS is affected.  The risk is in getting the bound
+  from the right place: VDS intentionally supports large valid mapping tables,
+  so an arbitrary maximum count would break legitimate files, and the limit
+  must derive from the encoded byte count plus an explicit resource policy.
+  Checked arithmetic must run BEFORE the 64-bit count is narrowed, or the
+  32-bit and 64-bit builds disagree about which files are rejected.
+
+sibling_audit: >-
+  Within libhdf5: H5D__virtual_load_layout is the one attacker-controlled VDS
+  global-heap mapping decoder at current head, and it is the one audited here.
+  The writer, the copy path (H5D__virtual_copy_layout, whose own done: block at
+  :1148 calls H5D__virtual_reset_layout) and the VDS tree helpers all multiply
+  counts, but from TRUSTED native values -- they need the same checked
+  -allocation discipline as hardening, not as defect fixes, and none was
+  measured.  H5D__virtual_reset_layout is a second cleanup path with the same
+  list_nused-driven shape and was not traced.
+  Within h5policy: the mapping-header check covers the count.  Whether the
+  same VDS layout arriving through an ATTRIBUTE rather than a dataset object
+  header takes the same validated path is asserted from the shared
+  implementation, not separately measured.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED, and deliberately not asserted.  Measured live on 2.3.0 against
+    a local source tree at 4b1ffa68a840, where the bundle records it as a
+    confirmed current-head violation.  No archaeology was run on H5Dvirtual.c
+    and no older tag was built.
+  note: >-
+    The H5_CHECK_OVERFLOW calls elsewhere in the same function suggest the
+    guards were added piecemeal as individual problems were found, rather than
+    the allocation site ever having had one -- but that is an inference from
+    code shape, not a measurement.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    THE REGISTRY REPORTS THIS FAMILY AS hdf5-ENFORCED WHILE ITS OWN EVIDENCE
+    FILE RECORDS THE CRASH -- see registry_claim_contradicted.  The verdict
+    derivation ignores a non-empty `crashes_on`, exactly as it ignores
+    `activation_observed` for external_link.  Fixing the two rows is not the
+    task; fixing the derivation and regenerating is, and regeneration flips
+    unrelated records.
+  - >-
+    NOTHING MEASURED IN THIS RECORD WAS RE-MEASURED AT PROMOTION -- see
+    measured.NOT_REMEASURED_AT_PROMOTION.  Source claims are current.
+  - >-
+    THE CLEANUP AMPLIFICATION HAS NO SPECIMEN.  It is source-derived only, and
+    the measured specimen cannot reach it because it dies on the first entry
+    write.  Build the variant_count_2pow61 shape as a tracked fixture (2^61 *
+    352 wraps to zero, so the allocation succeeds trivially while list_nused
+    stays 2^61) and probe it on both builds.  If it reaches
+    H5D__virtual_free_layout_mappings the impact of this record rises from an
+    over-write to an attacker-influenced free.
+  - >-
+    No 32-bit runtime measurement, and 32-bit is a DIFFERENT failure mode here
+    rather than the same one (see measured.width).  Host policy blocked
+    execution of the i386 binary; the struct size was obtained by compiling.
+  - >-
+    The tracked expectation runs the `legacy` profile only.  The bundle
+    measured all four, so an untrusted-strict expectation would cost nothing
+    and would pin the H5_POLICY_VDS secondary finding as well.
+open_questions:
+  - >-
+    Does H5D__virtual_reset_layout (the copy path's cleanup, reached from
+    H5D__virtual_copy_layout's done: at src/H5Dvirtual.c:1148) have the same
+    list_nused-driven exposure as H5D__virtual_free_layout_mappings?  It was
+    not traced.  If it does, object copy of a malformed VDS is a second route
+    to the cleanup primitive.
+  - >-
+    Is there any VDS mapping shape whose minimum encoded size is zero?  The
+    containment's headline check divides the payload byte count by a minimum
+    per-mapping cost, which is only sound if that minimum is provably non-zero.
+    Not established from the format description here.
+
+provenance:
+  found_by: >-
+    a supplied specimen, triaged through the h5cve bundle workflow in
+    cases/952893ae4bfff4962a6b4b2202df5078; promoted 2026-08-15.  The cleanup
+    amplification and the verdict-aggregation bug were both found at
+    promotion, by reading the failure path and the evidence file rather than
+    the bundle.
+  input_sha256: f513bb1c8fc2fa3b249cd68c1ff58abcb1a724ccb0a6e3713009182b0677f385
+  input_bytes: 4264
+  hdf5_build: >-
+    HDF5 2.3.0, local source tree at commit 4b1ffa68a840; baseline Release --
+    abort, signal 6; candidate RelWithDebInfo -fsanitize=address --
+    heap-buffer-overflow WRITE of size 8 at H5Dvirtual.c:795.  Both are
+    workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

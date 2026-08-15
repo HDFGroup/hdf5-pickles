@@ -1,0 +1,359 @@
+# A filtered fractal-heap huge object is read at its compressed length, and the
+# filter's output length then REPLACES that value and drives a copy into a
+# caller buffer sized from a different, separately decoded field -- one that
+# lives in the same B-tree record and is never compared against it.
+#
+# Promoted from one working bundle:
+#   cases/71fcb9d1d8a0571d1979dc82a7f27940
+#
+# READ THIS FIRST: unlike every other record in this directory, h5policy does
+# NOT detect this defect.  The oracle rejects the specimen for an unrelated
+# reason that happens to be present in the same file.  See oracle_gap -- this
+# record documents a genuine coverage gap, not an oracle-enforced case.
+schema_version: 1
+
+id: filtered-huge-object-decoded-size-unchecked
+title: the filter pipeline's output length overwrites a filtered huge object's
+  size and is copied into a buffer sized from the record's unrelated,
+  never-compared decoded-size field
+status: coverage-gap             # NOT oracle-hardened -- see oracle_gap
+disclosure: >-
+  n/a -- local analysis only.  The supplied pathname names an advisory
+  directory, but no advisory text, affected-release list, or disclosure state
+  was fetched or inferred, and none is reproduced here.
+
+# -- Triage -------------------------------------------------------------------
+record: shared_messages_legacy
+versions: [0]
+root_cause_classification: aggregate_object
+violated_invariant:
+  - sohm.filtered_huge_decoded_size    # PROPOSED, not yet catalogued -- see oracle_gap
+validation_closure: >-
+  the filtered huge-object record as a whole: the huge-index B-tree record's
+  compressed length AND its decoded obj_size, the heap's filter pipeline and
+  its client data, and the encoded object bytes -- with the transform's output
+  extent required to equal the record's declared decoded size before any bytes
+  reach shared-message materialisation.  Neither length closes it alone; the
+  defect is precisely that two lengths in one record are never related.
+activation_before_validation:
+  - native_construction
+  - decompression                # the filter RUNS before anything is validated
+entry_points:
+  - "libhdf5 H5Fopen then H5Oopen(file, \"/victim\") -- two calls, nothing more"
+  - "libhdf5 H5O__shared_decode -> H5O__shared_read -> H5HF_read -> H5HF__huge_read -> H5HF__huge_op_real (src/H5HFhuge.c:643-761)"
+  - "shipped tools: h5dump -H reaches the crashing path"
+  - h5policy (oracle) -- rejects this specimen, but NOT for this defect
+
+# -- The defect, read out of the source tree ----------------------------------
+defect: >-
+  A filtered huge-object B-tree record carries TWO lengths: `len`, the number of
+  bytes actually stored in the file, and `obj_size`, the size the object is
+  declared to have once decoded.  H5HF__huge_op_real uses the first and the
+  caller uses the second, and nothing ever compares them.
+  The read path takes the stored length:
+    H5_CHECKED_ASSIGN(obj_size, size_t, found_rec.len, hsize_t);   /* :703 (type 2), :721 (type 4) */
+    read_buf = H5MM_malloc((size_t)obj_size);                      /* :727 */
+    H5F_block_read(..., (size_t)obj_size, read_buf);               /* :735 */
+  then hands it to the pipeline and OVERWRITES it with whatever comes back:
+    read_size = nbytes = obj_size;                                 /* :749 */
+    H5Z_pipeline(&hdr->pline, H5Z_FLAG_REVERSE, &filter_mask, H5Z_NO_EDC,
+                 filter_cb, &nbytes, &read_size, &read_buf);       /* :750 */
+    obj_size = nbytes;                                             /* :753 -- REPLACED */
+  and finally copies that many bytes into the caller's buffer:
+    H5MM_memcpy(op_data, read_buf, (size_t)obj_size);              /* :761 */
+  The caller sized `op_data` from the OTHER field, obtained through a separate
+  call -- H5HF__huge_get_obj_len returns `found_rec.obj_size` (:520), not
+  `found_rec.len`.  So the buffer is sized from the declared decoded size while
+  the copy length is the filter's actual output, and the only thing keeping
+  them equal is the good faith of the file.
+  On the specimen those numbers are 64 and 65536: a 21-byte stored object whose
+  scale-offset pipeline declares 65536 elements expands to 65536 bytes and is
+  memcpy'd into a buffer sized 64, overrunning by 65472 bytes.  The destination
+  is H5O__shared_decode's 128-byte STACK buffer `mesg_buf`, so this is a stack
+  overflow rather than a heap one -- ASan reports the write starting at its end.
+  THE FIX IS A COMPARISON THE CODE IS ALREADY HOLDING BOTH SIDES OF.  Both
+  fields come from the same decoded B-tree record; retaining `found_rec.obj_size`
+  across the pipeline call and requiring `nbytes == found_rec.obj_size` costs
+  nothing.  A `<=` check is NOT sufficient: the shared-message decoder must
+  receive the exact encoded message extent, and a short successful transform
+  would leave it decoding uninitialised bytes.
+
+# -- The oracle does not catch this -------------------------------------------
+oracle_gap: >-
+  THE MOST IMPORTANT FIELD IN THIS RECORD.  h5policy rejects the specimen, and
+  that rejection is NOT evidence against this defect.
+  The stable oracle verdict is H5_CORRUPT_SOHM_STORAGE_ADDRESS at offset 218 --
+  "nonempty SOHM index has undefined index or heap storage" -- which routes to
+  the invariant shared.storage_address.  That is a DIFFERENT defect that happens
+  to be present in the same file.  Strip it and the oracle would, on current
+  evidence, accept the filtered-huge size mismatch: neither untrusted-strict nor
+  forensic compares the filter's output extent with the huge record's obj_size.
+  The bundle records this honestly as `stable_finding: false`.
+  Forensic does emit H5_ADVISORY_DECODE_FILTER at 394, and that advisory is
+  CORRECT rather than a near-miss: it records that a consumer must decode
+  untrusted data to read this object, which is exactly the boundary h5policy
+  refuses to cross.  It is not a detection of the mismatch.
+  So this record documents a latent false-accept, discovered through libhdf5
+  rather than through the oracle.  It is the mirror image of the usual case in
+  this directory, and the reason `status` is coverage-gap rather than
+  oracle-hardened.
+proposed_invariant: >-
+  sohm.filtered_huge_decoded_size, in the shared_messages_legacy family:
+    for a filtered huge-object record whose pipeline consists solely of BUILT-IN
+    filters with metadata-computable output extents, the extent computed from
+    the filter's client data must equal the record's declared decoded obj_size.
+  This is implementable WITHOUT crossing the no-decompression boundary, which is
+  what makes it worth doing.  Scale-offset's output size is a function of its
+  cd_values -- the specimen declares 65536 elements in 20 client-data values --
+  so the expected extent is arithmetic on metadata, not a transform.
+  The oracle already reasons about exactly these cd_values: sohm.filter_element_count
+  (H5_CORRUPT_FILTER_NELMTS_MISMATCH) is an existing invariant in this same
+  family doing metadata-only scale-offset element-count checking.  The proposed
+  invariant is an extension of a demonstrated capability, not a new class of
+  analysis.
+  Scope limit, and it must be stated in the implementation: where a pipeline
+  contains a dynamically registered filter, or a built-in filter whose output
+  extent is not computable from metadata, the check is not decidable and the
+  correct verdict is the existing advisory, not a corrupt finding.
+not_added_here: >-
+  The invariant and its finding were deliberately NOT added to
+  registry/validation-coverage.yml or registry/findings/catalog in this
+  promotion.
+  Adding an invariant row would assert coverage the oracle does not have --
+  h5policy cannot currently detect this, so a row claiming otherwise is simply
+  false, and it is the kind of false claim this registry exists to prevent.
+  Adding a finding code no pickle emits would also break check_registry.py's
+  routing invariants, which currently report unrouted=0 missing=0.
+  The correct order is: implement the check in the pickles, build a fixture,
+  measure it, and only then add the catalogue and coverage rows.  The bundle's
+  own promotion steps say the same thing ("only after review").  This record is
+  the specification and the evidence for that work.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    IMPORTANT.  Everything under `measured` is copied from the bundle as
+    recorded (h5policy 07ad5e7, libhdf5 2.2.0, hdf5 source 4b1ffa68a84) and was
+    NOT re-measured on 2026-08-15 -- the promoting session could not execute the
+    oracle or the probes.  The SOURCE lines quoted in `defect` were read from
+    the 2.3.0 tree at promotion and the unchecked overwrite is still there.
+  oracle_as_recorded: >-
+    untrusted-strict: reject_corrupt at 218 (H5_CORRUPT_SOHM_STORAGE_ADDRESS).
+    forensic: reject_corrupt, complete walk, same corruption plus
+    H5_ADVISORY_DECODE_FILTER at 394.
+    Boundary clean throughout: no libhdf5, plugin load, decompression, external
+    open, repair, write or application deserialisation.
+    Truncation sweep exhaustive over 1062 prefixes, no violations.
+    NONE of this is a detection of the size mismatch -- see oracle_gap.
+  libhdf5_as_recorded: >-
+    Stock 2.2.0 Release: SIGSEGV (signal 11) from H5Oopen("/victim").
+    ASan 2.2.0: stack-buffer-overflow, WRITE of size 65536, through
+    H5HF__huge_op_real <- H5HF__huge_read <- H5HF_read <- H5O__shared_read <-
+    H5O__shared_decode.  ASan identifies the destination as H5O__shared_decode's
+    128-byte mesg_buf, with the 65536-byte write starting at its end.
+    A targeted public-API probe of just H5Fopen + H5Oopen reproduces both.
+    No forbidden activation on either build.
+  specimen_geometry: >-
+    1061 bytes.  Fractal heap header at 238, filtered, id_length 8,
+    max_managed_object_bytes 4096, filter id 6 (scale-offset) with 20 client
+    data values declaring 65536 elements.  Huge B-tree header at 484, filtered
+    indirect leaf record (type 2, 36 bytes) at 522/528.  Encoded object at 1040,
+    21 bytes, filter_mask 0, declared decoded bytes 64.  Overrun 65472 bytes.
+  variants: >-
+    Three checksum-valid BTLF boundary variants from build-variants.py.
+    variant_declared_zero.h5 RETAINS the overflow -- a declared size of zero
+    does not help, which rules out a naive nonzero check as the fix.
+    variant_declared_65536.h5 (output-size-matching) and variant_filter_skipped.h5
+    both reject safely with no ASan report -- together they isolate the
+    EQUALITY of the two lengths as the operative property, rather than the
+    magnitude of either.
+  width: >-
+    NOT measured at 32 bits, and the bundle is explicit that this is arithmetic
+    analysis rather than an observed run: 21, 64 and 65536 all fit a 32-bit
+    size_t and the hsize_t-to-size_t conversion, so this is a decoded-size
+    contract failure rather than integer truncation, and the same overrun is
+    expected at 32 bits.
+  endianness: >-
+    The file is little-endian.  Scale-offset has a byte-order branch that
+    depends on host native order, so the transform's behaviour is not
+    order-independent even though the size mismatch is.  No big-endian build was
+    available.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt (for an unrelated defect)
+  libhdf5: crashed
+  libhdf5_version: 2.2.0 (measured); unchecked overwrite still present at 2.3.0 (source-verified)
+  classification: agreement-by-accident
+  note: >-
+    Both sides refuse this specimen, so there is no invariant-A disagreement to
+    carry and no entry in registry/h5policy-diff-tolerances.yml is warranted.
+    But the agreement is COINCIDENTAL and must not be recorded as coverage: the
+    oracle refuses because of the SOHM storage address, libhdf5 refuses by
+    crashing on the filtered-huge copy, and the two are unrelated defects that
+    happen to share a file.  A specimen carrying only the size mismatch would,
+    on current evidence, split them.  Building that specimen is the first
+    coverage_gaps item.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    In H5HF__huge_op_real, retain the expected decoded size -- the filtered
+    indirect B-tree record's obj_size, the value H5HF__huge_get_obj_len returns
+    at src/H5HFhuge.c:520 -- across the H5Z_pipeline call, and reject when the
+    pipeline's `nbytes` differs from it, BEFORE the assignment at :753 and
+    before the copy at :761.
+    Use strict equality.  A `<=` check is not sufficient: the shared-message
+    decoder must receive the exact encoded message extent, and a short but
+    "successful" transform leaves it decoding whatever was already in the
+    caller's buffer.
+    Both huge-ID forms need it.  Direct records encode the decoded size in the
+    ID itself; indirect records keep it in the type-2/type-4 B-tree record.  The
+    function handles both and the copy is shared, so a fix at the copy site
+    covers both -- which is the argument for putting it there rather than in
+    each caller.
+systemic:
+  semantic_boundary: >-
+    bounded filtered fractal-heap huge-object decode: validate the huge-index
+    record and heap-ID relation, run the declared built-in transform with a
+    checked output budget, require its output extent to EQUAL the record's
+    declared decoded obj_size, then expose that exact bounded slice to
+    shared-message materialisation.  Dynamic filters remain inactive until
+    policy permits activation.
+  status: open                   # NOT closed in the bounded path either
+  owner: unassigned -- libhdf5 for the fix, h5policy for the detection
+  description: >-
+    Unusually for this registry, BOTH sides are open.
+    libhdf5 reads the compressed length, permits H5Z_pipeline to replace it with
+    an untrusted decoded length, and copies the replacement into a buffer sized
+    from a different field.  The boundary covers both indirect and direct huge
+    IDs and every filtered fractal-heap client, not only scale-offset.
+    h5policy does not model the relation at all -- see oracle_gap.  It correctly
+    declines to execute the transform, but declining to execute it is not the
+    same as declining to trust its declared output size, and the latter is
+    decidable from metadata for built-in filters.
+  landed_changes: []             # none -- this is the gap, not the closure
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: cases/71fcb9d1d8a0571d1979dc82a7f27940/input.h5
+  direct_fixtures: []            # none tracked; see coverage_gaps
+  targeted_probe: >-
+    huge-filter-targeted-probe.c in the bundle -- H5Fopen followed only by
+    H5Oopen("/victim").  Two public calls and nothing else, which makes it the
+    cleanest crash reproducer of any case in this registry.
+  direct_fixture_note: >-
+    There is NO public raw-H5HF or raw-filter-pipeline entry point, so an
+    isolated raw-record test cannot honestly be claimed and the bundle does not
+    claim one.  Any direct fixture has to go through a whole file.
+  variant_engine: build-variants.py in the bundle (three checksum-valid BTLF
+    boundary variants; see measured.variants)
+  assertions:
+    stable_finding: false               # the oracle finding is a DIFFERENT defect
+    stable_oracle_primary_finding: H5_CORRUPT_SOHM_STORAGE_ADDRESS
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: false             # the built-in filter DOES run in libhdf5
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []
+
+fuzz_seed: >-
+  cases/71fcb9d1d8a0571d1979dc82a7f27940/input.h5 seeds the filtered-huge
+  neighbourhood.  The productive axis is the PAIR (stored len, declared
+  obj_size) against the filter's cd_values-implied output, and the variants
+  already show the interesting rows: equal (safe), zero (still overflows),
+  filter absent (safe).  A bounded raw-transform seam does not exist, so
+  mutation has to operate on whole files.
+
+compatibility_backport_risks: >-
+  A strict equality check rejects a filtered huge object whose actual decoded
+  length differs from its on-disk obj_size.  Since obj_size is the value used to
+  size the shared-message buffer, accepting a mismatch is unsafe by
+  construction, so no conforming file can depend on it.
+  What must be tested before backporting: filtered DIRECT and INDIRECT huge IDs
+  (they carry the decoded size differently), built-in versus dynamically
+  registered filters, the error-stack contract each branch produces, and the
+  32-bit size_t conversion on every supported branch.
+
+sibling_audit: >-
+  Within libhdf5: the transform and the post-transform copy are centralised in
+  H5HF__huge_op_real (src/H5HFhuge.c:643-761), which handles both direct and
+  indirect huge IDs, so EVERY filtered fractal-heap consumer reaching this
+  helper shares the missing equality check.  That centralisation is good news
+  for the fix and bad news for the exposure.  This is not a claim that unrelated
+  filter callers elsewhere were audited -- they were not.
+  Note the write path has the mirror-image shape at :330-335, where H5Z_pipeline
+  likewise replaces the length; that path takes trusted in-memory input rather
+  than file data, so it is hardening rather than a defect, and it was not
+  measured.
+  Within h5policy: the family already performs metadata-only scale-offset
+  reasoning via sohm.filter_element_count, which is why the proposed invariant
+  is an extension rather than new machinery.  Whether the same gap exists for
+  filtered MANAGED (non-huge) heap objects was not examined.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured on 2.2.0; the unchecked overwrite at
+    src/H5HFhuge.c:753 and the copy at :761 were verified present in the 2.3.0
+    tree at promotion.  No archaeology was run.
+  label: partially established (two points, not a range)
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    NO SPECIMEN ISOLATES THIS DEFECT.  The only specimen also carries an
+    unrelated SOHM storage-address defect, which is what the oracle actually
+    rejects.  Until a file exists that carries ONLY the filtered-huge size
+    mismatch, the claim "h5policy would accept this" is a well-supported
+    inference rather than a measurement -- and that specimen is also what any
+    future fixture must be built from.  This is the single most valuable next
+    step for this record.
+  - >-
+    THE ORACLE CANNOT DETECT THIS AT ALL, and no invariant or finding has been
+    added -- see oracle_gap and not_added_here.  Implementation order:
+    pickle check, fixture, measurement, then the catalogue and coverage rows.
+  - >-
+    NOTHING WAS RE-MEASURED AT PROMOTION -- see
+    measured.NOT_REMEASURED_AT_PROMOTION.
+  - >-
+    No 32-bit measurement (the bundle's 32-bit note is arithmetic analysis, not
+    an observed run), and no big-endian measurement, which matters more here
+    than usual because scale-offset has a host-byte-order branch.
+  - >-
+    Filtered MANAGED (non-huge) heap objects were not examined for the same
+    two-lengths-never-compared shape.
+open_questions:
+  - >-
+    Is the expected output extent of every BUILT-IN filter computable from its
+    client data?  The proposed invariant is decidable only for those that are.
+    Scale-offset is (the specimen's 65536 elements are declared in cd_values),
+    and n-bit is likely similar given the existing cd_values guards, but
+    deflate and szip are not -- their output size is genuinely unknown without
+    running them.  The invariant must therefore be per-filter and must fall back
+    to the existing advisory, not to a corrupt finding, wherever it cannot
+    decide.  Getting this wrong in the permissive direction loses the check;
+    getting it wrong in the strict direction rejects valid deflate files.
+  - >-
+    Does the same gap exist when the huge object feeds something other than a
+    shared message?  The crash here lands in H5O__shared_decode's 128-byte stack
+    buffer, and the stack destination is what makes it a stack overflow; other
+    callers of H5HF_read would give a different primitive from the same defect.
+
+provenance:
+  found_by: >-
+    a supplied specimen, triaged through the h5cve bundle workflow in
+    cases/71fcb9d1d8a0571d1979dc82a7f27940; promoted 2026-08-15 as a
+    coverage-gap record rather than an oracle-hardened one, after confirming
+    that the oracle's stable finding belongs to a different invariant.
+  input_sha256: a9c29a83de823ca259331d98665636f7ce012ae6820a4d763e116b7a88499db3
+  hdf5_build: >-
+    HDF5 2.2.0; baseline Release -- SIGSEGV; candidate RelWithDebInfo
+    -fsanitize=address -- stack-buffer-overflow WRITE of size 65536.  Source
+    verified against the 2.3.0 tree at promotion.  Workstation-local installs;
+    paths not recorded.
+  poke_version: GNU poke 4.3

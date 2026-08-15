@@ -1,0 +1,438 @@
+# A version-1 compound member's embedded-array promotion is unguarded on both
+# axes: the promotion arithmetic is unchecked, and the two guards that would
+# bound the result already ran against the pre-promotion type.
+#
+# Promoted from FOUR working bundles that describe ONE defect surface reached by
+# two coupled routes:
+#   arithmetic route (the multiply wraps)
+#     cases/40f5826c1ad2e1acde0ded339dfc540b   nelem/size overflow, i386 width witness
+#     cases/25420ff598c6dc6c75161afd98999a53   both invariants on one specimen
+#   ordering route (the guard ran too early)
+#     cases/40dc51154759c692cb3b31f403fc5692   promoted footprint escapes the bound
+#     cases/8e3dec666b6a2f1932c7ed577f98ff40   member offset outside the parent
+# They are recorded together because the two halves are not independently
+# fixable: a checked multiply still leaves a non-wrapping member that overruns
+# its element, and a re-ordered guard still lets the product wrap before the
+# guard sees it.  All four converge on the same consumer, H5T__conv_struct_opt.
+#
+# This record CLOSES items 2 and 3 of
+# registry/cases/arithmetic-divergences-backlog.yml, which asked "is the member
+# ever read at its declared extent?".  The answer is yes, and it is measured.
+schema_version: 1
+
+id: compound-member-array-promotion-unguarded
+title: a v1 compound member's embedded-array promotion multiplies unchecked and
+  happens after the guards that should bound it, so an oversized member is
+  published and later read out of bounds
+status: oracle-hardened          # h5policy rejects all four; libhdf5 accepts
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The bundles' supplied
+  file names are provenance, not root-cause classifications.
+
+# -- Triage -------------------------------------------------------------------
+record: datatypes
+versions: [1]                    # v1 compound datatype message (legacy embedded array)
+root_cause_classification: local_decode
+violated_invariant:
+  - datatype.size_arithmetic          # the multiply
+  - datatype.compound_member_bounds   # the guard ordering
+validation_closure: >-
+  the complete datatype record: parent element size, every member offset, the
+  legacy array rank and dimensions, the nested base type, the PROMOTED member
+  footprint, and the promoted member's end against the parent element.  The
+  promoted footprint is the operative value and does not exist until the array
+  is created, which is exactly why a guard placed before the promotion cannot
+  close this.
+activation_before_validation:
+  - native_construction
+  - cache_publication
+  - public_id
+entry_points:
+  - h5policy (oracle) -- untrusted-strict and forensic reject all four specimens
+  - "libhdf5 decode: H5Dopen2 -> H5O__dtype_decode -> H5O__dtype_decode_helper (src/H5Odtype.c) -> H5T__array_create (src/H5Tarray.c)"
+  - "libhdf5 use: H5Dread -> H5D__scatgath_read -> H5T_convert -> H5T__conv_struct_opt (src/H5Tconv_compound.c:859-868)"
+  - "public API: H5Tarray_create1/2 reach the same unchecked constructor"
+  - "shipped tools: h5dump -d and h5ls -v both ACCEPT and print the type"
+
+# -- The defect, read out of the source tree ----------------------------------
+defect: >-
+  HALF ONE -- the promotion arithmetic is unchecked.  H5T__array_create
+  (src/H5Tarray.c:156-162) accumulates the element count and the storage size:
+    for (u = 0, nelem = 1; u < ndims; u++) {
+        H5_CHECKED_ASSIGN(dim[u], size_t, dim[u], hsize_t);   /* :157 */
+        nelem *= (size_t)dim[u];                              /* :158 -- UNCHECKED */
+    }
+    size = parent->size * nelem;                              /* :162 -- UNCHECKED */
+  Note what IS guarded: the per-dimension narrowing at :157.  The author was
+  thinking about width; the accumulating product at :158 and the final multiply
+  at :162 simply have no overflow test.
+  HALF TWO -- the guards run before the promotion.  In
+  H5O__dtype_decode_helper, the member is decoded, then bounded:
+    if (temp_type->shared->size == 0)                                  /* :507 */
+        HGOTO_ERROR(... "type size can't be zero");
+    if ((memb[nmembs].offset + temp_type->shared->size) > dt->shared->size)  /* :509 */
+        HGOTO_ERROR(... "member type extends outside its parent compound type");
+  Both test `temp_type`, the BASE element type.  Only afterwards does the
+  legacy embedded-array encoding replace it:
+    array_dt = H5T__array_create(temp_type, ndims, dim);                /* :542 */
+  `array_dt` is `nelem` times larger, and neither guard re-runs against it.  So
+  a member that passes the bound as a 1-byte base can be published as a
+  multi-terabyte array member of a 16-byte element.
+  THEY WROTE THE GUARDS, 300 LINES AWAY.  The STANDALONE array decoder in the
+  same function has all three checks the embedded path lacks:
+    if (dim[u] != 0 && nelem > SIZE_MAX / dim[u])                       /* :815-817 */
+        HGOTO_ERROR(... "array element count overflows size_t");
+    if (parent->size > 0 && nelem > SIZE_MAX / parent->size)            /* :835-838 */
+        HGOTO_ERROR(... "array datatype size calculation would overflow");
+    expected_size = parent->size * nelem;
+    if (dt->shared->size != expected_size)                              /* :842-848 */
+        HGOTO_ERROR(... "array datatype size mismatch ...");
+  All three are SIZE_MAX-relative and therefore width-correct.  This is not an
+  oversight of the concept -- the identical arithmetic is guarded three ways in
+  one branch of one function and not at all in another branch of the same
+  function, because the legacy embedded-array path routes through
+  H5T__array_create instead.
+  THE CONSUMER.  H5T__conv_struct_opt (src/H5Tconv_compound.c:859-868) reads
+  each member at its declared offset and promoted size during H5Dread, whenever
+  the memory type differs from the file type.  That is what turns a bad decode
+  into a memory-safety event, and it is the same consumer for both halves.
+
+why_one_record: >-
+  Neither half is sufficient alone, and the bundles prove it with controls
+  rather than argument.
+  Fix only the multiply: variant_bounds_only.h5 (40f5826c) is a member that
+  overruns its element with NO wrap at any width -- still accepted, still read
+  out of bounds.
+  Fix only the guard ordering: the product still wraps inside H5T__array_create
+  before any re-ordered guard could inspect it, and on 32-bit
+  variant_wrap32_one.h5 wraps to a product of 1, decoding as a perfectly VALID
+  file.  A guard cannot reject what the arithmetic has already normalised.
+  40f5826c's own systemic section states the same conclusion independently --
+  "two coupled changes" -- and 25420ff5 carries BOTH invariants on a single
+  specimen, which is the clearest single argument that this is one surface.
+
+# -- The four specimens -------------------------------------------------------
+routes:
+  arithmetic:
+    - bundle: cases/40f5826c1ad2e1acde0ded339dfc540b
+      specimen: 535 bytes, input_sha256
+        3f0b74cea8bb3388eac54f79ffcb254293d66486e65b41613930245c640ec9b0
+      how: >-
+        Legacy embedded-array dimensions multiply into an element count that
+        wraps.  Oracle reports H5_CORRUPT_LENGTH_OVERFLOW @ 247 (count
+        overflow), with secondaries @ 295 for the storage-size overflow and the
+        member-bounds violation -- all three faces of the one defect on one
+        specimen.
+      tracked_fixture: malformed/compound_member_array_nelem_overflow.h5
+      note: >-
+        Carries the width work: an i386 witness compiled freestanding (-m32
+        -nostdlib -static, raw int 0x80 syscalls, because no 32-bit libc dev
+        files exist on the host) that RUNS the arithmetic rather than modelling
+        it.  This is the bundle that makes the 32-bit claims measurements.
+    - bundle: cases/25420ff598c6dc6c75161afd98999a53
+      how: >-
+        Legacy compound embedded-array creation multiplies attacker dimensions
+        into unchecked size_t values.  Records BOTH datatype.size_arithmetic and
+        datatype.compound_member_bounds against one specimen; oracle reports
+        H5_CORRUPT_LENGTH_OVERFLOW.
+      tracked_fixture: none -- the bundle's own input.h5 is its direct fixture
+  ordering:
+    - bundle: cases/40dc51154759c692cb3b31f403fc5692
+      how: >-
+        The v1 embedded-array FOOTPRINT escapes the pre-promotion member bound
+        -- the cleanest statement of half two, with no wrap involved at all.
+        Oracle reports H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_BOUNDS.
+      tracked_fixture: none -- the bundle's own input.h5 is its direct fixture
+      note: >-
+        Its variant_array_after_base_check.h5 is a two-byte promoted member at
+        offset 15, giving an ASan-visible two-byte overread -- the minimal
+        demonstration that the ordering alone suffices.
+    - bundle: cases/8e3dec666b6a2f1932c7ed577f98ff40
+      how: >-
+        A member declares a byte offset far outside its parent element.
+        Reaches the same H5T__conv_struct_opt dereference through the OFFSET
+        rather than the promoted size.  Oracle reports
+        H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_BOUNDS @ 295.
+      tracked_fixture: malformed/compound_member_offset_oob.h5
+      note: >-
+        Establishes the decode timing the whole family depends on: H5Fopen and
+        H5Ovisit3 both SUCCEED first, and the datatype is only decoded at
+        H5Dopen2 (measured, compound-member-conv-probe.txt).  So a preflight
+        that only opens and walks a file will not see this.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    IMPORTANT.  Everything under `measured` is copied from the bundles as
+    recorded and was NOT re-measured when this record was written on
+    2026-08-15 -- the promoting session could not execute the oracle or the
+    probes.  Re-run before relying on any offset.
+    NOTE A VERSION SKEW, and it matters: 40f5826c measured against libhdf5
+    2.2.0 (source 4d666721f42), whereas the SOURCE lines quoted in `defect`
+    above were read from the 2.3.0 tree at promotion time.  The guards are
+    still absent at 2.3.0 -- that was verified directly -- so the defect
+    persists across the two versions, but the measured OUTCOMES belong to
+    2.2.0 and a 2.3.0 re-measurement has not been done.
+  oracle_as_recorded: >-
+    All four specimens reject_corrupt under untrusted-strict, and h5policy is
+    width-independent by construction: it multiplies in exact 64 bits with a
+    checked multiply, then bounds-checks the promoted size against the element
+    (h5_datatype.pk:622 computes the promoted footprint; :628 tests
+    `member_off > elm_size || member_size > elm_size - member_off` --
+    subtraction after an explicit gate, so it cannot wrap at any target width).
+    It rejects every wrapping variant regardless of the consumer's size_t.
+  libhdf5_as_recorded: >-
+    ACCEPTS.  Both the stock and the ASan builds open the file, and the full
+    datatype canary completes -- H5Dopen2, H5Dread, H5Tget_size, H5Tget_class,
+    H5Tget_nmembers, H5Tget_member_type, H5Tget_super all succeed with zero
+    post-open call errors.  h5dump -d and h5ls -v accept and print the type.
+    oracle_alignment: divergent; comparison recorded as `regression`.
+    Confirmed reaching the value, not merely decoding it:
+    H5Tget_size(H5Tget_member_type(...)) returns 1125899906842624 on the
+    baseline build (array-promotion-probe.txt).  That is the answer to the
+    backlog's question -- the promoted size is not just stored, it is published
+    through the public API.
+  memory_safety_consequence: >-
+    variant_off12_reachable.h5 -- an 8-byte member at offset 12 of a 16-byte
+    element -- gives an AddressSanitizer heap-buffer-overflow READ of size 8 at
+    src/H5Tconv_compound.c:868 via H5Dread, 0 bytes after a 16-byte region.
+    This is the specimen that converts the family from an acceptance divergence
+    into a measured memory-safety defect, and it is why the backlog's
+    provisional `violation` allowance must not be read as benign.
+  denial_of_service_consequence: >-
+    variant_wrap64_zero.h5 -- product 2**64, so the promoted size is zero at
+    BOTH widths -- is accepted by libhdf5, and h5dump then prints
+    "HDF5: infinite loop closing library": H5_term_library cannot converge
+    (h5dump-transcript.txt).  A zero-sized member is a second, distinct
+    consequence of the same unchecked multiply, and it is not caught by a
+    bounds check -- only by the :507 zero-size guard, which likewise runs
+    before the promotion.
+  width: >-
+    MEASURED at both widths, unusually for this repo, via a freestanding i386
+    binary running the real arithmetic (nelem-width-witness.c/.txt).
+    The specimen's promoted member size is 1125899906842624 on 64-bit and 0 on
+    32-bit -- the same file is a different defect at each width.
+    The discriminating variants: variant_wrap32_zero (2**32, wraps to 0 on
+    32-bit only), variant_wrap32_one (2**32+1, decodes as a VALID file on
+    32-bit), variant_wrap32_two (2**32+2, an 8-byte member on 32-bit),
+    variant_wrap64_zero (2**64, zero-sized at both widths).
+    NOT measured: libhdf5 itself on 32-bit.  libc6-i386 is present but
+    libc6-dev-i386 is not, so gcc -m32 cannot link a hosted program and CMake
+    cannot configure a 32-bit build.  The width witness is the arithmetic, not
+    the library.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: accepted
+  libhdf5_version: 2.2.0 (measured); guards still absent at 2.3.0 (source-verified)
+  classification: A -- a real invariant-A disagreement, and an investigated one
+  note: >-
+    libhdf5 accepts all four specimens while h5policy rejects them, so this IS
+    an invariant-A divergence.  It is currently carried by the provisional
+    `violation` allowance described in
+    registry/cases/arithmetic-divergences-backlog.yml, which that file
+    explicitly flags as "provisional ... it must not be read as a judgement
+    that these are benign".
+    That allowance is now justified rather than provisional, and on stronger
+    grounds than a tolerance: acceptance here is not a reference-library defect
+    on one specimen but a whole class where libhdf5 publishes an oversized
+    member through the public API and reads it out of bounds on H5Dread.  If a
+    narrower carrier is wanted, a finding-code-scoped A~ predicate over
+    H5_CORRUPT_LENGTH_OVERFLOW + H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_BOUNDS
+    would be the shape -- NOT an entry in h5policy-diff-tolerances.yml.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Two coupled changes, both required.
+    (1) CHECKED MULTIPLICATION INSIDE H5T__array_create, for both the nelem
+    accumulation (src/H5Tarray.c:158) and the base_size*nelem product (:162),
+    mirroring the guards already present for standalone arrays at
+    src/H5Odtype.c:815-817 and :835-838.  Put it in the CONSTRUCTOR rather than
+    at the decode call site: H5T__array_create is also reached from the public
+    H5Tarray_create1/2, so a decode-site fix leaves the API route open.
+    (2) RE-EVALUATE THE :507 ZERO-SIZE AND :509 MEMBER-BOUNDS GUARDS AFTER THE
+    PROMOTION AT :542, against the promoted type rather than the base type.
+    Half (1) is essentially risk-free: a checked multiply can only reject
+    products that overflow size_t, and no writer has ever emitted the v1
+    embedded-array encoding with such dimensions.
+    Half (2) is the risk-bearing one: it newly rejects any v1 compound whose
+    promoted member footprint exceeds its declared element -- which is exactly
+    the set h5policy already rejects, so the blast radius is known.
+    BOTH halves must be tested on a 32-bit target.  The thresholds differ by 32
+    binary orders of magnitude and the wrapped residues that matter (0, 1 and 2
+    elements) occur only there; a fix validated solely on x86-64 would not
+    exercise the cases that decode as valid files on i386.
+systemic:
+  semantic_boundary: >-
+    the complete datatype record.  Decode legacy dimensions into inert values;
+    checked-multiply the count and the base footprint when the array type is
+    created; then check the PROMOTED member against its compound element,
+    before native construction or publication.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 decode and constructor still open
+  description: >-
+    h5policy computes the promoted footprint first and bounds it second, in
+    exact 64-bit arithmetic with a checked multiply, so no target-width wrap
+    can normalise a bad value before the bound sees it.  The member-bounds
+    expression is written as a subtraction after an explicit `member_off >
+    elm_size` gate specifically so it cannot wrap.  All four specimens and
+    every discriminating variant are rejected.
+    The remaining work is entirely libhdf5's.
+  landed_changes:
+    - h5policy/pickles/h5_datatype.pk (promoted footprint at :622; the
+      wrap-proof member bound at :628)
+    - registry/findings/catalog (H5_CORRUPT_LENGTH_OVERFLOW,
+      H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_BOUNDS)
+    - registry/validation-coverage.yml (datatype.size_arithmetic,
+      datatype.compound_member_bounds)
+    - h5policy/tools/h5policy-gencorpus (_make_compound_member_array_nelem_overflow,
+      and the bounds/offset fixtures)
+    - h5policy/tests/expected/malformed-compound_member_array_nelem_overflow.yml,
+      malformed-compound_member_array_bounds.yml,
+      malformed-compound_member_offset_oob.yml
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_pocs:
+    - cases/40f5826c1ad2e1acde0ded339dfc540b/input.h5
+    - cases/25420ff598c6dc6c75161afd98999a53/input.h5
+    - cases/40dc51154759c692cb3b31f403fc5692/input.h5
+    - cases/8e3dec666b6a2f1932c7ed577f98ff40/input.h5
+  direct_fixtures:
+    - h5policy/tests/malformed/compound_member_array_nelem_overflow.h5
+    - h5policy/tests/malformed/compound_member_array_bounds.h5
+    - h5policy/tests/malformed/compound_member_offset_oob.h5
+  control_fixture: >-
+    variant_fit.h5 in the 40f5826c bundle -- a valid embedded-array compound the
+    oracle ACCEPTS.  Essential here: the containment's half (2) newly rejects a
+    class of files, so a positive control is what shows the rule is not
+    over-broad.
+  memory_safety_witness: >-
+    variant_off12_reachable.h5 (40f5826c) -- ASan heap-buffer-overflow READ at
+    H5Tconv_compound.c:868 via H5Dread.  Not tracked in the corpus; see
+    coverage_gaps.
+  width_witness: >-
+    nelem-width-witness.c in the 40f5826c bundle.  One source, run twice: native
+    x86-64 and a freestanding i386 binary (-m32 -nostdlib -static, raw int 0x80
+    syscalls).  Executed arithmetic, not a uint32_t model.  Reusable for any
+    future width question in this repo.
+  generators: >-
+    The three tracked fixtures are generator-produced and reproducible from this
+    repo.  40f5826c's specimen differs from its tracked fixture in only 32 bytes
+    -- object-header timestamps and the chunk-0 checksums over them -- with the
+    datatype message byte-identical (corpus-identity.json).  So the tracked
+    fixture is a faithful stand-in for that specimen, which is NOT true of the
+    other three bundles' inputs.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true      # for h5policy
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: true
+
+backports: []          # nothing to backport in h5policy.
+
+fuzz_seed: >-
+  malformed/compound_member_array_nelem_overflow.h5 is already a seed.  The
+  un-corpused semantic neighbours are the four wrap-discriminating vectors
+  (wrap32_zero/one/two, wrap64_zero) plus variant_off12_reachable and
+  variant_bounds_only -- the boundary is at SIZE_MAX/base_size for each target
+  width, and the interesting residues are 0, 1 and 2 elements.
+
+compatibility_backport_risks: >-
+  See containment for the split: half (1) rejects only products that overflow
+  size_t and no writer has emitted such dimensions; half (2) newly rejects any
+  v1 compound whose promoted member footprint exceeds its declared element,
+  which is precisely the set h5policy already rejects.
+  The 32-bit obligation is the real risk and is not optional.  The thresholds
+  differ by 32 binary orders of magnitude between the widths, and the wrapped
+  residues that decode as VALID files (variant_wrap32_one) exist only at 32
+  bits -- so a 32-bit build with the fix applied could newly reject files that
+  a 64-bit build with the same fix still accepts, and vice versa.  Any backport
+  must state which width's behaviour is normative.
+
+sibling_audit: >-
+  Within libhdf5: H5T__array_create is reached from the v1 embedded-array
+  decode path AND from the public H5Tarray_create1/2, so the constructor is the
+  correct fix site and the API route is a second, unmeasured entry point.  The
+  standalone array decoder (src/H5Odtype.c:812-848) is audited and CORRECT --
+  it is the contrast that makes this record's argument.  The :507/:509 guards
+  were audited only for the v1 embedded-array ordering; whether other member
+  classes are promoted or transformed after those guards run was not checked.
+  Within h5policy: the promoted-footprint bound at h5_datatype.pk:628 is shared,
+  so v1 embedded arrays and ordinary members go through one expression.  Whether
+  the same compound shape arriving as an ATTRIBUTE datatype rather than a
+  dataset datatype takes the same validated path is asserted from the shared
+  implementation, not separately measured -- and attributes are known to use a
+  throwaway context copy, so this is worth confirming rather than assuming.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range, but spans at least 2.2.0 to 2.3.0.  The bundles
+    measured acceptance and the ASan over-read on 2.2.0 (source 4d666721f42);
+    the missing guards and the :507/:509-before-:542 ordering were verified
+    directly in the 2.3.0 tree at promotion.  No archaeology was run to find
+    when the legacy embedded-array path diverged from the standalone one.
+  note: >-
+    The shape suggests the standalone-array guards were added in response to a
+    specific report and the legacy embedded path was never revisited -- the
+    three guards there are notably more thorough than the surrounding code.
+    That is an inference from code shape, not a measurement.
+  label: partially established (two versions, not a range)
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    THE MEMORY-SAFETY WITNESS IS NOT TRACKED.  variant_off12_reachable.h5 is
+    the specimen that proves the family is a memory-safety defect rather than
+    an acceptance divergence, and it lives only in a gitignored bundle.  It
+    should become a tracked fixture with a generator -- it is the single most
+    valuable artifact in all four bundles.
+  - >-
+    NOTHING WAS RE-MEASURED AT PROMOTION, and the measured outcomes are 2.2.0
+    while the source claims are 2.3.0 -- see
+    measured.NOT_REMEASURED_AT_PROMOTION.  A 2.3.0 re-measurement would collapse
+    that skew and is the cheapest outstanding item.
+  - >-
+    libhdf5 itself is unmeasured at 32 bits (the arithmetic is measured; the
+    library is not).  Needs libc6-dev-i386 and a 32-bit libhdf5 build.  This
+    matters more here than in most records because variant_wrap32_one decodes
+    as a VALID file at 32 bits.
+  - >-
+    The public H5Tarray_create1/2 route into the unchecked constructor has no
+    specimen and no test -- it is an API-level entry point, not a file-format
+    one, so the corpus cannot cover it and a unit test would be needed.
+  - >-
+    The zero-size consequence (h5dump's non-converging H5_term_library) is
+    recorded from a transcript but has no tracked fixture and no expectation.
+open_questions:
+  - >-
+    Does the same promoted-after-guard ordering exist for other member
+    transformations, or is the v1 embedded array the only one?  Only this path
+    was audited.
+  - >-
+    Does an ATTRIBUTE carrying the same compound datatype take h5policy's
+    validated path?  Attributes are validated with a throwaway context copy,
+    and cross-message state in per-object globals does not reset the same way.
+    Asserted from the shared implementation, not measured.
+
+provenance:
+  found_by: >-
+    four supplied specimens, triaged through the h5cve bundle workflow in the
+    bundles listed under `routes`; promoted jointly 2026-08-15 after a source
+    re-reading established that the arithmetic and ordering halves are one
+    surface and that the standalone array decoder already carries the guards
+    the embedded path lacks.
+  hdf5_build: >-
+    Measured on HDF5 2.2.0 (source 4d666721f42); baseline Release and candidate
+    RelWithDebInfo -fsanitize=address, both accepting.  Source verified against
+    the 2.3.0 tree at promotion.  Both are workstation-local installs; paths not
+    recorded.  i386 toolchain: gcc 14.2.0, -m32 -nostdlib -static.
+  poke_version: GNU poke 4.3
