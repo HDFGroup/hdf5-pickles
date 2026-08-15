@@ -1,0 +1,426 @@
+# A v2 B-tree node's encoded record count is never checked against the capacity
+# the library itself derived for that node.  Two consumers then use the count
+# unbounded, one reading and one writing.
+#
+# Promoted from two working bundles that describe ONE libhdf5 defect reached by
+# two different consumers of the same corrupt field:
+#   cases/70fdc81328810912bacdaacd31b35e73   (corpus seed 63; checksum location, OOB READ)
+#   cases/e38d977307f5b49c54cea518f4ebfaf6   (corpus seed 62; record decode,     OOB WRITE)
+# They are recorded together deliberately.  Both specimens over-state `nrec` in
+# the same dense-link name-index tree, in files of the same lineage (BTHD at
+# 749, BTLF at 787, node_size 512, leaf capacity 45); they differ only in how
+# far the load path gets before the unbounded count is used.  One added
+# comparison closes both.
+#
+# The zero-record_size SIGFPE in the same header is a SEPARATE defect and has
+# its own record -- see registry/cases/v2-btree-record-size-zero-assert-only.yml
+# and the `not_this_record` section below.
+schema_version: 1
+
+id: v2-btree-nrec-unvalidated-against-node-capacity
+title: a v2 B-tree node's encoded record count is never bounded by the node
+  capacity the library derived, so checksum lookup reads and record decode
+  writes past the node allocation
+status: oracle-hardened          # h5policy rejects; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  Both bundles carry
+  "UNCONFIRMED offline" disclosure notes of their own and name a supplied
+  corpus specimen; those provenance strings are not reproduced as claims here.
+
+# -- Triage -------------------------------------------------------------------
+record: dense_index
+versions: [2]                    # v2 B-tree node format
+root_cause_classification: aggregate_object
+violated_invariant:
+  - dense.btree_node_size
+validation_closure: >-
+  the v2 B-tree header together with the node it selects: node_size, rrec_size,
+  the derived per-depth capacity, and the node's own encoded record count --
+  all established before the node image is checksummed or deserialized.  The
+  node alone does not close it, because the count is supplied by the parent
+  (header root pointer, or an internal node's child pointer) while the capacity
+  is a property of the header's geometry.
+activation_before_validation:
+  # The cache allocates node_size bytes and the loader runs verify_chksum and
+  # then deserialize against it, all while the count is still unvalidated.
+  - native_construction
+entry_points:
+  - h5policy (oracle) -- untrusted-strict rejects the plain shape; see
+    profile_split for the cache-image-wrapped one
+  - "libhdf5 public API: H5Fopen -> H5Gopen2('/') -> H5Gget_info -> H5Lget_name_by_idx"
+  - "shipped tools: h5dump -H and h5ls both reach it"
+  - h5policy-probe --exercise dense_index (H5Fopen -> H5Lvisit2)
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  The capacity is not missing.  H5B2__hdr_init computes it on every open and
+  stores it:
+    sz_max_nrec = H5B2_NUM_LEAF_REC(hdr->node_size, hdr->rrec_size);   /* H5B2hdr.c:140 */
+    H5_CHECKED_ASSIGN(hdr->node_info[0].max_nrec, unsigned, sz_max_nrec, size_t);  /* :141 */
+  with H5B2_NUM_LEAF_REC(n, r) = ((n) - H5B2_LEAF_PREFIX_SIZE) / (r)
+  (H5B2hdr.c:44), and the deeper levels from H5B2_NUM_INT_REC (H5B2pkg.h:109).
+  It then sizes the native record buffer FROM that capacity:
+    hdr->node_info[0].nat_rec_fac =
+        H5FL_fac_init(hdr->cls->nrec_size * hdr->node_info[0].max_nrec);  /* :147 */
+  So the correct bound exists, in memory, before any node is read.  Nothing on
+  the load path ever compares the encoded count to it.  `max_nrec` does not
+  appear in H5B2cache.c at all -- the only near-match there is `max_nrec_size`,
+  an unrelated encoding width used at :672 and :788.
+  The count flows in unchecked: H5B2__protect_leaf sets
+  `udata.nrec = node_ptr->node_nrec` (H5B2leaf.c:185) straight from the parent,
+  and the cache client then uses it twice.
+  CONSUMER 1 -- checksum location, H5B2__cache_leaf_verify_chksum:
+    chk_size = H5B2_LEAF_PREFIX_SIZE + (udata->nrec * udata->hdr->rrec_size);  /* H5B2cache.c:970 */
+    if (H5F_get_checksums(image, chk_size, &stored_chksum, &computed_chksum) < 0)  /* :973 */
+  `image` was allocated at hdr->node_size.  An inflated count places the
+  checksum read past it.  The function never looks at `len`.
+  CONSUMER 2 -- record decode, H5B2__cache_leaf_deserialize:
+    leaf->leaf_native = H5FL_FAC_MALLOC(udata->hdr->node_info[0].nat_rec_fac);  /* :1039 */
+    leaf->nrec = udata->nrec;                                                   /* :1042 */
+    for (u = 0; u < leaf->nrec; u++) {
+        (udata->hdr->cls->decode)(image, native, udata->hdr->cb_ctx);
+        image  += udata->hdr->rrec_size;
+        native += udata->hdr->cls->nrec_size;   /* :1046-1053 */
+    }
+  This is the sharper half, and the shape is the whole defect in two lines: the
+  buffer is sized from the DERIVED CAPACITY (max_nrec, via the factory) while
+  the loop is bounded by the ENCODED COUNT (udata->nrec).  Two different
+  sources for one buffer.  Every record past the capacity is written outside
+  it, by the client callback, which for the dense-link name index is
+  H5G__dense_btree2_name_decode.
+  The one place the relation is stated at all is an assert on the WRITE path --
+  `assert(curr_node_ptr->node_nrec < hdr->node_info[0].max_nrec)`
+  (H5B2leaf.c:344), in H5B2__insert_leaf -- compiled out under NDEBUG and not
+  on the read path in any build.  H5B2leaf.c:107 confirms the buffer's true
+  extent independently: it memsets `hdr->cls->nrec_size * max_nrec` bytes.
+
+not_this_record: >-
+  A zero `rrec_size` in the same BTHD header makes H5B2_NUM_LEAF_REC divide by
+  zero at H5B2hdr.c:140 -- a SIGFPE, guarded only by
+  `assert(cparam->rrec_size > 0)` at :113.  That is a DIFFERENT defect: a
+  different field, a different consumer, an assert-only guard rather than no
+  guard at all, and a DoS rather than memory corruption.  It has its own
+  record, registry/cases/v2-btree-record-size-zero-assert-only.yml, on the same
+  reasoning that keeps mdci-lru-rank-assert-only.yml separate from
+  mdci-reconstruct-cleanup-unsafe.yml.
+  The two do meet at one line.  H5B2hdr.c:140 is where the zero-width defect
+  FAULTS and where this defect's capacity is successfully COMPUTED and then
+  never used.  Fixing either does not fix the other.
+
+# -- The two consumers --------------------------------------------------------
+triggers:
+  checksum_location_read:
+    bundle: cases/70fdc81328810912bacdaacd31b35e73     # corpus seed 63
+    specimen: 1299 bytes, input_sha256
+      2857484691392669f1eddab578d04e559beeb38fb0deb3a2cc1f6c18ae1fbdb9
+    how: >-
+      BTHD at 749: type 5 (dense-link name index), node_size 512, record_size
+      11, depth 0, root at 787.  Root nrec is set to 60 against a leaf capacity
+      of 45.  chk_size becomes 6 + 60*11 = 666 on a 512-byte allocation, so the
+      stored checksum is fetched 154 bytes past the end.
+    impact: >-
+      Heap over-read.  NOT a crash on the stock build: it reads out of bounds,
+      compares garbage, and returns "incorrect metadata checksum after all read
+      attempts".  That graceful rejection is the RESULT of the overflow, not a
+      bound that prevented it -- which is exactly why the tracked fixture's
+      canary status is `unexercised` rather than `violation`.
+    crash_path: >-
+      H5F_get_checksums (src/H5Fio.c:534)
+      <- H5B2__cache_leaf_verify_chksum (src/H5B2cache.c:973)
+      <- H5C__load_entry (src/H5Centry.c:1215)
+      <- H5B2__protect_leaf (src/H5B2leaf.c:188)
+    asan: heap-buffer-overflow, READ of size 1, 154 bytes after a 512-byte allocation
+    oracle_finding: H5_CORRUPT_V2_BTREE_NODE_SIZE @ 787
+    tracked_fixtures:
+      - malformed/over_capacity_v2_btree_leaf.h5
+      - malformed/over_capacity_v2_btree_internal.h5   # internal-node layout differs
+  record_decode_write:
+    bundle: cases/e38d977307f5b49c54cea518f4ebfaf6     # corpus seed 62
+    specimen: input_sha256
+      e18bbfc9ec8b6245f34f0da859377681144f70b15d65d87d21a352a08cb07e26
+    how: >-
+      The same tree shape with nrec set to 65535, the u16 maximum, against the
+      same 45-record capacity -- and wrapped in a metadata cache image
+      (MDCI at 1331, 564 bytes) holding one entry: addr 787 len 512, the leaf.
+      The load reaches H5B2__cache_leaf_deserialize and decodes 65535 records
+      into a buffer sized for 45.
+    impact: >-
+      Heap over-WRITE -- memory corruption, and the more serious of the two.
+      The STOCK build SIGSEGVs (exit 139); no sanitizer is needed, and
+      h5dump/h5ls/H5Lget_name_by_idx all fault.  Under ASan it is a
+      heap-buffer-overflow WRITE of size 4, 8 bytes after a 540-byte region.
+    crash_path: >-
+      H5G__dense_btree2_name_decode (src/H5Gbtree2.c:293)
+      <- H5B2__cache_leaf_deserialize (src/H5B2cache.c:1048)
+      <- H5C__deserialize_prefetched_entry (src/H5Centry.c:1890)
+      <- H5C_protect (src/H5Centry.c:3060)
+      <- H5AC_protect (src/H5AC.c:1302)
+      <- H5B2__protect_leaf (src/H5B2leaf.c:188)
+    oracle_finding: >-
+      H5_CORRUPT_V2_BTREE_NODE_SIZE @ 787 under forensic; untrusted-strict
+      reports H5_UNSUPPORTED_PICKLE_COVERAGE_GAP @ 1310 instead -- see
+      profile_split, this is deliberate.
+    tracked_fixtures:
+      - malformed/cache_image_unshadowed_btree.h5      # forensic expectation
+
+profile_split: >-
+  The cache-image-wrapped trigger does NOT report the named cause under
+  untrusted-strict, and its expectation is a forensic one for that reason.
+  untrusted-strict stops at the first non-accept finding, which on that file is
+  the cache-image coverage gap itself, so it returns unsupported_coverage_gap
+  (exit 5).  That is a refusal, not an accept, so a conforming consumer is
+  protected either way; forensic is where H5_CORRUPT_V2_BTREE_NODE_SIZE
+  appears, and h5cve triage uses forensic.  Anyone adding a fixture for this
+  trigger must write the expectation against forensic with
+  expected_analysis.walk_completed false -- copying the plain leaf fixture's
+  untrusted-strict expectation will not work.
+  Why the corruption is reachable at all despite the image: the image shadows
+  the LEAF (787), while the corrupt field lives in the BTHD header at 749,
+  which it leaves unshadowed.  The capacity check is pure arithmetic on BTHD
+  fields and never reads leaf bytes, so it is sound to run on shadowed-leaf
+  files.  That asymmetry is what makes a per-address skip correct where a
+  whole-walk stop was not.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    IMPORTANT.  Everything under `measured` and under `triggers` is copied from
+    the two bundles as recorded (seed-63 refreshed at workspace commit
+    59464ed, seed-62 at h5policy 07ad5e7), and was NOT re-measured when this
+    record was written on 2026-08-15 -- the promoting session could not execute
+    the oracle or the probes.  Findings drift between bundling and promotion:
+    the fd-parent bundle's finding moved 37 bytes by the time it was promoted.
+    Re-run before relying on any offset here:
+      h5policy --profile untrusted-strict --json <specimen>
+      h5policy --profile forensic         --json cases/e38d97.../input.h5
+      h5policy-probe --exercise dense_index --hdf5-bindir <stock|asan>/bin --json <specimen>
+    and correct this block, recording superseded values rather than
+    overwriting them.
+  oracle_as_recorded: >-
+    seed-63 specimen: reject_corrupt, H5_CORRUPT_V2_BTREE_NODE_SIZE @ 787,
+    object /.  Truncation sweep exhaustive over 1300 prefixes, all
+    reject_corrupt, no violations.
+    seed-62 specimen: unsupported_coverage_gap (exit 5) under untrusted-strict
+    with H5_UNSUPPORTED_PICKLE_COVERAGE_GAP @ 1310; reject_corrupt with
+    H5_CORRUPT_V2_BTREE_NODE_SIZE @ 787 under forensic.  Truncation sweep
+    exhaustive over 1896 prefixes: 1895 reject_corrupt, 1 coverage gap.
+  libhdf5_stock_as_recorded: >-
+    seed-63: rejected_in_traversal -- the over-read happens and is then
+    reported as a checksum mismatch (see triggers.checksum_location_read.impact;
+    do not read this as a bound).
+    seed-62: CRASHED, SIGSEGV.  An uninstrumented build faults, which makes
+    this trigger the stronger of the two and independent of sanitizer access.
+  libhdf5_asan_as_recorded: >-
+    seed-63: crashed, SIGABRT, heap-buffer-overflow READ of size 1, 154 bytes
+    past a 512-byte allocation.  Comparison recorded as
+    sanitizer_confirms_memory_safety_defect.
+    seed-62: crashed, heap-buffer-overflow WRITE of size 4 at
+    H5Gbtree2.c:293, 8 bytes after a 540-byte region.
+    Activation counters zero on both (no external open, plugin load, write,
+    network).
+  valid_control: >-
+    h5policy/tests/valid/dense_links.h5 -- oracle accept, stock accepted, ASan
+    accepted, 41 dense_index exercises completed.  Recorded in the seed-63
+    bundle; the control that shows the capacity rule does not reject valid
+    dense-link trees.
+  width: >-
+    NOT measured at 32 bits.  Per the seed-62 bundle the u16 count and the
+    720895-byte used size fit conventional 32-bit and 64-bit size_t domains, so
+    no width wrap is needed to reach either consumer; allocator diagnostics and
+    ABI-specific behaviour are unmeasured.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: crashed (seed-62) / rejected-after-over-reading (seed-63)
+  libhdf5_version: 2.3.0
+  classification: agreement
+  note: >-
+    The oracle and libhdf5 agree that neither file may be accepted, so there is
+    no invariant-A disagreement and NO entry in
+    registry/h5policy-diff-tolerances.yml is warranted or present.  h5policy
+    reaches the verdict by arithmetic on BTHD fields; libhdf5 reaches it by
+    faulting, or on seed-63 by over-reading and then failing a checksum it
+    fetched from out of bounds.  The tracked fixtures are ordinary corpus
+    fixtures that both sides reject, so they need no exemption.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    One comparison, against a value the header already holds.  Before
+    H5F_get_checksums in H5B2__cache_leaf_verify_chksum (H5B2cache.c:970-973)
+    and before the decode loop in H5B2__cache_leaf_deserialize (:1039-1053),
+    reject when `udata->nrec > udata->hdr->node_info[depth].max_nrec`.  No new
+    arithmetic is required -- max_nrec is computed at H5B2hdr.c:140-141 on
+    every open and is what the native buffer was sized from at :147.
+    BOTH consumers need it.  Guarding only the checksum path leaves the decode
+    write live, and guarding only decode leaves the read live; the two bundles
+    exist to make that concrete.  The internal-node twins,
+    H5B2__cache_int_verify_chksum and H5B2__cache_int_deserialize, need the
+    same treatment -- their pointer layout differs, which is why the corpus
+    carries a separate internal-node fixture.
+    Use checked arithmetic for the chk_size product, and derive capacity from
+    the exact on-disk leaf/internal layouts rather than an ad hoc constant.
+    Promoting the H5B2leaf.c:344 insert-path assert is NOT a substitute: it is
+    on the write path and does not run on load in any build.
+systemic:
+  semantic_boundary: >-
+    a complete v2 B-tree node envelope -- header-derived capacity, parent
+    -supplied record count, node prefix, record width, child-pointer width when
+    internal, the fixed node allocation, and the trailing checksum location --
+    established before the node image is checksummed or deserialized.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 node load still open
+  description: >-
+    h5policy validates the count against the node's capacity with no native
+    allocation and no cache client, so neither consumer's class of defect can
+    arise: there is no node buffer to over-read and no native record array to
+    over-write.  The check lives in the shared v2-B-tree geometry validator and
+    therefore applies to every client role, not just the dense-link name index
+    this case measures.
+    The remaining work is entirely libhdf5's.
+  landed_changes:
+    - h5policy/pickles/h5_btree2.pk and the dense-link readers (used-byte count
+      vs declared node size; before 2026-07-22 the two hand-written name-index
+      readers compared it only against file_size)
+    - registry/findings/catalog (H5_CORRUPT_V2_BTREE_NODE_SIZE)
+    - registry/validation-coverage.yml (dense.btree_node_size)
+    - h5policy/tools/h5policy-gencorpus (_make_over_capacity_v2_btree_node)
+    - h5policy/tests/expected/malformed-over_capacity_v2_btree_{leaf,internal}.yml
+    - h5policy/tests/expected/malformed-cache_image_unshadowed_btree-forensic.yml
+    - the cache-image traversal boundary: a per-address skip of exactly the
+      addresses the image caches, replacing a whole-walk stop, so unshadowed
+      corruption is still reached
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc:
+    - cases/70fdc81328810912bacdaacd31b35e73/input.h5
+    - cases/e38d977307f5b49c54cea518f4ebfaf6/input.h5
+  direct_fixtures:
+    - h5policy/tests/malformed/over_capacity_v2_btree_leaf.h5
+    - h5policy/tests/malformed/over_capacity_v2_btree_internal.h5
+    - h5policy/tests/malformed/cache_image_unshadowed_btree.h5
+  expectations:
+    - h5policy/tests/expected/malformed-over_capacity_v2_btree_leaf.yml
+    - h5policy/tests/expected/malformed-over_capacity_v2_btree_internal.yml
+    - h5policy/tests/expected/malformed-cache_image_unshadowed_btree-forensic.yml
+  control_fixture: h5policy/tests/valid/dense_links.h5
+  targeted_probe: >-
+    btree-targeted-probe.c in each bundle -- public API only (H5Fopen,
+    H5Gopen2, H5Gget_info, H5Lget_name_by_idx).  On seed-62 it faults against
+    the STOCK build, so it needs no sanitizer.  node-capacity-witness.c in the
+    seed-63 bundle decodes the BTHD/BTLF relation directly without libhdf5.
+  generators: >-
+    _make_over_capacity_v2_btree_node builds the unshadowed leaf and internal
+    fixtures deterministically from this repo; _make_cache_image_shadowed_btree
+    builds the cache-image one.  Neither specimen is generated -- both are
+    supplied corpus finds, preserved with the sha256s above.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true    # seed-63 as recorded; seed-62's
+                                          # bundle records false, because its
+                                          # coverage gap precedes the cause
+                                          # under untrusted-strict
+    no_plugin_load: true
+    no_decompression: unverified
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []          # nothing to backport in h5policy.
+
+fuzz_seed: >-
+  Both specimens are seeds for the v2-B-tree node neighbourhood -- nrec at
+  capacity, capacity+1, and u16 max are the interesting boundary, and the
+  internal-node pointer layout is a separate axis.  seed-62 additionally seeds
+  the cache-image-wrapper shape: it demonstrates that an image can be built
+  around a defect, which is a mutation dimension in its own right.
+
+compatibility_backport_risks: >-
+  Low for the capacity check itself: a node whose encoded count cannot fit its
+  own fixed allocation cannot have been written by a conforming library, and
+  the valid control confirms ordinary dense-link trees are unaffected.  The
+  implementation must calculate capacity from the exact on-disk layouts, use
+  checked arithmetic, and preserve valid sparse/reserved node padding; test
+  boundary counts and every supported B-tree client before backporting.
+  The h5policy-side cache-image change is the one to watch, and it has already
+  landed: converting a hard traversal stop into a per-address skip means files
+  carrying an image are walked further than before and can surface findings
+  they previously never reached.  Decisions only become stricter, never laxer,
+  but a consumer pinning exact finding lists for cache-image files may see new
+  entries.
+
+sibling_audit: >-
+  Within libhdf5: H5B2__cache_int_verify_chksum and H5B2__cache_int_deserialize
+  carry the identical pattern for internal nodes and are equally unguarded --
+  both derive from udata->nrec after the loader has allocated hdr->node_size
+  bytes.  This record measures the dense-link LEAF path on both consumers; the
+  internal-node path is source-reviewed but not measured, and a client-type
+  matrix is not established.  Any v2-B-tree client with a decode callback is a
+  candidate for the write consumer, since the callback is what performs the
+  out-of-bounds store; only the type-5 dense-link name index is confirmed here.
+  Chunk index (types 10/11), SOHM and fractal-heap clients are unaudited.
+  Not established, and named in the seed-62 bundle: whether a cache image whose
+  entries shadow the DECLARING structure -- the BTHD itself, which both
+  specimens leave unshadowed -- would still be caught.  That is the residual
+  blind spot of the per-address skip.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED, and deliberately not asserted.  Measured live on 2.3.0 by both
+    bundles against a local source tree at commit 4b1ffa68a840.  No archaeology
+    was run on H5B2cache.c/H5B2hdr.c and no older tag was built, so nothing is
+    claimed about when either consumer lost (or never had) the bound, nor about
+    which supported branches carry it.
+  note: >-
+    The seed-63 bundle's own note that the h5policy-side check was only
+    corrected on 2026-07-22 concerns THIS repo's readers, not libhdf5, and must
+    not be mistaken for an upstream timeline.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    NOTHING IN THIS RECORD WAS RE-MEASURED AT PROMOTION -- see
+    measured.NOT_REMEASURED_AT_PROMOTION.  This is the first thing to close,
+    and until it is, every offset and outcome here is as-of the bundles.
+  - >-
+    The internal-node consumers are source-reviewed only.  A tracked fixture
+    exists for the internal-node CHECKSUM path
+    (over_capacity_v2_btree_internal.h5) but the internal-node DECODE path has
+    no specimen, and no exact-build measurement of either was made.
+  - >-
+    No 32-bit measurement on either specimen (see measured.width).
+  - >-
+    Client-type matrix absent: only the dense-link name index (type 5) is
+    confirmed on either consumer.
+open_questions:
+  - >-
+    Would a cache image that shadows the BTHD header itself defeat the check?
+    Both specimens leave the header unshadowed, which is why the pure-arithmetic
+    capacity test still runs.  An image that caches the declaring structure is
+    untested -- untested rather than known-bad.  Shared with the cache-image
+    boundary work recorded against malformed/cache_image_unshadowed_btree.h5.
+  - >-
+    Is `unsupported_coverage_gap` the right untrusted-strict verdict for a file
+    whose named cause IS reachable?  It is a refusal, so consumers are safe,
+    and the split is deliberate (see profile_split) -- but a caller reading only
+    the strict profile learns "not decodable" rather than "corrupt B-tree", and
+    the two warrant different operator responses.
+
+provenance:
+  found_by: >-
+    two supplied corpus specimens, triaged through the h5cve bundle workflow in
+    cases/70fdc81328810912bacdaacd31b35e73 (seed 63) and
+    cases/e38d977307f5b49c54cea518f4ebfaf6 (seed 62); promoted jointly
+    2026-08-15 after a source re-reading that established the two consumers
+    share one unchecked field.
+  hdf5_build: >-
+    HDF5 2.3.0, local source tree at commit 4b1ffa68a840; baseline Release
+    (NDEBUG) and candidate RelWithDebInfo -fsanitize=address.  Both are
+    workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

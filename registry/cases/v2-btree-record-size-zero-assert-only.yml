@@ -1,0 +1,288 @@
+# A v2 B-tree header declaring record_size == 0 makes the library divide by it
+# while deriving node capacity.  The only thing standing in the way is an
+# assert, so every NDEBUG build takes SIGFPE.
+#
+# Promoted from one working bundle:
+#   cases/1b9b7deea9ba2cdd84bf56426a92a7b3
+#
+# SEPARATE, DELIBERATELY, from
+# registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml.  The two
+# specimens come from the same file lineage and the same BTHD at offset 749,
+# which makes them look like one case; they are not.  See `not_that_record`.
+schema_version: 1
+
+id: v2-btree-record-size-zero-assert-only
+title: a v2 B-tree header's record size is checked only by an assert before it
+  is used as a divisor, so an encoded zero divides by zero on every NDEBUG build
+status: oracle-hardened          # h5policy rejects; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The bundle carries an
+  "UNCONFIRMED offline" note and a supplied specimen path of its own; that
+  provenance string is not reproduced as a claim here.
+
+# -- Triage -------------------------------------------------------------------
+record: dense_index
+versions: [2]                    # v2 B-tree header format
+root_cause_classification: record_local
+violated_invariant:
+  - dense.btree_record_size
+validation_closure: >-
+  the v2 B-tree header alone -- version, client role, node_size, record_size,
+  depth, root pointer, counts and header checksum.  This one is genuinely
+  record-local: the fault happens while initializing the header, before any
+  node address is followed, so no node or traversal state is needed to close it.
+activation_before_validation:
+  # H5B2__hdr_init runs as part of deserializing the header into native state;
+  # the divide happens there, before any node is protected.
+  - native_construction
+entry_points:
+  - h5policy (oracle) -- untrusted-strict and forensic both reject
+  - "libhdf5 public API: H5Fopen -> H5Gopen2('/') -> H5Gget_info"
+  - "shipped tools: h5dump -H dies with the SIGFPE"
+  - h5policy-probe --exercise dense_index (H5Fopen -> H5Lvisit2)
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  H5B2__hdr_init derives the per-node record capacity by dividing the node size
+  by the record size:
+    #define H5B2_NUM_LEAF_REC(n, r) (((n)-H5B2_LEAF_PREFIX_SIZE) / (r))   /* H5B2hdr.c:44 */
+    ...
+    sz_max_nrec = H5B2_NUM_LEAF_REC(hdr->node_size, hdr->rrec_size);      /* :140 */
+  `hdr->rrec_size` is taken straight from the decoded header at :125, and the
+  only thing that ever questions it is
+    assert(cparam->rrec_size > 0);                                        /* :113 */
+  which is compiled out under NDEBUG -- and both locally measured builds have
+  it out.  An encoded zero therefore reaches an integer division by zero:
+  SIGFPE, during header initialization, before a single node is read.
+  Note the asymmetry between the two capacity macros.  The LEAF macro divides
+  by `r` directly and faults.  The INTERNAL macro,
+    H5B2_NUM_INT_REC(h, d) = ((h)->node_size - (H5B2_INT_PREFIX_SIZE +
+        H5B2_INT_POINTER_SIZE(h, d))) / ((h)->rrec_size + H5B2_INT_POINTER_SIZE(h, d))
+  (H5B2pkg.h:109) divides by `rrec_size + pointer_size`, which stays non-zero
+  when rrec_size is zero.  So the fault is specific to the leaf-capacity line,
+  and a fix that only hardened the internal path would miss it.
+  This is an ASSERT-ONLY defect, not an unguarded one.  The invariant is known
+  to the authors and written down -- it is simply written in a form that does
+  not survive a release build.  That distinction is the reason this record
+  exists separately, and it is the same distinction that separates
+  registry/cases/mdci-lru-rank-assert-only.yml from the reconstruction record
+  next to it.
+
+not_that_record: >-
+  Do not merge this with
+  registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml.  The two
+  share a file lineage -- same BTHD at 749, same BTLF at 787, same node_size
+  512, both 1299-byte specimens -- and are still different defects on every
+  axis that governs a fix:
+    field     rrec_size (record width)      vs  nrec (encoded record count)
+    consumer  H5B2hdr.c:140 capacity divide vs  H5B2cache.c:970/:1039 node load
+    guard     assert, compiled out          vs  none at all, anywhere
+    failure   SIGFPE                        vs  OOB read and OOB write
+    impact    denial of service             vs  memory corruption
+  They meet at exactly one line.  H5B2hdr.c:140 is where THIS defect faults,
+  and where THAT defect's capacity is computed correctly and then never used as
+  a bound.  Promoting the assert here does nothing for the count defect;
+  bounding the count there does nothing for a zero width, which faults earlier.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    IMPORTANT.  Everything below is copied from the bundle as recorded
+    (workspace commit 0b429ac, hdf5 source 4b1ffa68a840) and was NOT
+    re-measured when this record was written on 2026-08-15 -- the promoting
+    session could not execute the oracle or the probes.  Findings drift between
+    bundling and promotion.  Re-run before relying on the offset:
+      h5policy --profile untrusted-strict --json cases/1b9b7dee.../input.h5
+      h5policy-probe --exercise dense_index --hdf5-bindir <stock|asan>/bin --json ...
+    and record superseded values rather than overwriting them.
+  oracle_as_recorded: >-
+    reject_corrupt, H5_CORRUPT_V2_BTREE_RECORD_SIZE @ 749, object /, message
+    "dense link v2 B-tree record size is zero".  Truncation sweep exhaustive
+    over 1300 prefixes, all reject_corrupt, no violations.
+    Decoded bytes at 749: BTHD, version 0, record_type 5 (dense-link name
+    index), node_size 512, record_size 0, depth 0, root address 787 (BTLF).
+  libhdf5_stock_as_recorded: >-
+    CRASHED, SIGFPE.  Release build, NDEBUG, so the :113 assert is absent.  The
+    bundle's btree-targeted-probe.c prints successful H5Fopen and H5Gopen2 and
+    then takes the signal inside H5Gget_info.  h5dump -H dies the same way.
+  libhdf5_asan_as_recorded: >-
+    CRASHED, SIGABRT.  RelWithDebInfo with -fsanitize=address.  Note this is
+    NOT an ASan memory report -- there is no out-of-bounds access to report; a
+    divide by zero is not a memory-safety event.  Activation counters zero on
+    both builds (no external open, plugin load, write, network).
+  valid_control: >-
+    h5policy/tests/valid/dense_links.h5 -- oracle accept, stock accepted, ASan
+    accepted, 41 dense_index exercises completed.
+  width: >-
+    NOT measured at 32 bits.  A divide by zero is not width-dependent, and
+    node_size 512 and record_size 0 fit any size_t, so the same trap is
+    expected on 32-bit builds; the signal delivery and any allocator
+    diagnostics are unmeasured.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: crashed
+  libhdf5_version: 2.3.0
+  classification: agreement
+  note: >-
+    Both sides refuse the file, so there is no invariant-A disagreement and NO
+    entry in registry/h5policy-diff-tolerances.yml is warranted or present.
+    h5policy rejects the header by decoding it; libhdf5 "rejects" it by taking
+    SIGFPE.  The tracked fixture is an ordinary corpus fixture that both sides
+    refuse, and it needs no exemption -- though note its canary status is
+    `violation`, since the crash IS observable on the uninstrumented build the
+    matrix runs against.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Two linked changes.
+    (1) Validate the decoded geometry in H5B2__cache_hdr_deserialize, before
+    H5B2__hdr_init is called: reject rrec_size == 0, and reject widths for
+    which a leaf has no room for even one record.  Return an HDF5 error rather
+    than deriving capacity by division.
+    (2) Defend H5B2__hdr_init itself with the same non-assert checks, for every
+    caller -- promoting H5B2hdr.c:113 from `assert` to `HGOTO_ERROR`.  The
+    creation path passes cparam from library code, so this rejects nothing a
+    conforming writer produces, and it is the change that makes the guarantee
+    hold in a release build rather than only under test.
+    The minimum-capacity rule must use the format's actual leaf-prefix
+    calculation (H5B2_LEAF_PREFIX_SIZE), not an ad hoc constant, and must be
+    checked against valid small-node files before backporting.
+systemic:
+  semantic_boundary: >-
+    v2 B-tree header-local geometry -- node_size and rrec_size, and their
+    relation -- established before H5B2__hdr_init derives any capacity or
+    allocates native node state.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 header init still open
+  description: >-
+    h5policy_validate_v2_btree_geometry rejects record_size == 0 and
+    record_size > node_size - 10 for every shared v2-B-tree client role, with no
+    native construction and no division performed on unvalidated input, so the
+    class of defect cannot arise in the bounded decoder.  The finding route
+    identifies the type-5 tree as dense_index rather than chunk_index, which is
+    what lets the registry map it correctly.
+    The remaining work is entirely libhdf5's.
+  landed_changes:
+    - h5policy/pickles (h5policy_validate_v2_btree_geometry -- zero and
+      over-wide record sizes, shared across client roles)
+    - registry/findings/catalog (H5_CORRUPT_V2_BTREE_RECORD_SIZE)
+    - registry/validation-coverage.yml (dense.btree_record_size)
+    - h5policy/tools/h5policy-gencorpus (zero_v2_btree_record_size.h5)
+    - h5policy/tests/expected/malformed-zero_v2_btree_record_size.yml
+      (family corrected from chunk_index to dense_index on 2026-07-22, when the
+      shared geometry check began naming its client role in the message)
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: cases/1b9b7deea9ba2cdd84bf56426a92a7b3/input.h5
+  direct_fixtures:
+    - h5policy/tests/malformed/zero_v2_btree_record_size.h5
+  expectations:
+    - h5policy/tests/expected/malformed-zero_v2_btree_record_size.yml
+  control_fixture: h5policy/tests/valid/dense_links.h5
+  targeted_probe: >-
+    btree-targeted-probe.c in the bundle -- public API only, compiled against
+    the release build.  It prints successful H5Fopen and H5Gopen2 calls, then
+    receives SIGFPE during H5Gget_info.  No sanitizer required.
+  generators: >-
+    The tracked fixture is generator-produced and reproducible from this repo.
+    The specimen is a supplied 1299-byte corpus find with no local reducer,
+    preserved with the sha256 below.  NOTE the two are different files: the
+    tracked fixture encodes the same invariant at 15752 bytes, so the bundle's
+    specimen is an independent shape rather than a copy.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: unverified
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []          # nothing to backport in h5policy.
+
+fuzz_seed: >-
+  cases/1b9b7deea9ba2cdd84bf56426a92a7b3/input.h5 seeds the v2-B-tree header
+  geometry neighbourhood.  The interesting boundary is rrec_size 0 / 1 /
+  node_size-10 / node_size, and node_size at and below the leaf prefix size --
+  the widths for which a leaf has no room for one record are the untested half.
+
+compatibility_backport_risks: >-
+  Low.  A zero raw-record width cannot describe a v2 B-tree record, so no
+  conforming file is affected, and the valid control confirms ordinary
+  dense-link trees still open.  The one implementation risk is the
+  minimum-capacity half of the rule: it must use the format's actual leaf
+  prefix calculation and be checked against valid small-node files, or it could
+  reject a legitimately tight tree.  Behaviourally the change converts a
+  SIGFPE into a clean error, which no consumer can reasonably depend on.
+
+sibling_audit: >-
+  Within libhdf5: H5B2__hdr_init is the audited function.  Its other decoded
+  inputs -- node_size, depth, split/merge percentages -- were NOT audited for
+  the same assert-only pattern, and the file records several more asserts in
+  the same initializer neighbourhood (for example the max_nrec_size bound at
+  H5B2hdr.c:165 and the monotonic-capacity assert at :172).  Each is a
+  candidate for the same treatment and none is measured here.  Non-B-tree
+  fractal-heap initialization fields are likewise unaudited.
+  Within h5policy: the geometry check is shared across client roles, so the
+  coverage is broader than the one measured role; that breadth is asserted from
+  the implementation, not measured per role.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED, and deliberately not asserted.  Measured live on 2.3.0 against
+    a local source tree at 4b1ffa68a840.  No archaeology was run on H5B2hdr.c
+    and no older tag was built.
+  note: >-
+    Assert-only guards tend to be old, and the H5B2 header initializer is
+    long-standing code, so this is likely to reach far back -- but that is a
+    guess about code age, not a measurement, and the record does not rely on it.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    NOTHING IN THIS RECORD WAS RE-MEASURED AT PROMOTION -- see
+    measured.NOT_REMEASURED_AT_PROMOTION.  Close this first.
+  - >-
+    The minimum-capacity half of the invariant (a record width too large for a
+    leaf to hold one record) has no specimen.  h5policy enforces
+    record_size > node_size - 10, but no fixture exercises it and libhdf5's
+    behaviour there -- a zero capacity rather than a divide by zero -- is
+    unmeasured.  That is the more interesting untested case, because a zero
+    max_nrec sizes the native record factory at zero bytes.
+  - >-
+    No 32-bit measurement (see measured.width).
+  - >-
+    The other assert-only guards in the same initializer are unaudited (see
+    sibling_audit).
+open_questions:
+  - >-
+    What does libhdf5 do with rrec_size = node_size, where the division
+    succeeds but yields max_nrec == 0?  H5FL_fac_init would then be asked for a
+    zero-size factory and the native record buffer would have no room for any
+    record, while a node could still declare nrec > 0 -- which would route into
+    the nrec defect recorded in
+    registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml rather
+    than this one.  Untested, and the cleanest single specimen that would
+    exercise both records at once.
+
+provenance:
+  found_by: >-
+    a supplied corpus specimen, triaged through the h5cve bundle workflow in
+    cases/1b9b7deea9ba2cdd84bf56426a92a7b3; promoted 2026-08-15, separately
+    from the two nrec bundles after a source re-reading established that the
+    shared file lineage hides two distinct defects.
+  input_sha256: 9639af81c723fb51f86e16bc8938f0bfdb1024bdfac1f3facd1c2d7690432d79
+  hdf5_build: >-
+    HDF5 2.3.0, local source tree at commit 4b1ffa68a840; baseline Release
+    (NDEBUG) -- SIGFPE; candidate RelWithDebInfo -fsanitize=address -- SIGABRT,
+    not an ASan memory report.  Both are workstation-local installs; paths not
+    recorded.
+  poke_version: GNU poke 4.3
