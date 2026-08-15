@@ -334,6 +334,64 @@ coverage_manifest_change: >-
   7f928c9 and the commits that followed it.  This record documents the libhdf5
   divergence those changes were built against.
 
+# -- Resolved -----------------------------------------------------------------
+resolved_questions:
+  - question: >-
+      Is the reverse-order teardown in `containment` actually sufficient?  A
+      malformed image might declare CYCLES among flush-dependency parents, and a
+      cyclic graph has no safe free order at all -- which would make the
+      recommendation unsound and force edge-teardown-before-free instead.
+    answer: >-
+      The recommendation is SOUND.  A reconstructed flush-dependency graph is
+      necessarily acyclic, for a structural reason plus one real runtime check.
+      STRUCTURAL: flush dependencies are resolved INSIDE the per-entry loop,
+      immediately after the entry is inserted into the index
+      (H5C__INSERT_IN_INDEX at H5Cimage.c:2510; the fd loop at :2524 resolves
+      each parent with H5C__SEARCH_INDEX).  A child can therefore only name a
+      parent that already appears at or before it in the image buffer.  A cycle
+      of length >= 2 needs A to name B and B to name A, which requires each to
+      precede the other -- impossible.  Whichever is decoded first fails with
+      "fd parent not in cache?!?" (:2533).
+      THE ONE SURVIVING CASE is a self-loop, where an entry names its own
+      address: the entry IS in the index by the time its parents are resolved,
+      so the search succeeds.  That is caught by a genuine runtime check --
+      `if (child_entry == parent_entry) HGOTO_ERROR(... "Child entry flush
+      dependency parent can't be itself")` in H5C_create_flush_dependency
+      (H5Centry.c:3836) -- not an assert, so it holds on a Release build.
+      Both rejections land in the H5Cimage.c:2635-2668 cleanup this record
+      documents, making them a third and fourth route into it, but neither is a
+      crash route on its own: the specimens carry no pinned parents, so the
+      unwind has no partially built graph to get wrong.
+    measured: >-
+      Two specimens built with the gencorpus _mdci_assemble/_mdci_entry helpers.
+      Self-loop (one entry, IS_FD_CHILD, parent address == its own): H5Fopen
+      succeeds, H5Gopen2 fails -- the image loads on first protect -- with
+      #011 H5Cimage.c:2547 "Can't restore flush dependency" ->
+      #012 H5Centry.c:3836 "Child entry flush dependency parent can't be
+      itself".  Two-cycle (A names B, B names A, both in-file): rejected at
+      #011 H5Cimage.c:2533 "fd parent not in cache?!?", confirming the forward
+      -reference argument above.  Both exit non-zero on the baseline and on the
+      asserts-on build, with no assert, no ASan report and no crash.
+    label: source-derived, confirmed by measured libhdf5 error stacks
+    side_effect: >-
+      Settling this exposed a PROVEN ORACLE FALSE-ACCEPT, now CLOSED.  h5policy
+      accepted the self-loop specimen -- exit 0, zero findings, under all four
+      profiles -- while libhdf5 rejected it on both builds.  A soundness gap, and
+      the reverse of every other divergence in this family, where h5policy is the
+      stricter side.  Cause: mdci.parent_addr_resolvable asks only whether a
+      declared parent address matches SOME entry, and a self-reference resolves
+      perfectly well -- the address is present, it is merely the entry's own.
+      Closed by a new invariant mdci.parent_addr_not_self and finding
+      H5_CORRUPT_MDCI_PARENT_ADDR_SELF, checked inline in the entry loop of
+      h5policy_validate_mdci_payload (the entry's own address is in scope there,
+      and no deferral is needed because resolvability is not the question).
+      Kept separate from parent_addr_resolvable deliberately: the two defects have
+      different libhdf5 diagnostics (H5Centry.c:3836 vs H5Cimage.c:2533), so
+      folding them would make the fixture assert a misleading cause.
+      Tracked as malformed/mdci_parent_addr_self.h5 (generator
+      _make_mdci_parent_addr_self); both sides now reject it, so no diff
+      tolerance is needed.
+
 # -- Open items ---------------------------------------------------------------
 coverage_gaps:
   - >-
@@ -369,13 +427,8 @@ open_questions:
     with the debug build only.  It does NOT bear on this record's defect: the
     unsafe cleanup is reached through the duplicate-address and dangling-parent
     detectors, neither of which involves lru_rank.
-  - >-
-    Is the reverse-order teardown actually sufficient?  The containment above
-    proposes freeing in reverse dependency order, but the reconstruction hash
-    table is not a DAG-ordered structure and a malformed image can declare
-    cycles among fd parents.  A cyclic dependency graph may have no safe free
-    order at all, in which case the fix must be edge-teardown-before-free rather
-    than reordering.  Not analysed.
+  # (the cycle question that stood here is answered in resolved_questions --
+  #  the graph is necessarily acyclic, so the containment above is sound)
   - >-
     The expunge-failure branch reports HDONE_ERROR "unable to expunge driver
     info block" (H5Cimage.c:2663) -- a copy-paste message from unrelated code.
