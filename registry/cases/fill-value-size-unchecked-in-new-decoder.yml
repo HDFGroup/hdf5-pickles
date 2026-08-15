@@ -141,25 +141,49 @@ branches:
       which is the whole reason this bundle is recorded here rather than
       separately.
     impact: >-
-      NOT DEMONSTRATED on this specimen, and deliberately not claimed.  See
-      measured.version_2_read_path.  The branch's decoder gap is source-derived
-      and certain; the consequence of that gap on this particular file is not
-      measured, because the specimen is multi-defect and libhdf5 turns it away
-      in traversal before the question is reached.
+      Heap over-read of 1024 bytes on every read of the dataset: a silent
+      disclosure on a stock build, a heap-buffer-overflow abort under ASan.
+      Four times the version-3 reach, and no write primitive on this route
+      either -- the copy reads out of bounds into a correctly sized caller
+      buffer.
+      DEMONSTRATED ON THE PURPOSE-BUILT FIXTURE, not on this specimen.  The
+      distinction matters and is kept deliberately: this specimen is
+      multi-defect and libhdf5 turns it away in traversal before the question is
+      reached, so it must never be cited as a reproducer.
+      malformed/fill_value_size_mismatch_v2.h5 carries the evidence -- stock
+      H5Dread returns 0 and hands back 178 non-zero bytes of adjacent heap
+      including allocator metadata; ASan reports "READ of size 1032".  See
+      measured.version_2_read_path.
+    crash_path: >-
+      Identical to the version-3 route above, at the same source lines, with
+      only the read width differing (1032 vs 256):
+      memcpy (sanitizer interceptor)
+      <- H5VM_array_fill (src/H5VM.c:753)
+      <- H5S_select_fill (src/H5Sselect.c:2377)
+      <- H5D__fill (src/H5Dfill.c:254)
+      <- H5D__read (src/H5Dio.c:266)
+      <- H5VL__native_dataset_read (src/H5VLnative_dataset.c:373)
     oracle_finding: H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH @ 904 (and again @ 928)
-    tracked_fixtures: []          # none -- see coverage_gaps, this is the gap
+    tracked_fixtures:
+      # Added 2026-08-15, built to this branch's shape rather than reduced from
+      # the specimen -- the specimen is multi-defect and has no local reducer.
+      - malformed/fill_value_size_mismatch_v2.h5    # v2, 8-byte fill / 1032-byte type
 
 # -- Measured behaviour -------------------------------------------------------
 measured:
   remeasured: 2026-08-15 at h5policy 9b2bd5d, hdf5 tree e4b6a964723
   oracle_after: >-
-    All three files reject_corrupt under untrusted-strict, at exactly the
+    All four files reject_corrupt under untrusted-strict, at exactly the
     offsets the bundles recorded in July -- no drift:
     7b9fb196 input.h5 @ 104, 04e1f6d2 input.h5 @ 904 (second report @ 928),
-    malformed/fill_value_size_mismatch.h5 @ 259.  The oracle covers BOTH decode
-    branches: it detects the version-2 message and the version-3 message alike,
-    through h5policy_update_fill_value_size, and in either message order
-    (fill-before-datatype and datatype-before-fill).
+    malformed/fill_value_size_mismatch.h5 @ 259, and the new
+    malformed/fill_value_size_mismatch_v2.h5 @ 259 on /dset with a complete
+    walk and exactly one finding.  The oracle covers BOTH decode branches: it
+    detects the version-2 message and the version-3 message alike, through
+    h5policy_update_fill_value_size, and in either message order
+    (fill-before-datatype and datatype-before-fill).  The two fixtures share an
+    offset because they share a base file; they differ in the version byte and
+    the payload layout, which is what routes them to different branches.
   libhdf5_stock: >-
     ACCEPTS.  h5policy-probe --exercise dataset_layout against the baseline
     build (2.3.0 Release, NDEBUG) reports outcome=accepted for both the
@@ -167,11 +191,15 @@ measured:
     explanation of invariant A, not "never loaded" and not "assert-only": the
     comparison is genuinely absent from the code path that runs.
   libhdf5_asan: >-
-    CRASHES.  The same probe against the ASan build reports outcome=crashed,
-    signal 6, with an ASan heap-buffer-overflow, "READ of size 256", on both the
-    version-3 specimen and the tracked fixture.  The report is a genuine
-    sanitizer diagnostic, not an assertion abort -- the stack is the memcpy
-    chain quoted in branches.version_3.crash_path.
+    CRASHES on all three.  The same probe against the ASan build reports
+    outcome=crashed, signal 6, heap-buffer-overflow:
+    "READ of size 256" on the version-3 specimen and on
+    malformed/fill_value_size_mismatch.h5;
+    "READ of size 1032" on malformed/fill_value_size_mismatch_v2.h5.
+    All three are genuine sanitizer diagnostics, not assertion aborts, and all
+    three carry the SAME six-frame stack at the same source lines -- the memcpy
+    chain quoted in branches.version_3.crash_path.  The read width is the only
+    thing that varies, and it tracks the datatype size in each file.
   stock_leak: >-
     Re-measured live at HEAD with the bundle's fill-leak-probe.c rebuilt against
     the baseline h5cc.  Version-3 specimen: H5Dread=0, tsize=256, 60 of bytes
@@ -181,15 +209,36 @@ measured:
     little-endian values are 0x55-prefixed heap addresses, and both differ from
     the values the bundle recorded in July -- ASLR, confirming live memory.
   version_2_read_path: >-
-    NOT MEASURED.  h5policy-probe reports rejected_in_traversal for the
-    version-2 specimen on BOTH the stock and the ASan build, and the bundle's
-    own measurement (22 datasets opened, 15 reads succeeding on stock and 16 on
-    ASan, no ASan report) agrees: this file is not a crash or disclosure
-    reproducer and must not be cited as one.  A targeted direct read of
-    /Array_be on both builds, which is what would settle whether the version-2
-    branch leaks the same way, was attempted at promotion and could not be run
-    in this session.  The version-2 branch is therefore SOURCE-DERIVED ONLY.
-    Closing this is the first item under coverage_gaps.
+    MEASURED ON STOCK 2026-08-15, on the purpose-built fixture rather than the
+    specimen.  malformed/fill_value_size_mismatch_v2.h5 under the version-3
+    bundle's fill-leak-probe.c, rebuilt against the baseline h5cc: H5Dread
+    returns 0, tsize=1032, and 178 of the 1024 bytes past the 8-byte declared
+    fill come back non-zero.  Byte 24 is 0x21 -- a 32-byte glibc chunk size
+    with PREV_INUSE set -- so the read walks allocator metadata, the same
+    signature the version-3 fixture shows at the same offset (0x61 there).
+    Three times the version-3 disclosure (178 bytes vs 60), because the
+    shortfall is 1024 rather than 255.  tsize=1032 also confirms the patched
+    datatype reaches the read path, so the fixture genuinely exercises
+    H5D__fill rather than failing earlier.
+    So the version-2 branch behaves exactly like the version-3 branch: the
+    stock build accepts, reads successfully, and discloses adjacent heap.  It
+    is no longer source-derived only.
+    ASAN MEASURED 2026-08-15 on the same fixture: outcome=crashed, signal 6,
+    heap-buffer-overflow, "READ of size 1032 at 0x502000003c78".  The stack is
+    BYTE-FOR-BYTE THE SAME SIX FRAMES as the version-3 fixture's, down to the
+    line numbers -- memcpy <- H5VM_array_fill (src/H5VM.c:753) <-
+    H5S_select_fill (src/H5Sselect.c:2377) <- H5D__fill (src/H5Dfill.c:254) <-
+    H5D__read (src/H5Dio.c:266) <- H5VL__native_dataset_read
+    (src/H5VLnative_dataset.c:373).  Only the read width differs: 1032 vs 256.
+    That identity is the strongest evidence for the joint record -- the two
+    decode branches diverge only inside H5O__fill_new_decode and reconverge on
+    one unsafe copy, so one added check closes both and neither fixture is
+    redundant.  Activation counters all zero (no external open, plugin load,
+    write or network) on both builds.
+    Separately, and unchanged: the multi-defect /Array_be SPECIMEN is still not
+    a crash or disclosure reproducer -- h5policy-probe reports
+    rejected_in_traversal for it on both builds, and it must not be cited as
+    one.  The purpose-built fixture is what carries this evidence.
   width: >-
     NOT measured at 32 bits, on either specimen.  The operative values (1 vs
     256; 8 vs 1032) fit comfortably in 32-bit and 64-bit size_t, so this is an
@@ -264,8 +313,10 @@ systemic:
     - registry/findings/catalog/dataset_layout_filter_fill.yml
       (H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH)
     - registry/validation-coverage.yml (layout.fill_value_size, line 397)
-    - h5policy/tools/h5policy-gencorpus (_make_fill_value_size_mismatch)
+    - h5policy/tools/h5policy-gencorpus (_make_fill_value_size_mismatch,
+      _make_fill_value_size_mismatch_v2)
     - h5policy/tests/expected/malformed-fill_value_size_mismatch.yml
+    - h5policy/tests/expected/malformed-fill_value_size_mismatch_v2.yml
     - h5policy/tools/h5policy-diff (fill_value_size_mismatch_only, the A~ predicate)
 
 # -- Reproducers --------------------------------------------------------------
@@ -274,9 +325,13 @@ reproducers:
     - cases/7b9fb196881b412936ddffd383a2e16a/input.h5        # v3, the crash/leak reproducer
     - cases/04e1f6d2092bd5dab2ed2b3a27c6fc8b/input.h5        # v2, multi-defect, NOT a crash reproducer
   direct_fixtures:
-    - h5policy/tests/malformed/fill_value_size_mismatch.h5
+    # One per decode branch.  The pair is the point: a fix that guards only one
+    # branch of H5O__fill_new_decode cannot pass both.
+    - h5policy/tests/malformed/fill_value_size_mismatch.h5      # v3 branch (:264)
+    - h5policy/tests/malformed/fill_value_size_mismatch_v2.h5   # v1/v2 branch (:213)
   expectations:
     - h5policy/tests/expected/malformed-fill_value_size_mismatch.yml
+    - h5policy/tests/expected/malformed-fill_value_size_mismatch_v2.yml
   control_fixture: h5policy/tests/valid/simple_dataset.h5
   leak_probe: >-
     cases/7b9fb196881b412936ddffd383a2e16a/fill-leak-probe.c -- 20 lines, public
@@ -362,20 +417,29 @@ version_range:
 # -- Open items ---------------------------------------------------------------
 coverage_gaps:
   - >-
-    NO TRACKED FIXTURE FOR THE VERSION-2 BRANCH.  This is the concrete gap the
-    joint record exists to surface.  malformed/fill_value_size_mismatch.h5 is
-    version 3, and _make_fill_value_size_mismatch shrinks a version-3 message,
-    so the `fill->version < H5O_FILL_VERSION_3` branch at src/H5Ofill.c:213 has
-    oracle coverage but no corpus specimen of its own.  A
-    _make_fill_value_size_mismatch_v2 alongside the existing generator would
-    close it, and the version-2 bundle's /Array_be gives the shape to copy
-    (8-byte fill, 1032-byte type).
+    CLOSED 2026-08-15 on the oracle side.  This was the concrete gap the joint
+    record existed to surface: malformed/fill_value_size_mismatch.h5 is version
+    3, so the `fill->version < H5O_FILL_VERSION_3` branch at src/H5Ofill.c:213
+    had oracle coverage but no corpus specimen of its own.
+    _make_fill_value_size_mismatch_v2 now emits
+    malformed/fill_value_size_mismatch_v2.h5 (1323 bytes) to the /Array_be shape
+    -- 8-byte declared fill, 1032-byte opaque datatype, alloc_time LATE,
+    fill_time IFSET, version byte 2 -- and the oracle rejects it
+    reject_corrupt with EXACTLY ONE finding,
+    H5_CORRUPT_FILL_VALUE_SIZE_MISMATCH @ 259 on /dset, walk complete.  Single
+    -defect is what the A~ predicate needs, and it is measured, not assumed.
+    Its expectation carries
+    `h5cve: {family: dataset_layout_filter_fill, allowed_statuses: [verified]}`.
+    That was added unmeasured on 2026-08-15 and CONFIRMED the same day on the
+    stock build -- H5Dread returns 0, so the canary is the leaking path and not
+    a fault, which is what makes `verified` right and `violation` wrong.  See
+    measured.version_2_read_path.
   - >-
-    The version-2 read path is unmeasured on both builds -- see
-    measured.version_2_read_path.  Until a targeted direct read of /Array_be
-    runs, the version-2 branch's consequence is inferred from source, not
-    observed.  Pair this with the fixture above: a purpose-built v2 fixture
-    would settle it more cleanly than the multi-defect specimen can.
+    CLOSED 2026-08-15.  This item read "ASan not run on
+    malformed/fill_value_size_mismatch_v2.h5".  It has now been run:
+    outcome=crashed, "READ of size 1032", same six frames as the version-3
+    fixture.  Both branches of the pair are measured on both builds, so nothing
+    about either fixture's behaviour is inferred any more.
   - >-
     No 32-bit measurement on either specimen (see measured.width).
   - >-

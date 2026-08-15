@@ -1014,6 +1014,8 @@ def _gen_malformed(root):
     # used to accept.
     _make_fill_value_size_mismatch(
         f"{root}/malformed/fill_value_size_mismatch.h5")
+    _make_fill_value_size_mismatch_v2(
+        f"{root}/malformed/fill_value_size_mismatch_v2.h5")
     _make_nbit_member_offset_wrap(
         f"{root}/malformed/nbit_member_offset_wrap.h5")
     _make_attr_reference_size_under(
@@ -3233,6 +3235,84 @@ def _make_fill_value_size_mismatch(path):
         raise RuntimeError("could not locate the 256-byte v3 fill-value message")
     i, pay, msg_size, size = hit
     struct.pack_into("<I", raw, pay + 2, 1)  # declared fill size: 256 -> 1
+    # Repair the enclosing object header's checksum, or libhdf5 refuses the file
+    # before it ever reaches H5D__fill and the fixture proves nothing.
+    ohdr = raw.rfind(b"OHDR", 0, i)
+    if ohdr < 0:
+        raise RuntimeError("fill-value message is not inside a v2 object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_fill_value_size_mismatch_v2(path):
+    """The same defect as _make_fill_value_size_mismatch, on the OTHER branch.
+
+    H5O__fill_new_decode (H5Ofill.c) handles fill message versions 1, 2 and 3 in
+    one function and compares the fill size to the datatype on none of them --
+    it is handed the object header as `open_oh` and marks it H5_ATTR_UNUSED,
+    which is exactly the handle H5O__fill_old_decode uses to enforce the
+    relation.  Versions 1 and 2 take the `fill->version < H5O_FILL_VERSION_3`
+    branch, version 3 takes the other, and the sibling fixture only covers
+    version 3.  This one covers the v1/v2 branch, so a fix that guards one
+    branch and not the other cannot pass the corpus.
+
+    The shape is copied from the /Array_be dataset of the version-2 specimen in
+    the case bundle: an 8-byte declared fill behind a 1032-byte datatype, so
+    H5D__fill over-reads 1024 bytes rather than the sibling's 255.
+
+    Byte-patched because no libver can write it.  H5O_fill_ver_bounds maps
+    EARLIEST to version 1 and every later bound to version 3, so version 2 on
+    disk only ever came from a historical library -- current libhdf5 reaches
+    version 2 solely by normalising the OLD message (H5O__fill_old_decode sets
+    fill->version = H5O_FILL_VERSION_2 in memory).  We therefore write a v3
+    message with h5py and rewrite its payload in place.
+
+    The two payload layouts differ, and the v1/v2 one is two bytes longer:
+        v3      version(1) flags(1)                                size(4) value
+        v1/v2   version(1) alloc_time(1) fill_time(1) defined(1)   size(4) value
+    Rewriting a 1032-byte v3 fill as an 8-byte v2 fill leaves the tail of the
+    message unused.  That is deliberate and harmless: both branches stop after
+    `size` value bytes and never look further, so the slack stays zero-filled
+    rather than being reclaimed by shrinking the message -- which would move
+    every following message and require rebuilding the header.  Keeping the
+    datatype, dataspace and layout exactly as h5py wrote them is what keeps this
+    a single-defect fixture, which the A~ predicate in h5policy-diff requires.
+    """
+    def build(h):
+        dt = h5py.h5t.create(h5py.h5t.OPAQUE, 1032)
+        sid = h5py.h5s.create_simple((1,))
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_fill_value(np.zeros(1, dtype="V1032"))
+        h5py.h5d.create(h.id, b"dset", dt, sid, dcpl=dcpl)
+
+    raw = _base_bytes(build)
+    # Locate the v3 fill message we just wrote, via the v2 object-header message
+    # prefix: type(1), size(2), flags(1).  Same search as the v3 sibling, keyed
+    # on the declared size so a different h5py layout fails loudly.
+    hit = None
+    for i in range(len(raw) - 12):
+        if raw[i] != 0x05:
+            continue
+        msg_size = struct.unpack_from("<H", raw, i + 1)[0]
+        pay = i + 4
+        if raw[pay] != 3 or msg_size < 6 or pay + msg_size > len(raw):
+            continue
+        if struct.unpack_from("<I", raw, pay + 2)[0] == 1032:   # the fill we wrote
+            hit = (i, pay, msg_size)
+            break
+    if hit is None:
+        raise RuntimeError("could not locate the 1032-byte v3 fill-value message")
+    i, pay, msg_size = hit
+    if msg_size < 16:
+        raise RuntimeError(f"fill message is {msg_size} bytes, too short to "
+                           f"hold a v1/v2 payload with an 8-byte value")
+    # alloc_time 2 (H5D_ALLOC_TIME_LATE) and fill_time 2 (H5D_FILL_TIME_IFSET)
+    # are the values the /Array_be specimen carries.  LATE leaves the contiguous
+    # data address undefined, so a read is served entirely from the fill value
+    # and reaches H5D__fill -> H5S_select_fill -> H5VM_array_fill.
+    struct.pack_into("<BBBB", raw, pay, 2, 2, 2, 1)
+    struct.pack_into("<i", raw, pay + 4, 8)        # INT32: declared fill size
+    raw[pay + 8:pay + msg_size] = bytes(msg_size - 8)
     # Repair the enclosing object header's checksum, or libhdf5 refuses the file
     # before it ever reaches H5D__fill and the fixture proves nothing.
     ohdr = raw.rfind(b"OHDR", 0, i)
