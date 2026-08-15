@@ -103,8 +103,14 @@ so those rows report `not_comparable` rather than a divergence.
 A canary that passes on a valid fixture does not show it could detect a defect.
 Each family therefore also needs a malformed fixture that libhdf5 opens
 successfully and that carries the family's defect: one rejected at `H5Fopen`
-never reaches the family surface at all. All 15 families with canaries currently
-have such a specimen.
+never reaches the family surface at all.
+
+<!-- canary-family-inventory: 16/16 -->
+
+All **16 of 16** record families have a canary, and each has such a malformed,
+open-successfully specimen. `tools/check_quickstart.py` derives and checks this
+inventory from `tools/h5cve` and `registry/validation-coverage.yml` as part of
+`docs-check`.
 
 `h5cve evidence` turns a matrix run into a per-family verdict on the selected
 build (`enforced`, `partial`, `diverges`, `unmeasured`) and writes

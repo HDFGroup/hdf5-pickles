@@ -89,13 +89,10 @@ Finding and routing counts are derived rather than copied into this document:
 python3 tools/finding_registry.py stats
 ```
 
-There are currently 128 expectations with an `h5cve` contract out of 180, and
-15 of 16 record families have an exact-build canary.
-
-`validation_controls` is the family without a canary, by design: it covers
-budgets, base address, free-space managers and profile validity, which have no
-single traversal surface to exercise. Its fixtures state `coverage_gap` in
-`allowed_statuses` rather than claiming a canary ran.
+The exact-build canary inventory covers every record family. Its count is
+derived and checked by `tools/check_quickstart.py`; see the
+[tool guide](../docs/TOOLS.md#exact-build-canary-matrix) for the current,
+machine-checked inventory and its malformed-fixture contract.
 
 Of the 52 uncontracted expectations, 51 are fixtures the oracle **accepts**. A
 family cannot be derived mechanically for those: the only findings present are
@@ -126,8 +123,7 @@ Current verdicts, against libhdf5 2.2.0:
 | verdict | families |
 |---|---|
 | `enforced` | 10 |
-| `partial` — some invariants enforced, some not | 5 |
-| `unmeasured` — no canary (`validation_controls`) | 1 |
+| `partial` — some invariants enforced, some not | 6 |
 
 Only `reject_corrupt` specimens count toward a verdict. Activation events
 (`external_open`) and crashes are recorded separately, since a build can enforce
