@@ -12,12 +12,18 @@ id: mdci-lru-rank-assert-only
 title: cache-image entry lru_rank/IN_LRU relation is guarded by assert only, so NDEBUG builds reconstruct from a contradictory LRU description
 status: oracle-hardened          # h5policy rejects; libhdf5 containment not reported
 disclosure: >-
-  n/a -- local analysis only. Reached while working GHSA-q2jp-vm8c-7h3c's
-  poc_dos.h5, whose entry 0 carries lru_rank 2816 with IN_LRU clear. No advisory
-  database was consulted and no identifier was looked up; see
-  registry/cases/ for the sibling MDCI cases.
+  n/a -- local analysis only. Reached while triaging the DoS specimen held in
+  cases/mdci_reconstruct_fd_parent_uaf_dos/, whose entry 0 carries lru_rank 2816
+  with IN_LRU clear. No advisory database was consulted and no identifier was
+  looked up; see registry/cases/ for the sibling MDCI cases.
 
 record: cache_image_dependency_graph
+# Sibling records in this family:
+#   mdci-reconstruct-cleanup-unsafe.yml -- what an inconsistent entry description
+#     goes on to DO in a full specimen: the memory-unsafe reconstruction-failure
+#     cleanup (NULL-deref DoS and double-free). This record covers only the
+#     missing guard; that one covers the consequence.
+#   mdci-image-checksum-unverified.yml -- the whole-image integrity gap.
 root_cause_classification: reference_graph
 violated_invariant: mdci.entry_lru_consistent
 entry_points:
@@ -92,8 +98,8 @@ measured:
     { (4) / (4) }); `h5stat` exits 0. No tool return code corroborates the
     rejection, which is why invariant A fails and why this entry exists.
   libhdf5_asserts_on: >-
-    aborts. The ~/.local/hdf5-asan build (RelWithDebInfo, asserts live) gives
-    `h5dump: /home/bob/projects/hdf5/src/H5Cimage.c:2813:
+    aborts. The candidate build (RelWithDebInfo, asserts live) gives
+    `h5dump: src/H5Cimage.c:2813:
     H5C__reconstruct_cache_entry: Assertion `(in_lru && pf_entry_ptr->lru_rank >= 0)
     || (!in_lru && pf_entry_ptr->lru_rank == -1)' failed.` and exits 134 (SIGABRT).
     This is the evidence the differential harness cannot observe through the stock
@@ -143,12 +149,16 @@ reproducers:
     IN_LRU clear, lru_rank 5, caching the real root OH body)"
   expectation: h5policy/tests/expected/malformed-mdci_entry_lru_inconsistent.yml
   integration_pocs:
-    - "GHSA-q2jp-vm8c-7h3c poc_dos.h5 -- entry 0 has lru_rank 2816 with IN_LRU
-       clear, i.e. the same shape at a wilder value. See the open question below
-       before treating that file as evidence FOR this invariant."
+    - "cases/mdci_reconstruct_fd_parent_uaf_dos/input.h5 -- entry 0 has lru_rank
+       2816 with IN_LRU clear, i.e. the same shape at a wilder value. See the open
+       question below before treating that file as evidence FOR this invariant."
   asserts_on_repro: >-
-    LD_LIBRARY_PATH=~/.local/hdf5-asan/lib ~/.local/hdf5-asan/bin/h5dump -H
-    h5policy/tests/malformed/mdci_entry_lru_inconsistent.h5
+    Run h5dump -H from the candidate build against
+    h5policy/tests/malformed/mdci_entry_lru_inconsistent.h5, with that build's lib
+    directory on LD_LIBRARY_PATH. The candidate is an asserts-live build of the
+    source tree named in `provenance.hdf5_build` below, configured RelWithDebInfo
+    with -fsanitize=address; its install location is workstation-local and
+    deliberately not recorded in this repo.
 
 # ── Open items ───────────────────────────────────────────────────────────────
 open_questions:
@@ -161,15 +171,20 @@ open_questions:
     is settled the tolerance rests on the divergence (stock accepts, asserts-on
     aborts), which is sufficient for the harness but is not a vulnerability claim.
   - >-
-    Do not conflate this with the NULL-deref teardown in the same family. Under
-    `ulimit -v 2G`, h5dump on GHSA-q2jp-vm8c-7h3c/poc_dos.h5 segfaults with
+    Do not conflate this with the NULL-deref teardown in the same family. h5dump
+    on cases/mdci_reconstruct_fd_parent_uaf_dos/input.h5 segfaults with
     cache_ptr=0x0 in H5C__unpin_entry_real (H5Centry.c:175), via
     H5C_destroy_flush_dependency (:3995) <- H5C__prefetched_entry_notify
     (H5Cprefetched.c:244) <- H5C__flush_single_entry (:659) <- H5C_expunge_entry
-    (:4107) <- H5C__reconstruct_cache_contents (H5Cimage.c:2657). That is an
-    allocation-failure-driven unwind of a partially built pinned dependency graph,
-    triggered by memory pressure, NOT by the LRU field. poc_dos.h5 carries both
-    defects at once; the fixture here isolates only the LRU one.
+    (:4107) <- H5C__reconstruct_cache_contents (H5Cimage.c:2657). That is an unwind
+    of a partially built pinned dependency graph, driven by the dangling
+    flush-dependency parent in that file, NOT by the LRU field. It carries both
+    defects at once; the fixture here isolates only the LRU one, and the teardown
+    itself is registry/cases/mdci-reconstruct-cleanup-unsafe.yml.
+    CORRECTED 2026-08-15: an earlier revision of this item described the segfault
+    as allocation-failure-driven, observed under `ulimit -v 2G` and "triggered by
+    memory pressure". Remeasured and wrong on both counts -- the same SIGSEGV
+    occurs uncapped, at under 10 MB RSS. The cap was incidental, not causal.
   - >-
     The encode side (H5Cimage.c:1463-1464, :1649, :1679) asserts the same relation
     when WRITING an image. Unmeasured whether a caller can drive the library into
@@ -184,11 +199,17 @@ open_questions:
 
 # ── How this was investigated ────────────────────────────────────────────────
 method: >-
-  Working backwards from poc_dos.h5 rather than forwards from the source. That
-  file OOM-killed the workstation through an uncapped h5dump (13.7 GiB RSS, no
-  swap), and re-running it under `ulimit -v` to make it survivable is what
-  produced the teardown backtrace. Reading H5Cimage.c to explain that backtrace
-  surfaced the assert at :2813 as a separate, simpler defect in the same decoder.
+  Working backwards from the DoS specimen
+  (cases/mdci_reconstruct_fd_parent_uaf_dos/input.h5) rather than forwards from
+  the source: running it under h5dump produced a teardown backtrace, and reading
+  H5Cimage.c to explain that backtrace surfaced the assert at :2813 as a separate,
+  simpler defect in the same decoder.
+  CORRECTED 2026-08-15: an earlier revision of this paragraph said that specimen
+  OOM-killed the workstation through an uncapped h5dump at 13.7 GiB RSS, and that
+  re-running it under `ulimit -v` was what made the backtrace observable.
+  Remeasured and false -- the file peaks under 10 MB RSS before faulting, capped
+  or uncapped, and does not amplify at all. The OOM belonged to an unrelated
+  specimen held outside this repo.
   Splitting the two into independent fixtures -- one for the LRU relation, one for
   the dangling parent -- is what revealed the asymmetry that matters here: the
   parent case is a real check and agrees across builds, the LRU case is an assert
@@ -196,7 +217,8 @@ method: >-
   libhdf5's guard style, not of the fixture or of h5policy.
 
 provenance:
-  found_by: "GHSA-q2jp-vm8c-7h3c poc_dos.h5 triage; worked end to end 2026-08-14"
+  found_by: "triage of the DoS specimen in
+    cases/mdci_reconstruct_fd_parent_uaf_dos/; worked end to end 2026-08-14"
   hdf5_build: "HDF5 2.3.0 @e4b6a964723 (final_autotools_develop-607); baseline
-    ~/.local Release (NDEBUG, asserts off), asserts-on ~/.local/hdf5-asan
-    RelWithDebInfo -fsanitize=address"
+    Release (NDEBUG, asserts off), candidate RelWithDebInfo -fsanitize=address
+    with asserts live. Both are workstation-local installs; paths not recorded."

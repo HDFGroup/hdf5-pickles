@@ -4,8 +4,8 @@
 
 - The CVE workflow below applies only when a task involves a vulnerability
   specimen, advisory, OSS-Fuzz finding, or explicit CVE-case analysis.
-- The documentation, generated-file, boundary, and verification rules apply to
-  every task.
+- The documentation, generated-file, portable-provenance, boundary, and
+  verification rules apply to every task.
 
 ## CVE case workflow
 
@@ -25,6 +25,10 @@ Produce a complete, self-contained bundle under `cases/<id>/`:
   needed to support the conclusions.
 
 These must be real artifacts with filled, measured fields, not sketches.
+
+`<id>` follows the convention already in that tree — `md5(input.h5)`, or a short
+descriptive slug for a hand-built specimen. Never name a bundle after an
+advisory.
 
 ### Evidence requirements
 
@@ -52,7 +56,8 @@ measurements against current HEAD and replace TODOs or unsupported assertions.
 ### Write and promotion boundary
 
 - During case development, write only under `cases/<id>/` and temporary build
-  directories.
+  directories. `cases/` is gitignored, so nothing there is recoverable through
+  Git — back it up before any bulk rewrite, rename, or delete across bundles.
 - Do not modify tracked corpus, generators, `registry/`, or `h5policy/tests/`.
   Do not use `h5policy-gencorpus` to rewrite a tracked destination.
 - List proposed tracked changes as explicit promotion steps. Stop and let the
@@ -79,6 +84,27 @@ measurements against current HEAD and replace TODOs or unsupported assertions.
 - `docs/generated/*.md` is generated from `docs/spec/*.yml` and `pickles/*.pk`
   with `tools/pkdoc.py`. Edit the sources, regenerate, and run `docs-check`.
 
+## Portable provenance
+
+Records outlive the machine that produced them, so they must identify a build, a
+specimen, or a tool without recording where this particular machine keeps it.
+This constrains *how* to satisfy the CVE evidence rules, not whether to: both are
+satisfiable at once.
+
+- Name builds by role: **baseline** (Release, asserts off) and **candidate**
+  (asserts live, sanitizers). Pin them with `settings_sha256`, `build_mode`, and
+  `sanitizers`, which identify a build exactly, and say "workstation-local
+  installs; paths not recorded". A path is not what makes a build reproducible.
+- Identify a specimen by its sha256 and its in-repo bundle path, never by the
+  external directory it arrived from.
+- Inside the repo, write repo-relative paths. Outside it, keep the basename
+  only — for a shared library, the soname.
+- **If a generator emits a host path, fix the generator.** Editing its output
+  alone leaves the next run to undo the fix. `tools/h5cve` and
+  `h5policy/tools/h5policy-probe` each carry a `portable_path()` applied at
+  emission for this reason; the values they hold internally stay absolute,
+  because `h5cc` drives the sibling-lib lookup and the probe build-cache key.
+
 ## Boundaries
 
 ### Ask first
@@ -91,8 +117,13 @@ measurements against current HEAD and replace TODOs or unsupported assertions.
 ### Never
 
 - Commit secrets, credentials, or tokens.
-- Introduce `GHSA-*` identifiers into comments or commit messages; they are not
-  authoritative here. Use OSS-Fuzz identifiers when applicable.
+- Introduce `GHSA-*` identifiers **anywhere in the repository** — record fields,
+  prose, comments, commit messages, file names, or directory names, in either
+  the canonical `GHSA-xxxx-yyyy-zzzz` spelling or a `ghsa_xxxx_yyyy_zzzz` slug.
+  They are not authoritative here. Use OSS-Fuzz identifiers when applicable.
+- Record host paths — `$HOME`, build install prefixes, external specimen stores —
+  in any file under `registry/`, `cases/`, or the tracked tree. See
+  [Portable provenance](#portable-provenance).
 - Use destructive Git operations unless explicitly requested.
 
 ## Verification
