@@ -28,6 +28,9 @@ every entry's fixed metadata. It does not decode each entry's image,
 since that payload's format is the client's own on-disk structure, not
 part of the cache-image container format itself.
 
+The decoder verifies the block's lookup3 checksum before accepting the
+container; individual entry images remain opaque client-owned payloads.
+
 All fields are stored in little-endian byte order.
 
 ## Metadata Cache Image Block

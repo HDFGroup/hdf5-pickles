@@ -23,6 +23,9 @@ Because the section-info block packs variable-width records, `fs_sinfo`
 is mapped as one raw byte array whose `_print` method walks the section
 groups; only the fixed header exposes typed fields.
 
+The decoder verifies the lookup3 checksum on the fixed `FSHD` header.
+The raw `FSSE` section-info block is not yet checksum-validated.
+
 All fields are stored in little-endian byte order.
 
 ## Free-space Manager Header

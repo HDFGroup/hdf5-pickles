@@ -48,6 +48,9 @@ file.  All pages within one data block hold the same number of elements.
 Use `print_ea(addr#B)` to map the header, print it and the index block,
 and recursively walk all reachable data blocks and secondary blocks.
 
+The decoder verifies the lookup3 checksum on every EA header, index and
+secondary block, data-block prefix, and data-block page.
+
 ## Extensible Array Header
 
 Pickle type: `ea_hdr`.

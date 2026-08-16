@@ -34,6 +34,9 @@ enough, all elements are stored directly in the data block (`fadb_nopaged`).
 Use `print_fa(addr#B)` to map the header, print it, and recursively
 print the data block and all pages.
 
+The decoder verifies the lookup3 checksum on the header, each data-block
+prefix, and every data-block page.
+
 ## Fixed Array Header
 
 Pickle type: `fa_hdr`.
