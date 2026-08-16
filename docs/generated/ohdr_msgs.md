@@ -37,8 +37,11 @@ All fields are stored in little-endian byte order. The executable mappings
 reject source-defined local invariants before a malformed field can drive a
 later map: unsupported dataspace, link, layout, and index versions; reserved
 flag bits; invalid scalar/null dataspace ranks; zero link names; zero-length
-continuation chunks; and invalid chunk-index encodings. Cross-record range,
-checksum, and graph validation remain outside this format-inspection layer.
+continuation chunks; and invalid chunk-index encodings. Once a superblock
+has supplied its declared EOF, hard-link targets plus continuation and
+metadata-cache-image address ranges are checked against that bound. Target
+type validation and graph-wide consistency remain outside this
+format-inspection layer.
 
 <a id="subsec_fmt4_dataobject_hdr_prefix"></a>
 

@@ -18,6 +18,12 @@ replaces the symbol-table root group entry with a plain object header
 address and adds a checksum. Version 3 additionally restricts which
 bits of the consistency flags field may be set.
 
+Mapping a superblock records its declared end-of-file address as the
+logical range for subsequent metadata decoding. Addresses and address/
+size pairs checked by other pickles are rejected when they point at or
+extend beyond that exclusive bound; this remains independent of any
+surplus bytes exposed by a file driver.
+
 ## Superblock
 
 Pickle type: `superblock`.

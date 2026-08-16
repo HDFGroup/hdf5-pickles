@@ -28,6 +28,12 @@ serialized selection.
 Serialized dataspace selections use the same wire format as `dspace_enc`
 / `vds`.
 
+The decoder accepts only the source-supported revised reference kinds
+(plus the null form), caps inline token widths at the library's
+16-byte token maximum, and—after a superblock has been mapped—checks
+object and global-heap addresses against the declared EOF. It validates
+reachability bounds, not the target object's type or identity.
+
 All fields are stored in little-endian byte order.
 
 ## Reference Header
