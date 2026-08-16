@@ -617,6 +617,69 @@ fun h5policy_frhp_iblock_size = (uint<64> nrows, uint<64> table_width,
                                     "fractal heap indirect block checksum size overflow");
 }
 
+/* File address of the FRHP header whose blocks are currently being walked, or
+   the undef sentinel when no heap is active.
+
+   Every fractal-heap indirect and direct block repeats its owning header's
+   address in its prefix, and libhdf5 rejects a block whose copy disagrees
+   (H5HFcache.c "incorrect heap header address for direct block", for both
+   H5HF__cache_iblock_deserialize and H5HF__cache_dblock_deserialize).  Without
+   that check a heap ID resolves through a block belonging to a DIFFERENT heap:
+   the doubling-table geometry used to translate the heap offset comes from this
+   heap's header while the bytes come from the other heap's block, so dense link
+   and attribute records are decoded at attacker-chosen offsets that h5policy
+   has already bounds-checked against the wrong extent.
+
+   Carried as module state rather than a parameter because the three walkers
+   that reach h5policy_frhp_locate (dense links, dense attributes, SOHM) each
+   funnel through several intermediate record/leaf/node helpers that thread only
+   the heap's geometry, not its header address.  This mirrors
+   h5policy_dense_link_frhp_trusted.  A heap walk sets it immediately after the
+   header passes its checksum; the sentinel makes a walker that forgets to set
+   it fall back to today's behaviour instead of inventing a comparison.  */
+var h5policy_frhp_owner_addr = 0xffffffffffffffffUL;
+
+/* Block addresses whose owner mismatch has already been reported.  One bad
+   block is re-reached once per heap ID that routes through it -- every link in
+   a dense index, for a root indirect block -- and the defect is a property of
+   the block, not of each ID.  The CHECK still runs each time so the descent
+   stops every time; only the finding is deduplicated.  */
+var h5policy_frhp_owner_reported = uint<64>[]();
+
+/* Compare one block's stored owner address against the active heap header.
+   The owner field sits directly after the signature (4) and version (1) in both
+   block kinds and is sizeof_offsets wide -- the same field the block-size
+   helpers account for as `5 + o` before the heap-offset-sized block offset.
+   The finding points at the owner bytes rather than the block prefix, so the
+   reported offset is the field that disagrees.  */
+fun h5policy_frhp_owner_ok = (int ios, H5PolicyProfile profile,
+                              uint<64> block_addr,
+                              string object, string kind) int:
+{
+    if (h5policy_frhp_owner_addr == 0xffffffffffffffffUL)
+        return 1;
+    var o = global_sizeof_offsets as uint<64>;
+    var owner = h5policy_msg_addr_at(ios, profile, block_addr#B + 5#B, o);
+    if (owner == h5policy_frhp_owner_addr)
+        return 1;
+    if (h5policy_seen_u64(h5policy_frhp_owner_reported, block_addr))
+        return 0;
+    h5policy_frhp_owner_reported += [block_addr];
+    h5policy_emit_error_ev("H5_CORRUPT_FRACTAL_HEAP_BACKPOINTER", "corrupt",
+                           block_addr#B + 5#B, object,
+                           kind + " points at the wrong heap header",
+                           H5Evidence {
+                               field = "heap.fractal_block_owner",
+                               actual = owner,
+                               expected = h5policy_frhp_owner_addr,
+                               comparison = "equal",
+                               has_loc1 = 1, loc1_role = "actual",
+                               loc1 = block_addr#B + 5#B,
+                               loc1_len = o
+                           });
+    return 0;
+}
+
 /* Verify an indirect block enough to trust its row table.  The caller supplies
    the expected geometry from the heap header or parent descent.  */
 fun h5policy_verify_frhp_iblock = (int ios, H5PolicyProfile profile,
@@ -649,6 +712,11 @@ fun h5policy_verify_frhp_iblock = (int ios, H5PolicyProfile profile,
                                 "fractal heap indirect block has an unsupported version");
             return 0;
         }
+    /* The row table this function exists to certify is only meaningful for the
+       heap that owns the block, so a wrong owner stops the descent here.  */
+    if (!h5policy_frhp_owner_ok(ios, profile, iblock_addr, object,
+                                "fractal heap indirect block"))
+        return 0;
     return 1;
 }
 
@@ -704,6 +772,13 @@ fun h5policy_verify_frhp_dblock = (int ios, H5PolicyProfile profile,
                                 "fractal heap direct block has an unsupported version");
             return 0;
         }
+    /* Checked BEFORE the checksum early-return below: heaps that do not
+       checksum their direct blocks still carry the owner field, and it is the
+       only thing tying the object bytes this block supplies to the heap whose
+       geometry located them.  */
+    if (!h5policy_frhp_owner_ok(ios, profile, dblock_addr, object,
+                                "fractal heap direct block"))
+        return 0;
     if (checksum_dblocks == 0UB || !h5policy_dense_mark_checksummed(dblock_addr))
         return 1;
 
@@ -1786,6 +1861,7 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
                                  off64 loc, string object) int:
 {
     h5policy_dense_link_frhp_trusted = 0;
+    h5policy_frhp_owner_addr = 0xffffffffffffffffUL;
     var o = global_sizeof_offsets as uint<64>;
     var el = global_sizeof_lengths as uint<64>;
     var file_size = h5policy_ceiling(ios);
@@ -1819,6 +1895,8 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
                                                  "fractal heap header"))
         return 0;
     h5policy_dense_link_frhp_trusted = 1;
+    /* Only a checksum-clean header is worth comparing blocks against.  */
+    h5policy_frhp_owner_addr = fheap_addr;
     if (filter_len != 0UL)
         {
             var pipeline_ok = h5policy_validate_filter_pipeline_payload(

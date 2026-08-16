@@ -137,6 +137,10 @@ ROLE_PARAMS = {
     # message and in the header of a filtered fractal heap (dense link, dense
     # attribute, SOHM) -- four clients, four families.
     "h5policy_validate_filter_pipeline_payload": 6,
+    # h5_dense_links.pk: direct and indirect fractal-heap blocks carry the same
+    # owner back-pointer at the same prefix offset, so one comparison serves
+    # both and names which block kind it read.
+    "h5policy_frhp_owner_ok": 4,
 }
 
 
