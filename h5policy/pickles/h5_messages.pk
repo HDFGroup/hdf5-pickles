@@ -859,6 +859,23 @@ fun h5policy_validate_fsinfo_payload = (int ios,
     return ctx;
 }
 
+/* Enum ceilings for the three single-byte fields in a cache-image entry
+   header.  They are libhdf5 build constants rather than format-spec values, so
+   they live with this validator instead of h5_format_constants.pk:
+
+     H5AC_NTYPES                       H5ACprivate.h -- one past the last cache
+                                       client class id (currently
+                                       H5AC_PREFETCHED_ENTRY_ID = 29)
+     H5C_RING_NTYPES                   H5Cprivate.h  -- one past H5C_RING_SB
+     H5AC__CACHE_IMAGE__ENTRY_AGEOUT__MAX  H5ACpublic.h
+
+   A libhdf5 that adds a client class raises H5AC_NTYPES and would make this
+   bound stale in the strict direction (h5policy rejecting an id that build
+   accepts), so the differential harness is what catches a bump here.  */
+var H5AC_NTYPES = 30UL;
+var H5C_RING_NTYPES = 6UL;
+var H5AC_CACHE_IMAGE_ENTRY_AGEOUT_MAX = 100UL;
+
 /* Metadata cache image messages name a cached metadata image.  The first pass
    bounds and authenticates each entry, then a second pass routes normal reads
    at cached logical addresses to the entry bodies. */
@@ -1016,6 +1033,76 @@ fun h5policy_validate_mdci_payload = (int ios,
                     var eoff = image_addr#B + cur#B;
                     var type_id = h5policy_msg_u64_at(ios, profile, eoff, 1UL);
                     var eflags = h5policy_msg_u64_at(ios, profile, eoff + 1#B, 1UL);
+                    var ring = h5policy_msg_u64_at(ios, profile, eoff + 2#B, 1UL);
+                    var age = h5policy_msg_u64_at(ios, profile, eoff + 3#B, 1UL);
+
+                    /* Three single-byte enums libhdf5 range-checks on the READ
+                       path, in H5C__reconstruct_cache_entry (H5Cimage.c) -- not
+                       in H5C__decode_cache_image_entry, which is the write-side
+                       verification path and only asserts.  Checked here in
+                       libhdf5's own order, before the flag/count consistency
+                       rules below, because the first of them selects a
+                       deserializer.
+
+                       type_id is not an inert label: it indexes the cache
+                       client class table, and h5policy records it per entry
+                       (h5policy_mdci_body_types) to decide which bodies the
+                       replay pass decodes as object headers.  An out-of-range
+                       id therefore steers dispatch on both sides.  */
+                    if (type_id >= H5AC_NTYPES)
+                        {
+                            h5policy_emit_error_ev(
+                                "H5_CORRUPT_MDCI_ENTRY_CLASS", "corrupt",
+                                eoff, object,
+                                "metadata cache image entry names an unknown cache client type",
+                                H5Evidence {
+                                    field = "mdci.entry_class_valid",
+                                    actual = type_id,
+                                    expected = H5AC_NTYPES - 1UL,
+                                    comparison = "at_most",
+                                    has_loc1 = 1, loc1_role = "actual",
+                                    loc1 = eoff, loc1_len = 1UL
+                                });
+                            return;
+                        }
+                    /* Ring 0 (H5C_RING_UNDEFINED) is deliberately NOT rejected:
+                       the read path bounds only the top of the range, so a zero
+                       ring is accepted by a Release build and merely trips an
+                       assert in a debug one.  Rejecting it here would make
+                       h5policy refuse a file libhdf5 opens.  */
+                    if (ring >= H5C_RING_NTYPES)
+                        {
+                            h5policy_emit_error_ev(
+                                "H5_CORRUPT_MDCI_ENTRY_CLASS", "corrupt",
+                                eoff + 2#B, object,
+                                "metadata cache image entry names an unknown cache ring",
+                                H5Evidence {
+                                    field = "mdci.entry_class_valid",
+                                    actual = ring,
+                                    expected = H5C_RING_NTYPES - 1UL,
+                                    comparison = "at_most",
+                                    has_loc1 = 1, loc1_role = "actual",
+                                    loc1 = eoff + 2#B, loc1_len = 1UL
+                                });
+                            return;
+                        }
+                    if (age > H5AC_CACHE_IMAGE_ENTRY_AGEOUT_MAX)
+                        {
+                            h5policy_emit_error_ev(
+                                "H5_CORRUPT_MDCI_ENTRY_CLASS", "corrupt",
+                                eoff + 3#B, object,
+                                "metadata cache image entry age exceeds the ageout policy maximum",
+                                H5Evidence {
+                                    field = "mdci.entry_class_valid",
+                                    actual = age,
+                                    expected = H5AC_CACHE_IMAGE_ENTRY_AGEOUT_MAX,
+                                    comparison = "at_most",
+                                    has_loc1 = 1, loc1_role = "actual",
+                                    loc1 = eoff + 3#B, loc1_len = 1UL
+                                });
+                            return;
+                        }
+
                     var child_count = h5policy_msg_u64_at(ios, profile,
                                                           eoff + 4#B, 2UL);
                     var dirty_child_count = h5policy_msg_u64_at(ios, profile,
