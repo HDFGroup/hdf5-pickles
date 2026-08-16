@@ -6,7 +6,11 @@ a security profile, and emits a stable JSON decision.
 
 Files with an HDF5 user block are supported. The superblock is discovered at a
 legal boundary and base-relative HDF5 addresses are translated to physical file
-offsets before metadata is mapped.
+offsets before metadata is mapped. This includes the addresses a metadata cache
+image records for the entries it shadows: they are base-relative like any other
+file address, and the corpus covers a user block and a cache image together
+(`valid/userblock_cache_image.h5`) because only their combination reaches that
+translation.
 
 The tool is intentionally a metadata-only boundary:
 

@@ -1,12 +1,27 @@
 /* Create a small, valid metadata-cache-image fixture for h5policy's corpus.
  * This uses only public HDF5 APIs because h5py does not expose the MDC-image
- * FAPL setting. */
+ * FAPL setting.
+ *
+ * Usage: make_cache_image OUTPUT.h5 [USERBLOCK_BYTES]
+ *
+ * The optional user block shifts every metadata address by the base address,
+ * which is the only way to exercise a cache image whose entry addresses are
+ * base-relative.  Omit it (or pass 0) for the plain fixture. */
 #include <hdf5.h>
+#include <stdlib.h>
 
 int main(int argc, char **argv)
 {
-    if (argc != 2)
+    if (argc != 2 && argc != 3)
         return 2;
+
+    hsize_t userblock = 0;
+    if (argc == 3) {
+        char *end = NULL;
+        userblock = (hsize_t)strtoull(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0')
+            return 2;
+    }
 
     H5AC_cache_image_config_t image = {
         H5AC__CURR_CACHE_IMAGE_CONFIG_VERSION,
@@ -20,8 +35,19 @@ int main(int argc, char **argv)
         H5Pset_mdc_image_config(fapl, &image) < 0)
         return 3;
 
-    hid_t file = H5Fcreate(argv[1], H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    hid_t fcpl = H5P_DEFAULT;
+    if (userblock > 0) {
+        fcpl = H5Pcreate(H5P_FILE_CREATE);
+        if (fcpl < 0 || H5Pset_userblock(fcpl, userblock) < 0) {
+            H5Pclose(fapl);
+            return 6;
+        }
+    }
+
+    hid_t file = H5Fcreate(argv[1], H5F_ACC_TRUNC, fcpl, fapl);
     H5Pclose(fapl);
+    if (fcpl != H5P_DEFAULT)
+        H5Pclose(fcpl);
     if (file < 0)
         return 4;
     hid_t group = H5Gcreate2(file, "indexed", H5P_DEFAULT, H5P_DEFAULT,

@@ -55,6 +55,24 @@ Important keys:
 - `v`: pretty-print the current object header or chunk-index metadata.
 - `p`: switch to the backing GNU poke process buffer.
 
+## User blocks
+
+Unlike `h5policy` and `h5explain`, this front end does not scan for the
+superblock: a session starts at `hdf5-poke-default-superblock-offset`, which is
+`"0#B"`.  A file with an HDF5 user block keeps its superblock at the user block
+boundary instead, so opening one at the default offset fails to map anything.
+Press `S` (`hdf5-poke-set-superblock-offset`) and enter that boundary --
+`512#B`, `1024#B`, and so on -- or set the default in your config:
+
+```elisp
+(setq hdf5-poke-default-superblock-offset "512#B")
+```
+
+Once set, every command in the session inherits the offset, and the pickles
+translate base-relative HDF5 addresses to physical offsets from there.  Running
+`h5policy` over the file first is the quickest way to learn the offset: its
+report carries the superblock location.
+
 Link and message buffers carry breadcrumb buttons for path-oriented browsing.
 Path commands resolve hard links from `/`, so users can enter paths such as
 `/group/dset_00` instead of object-header offsets.

@@ -68,7 +68,11 @@ The catalog intentionally favors byte-level changes backed by complete
 `h5policy` reachability and exact on-disk evidence:
 
 - restore the HDF5 file signature when the surrounding superblock fields are
-  plausible;
+  plausible.  Plausibility requires more than version and address widths: the
+  candidate body must also record its own location as its base address and name
+  a root object header inside the file.  This is what keeps the byte-0 fallback
+  off a user block, whose application bytes are not a superblock even when they
+  happen to look like one;
 - normalize a mismatched v2/v3 superblock base address to the discovered
   superblock offset and reseal the superblock;
 - clear stale v2/v3 superblock file-consistency flags;
@@ -103,3 +107,18 @@ the affected structure has unrelated corruption.
 Future repair classes can add B-tree rebuilds, orphan pruning, continuation
 chunk repair, end-of-address expansion, and chunk-index reconstruction behind
 the same plan/apply/log interface.
+
+## User blocks
+
+Files with an HDF5 user block are supported.  The superblock is located the way
+`h5policy` and libhdf5 locate it -- byte 0, then 512, 1024, 2048, and so on --
+and the plan reports the discovered `superblock_offset`.
+
+Every address stored in HDF5 metadata is relative to the superblock's base
+address, so a repair that follows one (a symbol-table entry's object header, a
+v2 B-tree's root node, a free-space section list) must translate before reading
+bytes.  An untranslated read lands a base short of its target on a user-block
+file, the structure check fails, and the repair is quietly not offered rather
+than misapplied.  `h5patch/tests/test_h5patch.py` pins this: the SNOD and
+depth-0 v2 B-tree count repairs each run twice, once with a user block and once
+without.
