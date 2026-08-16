@@ -83,8 +83,8 @@ Layout for superblock versions 0 and 1. Version 1 extends version 0 by adding th
 | Root Symbol Table Version | `root_stab_vers` | Version of the root group symbol table entry format. Must be 0. |
 | Reserved | `res1` | Reserved. Must be zero. |
 | Shared Header Version | `shared_hdr_vers` | Version of the shared object header message format. Must be 0. |
-| Size of Offsets | `sizeof_offsets` | Size in bytes of file addresses (offsets). Typical value: 8. Sets the global `sizeof_offsets` used by all subsequent address fields. |
-| Size of Lengths | `sizeof_lengths` | Size in bytes of file lengths. Typical value: 8. Sets the global `sizeof_lengths` used by all length fields. |
+| Size of Offsets | `sizeof_offsets` | Size in bytes of file addresses (offsets). Typical value: 8. Valid values are 2, 4, 8, 16, and 32; other widths are rejected before they can control later variable-width maps. Sets the global `sizeof_offsets` used by all subsequent address fields. |
+| Size of Lengths | `sizeof_lengths` | Size in bytes of file lengths. Typical value: 8. Sets the global `sizeof_lengths` used by all length fields. Valid values are 2, 4, 8, 16, and 32. |
 | Reserved | `res2` | Reserved. Must be zero. |
 | Symbol Table Leaf K | `stab_leaf_k` | Half the rank of leaf nodes in the version 1 group B-tree. Must be greater than zero.  The maximum number of entries in a leaf node is `2 * stab_leaf_k`. |
 | Symbol Table Internal K | `stab_internal_k` | Half the rank of internal nodes in the version 1 group B-tree. Must be greater than zero. |
@@ -114,4 +114,4 @@ Compact layout introduced in superblock version 2. Replaces the symbol-table roo
 | Ext Address Raw | `ext_addr_raw` | File address of the superblock extension object header, or HADDR_UNDEF if no extension is present. The extension carries optional metadata such as the driver information message. |
 | End-of-file Address Raw | `eof_addr_raw` | File address of the first byte beyond all HDF5 data. |
 | Root Object Address Raw | `root_obj_addr_raw` | File address of the root group object header. |
-| Chksum | `chksum` | Jenkins lookup3 checksum computed over all preceding superblock bytes (from the signature through `root_obj_addr_raw`). |
+| Chksum | `chksum` | Jenkins lookup3 checksum computed over all preceding superblock bytes (from the signature through `root_obj_addr_raw`). The executable mapping verifies it before accepting the superblock. |

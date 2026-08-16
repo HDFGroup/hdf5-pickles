@@ -33,7 +33,12 @@ Several messages exist in an "old" and a "new" versioned form:
 `oh_msg_mtime`. Applications should write only the new form; the old
 form is retained for reading legacy files.
 
-All fields are stored in little-endian byte order.
+All fields are stored in little-endian byte order. The executable mappings
+reject source-defined local invariants before a malformed field can drive a
+later map: unsupported dataspace, link, layout, and index versions; reserved
+flag bits; invalid scalar/null dataspace ranks; zero link names; zero-length
+continuation chunks; and invalid chunk-index encodings. Cross-record range,
+checksum, and graph validation remain outside this format-inspection layer.
 
 <a id="subsec_fmt4_dataobject_hdr_prefix"></a>
 
