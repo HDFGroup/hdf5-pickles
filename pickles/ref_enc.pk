@@ -182,12 +182,28 @@ type ref_enc_hdr = struct {
 /* ----------------------------------------------------------------------- *
  * rf_enc_print_token -- print an object token as a hex address.
  *
- *   blob   : byte array containing the blob data
+ *   blob   : byte array containing the exact global-heap object data
  *   off    : offset within blob of the 1-byte token_size field
  * ----------------------------------------------------------------------- */
+fun rf_enc_blob_has = (byte[] blob, uint<64> off, uint<64> need) int:
+{
+    var blob_len = blob'length as uint<64>;
+    return off <= blob_len && need <= blob_len - off;
+}
+
 fun rf_enc_print_token = (byte[] blob, uint<64> off) uint<64>:
 {
+    if (!rf_enc_blob_has(blob, off, 1UL)) {
+        printf("  [invalid: blob ends before token size]\n");
+        return 0UL;
+    }
+
     var token_size = blob[off] as uint<64>;
+    if (token_size > 16UL || !rf_enc_blob_has(blob, off + 1UL, token_size)) {
+        printf("  [invalid: token size %u64d exceeds blob bounds]\n", token_size);
+        return 0UL;
+    }
+
     var addr       = bytes_to_u64_le_at(blob, off + 1UL, token_size);
     printf("  token_size=%u64d  token=0x%u64x  (%u64d)\n",
            token_size, addr, addr);
@@ -201,17 +217,35 @@ fun rf_enc_print_token = (byte[] blob, uint<64> off) uint<64>:
  * Used for VIII.C region references where there is no preceding
  * sel_size / rank header — the selection wire bytes start immediately.
  * ----------------------------------------------------------------------- */
-fun rf_enc_print_sel_at = (offset<uint<64>,B> sel_abs_off) void:
+fun rf_enc_print_sel_at = (offset<uint<64>,B> sel_abs_off,
+                           uint<64>            available) void:
 {
+    if (available < 8UL) {
+        printf("  [invalid: heap object ends before selection header]\n");
+        return;
+    }
+
     var hdr8     = byte[8] @ sel_abs_off;
     var sel_type = bytes_to_u64_le_at(hdr8, 0UL, 4UL);
 
     if (sel_type == H5S_SEL_NONE || sel_type == H5S_SEL_ALL) {
+        if (available < 16UL) {
+            printf("  [invalid: heap object ends before fixed selection]\n");
+            return;
+        }
         var sel = byte[16] @ sel_abs_off;
         dspace_enc_print_sel(sel, 0UL, "selection");
     } else {
+        if (available < 24UL) {
+            printf("  [invalid: heap object ends before selection probe]\n");
+            return;
+        }
         var probe   = byte[24] @ sel_abs_off;
         var sel_sz  = dspace_enc_sel_size(probe, 0UL);
+        if (sel_sz > available) {
+            printf("  [invalid: selection size %u64d exceeds heap object]\n", sel_sz);
+            return;
+        }
         var sel_dat = byte[sel_sz] @ sel_abs_off;
         dspace_enc_print_sel(sel_dat, 0UL, "selection");
     }
@@ -227,9 +261,18 @@ fun rf_enc_print_sel_at = (offset<uint<64>,B> sel_abs_off) void:
 fun rf_enc_print_blob_reg2 = (byte[] blob, uint<64> off,
                                 offset<uint<64>,B> data_abs_off) void:
 {
+    if (!rf_enc_blob_has(blob, off, 8UL)) {
+        printf("  [invalid: blob ends before region descriptor]\n");
+        return;
+    }
+
     var sel_size = bytes_to_u64_le_at(blob, off, 4UL);
     var rank     = bytes_to_u64_le_at(blob, off + 4UL, 4UL);
     printf("  sel_size=%u64d  rank=%u64d\n", sel_size, rank);
+    if (!rf_enc_blob_has(blob, off + 8UL, sel_size)) {
+        printf("  [invalid: selection size exceeds blob bounds]\n");
+        return;
+    }
     var sel_dat = byte[sel_size] @ (data_abs_off + (off + 8UL)#B);
     dspace_enc_print_sel(sel_dat, 0UL, "selection");
 }
@@ -261,7 +304,11 @@ type ref_enc_block = struct {
                                                   (hdr.flags & 1UB) == 0UB);
 
     /* Case 2: blob format */
-    byte[4]                     blob_size_raw if (hdr.ref_type != 2UB ||
+    byte[4]                     blob_size_raw:
+                                                  (hdr.ref_type == 0UB
+                                                   ? bytes_to_u64_le(blob_size_raw) == 0UL
+                                                   : bytes_to_u64_le(blob_size_raw) >= 3UL)
+                                                  if (hdr.ref_type != 2UB ||
                                                   (hdr.flags & 1UB) != 0UB);
     byte[global_sizeof_offsets] heap_addr_raw:
                                                   (hdr.ref_type == 0UB
@@ -269,7 +316,9 @@ type ref_enc_block = struct {
                                                    : hdf5_addr_in_declared_eof(heap_addr_raw, 0))
                                                   if (hdr.ref_type != 2UB ||
                                                       (hdr.flags & 1UB) != 0UB);
-    byte[4]                     heap_idx_raw  if (hdr.ref_type != 2UB ||
+    byte[4]                     heap_idx_raw:  (hdr.ref_type == 0UB ||
+                                                  hdf5_bytes_nonzero(heap_idx_raw))
+                                                  if (hdr.ref_type != 2UB ||
                                                   (hdr.flags & 1UB) != 0UB);
 
     method _print = void:
@@ -318,13 +367,33 @@ type ref_enc_block = struct {
                 printf("}\n");
                 return;
             }
+            if (global_gheap_last_obj_size != blob_size) {
+                printf("  [invalid: descriptor size %u64d does not match heap object size %u64d]\n",
+                       blob_size, global_gheap_last_obj_size);
+                printf("}\n");
+                return;
+            }
 
             var blob     = byte[blob_size] @ data_off;
             var consumed = rf_enc_print_token(blob, 0UL);
+            if (consumed == 0UL) {
+                printf("}\n");
+                return;
+            }
 
             if (is_external) {
+                if (!rf_enc_blob_has(blob, consumed, 2UL)) {
+                    printf("  [invalid: blob ends before filename length]\n");
+                    printf("}\n");
+                    return;
+                }
                 var fn_len = bytes_to_u64_le_at(blob, consumed, 2UL);
                 printf("  filename_len=%u64d\n", fn_len);
+                if (!rf_enc_blob_has(blob, consumed + 2UL, fn_len)) {
+                    printf("  [invalid: filename exceeds blob bounds]\n");
+                    printf("}\n");
+                    return;
+                }
                 printf("  filename=\"");
                 for (var i = 0UL; i < fn_len; i = i + 1UL)
                     printf("%c", blob[consumed + 2UL + i] as char);
@@ -335,8 +404,18 @@ type ref_enc_block = struct {
             if (rt == H5R_DATASET_REGION2) {
                 rf_enc_print_blob_reg2(blob, consumed, data_off);
             } else if (rt == H5R_ATTR) {
+                if (!rf_enc_blob_has(blob, consumed, 2UL)) {
+                    printf("  [invalid: blob ends before attribute-name length]\n");
+                    printf("}\n");
+                    return;
+                }
                 var name_len = bytes_to_u64_le_at(blob, consumed, 2UL);
                 printf("  attr_name_len=%u64d\n", name_len);
+                if (!rf_enc_blob_has(blob, consumed + 2UL, name_len)) {
+                    printf("  [invalid: attribute name exceeds blob bounds]\n");
+                    printf("}\n");
+                    return;
+                }
                 printf("  attr_name=\"");
                 for (var i = 0UL; i < name_len; i = i + 1UL)
                     printf("%c", blob[consumed + 2UL + i] as char);
@@ -429,7 +508,7 @@ fun print_ref_enc_obj1 = (offset<uint<64>,B> abs_off) void:
  * ----------------------------------------------------------------------- */
 type ref_enc_region1_block = struct {
     byte[global_sizeof_offsets] heap_addr_raw: hdf5_addr_in_declared_eof(heap_addr_raw, 0);
-    byte[4]                     heap_idx_raw;
+    byte[4]                     heap_idx_raw: hdf5_bytes_nonzero(heap_idx_raw);
 
     method _print = void:
     {
@@ -447,11 +526,22 @@ type ref_enc_region1_block = struct {
         }
 
         var sizeof_addr  = global_sizeof_offsets as uint<64>;
+        if (global_gheap_last_obj_size < sizeof_addr) {
+            printf("  [invalid: heap object ends before dataset address]\n");
+            printf("}\n");
+            return;
+        }
         var ds_addr_raw  = byte[sizeof_addr] @ data_off;
         var dataset_addr = bytes_to_u64_le(ds_addr_raw);
         printf("  dataset_addr=0x%u64x  (%u64d)\n", dataset_addr, dataset_addr);
+        if (!hdf5_addr_in_declared_eof(ds_addr_raw, 0)) {
+            printf("  [invalid: dataset address is outside declared EOF]\n");
+            printf("}\n");
+            return;
+        }
 
-        rf_enc_print_sel_at(data_off + sizeof_addr#B);
+        rf_enc_print_sel_at(data_off + sizeof_addr#B,
+                            global_gheap_last_obj_size - sizeof_addr);
 
         printf("}\n");
     }
