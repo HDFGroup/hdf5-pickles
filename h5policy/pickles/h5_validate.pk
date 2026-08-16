@@ -225,6 +225,103 @@ fun h5policy_validate_optional_addr = (byte[] raw, uint<64> file_size,
         }
 }
 
+/* v0/v1 superblocks carry driver information in a standalone block at the
+   superblock's driver-info address; v2+ moved the same payload into a
+   superblock-extension message (0x0014), which h5policy_validate_drvinfo_payload
+   handles.  The encodings differ, and so do their failure modes.  A message is
+   bounded by the object header that contains it, so its length can be checked
+   against an enclosing extent.  This block has no container: its length is read
+   straight out of the file and bounded by nothing.
+
+   That is the live half of registry/cases/driver-info-block-fields-unbounded.yml.
+   libhdf5 decodes the prefix in H5F__drvrinfo_prefix_decode
+   (src/H5Fsuper_cache.c), which bounds every field against the 16-byte IMAGE
+   BUFFER it was handed and no field against the FILE.  The decoded length then
+   extends the EOA to cover itself and, in the same callback, becomes the cache
+   entry's allocation size -- so it self-authorises, and every downstream
+   EOA-relative check is satisfied by construction.  h5policy has no EOA to move,
+   so it bounds the block against the ceiling the superblock already declared.
+
+   Header layout is [version:1][reserved:3][len:4][driver id:8]; `len` counts
+   only the driver-specific bytes that follow those 16.  */
+fun h5policy_validate_drvinfo_block = (int ios, H5PolicyProfile profile,
+                                       uint<64> addr) void:
+{
+    var object = "/<driver-info-block>";
+    var ceiling = h5policy_ceiling(ios);
+    var loc = addr#B;
+
+    /* The header itself must lie in the file.  libhdf5 reads it speculatively
+       and the sec2 driver zero-fills past EOF, so a header running off the end
+       decodes as an all-zero block rather than failing -- the same zero-fill
+       that made a wild driver-info ADDRESS silently acceptable before 2.3.0
+       bounded it.  Written as subtraction because addr + 16 is attacker-reachable
+       arithmetic.  */
+    if (addr > ceiling || ceiling - addr < 16UL)
+        {
+            h5policy_emit_error_ev(
+                "H5_CORRUPT_DRVINFO_BLOCK_EXTENT", "corrupt", loc, object,
+                "driver-info block header does not fit in the file",
+                H5Evidence {
+                    field = "control.driver_info_extent",
+                    actual = addr,
+                    expected = (ceiling < 16UL) ? 0UL : ceiling - 16UL,
+                    comparison = "at_most",
+                    has_loc1 = 1, loc1_role = "actual",
+                    loc1 = loc, loc1_len = 1UL
+                });
+            return;
+        }
+
+    var version = h5policy_read_u64_le_at(ios, profile, loc, 1UL);
+    if (version != 0UL)
+        {
+            h5policy_emit_error_ev(
+                "H5_CORRUPT_UNSUPPORTED_DRVINFO_VERSION", "corrupt", loc, object,
+                "driver-info block has an unsupported version",
+                H5Evidence {
+                    field = "control.driver_info_encoding",
+                    actual = version,
+                    expected = 0UL,
+                    comparison = "equal",
+                    has_loc1 = 1, loc1_role = "actual",
+                    loc1 = loc, loc1_len = 1UL
+                });
+            return;
+        }
+
+    /* The three reserved bytes are deliberately NOT checked.  libhdf5 skips them
+       without inspection (`image += 3`), so rejecting a nonzero value would make
+       h5policy refuse a file libhdf5 opens.  pickles/drv_info.pk constrains them
+       to zero, but that is the descriptive model of a conforming writer, not the
+       bound this oracle may enforce.  */
+
+    var body_len = h5policy_read_u64_le_at(ios, profile, loc + 4#B, 4UL);
+    if (body_len > ceiling - addr - 16UL)
+        {
+            h5policy_emit_error_ev(
+                "H5_CORRUPT_DRVINFO_BLOCK_EXTENT", "corrupt", loc + 4#B, object,
+                "driver-info block body extends past the end of the file",
+                H5Evidence {
+                    field = "control.driver_info_extent",
+                    actual = body_len,
+                    expected = ceiling - addr - 16UL,
+                    comparison = "at_most",
+                    has_loc1 = 1, loc1_role = "actual",
+                    loc1 = loc + 4#B, loc1_len = 4UL
+                });
+            return;
+        }
+
+    /* The driver identification and the driver-specific bytes after it are
+       consumed by a VFD and can name other files.  As on the message path, an
+       opaque body that decodes cleanly is not a validated one, so a well-formed
+       block stays an explicit coverage refusal rather than an accept.  */
+    h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP", "unsupported",
+                        loc + 8#B, object,
+                        "driver-specific member files are not validated");
+}
+
 /* v0/v1 superblocks have no superblock-extension object header.  Return the
    undefined-address sentinel so the reachable walk can treat "none" uniformly. */
 fun h5policy_super_ext_addr = (superblock sb) uint<64>:
@@ -333,10 +430,22 @@ fun h5policy_validate_superblock = (int ios, superblock sb,
                                             file_size, super_off,
                                             "superblock",
                                             "free-space info address is outside the file");
-            h5policy_validate_optional_addr(sb.super.v0_v1.drv_info_addr_raw,
-                                            file_size, super_off,
-                                            "superblock",
-                                            "driver-info address is outside the file");
+            /* The address bound is the half libhdf5 gained at 2.3.0 (driver_addr
+               against stored_eof, src/H5Fsuper_cache.c).  The block BEHIND that
+               address is still unbounded upstream, so h5policy decodes it here
+               rather than stopping at the pointer.  Only reached when the address
+               is defined and in the file -- a wild address is already a finding,
+               and reading a block at it would be decoding on top of a rejection.  */
+            if (!h5policy_addr_is_undef(sb.super.v0_v1.drv_info_addr_raw))
+                {
+                    var drv_addr = hdf5_addr_to_file_u64(
+                        bytes_to_u64_le(sb.super.v0_v1.drv_info_addr_raw));
+                    if (h5policy_addr_in_file(drv_addr, file_size,
+                                              "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                              super_off, "superblock",
+                                              "driver-info address is outside the file"))
+                        h5policy_validate_drvinfo_block(ios, profile, drv_addr);
+                }
         }
     else
         {

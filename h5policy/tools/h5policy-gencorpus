@@ -459,6 +459,8 @@ def _gen_resource(root):
         g.create_dataset("beta", data=np.arange(6, dtype="i4"))
         h.create_dataset("top", data=np.arange(3, dtype="i4"))
     _write_earliest(f"{root}/valid/old_style_group.h5", _old_style)
+    # Structurally sound, deliberately not `accept`: see _make_drvinfo_block.
+    _make_drvinfo_block(f"{root}/valid/drvinfo_block.h5")
 
     # Old-format chunked dataset: v3 layout -> v1 (type-1) B-tree chunk index
     # with several leaf entries.  Exercises chunk-index traversal and counting.
@@ -797,10 +799,125 @@ def _make_root_object_not_group(path):
     _patch(path, bytes(raw))
 
 
+def _drvinfo_block(version=0, body_len=None, drv_id=b"NCSAtest",
+                   body=b"\x00" * 8):
+    """Encode a v0/v1 driver information block.
+
+    The 16-byte header is [version:1][reserved:3][len:4][driver id:8], followed
+    by `len` driver-specific bytes; `len` counts only those trailing bytes, not
+    the header.  `body_len` defaults to the real body length -- passing it
+    explicitly is how the length fixture claims more than it carries.
+
+    The driver id is deliberately NOT "NCSAfami" or "NCSAmult".  H5FD_sb_load
+    (src/H5FD.c) rejects those two unless the file was opened with the matching
+    VFD, so either would make libhdf5 refuse the well-formed fixture for a
+    reason that has nothing to do with what it is testing.  Any other name
+    reaches H5FD__sb_decode, which is a no-op under sec2 because that driver has
+    no sb_decode callback.
+    """
+    if body_len is None:
+        body_len = len(body)
+    return (bytes([version, 0, 0, 0]) + struct.pack("<I", body_len)
+            + drv_id + body)
+
+
+def _drvinfo_assemble(path, block=b"", addr=None):
+    """Attach a driver information block to a superblock-v0 file.
+
+    h5py cannot write one: the block only appears when the file was created with
+    the family or multi VFD, and then only carrying those drivers' own payloads.
+    So the block is appended to a plain earliest-format file and the
+    superblock's driver-info address (v0 bytes 48-55) is pointed at it, with the
+    declared EOF (bytes 40-47) moved to the new physical end.
+
+    A v0 superblock carries no checksum, so nothing needs repairing afterwards
+    -- unlike every v2+ fixture in this file, where the same edit would have to
+    rewrite the trailing Jenkins sum.
+
+    `addr` defaults to where the block was appended.  Passing it explicitly
+    aims the superblock at somewhere else in the file, which is how the
+    truncated-header fixture is built.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("a", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    assert raw[8] == 0, f"expected a v0 superblock, got version {raw[8]}"
+    block_at = len(raw)
+    raw += block
+    struct.pack_into("<Q", raw, 40, len(raw))          # declared EOF
+    struct.pack_into("<Q", raw, 48,
+                     block_at if addr is None else addr)
+    _patch(path, bytes(raw))
+
+
+def _make_drvinfo_block(path):
+    """A well-formed v0 driver information block: version 0, an 8-byte body,
+    and a driver id no VFD in this build claims.
+
+    Not a malformed fixture.  It exists to pin the COVERAGE REFUSAL -- h5policy
+    decodes the envelope, finds it sound, and still declines to accept, because
+    the driver-specific bytes can name member files it does not validate.  Same
+    treatment the superblock-extension message path gives an equally well-formed
+    0x0014 message.
+    """
+    _drvinfo_assemble(path, _drvinfo_block())
+
+
+def _make_drvinfo_block_bad_version(path):
+    """A driver information block whose version byte is 1.
+
+    HDF5_DRIVERINFO_VERSION_0 is the only value libhdf5 accepts;
+    H5F__drvrinfo_prefix_decode errors with "bad driver information block
+    version number", so this is a genuine agreement case, not a divergence.
+    """
+    _drvinfo_assemble(path, _drvinfo_block(version=1))
+
+
+def _make_drvinfo_block_len_past_eof(path):
+    """A driver information block carrying 8 bytes but declaring 1 MiB.
+
+    This is the LENGTH half of the driver-info record, which is still unbounded
+    upstream: the declared length extends the EOA to cover itself and then sizes
+    the cache allocation, so no downstream EOA check can catch it.
+
+    1 MiB rather than the multi-gigabyte value the original specimen used, and
+    the size is a safety property of the fixture, not an arbitrary choice.  A
+    length near 2**32 makes libhdf5 allocate that much during H5Fopen, and an
+    uncapped h5dump on such a file can OOM-kill the whole desktop session.  1
+    MiB is four orders of magnitude past this file's EOF -- far more than enough
+    to exercise the bound -- while staying harmless to measure.
+    """
+    _drvinfo_assemble(path, _drvinfo_block(body_len=1 << 20))
+
+
+def _make_drvinfo_block_header_truncated(path):
+    """A superblock aiming its driver-info address 8 bytes before EOF, so the
+    16-byte header cannot fit.
+
+    The address itself is in the file, so the address bound libhdf5 gained at
+    2.3.0 does not intercept it; the block is what runs off the end.  libhdf5
+    reads 16 bytes anyway and the sec2 driver ZERO-FILLS past EOF, so the
+    fabricated tail decodes as a structurally valid block -- version 0, length
+    0, an all-NUL driver id.  The eight real bytes are appended as zeros so the
+    fabricated header is deterministic rather than whatever file content
+    happened to land there.
+    """
+    _drvinfo_assemble(path, b"\x00" * 8, addr=None)
+    raw = bytearray(open(path, "rb").read())
+    struct.pack_into("<Q", raw, 48, len(raw) - 8)
+    _patch(path, bytes(raw))
+
+
 def _gen_malformed(root):
     # ---- malformed/ : expected `reject_corrupt`, byte-patched from a base --
     base = f"{root}/valid/empty.h5"
     raw = open(base, "rb").read()
+    _make_drvinfo_block_bad_version(
+        f"{root}/malformed/drvinfo_block_bad_version.h5")
+    _make_drvinfo_block_len_past_eof(
+        f"{root}/malformed/drvinfo_block_len_past_eof.h5")
+    _make_drvinfo_block_header_truncated(
+        f"{root}/malformed/drvinfo_block_header_truncated.h5")
     _patch(f"{root}/malformed/bad_signature.h5",
            bytes([raw[0] ^ 0xFF]) + raw[1:])
     _patch(f"{root}/malformed/truncated.h5", raw[:32])
