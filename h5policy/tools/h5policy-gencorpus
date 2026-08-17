@@ -987,6 +987,10 @@ def _gen_malformed(root):
     _make_root_object_not_group(
         f"{root}/malformed/root_object_not_group.h5")
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
+    _make_layout_chunk_ndims_one(
+        f"{root}/malformed/bad_layout_chunk_ndims_one.h5")
+    _make_fsinfo_page_size_over_max(
+        f"{root}/malformed/bad_fsinfo_page_size_over_max.h5")
     _make_dtype_float_normalization(
         f"{root}/malformed/bad_dtype_float_normalization.h5")
     _make_dtype_opaque_tag_unaligned(
@@ -4078,6 +4082,71 @@ def _patch_dtype_size(raw, header_byte, expect_size, new_size, what):
                            f"size {expect_size}, found {len(hits)}")
     struct.pack_into("<I", raw, hits[0] + 4, new_size)
     return hits[0]
+
+
+def _make_layout_chunk_ndims_one(path):
+    """A version-3 chunked layout declaring one dimension.
+
+    In layout versions 1 to 3 the trailing chunk dimension is the element size,
+    so a chunk needs at least one real dimension plus that one and libhdf5
+    refuses fewer ("bad dimensions for chunked storage").  h5policy rejected
+    only zero, so a one-dimensional chunked layout -- a chunk with no real
+    dimensions at all -- was accepted.
+
+    h5py writes a rank-1 chunked dataset as ndims 2 (one data dimension plus the
+    element size).  Dropping the field to 1 leaves the dimension list itself in
+    place, so the declared count is the only defect; the bytes behind it still
+    describe the chunk libhdf5 wrote.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", shape=(8,), dtype="i4", chunks=(4,),
+                                   track_times=False),
+        libver="earliest")
+    hits = []
+    for o in range(len(raw) - 8):
+        if raw[o] != 3 or raw[o + 1] != 2:      # layout version 3, class 2
+            continue
+        if raw[o + 2] != 2:                     # ndims as libhdf5 wrote it
+            continue
+        hits.append(o)
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one v3 chunked layout, found {len(hits)}")
+    raw[hits[0] + 2] = 1
+    _patch(path, bytes(raw))
+
+
+def _make_fsinfo_page_size_over_max(path):
+    """A file-space-info message whose page size exceeds the format maximum.
+
+    H5F_FILE_SPACE_PAGE_SIZE_MAX is 1 GiB and libhdf5 refuses anything above it
+    in the same test that rejects zero ("invalid page size in file space info").
+    h5policy checked only the zero half.
+
+    The fixture raises a real paged file's 4096-byte page size to 1 GiB + 1 --
+    one past the bound rather than absurdly large, so the case pins the boundary
+    rather than merely a big number.  The message lives in the superblock
+    extension's object header, whose checksum is repaired afterwards.
+    """
+    src = path + ".base"
+    _write_page_fsinfo(src, False, lambda h: h.create_dataset("d", data=[1, 2, 3]))
+    raw = bytearray(open(src, "rb").read())
+    os.unlink(src)
+    # v1 FSINFO payload: version(1) strategy(1) persist(1) threshold(8)
+    # page_size(8), so the page size sits 11 bytes into the payload.  Anchor on
+    # the value libhdf5 wrote and confirm the three bytes that open the payload:
+    # version 1, strategy 1 (page), persist 0.
+    want = struct.pack("<Q", 4096)
+    hits = [o for o in range(11, len(raw) - 8)
+            if raw[o:o + 8] == want
+            and raw[o - 11] == 1 and raw[o - 10] == 1 and raw[o - 9] == 0]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one v1 fsinfo page size, found {len(hits)}")
+    struct.pack_into("<Q", raw, hits[0], 1073741825)
+    ohdr = raw.rfind(b"OHDR", 0, hits[0])
+    if ohdr < 0:
+        raise RuntimeError("fsinfo message is not inside a v2 object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
 
 
 def _make_dtype_float_normalization(path):
