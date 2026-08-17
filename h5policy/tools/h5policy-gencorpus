@@ -438,6 +438,8 @@ def _gen_policy(root):
     _write(f"{root}/policy/external_link_parent.h5",
            lambda h: h.__setitem__(
                "ext", h5py.ExternalLink("../elink_target.h5", "/secret")))
+    _make_unknown_message_skippable(
+        f"{root}/policy/unknown_message_skippable.h5")
     _write(f"{root}/policy/external_storage.h5",
            lambda h: h.create_dataset(
                "external", shape=(16,), dtype="u1",
@@ -1001,6 +1003,8 @@ def _gen_malformed(root):
         f"{root}/malformed/bad_dtype_duplicate_member_name.h5")
     _make_nul_compact_link_name(
         f"{root}/malformed/nul_compact_link_name.h5")
+    _make_unknown_message_fail_always(
+        f"{root}/malformed/bad_unknown_message_fail_always.h5")
     _make_link_reserved_flags(
         f"{root}/malformed/bad_link_reserved_flags.h5")
     _make_link_type_invalid(
@@ -5744,6 +5748,78 @@ def _make_dataspace_nelem_overflow(path):
     if ohdr < 0:
         raise RuntimeError("could not locate the dataset object header")
     _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _repurpose_root_nil_message(raw, m_type, m_flags):
+    """Turn the root v2 object header's trailing NIL message into a message of
+    type ``m_type`` carrying ``m_flags``, and re-seal the header checksum.
+
+    A NIL message is the one message with no payload semantics at all, so its
+    body can stand in for any message an unknown-ID reader will not decode.
+    Rewriting its two header bytes in place keeps every size and offset in the
+    header exactly as h5py wrote them, which is what isolates the message-type
+    and flag bytes as the only variables under test.
+    """
+    ohdr = raw.find(b"OHDR")
+    if ohdr < 0:
+        raise RuntimeError("root object header not found")
+
+    # Parse the v2 prefix to bound chunk 0: flags byte, optional times and
+    # phase-change values, then the chunk-0 size in 1 << (flags & 3) bytes.
+    flags = raw[ohdr + 5]
+    cursor = ohdr + 6
+    if flags & 0x20:
+        cursor += 16
+    if flags & 0x10:
+        cursor += 4
+    size_len = 1 << (flags & 0x03)
+    chunk0 = int.from_bytes(raw[cursor:cursor + size_len], "little")
+    cursor += size_len
+    end = cursor + chunk0
+
+    # Messages are (type, size, flags) then an optional 2-byte creation index.
+    while cursor < end:
+        mtype = raw[cursor]
+        msize = struct.unpack_from("<H", raw, cursor + 1)[0]
+        body = cursor + 4 + (2 if flags & 0x04 else 0)
+        if body + msize > end:
+            break
+        if mtype == 0x00:
+            raw[cursor] = m_type
+            raw[cursor + 3] = m_flags
+            _fix_v2_ohdr_checksum(raw, ohdr)
+            return cursor
+        cursor = body + msize
+    raise RuntimeError("no NIL message in the root object header")
+
+
+def _make_unknown_message_fail_always(path):
+    """Unknown object-header message ID carrying FAIL_IF_UNKNOWN_ALWAYS.
+
+    H5O__chunk_deserialize points any ID at or above H5O_UNKNOWN_ID (0x18) at
+    the "unknown" message class and carries on -- unknown IDs are the format's
+    forward-compatibility mechanism, not corruption.  Flag 0x80 is the one that
+    withdraws that permission unconditionally, so a reader that honours the
+    format still cannot load this header.  Flag 0x08 would withdraw it only for
+    a writer, which is why the two are not interchangeable.
+    """
+    raw = _base_bytes(lambda h: h.create_dataset("dset", data=np.arange(4)))
+    _repurpose_root_nil_message(raw, 0x30, 0x80)
+    _patch(path, bytes(raw))
+
+
+def _make_unknown_message_skippable(path):
+    """Unknown object-header message ID a read-only consumer may skip.
+
+    Same ID as the fail-always fixture with no flags set at all: libhdf5 opens
+    the file and reports the group's contents normally.  h5policy must not call
+    this corrupt -- rejecting it is a *policy* decision the unknown-message
+    feature toggle owns.  This is the accept-side control for the flag rule; the
+    pair is what keeps 0x80 from being read as "any flag" or "no flag".
+    """
+    raw = _base_bytes(lambda h: h.create_dataset("dset", data=np.arange(4)))
+    _repurpose_root_nil_message(raw, 0x30, 0x00)
     _patch(path, bytes(raw))
 
 
