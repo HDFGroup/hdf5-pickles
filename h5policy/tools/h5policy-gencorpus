@@ -169,6 +169,24 @@ def _base_bytes(build, libver="latest"):
         os.unlink(base)
 
 
+def _build_dynamic_filter(h):
+    """A chunked dataset whose pipeline is lz4 (32004), shuffle and gzip.
+
+    h5py has no high-level spelling for an unregistered filter ID, so the
+    pipeline is assembled through the property-list API.  H5Z_FLAG_OPTIONAL is
+    what lets libhdf5 encode a filter it cannot find: H5Z_find fails, the name
+    stays NULL, and the descriptor is written with a *present but zero*
+    name-length field -- the distinction this fixture exists to pin down.
+    """
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_chunk((4,))
+    dcpl.set_filter(32004, h5py.h5z.FLAG_OPTIONAL, (1, 2))  # lz4, unregistered
+    dcpl.set_shuffle()
+    dcpl.set_deflate(4)
+    sid = h5py.h5s.create_simple((8,))
+    h5py.h5d.create(h.id, b"d", h5py.h5t.NATIVE_INT32, sid, dcpl=dcpl)
+
+
 def _build_shared_attr(h):
     """A dataset `d` carrying an attribute whose datatype is the committed
     (shared) datatype `t`.  Shared by the valid fixture and the NUL-link-name
@@ -327,6 +345,18 @@ def _gen_valid(root):
            lambda h: h.create_dataset(
                "d", data=np.arange(100, dtype="i4").reshape(10, 10),
                chunks=(5, 5), scaleoffset=0))
+    # A well-formed version-2 pipeline led by a dynamically registered filter.
+    # Version 2 drops the name-length field only for filter IDs below
+    # H5Z_FILTER_RESERVED (256); every dynamic filter -- lz4 (32004) here, as
+    # blosc and zstd would be -- sits above it and keeps the field, so its
+    # descriptor header is eight bytes, not six.  The shuffle and gzip filters
+    # behind it are what make this a regression guard: assuming a flat six-byte
+    # v2 header reads cd_nelmts out of the flags field and shifts every
+    # following descriptor, which silently loses the gzip decode advisory and
+    # invents a phantom filter ID 0.  The filter is declared optional so no
+    # plugin is needed to write it, and no data is written, so none is needed to
+    # read the file either.
+    _write(f"{root}/valid/dynamic_filter_pipeline.h5", _build_dynamic_filter)
     # A well-formed n-bit dataset with a compound datatype.  h5py cannot write
     # n-bit, so repack a normal compound dataset through libhdf5.  Accepted (with
     # the decode advisory); its cd_values type tree is consistent, so the n-bit
@@ -1244,6 +1274,12 @@ def _gen_malformed(root):
                              "BTLF")
     _make_bad_dense_checksum(f"{root}/malformed/bad_dense_btin_checksum.h5",
                              "BTIN")
+    _make_filter_name_length_unaligned(
+        f"{root}/malformed/bad_filter_name_length_unaligned.h5")
+    _make_filter_name_not_terminated(
+        f"{root}/malformed/bad_filter_name_not_terminated.h5")
+    _make_filter_count_over_format_max(
+        f"{root}/malformed/bad_filter_count_over_format_max.h5")
 
 
 WRITER_RECORD = "CORPUS-WRITER.txt"
@@ -1653,6 +1689,121 @@ def _make_scaleoffset_size_mismatch(path):
     driving the same out-of-bounds write.  h5policy rejects it because the
     declared element size disagrees with the dataset's datatype size."""
     _scaleoffset_cd_patch(path, 4, 131073)
+
+
+def _v1_pline_message(raw):
+    """Locate a version-1 filter-pipeline message inside a version-1 object header.
+
+    Version-1 object headers carry neither an OHDR signature nor a checksum, so
+    there is no anchor to walk from the way ``_v4_layout_message`` walks a v2
+    header -- and, usefully, nothing to repair after a patch.  Match on the
+    message instead: a v1 message header is type(2) size(2) flags(1)
+    reserved(3), and a v1 pipeline body opens with version 1, a nonzero filter
+    count, and six reserved zero bytes.  That is specific enough for the
+    single-dataset bases below.
+
+    Returns ``(mbody, msize)``: the payload offset and its declared size.
+    """
+    for p in range(len(raw) - 16):
+        if raw[p] != 0x0B or raw[p + 1] != 0x00:
+            continue
+        if raw[p + 5:p + 8] != b"\x00\x00\x00":
+            continue
+        msize = struct.unpack_from("<H", raw, p + 2)[0]
+        mbody = p + 8
+        if msize < 16 or mbody + msize > len(raw):
+            continue
+        if raw[mbody] != 1 or raw[mbody + 1] == 0:
+            continue
+        if raw[mbody + 2:mbody + 8] != b"\x00" * 6:
+            continue
+        return mbody, msize
+    raise RuntimeError("could not locate a version-1 filter-pipeline message")
+
+
+def _v1_gzip_pipeline(path, mutate):
+    """Write a chunked gzip dataset whose version-1 pipeline message ``mutate``
+    corrupts, as ``mutate(raw, mbody, msize)``.
+
+    Pinned to the earliest library bound because ``H5O_pline_ver_bounds`` picks
+    the version-1 pipeline encoding only there, and version 1 is the encoding
+    that pads the filter name and constrains its length.  gzip is used because
+    it is a registered filter, so libhdf5 writes a real "deflate\\0" name padded
+    to eight bytes -- exactly the field these fixtures corrupt.
+
+    The dataset is created but never written, so no chunk is ever allocated.
+    That keeps the defect in the pipeline *message*: a reader reaches the
+    corrupted descriptor while decoding the object header and never calls the
+    deflate filter itself, so the fixture cannot be confused with a
+    decompression failure over corrupted client data.
+    """
+    def build(h):
+        h.create_dataset("d", shape=(8,), dtype="i4", chunks=(4,),
+                         compression="gzip", track_times=False)
+    raw = _base_bytes(build, libver="earliest")
+    mbody, msize = _v1_pline_message(raw)
+    # Descriptor 0 follows the eight-byte v1 pipeline header, and its own header
+    # is id(2) name_length(2) flags(2) cd_nelmts(2).
+    if struct.unpack_from("<H", raw, mbody + 8)[0] != 1:
+        raise RuntimeError("expected the deflate filter in descriptor 0")
+    if struct.unpack_from("<H", raw, mbody + 10)[0] != 8:
+        raise RuntimeError('expected a name_length of 8 for "deflate\\0"')
+    mutate(raw, mbody, msize)
+    _patch(path, bytes(raw))
+
+
+def _make_filter_name_length_unaligned(path):
+    """A version-1 filter pipeline whose filter name length is not a multiple of
+    eight.
+
+    Version 1 pads the stored name out to an eight-byte boundary, and libhdf5
+    refuses any other length outright ("filter name length is not a multiple of
+    eight" in H5O__pline_decode).  Dropping the declared length from 8 to 7 --
+    the true length of "deflate" without its terminator -- is the smallest
+    change that violates it: the terminating NUL now sits one byte past the
+    declared name, still inside the message, so libhdf5's separate
+    NUL-termination scan is satisfied and this fixture isolates the alignment
+    rule on its own.
+    """
+    def mutate(raw, mbody, msize):
+        struct.pack_into("<H", raw, mbody + 10, 7)
+    _v1_gzip_pipeline(path, mutate)
+
+
+def _make_filter_name_not_terminated(path):
+    """A version-1 filter pipeline whose filter name has no terminating NUL.
+
+    libhdf5 locates the terminator with a strnlen bounded by the rest of the
+    *message*, not by the declared name length, and fails with "filter name not
+    null terminated" only when no NUL appears before the payload ends.  So the
+    fill has to run from the name all the way to the end of the message
+    payload -- overwriting just the eight name bytes would leave the NULs in the
+    client-data word behind it and libhdf5 would accept the file.  Everything
+    from the name to the message end therefore becomes 0xAA, which is also why
+    the base dataset holds no chunk: the mangled deflate client data is never
+    handed to the filter.
+    """
+    def mutate(raw, mbody, msize):
+        start = mbody + 16
+        end = mbody + msize
+        raw[start:end] = b"\xaa" * (end - start)
+    _v1_gzip_pipeline(path, mutate)
+
+
+def _make_filter_count_over_format_max(path):
+    """A filter pipeline declaring more filters than the format allows.
+
+    H5Z_MAX_NFILTERS (32) is a format-defined ceiling libhdf5 enforces
+    unconditionally in H5O__pline_decode, independent of any consumer budget --
+    which is what separates this from H5_RESOURCE_FILTER_COUNT, whose limit
+    comes from the selected profile and is satisfiable by loosening it.  The
+    declared count is raised to 33 while a single descriptor is actually
+    encoded, so a validator that only budgets filter counts accepts the file
+    under any profile permitting 33.
+    """
+    def mutate(raw, mbody, msize):
+        raw[mbody + 1] = 33
+    _v1_gzip_pipeline(path, mutate)
 
 
 def _v4_layout_message(raw):

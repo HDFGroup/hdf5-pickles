@@ -145,9 +145,53 @@ var LIMIT_TWO_FILTERS =
      2UB, 0UB, 0UB, 0UB, 0UB, 0UB,
      3UB, 0UB, 0UB, 0UB, 0UB, 0UB];
 
-/* Valid v2 pipeline with one non-core filter (ID 256).  */
+/* Valid v2 pipeline with one non-core filter (ID 256).
+   256 is H5Z_FILTER_RESERVED itself, the exact point where a v2 descriptor
+   regains the name-length field it omits for core filters, so the header here
+   is eight bytes: id(2) name_length(2) flags(2) cd_nelmts(2).  The name length
+   is zero -- which is what libhdf5 writes for a filter it cannot look up -- but
+   the field is present, and a six-byte descriptor at this ID is not a legal
+   encoding.  */
 var LIMIT_DYNAMIC_FILTER =
-    [2UB, 1UB, 0UB, 1UB, 0UB, 0UB, 0UB, 0UB];
+    [2UB, 1UB, 0UB, 1UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+
+/* v1 pipeline with one deflate descriptor whose name is "gzip\0" padded to
+   eight bytes -- the shape the name-field cases below corrupt.  Descriptor:
+   id 1, name_length 8, no flags, no client data.  */
+var LIMIT_V1_NAMED_FILTER =
+    [1UB, 1UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     1UB, 0UB, 8UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     103UB, 122UB, 105UB, 112UB, 0UB, 0UB, 0UB, 0UB];
+
+/* The same pipeline with name_length 7 -- "gzip\0" is still terminated inside
+   the payload, so only the alignment rule is violated.  */
+var LIMIT_V1_NAME_UNALIGNED =
+    [1UB, 1UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     1UB, 0UB, 7UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     103UB, 122UB, 105UB, 112UB, 0UB, 0UB, 0UB, 0UB];
+
+/* No NUL between the name and the end of the payload: "gzipxxxx" fills the
+   descriptor exactly and the message ends there.  */
+var LIMIT_V1_NAME_UNTERMINATED =
+    [1UB, 1UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     1UB, 0UB, 8UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     103UB, 122UB, 105UB, 112UB, 120UB, 120UB, 120UB, 120UB];
+
+/* The same unterminated name, but the payload runs eight bytes past the
+   descriptor and those bytes contain NULs.  libhdf5's strnlen is bounded by the
+   rest of the message rather than by name_length, so it finds a terminator here
+   and opens the file; this pins h5policy to that same bound.  */
+var LIMIT_V1_NAME_LATE_NUL =
+    [1UB, 1UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     1UB, 0UB, 8UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     103UB, 122UB, 105UB, 112UB, 120UB, 120UB, 120UB, 120UB,
+     120UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+
+/* One encoded descriptor but a declared count of 33, one past H5Z_MAX_NFILTERS.  */
+var LIMIT_V1_FILTER_COUNT_33 =
+    [1UB, 33UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     1UB, 0UB, 8UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     103UB, 122UB, 105UB, 112UB, 0UB, 0UB, 0UB, 0UB];
 
 /* Valid external-link message named "x".  Its value contains the version byte,
    target file "f\0", and an empty target object path.  */
@@ -649,6 +693,59 @@ expect_limit("dynamic_filter_allowed_no_policy",
              dynamic_allowed
              && h5policy_feature_dynamic_filters'length == 1UL
              && !limit_has_code("H5_POLICY_DYNAMIC_FILTER"));
+
+/* The descriptor above is also the regression guard for the v2 header width:
+   at ID 256 the name-length field is present, so a walker assuming a flat
+   six-byte v2 header reads cd_nelmts out of the flags field and runs the
+   descriptor off the end of the blob.  Core filters (IDs 2 and 3 here) must
+   keep the six-byte form, so both encodings have to parse clean.  */
+reset_limit_case;
+var pipeline_v2_core = run_limit_pipeline(LIMIT_PROFILE, LIMIT_TWO_FILTERS);
+expect_limit("filter_v2_descriptor_widths",
+             dynamic_allowed && pipeline_v2_core
+             && !limit_has_code("H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE"));
+
+/* libhdf5 refuses a v1 name length that is not a multiple of eight
+   (H5O__pline_decode).  7 is the length of "gzip\0" padding excluded: the NUL
+   still sits inside the message, so the separate termination scan stays
+   satisfied and the alignment rule is exercised alone.  */
+reset_limit_case;
+var pipeline_unaligned = run_limit_pipeline(LIMIT_PROFILE,
+                                            LIMIT_V1_NAME_UNALIGNED);
+expect_limit("filter_v1_name_length_unaligned",
+             limit_has_code_class("H5_CORRUPT_FILTER_NAME_LENGTH_UNALIGNED",
+                                  "corrupt")
+             && !limit_has_code("H5_CORRUPT_FILTER_NAME_NOT_TERMINATED"));
+
+/* No NUL anywhere from the name to the end of the payload -- the bound libhdf5
+   actually uses.  */
+reset_limit_case;
+var pipeline_unterminated = run_limit_pipeline(LIMIT_PROFILE,
+                                               LIMIT_V1_NAME_UNTERMINATED);
+expect_limit("filter_name_not_terminated",
+             limit_has_code_class("H5_CORRUPT_FILTER_NAME_NOT_TERMINATED",
+                                  "corrupt"));
+
+/* The mirror case that keeps the check from tightening past libhdf5: the name
+   overruns its own name_length but a NUL still appears later in the payload,
+   which libhdf5 accepts, so h5policy must not report it.  */
+reset_limit_case;
+var pipeline_late_nul = run_limit_pipeline(LIMIT_PROFILE,
+                                           LIMIT_V1_NAME_LATE_NUL);
+expect_limit("filter_name_late_nul_accepted",
+             !limit_has_code("H5_CORRUPT_FILTER_NAME_NOT_TERMINATED"));
+
+/* H5Z_MAX_NFILTERS is a format ceiling, not a budget: raising the profile's
+   filter limit past 32 silences the resource finding but must not make the
+   file acceptable.  */
+reset_limit_case;
+LIMIT_PROFILE.resources.max_filter_count = 64UL;
+var pipeline_over_max = run_limit_pipeline(LIMIT_PROFILE,
+                                           LIMIT_V1_FILTER_COUNT_33);
+expect_limit("filter_count_over_format_max",
+             limit_has_code_class("H5_CORRUPT_FILTER_PIPELINE_TOO_MANY_FILTERS",
+                                  "corrupt")
+             && !limit_has_code("H5_RESOURCE_FILTER_COUNT"));
 
 reset_limit_case;
 LIMIT_PROFILE.features.allow_unknown_messages = 0UB;
