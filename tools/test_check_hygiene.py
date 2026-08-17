@@ -65,6 +65,24 @@ def main() -> int:
         if result.returncode != 1 or "advisory identifier" not in result.stderr:
             fail("advisory identifier content was not rejected")
 
+        # A promoted record must not point into the gitignored bundle tree, and
+        # the two spellings that are NOT such a pointer must keep passing: the
+        # cases/<id>/ placeholder documentation quotes, and registry/cases/,
+        # which is tracked.
+        # Written by parts, like the host-path case above: a literal here would
+        # be a real violation in a tracked file.
+        leaked.write_text(
+            "promoted from " + "/".join(("cases", "0123456789abcdef", "input.h5")))
+        result = run(tmp)
+        if result.returncode != 1 or "case-bundle reference" not in result.stderr:
+            fail("case-bundle reference was not rejected")
+
+        leaked.write_text("bundles live under cases/<id>/; see "
+                          "registry/cases/some-record.yml\n")
+        result = run(tmp)
+        if result.returncode:
+            fail(f"placeholder and registry/cases/ were rejected: {result.stderr}")
+
     with tempfile.TemporaryDirectory(prefix="hygiene-outside-") as raw_tmp:
         outside = Path(raw_tmp)
         result = subprocess.run(

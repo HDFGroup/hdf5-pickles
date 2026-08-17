@@ -17,9 +17,9 @@ H5C__check_for_duplicates (H5Cimage.c:2418) and h5policy does not yet model.
 Template: h5policy/tests/cve/make_cve_2020_10812.py (same v1-OH + MDCI-message
 grafting, same lookup3).
 
-PROMOTED 2026-08-15 from cases/mdci_reconstruct_dup_addr_heap_corruption, which
-is gitignored working scratch.  This file was the only copy of the witness named
-in registry/cases/mdci-reconstruct-cleanup-unsafe.yml under
+PROMOTED 2026-08-15 from an h5cve working bundle, which is gitignored working
+scratch.  This file was the only copy of the witness named in
+registry/cases/mdci-reconstruct-cleanup-unsafe.yml under
 `reproducers.regression_witness`, so the record depended on an untracked file.
 It is invoked from h5policy-gencorpus (_make_mdci_dup_addr_witness) and its
 output is a committed cve/ seed, checked byte-for-byte by run.sh's

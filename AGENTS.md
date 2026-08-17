@@ -115,8 +115,11 @@ measurements against current HEAD and replace TODOs or unsupported assertions.
 - A promotion must not add a tracked reference to a case artifact, including a
   specimen, probe, log, or report under `cases/<id>/`. Promote a reproducible
   fixture, generator, checksum-backed provenance record, or an explicit `n/a`
-  limitation instead. Before promotion, inspect added tracked lines with
-  `git diff -- <promotion paths> | rg '^\+.*cases/[A-Za-z0-9_][A-Za-z0-9_.-]*/'`.
+  limitation instead. `tools/check_hygiene.py` enforces this over the tracked
+  set — it rejects any `cases/<bundle>` reference outside `cases/` itself,
+  allowing only the `cases/<id>/` placeholder that documentation quotes and the
+  tracked `registry/cases/` records — so run it before promotion rather than
+  grepping the diff by hand.
 - Before handing off a bundle, run `python3 tools/check_hygiene.py --paths
   cases/<id>` and correct every reported portable-provenance or identifier
   violation.
@@ -172,12 +175,15 @@ satisfiable at once.
   emission for this reason; the values they hold internally stay absolute,
   because `h5cc` drives the sibling-lib lookup and the probe build-cache key.
 
-`tools/check_hygiene.py` enforces the portable-path and prohibited-identifier
-rules over tracked files as part of `docs-check`. Its default does not gate all
-of `cases/`: that tree is gitignored scratch, regenerated per machine, so a
-failure there would be unfixable by any commit. The explicit per-bundle command
-in [Write and promotion boundary](#write-and-promotion-boundary) closes that
-gap before handoff; `portable_path()` remains the generator-side prevention.
+`tools/check_hygiene.py` enforces the portable-path, prohibited-identifier and
+case-bundle-reference rules over tracked files as part of `docs-check`. Its
+default does not gate all of `cases/`: that tree is gitignored scratch,
+regenerated per machine, so a failure there would be unfixable by any commit —
+and for the same reason the case-reference rule never applies to files *inside*
+a bundle, where naming your own artifacts is correct. The explicit per-bundle
+command in [Write and promotion boundary](#write-and-promotion-boundary) closes
+that gap before handoff; `portable_path()` remains the generator-side
+prevention.
 
 ## Boundaries
 
