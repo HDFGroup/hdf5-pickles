@@ -1280,6 +1280,10 @@ def _gen_malformed(root):
         f"{root}/malformed/bad_filter_name_not_terminated.h5")
     _make_filter_count_over_format_max(
         f"{root}/malformed/bad_filter_count_over_format_max.h5")
+    _make_fill_v3_unknown_flags(
+        f"{root}/malformed/bad_fill_v3_unknown_flags.h5")
+    _make_fill_v3_flag_conflict(
+        f"{root}/malformed/bad_fill_v3_flag_conflict.h5")
 
 
 WRITER_RECORD = "CORPUS-WRITER.txt"
@@ -1804,6 +1808,86 @@ def _make_filter_count_over_format_max(path):
     def mutate(raw, mbody, msize):
         raw[mbody + 1] = 33
     _v1_gzip_pipeline(path, mutate)
+
+
+def _v3_fill_message(raw):
+    """Locate the version-3 fill-value message in a v2 object header.
+
+    Returns ``(ohdr_off, mbody)`` so a caller can patch the message bytes and
+    then repair the header checksum with ``_fix_v2_ohdr_checksum``.
+    """
+    for o in range(len(raw) - 4):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        p = cur + size_w
+        end = cur + size_w + chunk0
+        while p < end - 3:
+            mtype = raw[p]
+            msize = struct.unpack_from("<H", raw, p + 1)[0]
+            mbody = p + 4 + (2 if flags & 0x04 else 0)
+            if mtype == 0x05 and raw[mbody] == 3:
+                return o, mbody
+            p = mbody + msize
+    raise RuntimeError("could not locate a version-3 fill-value message")
+
+
+def _make_fill_v3_flags(path, extra_bits):
+    """A dataset with an explicit fill value whose v3 flags gain ``extra_bits``.
+
+    The base message is what libhdf5 writes for ``fillvalue=7`` on an i4
+    dataset: version 3, HAVE_VALUE (0x20) set, UNDEFINED_VALUE (0x10) clear, the
+    two 2-bit time codes below them, and nothing above 0x3f.  Those three
+    properties are asserted rather than the literal flag byte, because the time
+    codes are a writer's choice and this fixture does not depend on them.
+
+    Only the flag byte changes, so the message stays exactly as long as it was
+    and the size and value bytes behind it remain well-formed -- the defect is
+    the flag combination alone.  The enclosing v2 object header is checksummed,
+    so it is repaired afterwards or libhdf5 rejects the file for the checksum
+    and the fixture proves nothing.
+    """
+    def build(h):
+        h.create_dataset("d", data=np.arange(8, dtype="i4"), fillvalue=7,
+                         track_times=False)
+    raw = _base_bytes(build)
+    ohdr, mbody = _v3_fill_message(raw)
+    flags = raw[mbody + 1]
+    if not flags & 0x20 or flags & 0x10 or flags & 0xC0:
+        raise RuntimeError(
+            f"unexpected base fill-value flags 0x{flags:02x}: expected "
+            "HAVE_VALUE set, UNDEFINED_VALUE clear, no undefined bits")
+    raw[mbody + 1] = flags | extra_bits
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_fill_v3_unknown_flags(path):
+    """A v3 fill-value message setting a flag bit the format does not define.
+
+    H5O_FILL_FLAGS_ALL is 0x3f -- two 2-bit time codes plus the undefined and
+    have-value bits -- and libhdf5 refuses anything above it ("unknown flag for
+    fill value message").  Bit 7 is set here; bit 6 would do equally well, and
+    they are the only two bits that can be wrong, since neither 2-bit time code
+    has a reserved encoding.
+    """
+    _make_fill_v3_flags(path, 0x80)
+
+
+def _make_fill_v3_flag_conflict(path):
+    """A v3 fill-value message claiming the value is both undefined and present.
+
+    UNDEFINED_VALUE (0x10) and HAVE_VALUE (0x20) are contradictory claims about
+    the same message and libhdf5 rejects the pair ("have value and undefined
+    value flags both set").  Setting 0x10 on a message that already has 0x20 is
+    the whole mutation: the size field and value bytes behind the flags are
+    untouched and still describe a perfectly good fill value, which is what
+    makes this a pure flag-semantics case rather than a truncation one.
+    """
+    _make_fill_v3_flags(path, 0x10)
 
 
 def _v4_layout_message(raw):
