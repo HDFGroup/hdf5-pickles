@@ -1188,6 +1188,9 @@ def _gen_malformed(root):
     _make_bad_group_btree_child_address(
         f"{root}/malformed/bad_group_btree_child_address.h5",
         f"{root}/valid/old_style_group.h5")
+    _make_btree_v1_child_level(
+        f"{root}/malformed/bad_btree_v1_child_level.h5",
+        f"{root}/valid/chunked_v1_btree_deep.h5")
     _make_bad_group_btree_declared_size(
         f"{root}/malformed/bad_group_btree_declared_size.h5",
         f"{root}/valid/compact_layout.h5")
@@ -1289,6 +1292,8 @@ def _gen_malformed(root):
         f"{root}/malformed/bad_filter_name_not_terminated.h5")
     _make_filter_count_over_format_max(
         f"{root}/malformed/bad_filter_count_over_format_max.h5")
+    _make_ohdr_v1_message_unaligned(
+        f"{root}/malformed/bad_ohdr_v1_message_unaligned.h5")
     _make_fill_v3_unknown_flags(
         f"{root}/malformed/bad_fill_v3_unknown_flags.h5")
     _make_fill_v3_flag_conflict(
@@ -1441,6 +1446,40 @@ def _make_bad_group_btree_child_address(path, base_path):
     len_size = raw[14]
     child0 = tree + 8 + (2 * off_size) + len_size
     struct.pack_into("<Q", raw, child0, 0x2000_0000_0000_0430)
+    _patch(path, bytes(raw))
+
+
+def _make_btree_v1_child_level(path, base_path):
+    """A chunk v1 B-tree whose leaf declares a level three above its real one.
+
+    A v1 B-tree child must sit exactly one level below its parent, and libhdf5
+    threads the expected level into the cache load to enforce it ("level is not
+    as expected, possibly corrupted").  The guard was added after a forged level
+    segfaulted h5dump, and it first shipped in 2.0.0 -- so the 1.14.5 that h5py
+    links does not have it, and this registers as A+ with the h5dump (2.3.0)
+    tool evidence rather than A'.
+
+    The level is what tells a reader whether the entries after each key are
+    child pointers or chunk records, so a forged one makes the reader interpret
+    addresses as chunk offsets: node-type confusion, not a range error.  Nothing
+    else in the node changes -- the entry count, keys and pointers all stay
+    valid -- which is what leaves the parent/child relationship as the only
+    detectable defect.
+
+    The first type-1 leaf (level 0) is raised to level 3; its parent is at level
+    1 and therefore expects 0.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    i = raw.find(b"TREE")
+    target = None
+    while i != -1:
+        if raw[i + 4] == 1 and raw[i + 5] == 0:      # type 1 (chunk), leaf
+            target = i
+            break
+        i = raw.find(b"TREE", i + 1)
+    if target is None:
+        raise RuntimeError("could not locate a chunk v1 B-tree leaf node")
+    raw[target + 5] = 3
     _patch(path, bytes(raw))
 
 
@@ -1731,6 +1770,76 @@ def _make_scaleoffset_size_mismatch(path):
     driving the same out-of-bounds write.  h5policy rejects it because the
     declared element size disagrees with the dataset's datatype size."""
     _scaleoffset_cd_patch(path, 4, 131073)
+
+
+def _v1_object_header(raw, want_type):
+    """Locate a version-1 object header and one of its messages.
+
+    Version-1 headers have no signature, so match on the prefix shape --
+    version 1, a reserved zero byte, plausible message/link counts, a
+    four-byte zero pad -- and then require the message list to walk *exactly*
+    to the end of the chunk with every size already 8-aligned.  That last
+    condition is what makes the match trustworthy: random bytes will not
+    produce a self-consistent message list.
+
+    Returns ``(msg_off, msg_size)`` for the last message of type ``want_type``.
+    """
+    for o in range(len(raw) - 16):
+        if raw[o] != 1 or raw[o + 1] != 0:
+            continue
+        nmesgs = struct.unpack_from("<H", raw, o + 2)[0]
+        nlink = struct.unpack_from("<I", raw, o + 4)[0]
+        osize = struct.unpack_from("<I", raw, o + 8)[0]
+        if not (1 <= nmesgs <= 64 and 1 <= nlink <= 8 and 8 <= osize <= 65536):
+            continue
+        if struct.unpack_from("<I", raw, o + 12)[0] != 0:
+            continue
+        if o + 16 + osize > len(raw):
+            continue
+        p = o + 16
+        end = p + osize
+        found = None
+        seen = 0
+        while p < end - 3 and seen < nmesgs:
+            msize = struct.unpack_from("<H", raw, p + 2)[0]
+            if raw[p + 5:p + 8] != b"\x00\x00\x00" or msize % 8:
+                break
+            if struct.unpack_from("<H", raw, p)[0] == want_type:
+                found = (p, msize)
+            seen += 1
+            p = p + 8 + msize
+        if seen == nmesgs and p == end and found is not None:
+            return found
+    raise RuntimeError(
+        f"could not locate a version-1 object header message of type {want_type:#x}")
+
+
+def _make_ohdr_v1_message_unaligned(path):
+    """A version-1 object header whose last message declares an unaligned size.
+
+    Version 1 pads every message body to an 8-byte boundary, so the stored size
+    is always a multiple of 8, and libhdf5 refuses any other value while
+    deserializing the header ("message not aligned" -- the check added for
+    CVE-2018-17234, so it is present well before the 1.14.5 h5py links).
+    h5policy read the size only to bound the payload and never checked its
+    alignment.
+
+    The NIL message that pads out the header is the target, chosen because it
+    has no payload at all: dropping its size by one breaks the alignment rule
+    without disturbing any field a payload validator would look at, so the
+    fixture isolates the envelope rule from message semantics.  The lost byte
+    does leave a one-byte tail, which h5policy separately (and correctly)
+    reports as a null-message gap.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                                   track_times=False),
+        libver="earliest")
+    msg_off, msg_size = _v1_object_header(raw, 0x0000)   # H5O_NULL_ID
+    if msg_size < 16:
+        raise RuntimeError("NIL message is too small to shorten")
+    struct.pack_into("<H", raw, msg_off + 2, msg_size - 1)
+    _patch(path, bytes(raw))
 
 
 def _v1_pline_message(raw):

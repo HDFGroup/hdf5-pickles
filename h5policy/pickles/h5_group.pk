@@ -304,7 +304,8 @@ fun h5policy_walk_snod = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
 fun h5policy_walk_group_btree = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                  uint<64> btree_addr, uint<64> data_seg_addr,
                                  string parent_path, uint<64> obj_depth,
-                                 uint<64> btree_depth) H5WalkContext:
+                                 uint<64> btree_depth,
+                                 uint<64> exp_level) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
     var l = global_sizeof_lengths as uint<64>;
@@ -349,6 +350,32 @@ fun h5policy_walk_group_btree = (int ios, H5PolicyProfile profile, H5WalkContext
         }
 
     var node_level = h5policy_msg_u64_at(ios, profile, btree_addr#B + 5#B, 1UL);
+
+    /* A child's level must be exactly one below its parent's.  libhdf5 threads
+       the expected level into the cache load and refuses a mismatch ("level is
+       not as expected, possibly corrupted"), a guard added after a forged level
+       segfaulted h5dump.  The level decides whether the node is read as an
+       internal node of child pointers or as a leaf of symbol-table entries, so
+       a forged one makes a walker read pointers as entries -- the node-type
+       confusion the guard exists to stop.  Stop descending rather than continue
+       under a level just proved wrong: the subtree has no defined reading, and
+       walking it would derive findings from bytes whose meaning is unknown. */
+    if (exp_level != H5POLICY_BTREE_LEVEL_UNKNOWN && node_level != exp_level)
+        {
+            h5policy_emit_error_ev("H5_CORRUPT_BTREE_NODE_LEVEL", "corrupt",
+                                   btree_addr#B + 5#B, parent_path,
+                                   "group B-tree child node level is not one below its parent",
+                                   H5Evidence {
+                                       field = "btree.node_level",
+                                       actual = node_level,
+                                       expected = exp_level,
+                                       comparison = "equal",
+                                       has_loc1 = 1, loc1_role = "actual",
+                                       loc1 = btree_addr#B + 5#B, loc1_len = 1UL,
+                                   });
+            return ctx;
+        }
+
     var entries_used = h5policy_msg_u64_at(ios, profile, btree_addr#B + 6#B, 2UL);
     var pair = l + o;
     var capacity = h5policy_checked_mul_u64(2UL, h5policy_super_stab_internal_k,
@@ -429,7 +456,8 @@ fun h5policy_walk_group_btree = (int ios, H5PolicyProfile profile, H5WalkContext
                         ctx = h5policy_walk_group_btree(ios, profile, ctx,
                                                         child_addr, data_seg_addr,
                                                         parent_path, obj_depth,
-                                                        btree_depth + 1UL);
+                                                        btree_depth + 1UL,
+                                                        node_level - 1UL);
                     else
                         ctx = h5policy_walk_snod(ios, profile, ctx,
                                                  child_addr, data_seg_addr,
@@ -485,6 +513,9 @@ fun h5policy_validate_stab_payload = (int ios,
     /* The heap supplies link names while the B-tree/SNOD path supplies object
        addresses; passing the same parent path keeps discovered children labeled
        consistently with modern hard-link traversal.  */
+    /* The root of the tree has no parent to constrain its level, exactly as
+       libhdf5 passes H5B_UNKNOWN_NODELEVEL for the entry node.  */
     return h5policy_walk_group_btree(ios, profile, ctx, btree_addr, data_seg_addr,
-                                     object, h5policy_current_object_depth, 0UL);
+                                     object, h5policy_current_object_depth, 0UL,
+                                     H5POLICY_BTREE_LEVEL_UNKNOWN);
 }

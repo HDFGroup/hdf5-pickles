@@ -92,6 +92,28 @@ fun reset_limit_case = void:
     global_sizeof_lengths = 8UB;
 }
 
+/* A version-1 object-header chunk holding one NIL message.  Prefix is type(2)
+   size(2) flags(1) reserved(3); the body follows.  Sized so the message covers
+   the chunk exactly, leaving no trailing gap to confuse the cases below.  */
+var LIMIT_V1_CHUNK_ALIGNED =
+    [0UB, 0UB, 8UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+
+/* The same chunk with the NIL size at 7: version 1 pads bodies to 8, so this is
+   an encoding libhdf5 refuses.  The chunk is one byte shorter so the message
+   still ends exactly at the chunk end and no gap finding is drawn in.  */
+var LIMIT_V1_CHUNK_UNALIGNED =
+    [0UB, 0UB, 7UB, 0UB, 0UB, 0UB, 0UB, 0UB,
+     0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+
+/* A version-2 chunk with the same unaligned size.  Version 2 dropped the
+   padding and stores exact sizes, so 7 is legal there: the control that keeps
+   the rule from being applied to the wrong header version.  Prefix is
+   type(1) size(2) flags(1).  */
+var LIMIT_V2_CHUNK_UNALIGNED =
+    [0UB, 7UB, 0UB, 0UB,
+     0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+
 /* Valid old fill-value message: four-byte length followed by four bytes.  */
 var LIMIT_FILL = [4UB, 0UB, 0UB, 0UB, 1UB, 2UB, 3UB, 4UB];
 
@@ -295,6 +317,21 @@ fun run_limit_attribute_blob = (H5PolicyProfile profile, H5WalkContext ctx,
     return ctx;
 }
 
+/* Drive the object-header message-prefix walk over a synthetic chunk.  The
+   chunk is exactly the blob, so a case can control whether a trailing gap
+   exists by sizing the blob. */
+fun run_limit_msg_chunk = (H5PolicyProfile profile, uint<8> version,
+                           int prefix_bytes, byte[] blob) H5WalkContext:
+{
+    var ios = open("*limits*");
+    byte[blob'length] @ ios : 0#B = blob;
+    var ctx = h5policy_new_walk_context;
+    ctx = h5policy_validate_msg_chunk(ios, profile, ctx, version, prefix_bytes,
+                                      0, 0#B, blob'length, 0UL, 0UL, "/u");
+    close(ios);
+    return ctx;
+}
+
 fun run_limit_wide_attribute = (H5PolicyProfile profile,
                                  H5WalkContext ctx) H5WalkContext:
 {
@@ -475,6 +512,28 @@ LIMIT_PROFILE.resources.max_single_value_bytes = 0UL;
 var ctx_fill_disabled = run_limit_fill(LIMIT_PROFILE);
 expect_limit("single_value_zero_disables",
              !limit_has_code("H5_RESOURCE_SINGLE_VALUE_BYTES"));
+
+/* Version-1 message sizes must be multiples of eight (libhdf5: "message not
+   aligned").  Version 2 stores exact sizes and must stay exempt. */
+reset_limit_case;
+var ctx_chunk_ok = run_limit_msg_chunk(LIMIT_PROFILE, 1UB, 8,
+                                       LIMIT_V1_CHUNK_ALIGNED);
+expect_limit("ohdr_v1_message_aligned_quiet",
+             !limit_has_code("H5_CORRUPT_MESSAGE_SIZE_UNALIGNED"));
+
+reset_limit_case;
+var ctx_chunk_bad = run_limit_msg_chunk(LIMIT_PROFILE, 1UB, 8,
+                                        LIMIT_V1_CHUNK_UNALIGNED);
+expect_limit("ohdr_v1_message_unaligned",
+             limit_has_code_class("H5_CORRUPT_MESSAGE_SIZE_UNALIGNED",
+                                  "corrupt")
+             && !limit_has_code("H5_CORRUPT_NULL_MESSAGE_GAP"));
+
+reset_limit_case;
+var ctx_chunk_v2 = run_limit_msg_chunk(LIMIT_PROFILE, 2UB, 4,
+                                       LIMIT_V2_CHUNK_UNALIGNED);
+expect_limit("ohdr_v2_message_unaligned_exempt",
+             !limit_has_code("H5_CORRUPT_MESSAGE_SIZE_UNALIGNED"));
 
 /* The attribute name-field rules.  The valid blob is the control: its name is
    "a\0", so neither check may fire or every ordinary attribute would be
