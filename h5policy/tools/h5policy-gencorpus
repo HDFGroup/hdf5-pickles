@@ -429,6 +429,35 @@ def _gen_policy(root):
     _make_vds_nentries_overcount(
         f"{root}/malformed/vds_nentries_overcount.h5",
         f"{root}/policy/vds_absolute_source.h5")
+    # A second VDS base, because vds_absolute_source maps a whole extent and so
+    # serializes H5S_SEL_ALL for BOTH selections -- a 16-byte header with no
+    # flags, no encoding size and no rank.  Selection-header fixtures need a
+    # real hyperslab, which only appears when the mapping covers part of the
+    # virtual extent.
+    def _vds_hyperslab(h):
+        layout = h5py.VirtualLayout(shape=(4, 6), dtype="i4")
+        source = h5py.VirtualSource(
+            "/private/tmp/h5policy/vds_source_outside.h5", "src", shape=(2, 6))
+        layout[1:3, :] = source
+        h.create_virtual_dataset("vds", layout)
+    _write(f"{root}/policy/vds_hyperslab.h5", _vds_hyperslab)
+    _make_vds_selection_rank_zero(
+        f"{root}/malformed/vds_selection_rank_zero.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_selection_enc_size(
+        f"{root}/malformed/vds_selection_enc_size.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_selection_unknown_flag(
+        f"{root}/malformed/vds_selection_unknown_flag.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    # Version 2 selections, which no writer available here emits -- see
+    # _vds_selection_v3_to_v2 for why they have to be built rather than written.
+    _make_vds_selection_v2(
+        f"{root}/policy/vds_selection_v2.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_selection_v2_rank_zero(
+        f"{root}/malformed/vds_selection_v2_rank_zero.h5",
+        f"{root}/policy/vds_hyperslab.h5")
     _make_mdci_dup_addr_witness(f"{root}/cve/mdci_dup_addr_witness.h5")
 
 
@@ -2067,6 +2096,261 @@ def _make_vds_nentries_overcount(path, base_path):
     struct.pack_into("<I", raw, checksum,
                      _jenkins_lookup3()(bytes(raw[data:checksum])))
     _patch(path, raw)
+
+
+def _vds_virtual_selection_offset(raw):
+    """Locate the VIRTUAL selection header inside a single-mapping VDS block.
+
+    Returns (file_offset_of_selection, data_start, checksum_offset).
+
+    Parsed rather than hard-coded, because every offset in a mapping block sits
+    behind two NUL-terminated names whose lengths change with the fixture.  The
+    walk mirrors h5policy_validate_vds_layout: version, mapping count, source
+    file name, source dataset name, source selection, virtual selection.
+
+    The source selection is asserted to be H5S_SEL_ALL rather than sized
+    generally.  The bases here map a full source extent, so it always is, and
+    an assert is the honest way to say "this generator does not implement a
+    selection sizer" -- if a base ever changes shape, this raises instead of
+    silently patching the wrong bytes.
+    """
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError("generated VDS fixture has no global heap")
+    data = gcol + 32
+    obj_size = struct.unpack_from("<Q", raw, gcol + 24)[0]
+    if obj_size < 13 or data + obj_size > len(raw):
+        raise RuntimeError("generated VDS heap object geometry changed")
+    body = bytes(raw[data:data + obj_size])
+    nentries = struct.unpack_from("<Q", body, 1)[0]
+    if nentries != 1:
+        raise RuntimeError(f"expected a single-mapping VDS base, got {nentries}")
+    pos = 9
+    for _ in range(2):                       # source file, source dataset
+        end = body.index(b"\x00", pos)
+        pos = end + 1
+    sel_type, sel_ver = struct.unpack_from("<II", body, pos)
+    if (sel_type, sel_ver) != (3, 1):        # H5S_SEL_ALL, version 1
+        raise RuntimeError(
+            f"expected an ALL source selection, got type={sel_type} "
+            f"version={sel_ver}")
+    pos += 16
+    return data + pos, data, data + obj_size - 4
+
+
+def _patch_vds_selection(path, base_path, patch):
+    """Byte-patch one field of a VDS virtual selection header and repair the
+    mapping block's trailing Jenkins checksum, so the selection field under
+    test is the only thing wrong with the file."""
+    raw = bytearray(open(base_path, "rb").read())
+    # create_virtual_dataset can't set track_times=False; pin the timestamps so
+    # these fixtures stay byte-reproducible.
+    _pin_ohdr_times(raw)
+    sel, data, checksum = _vds_virtual_selection_offset(raw)
+    sel_type, sel_ver = struct.unpack_from("<II", raw, sel)
+    if (sel_type, sel_ver) != (2, 3):        # H5S_SEL_HYPERSLABS, version 3
+        raise RuntimeError(
+            f"expected a version-3 hyperslab virtual selection, got "
+            f"type={sel_type} version={sel_ver}")
+    patch(raw, sel)
+    struct.pack_into("<I", raw, checksum,
+                     _jenkins_lookup3()(bytes(raw[data:checksum])))
+    _patch(path, raw)
+
+
+def _vds_selection_v3_to_v2(sel):
+    """Re-encode one version-3 REGULAR hyperslab selection as version 2.
+
+    h5py cannot write a version-2 selection -- libhdf5 picks the version from
+    the selection's own properties and modern writers land on 3 -- so the only
+    way to get one into the tracked corpus is to build it.  This is the whole
+    reason the generator exists: version 2 is the arm the false positive in
+    registry/cases/vds-selection-rank-oracle-false-positive.yml lived in, and
+    every h5py-written fixture exercises version 3 instead.
+
+    The two encodings differ in BOTH halves of the selection:
+
+      v3 header  [type:4][version:4][flags:1][enc_size:1][rank:4]
+      v2 header  [type:4][version:4][flags:1][length:4    ][rank:4]
+
+    and v2 has no enc_size field at all, because libhdf5 pins it to 8 (the
+    serializer asserts version 3 for every other size).  So every field of the
+    payload has to be widened from `enc_size` bytes to 8 as well.
+
+    THE UNLIMITED SENTINEL IS WHY THIS IS NOT A PLAIN WIDENING.  libhdf5 writes
+    an all-ones field to mean H5S_UNLIMITED and converts it back on read, per
+    width -- H5S_UINT16_MAX for enc_size 2, H5S_UINT64_MAX for 8.  Zero-extending
+    such a field would turn "unlimited" into the literal 65535.  Only `count`
+    and `block` carry the sentinel; `start` and `stride` never do, so widening
+    them unconditionally is correct.
+
+    The length field is what libhdf5's own v2 encoder stores there: 4 for the
+    rank plus the payload size (src/H5Shyper.c, `UINT32ENCODE(lenp, len)`).
+    Nothing reads it back -- the deserializer skips those four bytes -- and the
+    bundle's real v2 specimens carry a stale 4, which is itself evidence that it
+    is unread.  This writes the correct value anyway, so the fixture is what a
+    libhdf5 of that vintage would have produced.
+    """
+    sel_type, version = struct.unpack_from("<II", sel, 0)
+    flags, enc = sel[8], sel[9]
+    rank = struct.unpack_from("<I", sel, 10)[0]
+    if (sel_type, version) != (2, 3):
+        raise RuntimeError(f"expected hyperslab v3, got type={sel_type} "
+                           f"version={version}")
+    if not flags & 0x01:
+        raise RuntimeError("only REGULAR hyperslabs are re-encoded; the "
+                           "block-list form has a different payload shape")
+    if enc not in (2, 4, 8):
+        raise RuntimeError(f"unsupported source encoding size {enc}")
+    if len(sel) != 14 + 4 * rank * enc:
+        raise RuntimeError(f"v3 selection is {len(sel)} bytes, expected "
+                           f"{14 + 4 * rank * enc}")
+    unlimited = (1 << (8 * enc)) - 1
+    fields = []
+    for i in range(4 * rank):
+        v = int.from_bytes(sel[14 + i * enc:14 + (i + 1) * enc], "little")
+        # Per dimension the order is start, stride, count, block; the sentinel
+        # is only meaningful for the last two.
+        if i % 4 in (2, 3) and v == unlimited:
+            v = (1 << 64) - 1
+        fields.append(v)
+    payload = b"".join(struct.pack("<Q", v) for v in fields)
+    return (struct.pack("<II", sel_type, 2) + bytes([flags])
+            + struct.pack("<I", 4 + len(payload))
+            + struct.pack("<I", rank) + payload)
+
+
+def _vds_rewrite_virtual_selection(path, base_path, rewrite):
+    """Replace a VDS mapping's virtual selection with bytes of a DIFFERENT
+    length, repairing everything the length change invalidates.
+
+    _patch_vds_selection only ever flips a byte in place, so it needs no
+    geometry repair.  Re-encoding a selection does, because the mapping block
+    grows: the global-heap object's size field, its 8-byte padding, and the
+    free-space object that follows it all have to move with it.
+
+    The collection is NOT resized and the file does not grow.  The growth is
+    taken out of the trailing null object, which is what global-heap free space
+    is for -- so the fixture stays the same length as its base and no address
+    outside the collection changes.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    _pin_ohdr_times(raw)
+    sel, data, checksum = _vds_virtual_selection_offset(raw)
+    gcol = raw.find(b"GCOL")
+    coll_size = struct.unpack_from("<Q", raw, gcol + 8)[0]
+    obj_hdr = gcol + 16
+    old_size = struct.unpack_from("<Q", raw, obj_hdr + 8)[0]
+    if data != obj_hdr + 16:
+        raise RuntimeError("VDS heap object is not the first in its collection")
+    # The mapping's virtual selection is the last thing before the block's
+    # trailing checksum, so the old selection is exactly this slice.
+    new_sel = rewrite(bytes(raw[sel:checksum]))
+    body = bytes(raw[data:sel]) + new_sel
+    new_size = len(body) + 4
+    old_pad = ((old_size + 7) // 8) * 8
+    new_pad = ((new_size + 7) // 8) * 8
+    free_hdr = data + old_pad
+    free_idx = struct.unpack_from("<H", raw, free_hdr)[0]
+    free_size = struct.unpack_from("<Q", raw, free_hdr + 8)[0]
+    if free_idx != 0:
+        raise RuntimeError("expected a null free-space object after the VDS "
+                           f"object, got index {free_idx}")
+    grow = new_pad - old_pad
+    if free_size - grow < 16:
+        raise RuntimeError("global-heap free space cannot absorb the re-encoded "
+                           f"selection (need {grow}, have {free_size - 16})")
+    block = bytearray(coll_size)
+    block[0:16] = raw[gcol:gcol + 16]                   # collection header
+    block[16:32] = raw[obj_hdr:obj_hdr + 16]            # object header
+    struct.pack_into("<Q", block, 24, new_size)         # object size
+    block[32:32 + len(body)] = body
+    struct.pack_into("<I", block, 32 + len(body),
+                     _jenkins_lookup3()(body))
+    # Rewrite the trailing null object in its new position; the remaining bytes
+    # of the collection are already zero from the fresh bytearray.
+    struct.pack_into("<Q", block, 32 + new_pad + 8, free_size - grow)
+    raw[gcol:gcol + coll_size] = block
+    _patch(path, raw)
+
+
+def _make_vds_selection_v2(path, base_path):
+    """A VALID VDS whose virtual selection is a VERSION 2 serialized hyperslab.
+
+    The regression guard for
+    registry/cases/vds-selection-rank-oracle-false-positive.yml.  That case was
+    a valid version-2 file rejected as corrupt, because h5policy read the v2
+    header's four-byte length field as if it were the payload and under-sized
+    the selection by the whole payload, desynchronising the mapping cursor.
+    Nothing in the corpus could catch it: h5py writes version 3, and the only
+    version-2 witnesses were in a gitignored bundle.
+    """
+    _vds_rewrite_virtual_selection(path, base_path, _vds_selection_v3_to_v2)
+
+
+def _make_vds_selection_v2_rank_zero(path, base_path):
+    """A version-2 serialized hyperslab declaring rank 0.
+
+    The malformed half of the version-2 pair, proving the rank rule fires on
+    the v2 arm and not only on the v3 arm the other fixtures exercise.  The
+    rank sits at +13 in this encoding rather than +10, so a fixture patched at
+    the v3 offset would have hit the length field instead and tested nothing.
+    """
+    def rewrite(sel):
+        v2 = bytearray(_vds_selection_v3_to_v2(sel))
+        struct.pack_into("<I", v2, 13, 0)
+        return bytes(v2)
+    _vds_rewrite_virtual_selection(path, base_path, rewrite)
+
+
+def _make_vds_selection_rank_zero(path, base_path):
+    """A serialized hyperslab selection declaring rank 0.
+
+    libhdf5 rejects it in H5S__hyper_deserialize (src/H5Shyper.c) with
+    "invalid rank (0) for serialized hyperslab selection", the same condition
+    that catches rank > H5S_MAX_RANK.
+
+    Zero is the interesting end of that range for an oracle: a rank-0 REGULAR
+    hyperslab sizes its payload as 4 * rank * enc_size == 0, so a sizer that
+    only bounds the top of the range accepts it as a well-formed 14-byte
+    selection and walks on.  That is exactly what h5policy used to do.
+    """
+    _patch_vds_selection(
+        path, base_path,
+        lambda raw, sel: struct.pack_into("<I", raw, sel + 10, 0))
+
+
+def _make_vds_selection_enc_size(path, base_path):
+    """A serialized hyperslab selection whose encoding size is 3.
+
+    Legal encoding sizes are exactly 2, 4 and 8.  Three is a good witness
+    because it fails libhdf5's FIRST filter, `enc_size &
+    ~H5S_SELECT_INFO_ENC_SIZE_BITS` -- 3 & ~0x0e is 1, nonzero -- so it is
+    refused before the switch that would have caught it anyway.
+
+    It is also the shape the previous h5policy bound admitted: that test was
+    `enc == 0 || enc > 8`, a range, so 3 passed it and then SIZED the payload
+    as 4 * rank * 3 bytes, an extent libhdf5 would never compute for any
+    input.
+    """
+    _patch_vds_selection(
+        path, base_path,
+        lambda raw, sel: raw.__setitem__(sel + 9, 3))
+
+
+def _make_vds_selection_unknown_flag(path, base_path):
+    """A serialized hyperslab selection setting flag bit 0x02.
+
+    H5S_SELECT_FLAG_BITS is H5S_HYPER_REGULAR (0x01) alone, so libhdf5 rejects
+    anything else with "unknown flag for selection".  The fixture keeps 0x01
+    set as well, so the selection remains a REGULAR hyperslab with a valid
+    payload and the unknown neighbour bit is the only defect -- a file whose
+    flags byte is merely 0x02 would also change the payload encoding and stop
+    testing the flag check alone.
+    """
+    _patch_vds_selection(
+        path, base_path,
+        lambda raw, sel: raw.__setitem__(sel + 8, 0x03))
 
 
 def _fix_sb_checksum(raw):

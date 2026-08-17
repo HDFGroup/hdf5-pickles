@@ -44,6 +44,11 @@ EMIT_SITES = {
     "h5policy_checked_mul_u64": (3, 7),
     # h5_validate.pk: the shared address-in-file predicate.
     "h5policy_addr_in_file": (2, 5),
+    # h5_vds.pk: the serialized-selection header rejector.  Code and message
+    # both come from the caller, and it exists so the three selection-header
+    # rules share one "report and return 0" shape; its call sites are the emit
+    # sites.
+    "h5policy_selection_reject": (0, 3),
 }
 
 # Helpers that build the message from a caller-supplied `what` and emit a fixed

@@ -58,6 +58,7 @@ import argparse
 import glob
 import json
 import os
+import resource
 import shutil
 import subprocess
 import sys
@@ -77,6 +78,52 @@ TOLERANCES_FILE = os.path.join(REPO, "registry", "h5policy-diff-tolerances.yml")
 KNOWN_EXITS = {0, 1, 2, 3, 4, 5, 70}
 READ_PROBE_MAX_BYTES = 16 * 1024 * 1024
 KNOWN_INVARIANTS = {"A", "A'", "B", "D"}
+
+# Address-space ceiling for every child this harness spawns.  The 60s timeouts
+# below bound how LONG a child runs; they say nothing about how much memory it
+# claims while running, and several fixtures in this corpus are memory
+# amplifiers under libhdf5: cve/dtype_unbounded_recursion.h5,
+# cve/dtype_compound_unbounded_recursion.h5,
+# malformed/oversize_v2_btree_node_size.h5 and (data path only)
+# malformed/attr_vlen_size_under.h5 each drive h5dump past 4 GiB within four
+# seconds and are still climbing.  Uncapped, one 60s budget is enough to
+# exhaust a 14 GiB machine -- on 2026-08-16 this took out the whole session,
+# not just the child.
+#
+# 3 GiB is measured, not guessed: the full corpus runs to "0 hard failures"
+# under this ceiling, because a capped h5dump still exits non-zero on the
+# fixtures those checks expect it to reject.  Raising it re-opens the hazard;
+# lowering it risks converting a legitimate accept into a spurious rejection.
+DEFAULT_MEM_MB = 3072
+
+
+def _mem_cap(mem_mb=None):
+    """preexec_fn capping a child's address space, or None to leave it alone.
+
+    Set H5POLICY_DIFF_MEM_MB=0 to disable -- needed when --hdf5-bindir points at
+    an ASAN-instrumented build, since ASAN maps a ~20 TB shadow region at
+    startup and aborts before main() under any RLIMIT_AS (see h5policy-probe).
+
+    The closure never raises.  Some hosts refuse RLIMIT_AS outright, and a
+    preexec_fn that throws turns every child into a subprocess failure -- which
+    reads as "libhdf5 rejects these bytes" and would silently corrupt every
+    invariant here.  Failing open (uncapped child) is wrong in the same
+    direction as the old behaviour and no worse; failing closed is a fake
+    differential result.
+    """
+    if mem_mb is None:
+        mem_mb = int(os.environ.get("H5POLICY_DIFF_MEM_MB", DEFAULT_MEM_MB))
+    if mem_mb <= 0:
+        return None
+
+    def apply():
+        try:
+            soft_as = mem_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (soft_as, soft_as))
+        except (ValueError, OSError):
+            pass
+
+    return apply
 
 
 def load_tolerances():
@@ -140,7 +187,7 @@ def run_h5policy(path):
     try:
         proc = subprocess.run([H5POLICY, "--profile", "forensic", "--json", path],
                               capture_output=True, text=True, errors="replace",
-                              timeout=60)
+                              timeout=60, preexec_fn=_mem_cap())
     except subprocess.TimeoutExpired:
         raise ToolError("h5policy exceeded the 60s harness timeout")
     err = proc.stderr.strip()[:200]
@@ -162,7 +209,8 @@ def reference_rc(tool, path):
     args = [tool, "-pBH", path] if tool == "h5dump" else [tool, path]
     try:
         return subprocess.run(args, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=60).returncode
+                              stderr=subprocess.DEVNULL, timeout=60,
+                              preexec_fn=_mem_cap()).returncode
     except subprocess.TimeoutExpired:
         return 124
 
@@ -178,7 +226,8 @@ def h5dump_data_rc(path):
         return None
     try:
         return subprocess.run(["h5dump", "-pB", path], stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=60).returncode
+                              stderr=subprocess.DEVNULL, timeout=60,
+                              preexec_fn=_mem_cap()).returncode
     except subprocess.TimeoutExpired:
         return 124
 
@@ -240,14 +289,19 @@ def introspect_isolated(path):
     libhdf5 is not crash-safe on hostile input; since introspect() drives it
     in-process via h5py, we fork a child.  A crashed/timed-out child means
     libhdf5 could not accept the bytes -- read as opens=False, the same signal
-    as a clean rejection (the strongest form of "libhdf5 rejects").
+    as a clean rejection (the strongest form of "libhdf5 rejects").  A child
+    that dies on the _mem_cap() ceiling lands in the same bucket, which is the
+    honest reading: libhdf5 could not traverse the file within a sane memory
+    budget.  h5py links libhdf5 in-process, so this child amplifies exactly
+    like h5dump does and needs the same ceiling.
     """
     hard_reject = dict(opens=False, ext_links=0, max_logical=0, max_rank=0,
                        error="child process crashed or timed out")
     try:
         proc = subprocess.run(
             [sys.executable, os.path.realpath(__file__), "--introspect", path],
-            capture_output=True, text=True, errors="replace", timeout=60)
+            capture_output=True, text=True, errors="replace", timeout=60,
+            preexec_fn=_mem_cap())
     except subprocess.TimeoutExpired:
         return hard_reject
     if proc.returncode != 0:
@@ -399,11 +453,12 @@ def eager_probe(path):
 
 
 def eager_probe_isolated(path):
-    """Run the eager probe in a child so crashes/hangs become evidence."""
+    """Run the eager probe in a child so crashes/hangs/OOM become evidence."""
     try:
         proc = subprocess.run(
             [sys.executable, os.path.realpath(__file__), "--probe-eager", path],
-            capture_output=True, text=True, errors="replace", timeout=60)
+            capture_output=True, text=True, errors="replace", timeout=60,
+            preexec_fn=_mem_cap())
     except subprocess.TimeoutExpired:
         return {"probe_error": "timeout"}
     if proc.returncode != 0:

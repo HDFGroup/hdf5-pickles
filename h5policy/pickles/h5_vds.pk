@@ -98,6 +98,101 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
     return h5policy_vds_ref_none;
 }
 
+/* Serialized H5S selections are the one FILE-RESIDENT use of the H5S selection
+   encoding: they appear only inside a VDS mapping block, two per mapping
+   (source then virtual).  libhdf5 decodes them in H5S__hyper_deserialize
+   (src/H5Shyper.c) and H5S__point_deserialize (src/H5Spoint.c).
+
+   Set when this sizer has already emitted a SPECIFIC finding, so the caller
+   does not follow it with the generic H5_CORRUPT_VDS_SELECTION.  Each
+   selection is sized exactly once per call site and never speculatively, so
+   the flag cannot leak into an unrelated decode; the caller clears it before
+   each call.  */
+var h5policy_vds_selection_reported = 0;
+
+/* enc_size legality.  libhdf5 filters it TWICE and the two filters disagree,
+   which is why this is set membership rather than the mask or the range it
+   looks like:
+
+     if (enc_size & ~H5S_SELECT_INFO_ENC_SIZE_BITS)   -- admits any subset of
+                                                        {2,4,8}, so 0, 6, 10,
+                                                        12 and 14 all pass
+     switch (enc_size) { case 2: case 4: case 8: ... default: HGOTO_ERROR }
+
+   The switch default is the real gate, so the effective rule is exactly
+   {2,4,8}.  h5policy models the EFFECTIVE rule.  The previous bound here was
+   `enc == 0 || enc > 8`, which was wrong in both directions: it admitted 1, 3,
+   5, 6 and 7 (all of which libhdf5 refuses) and it sized the payload using
+   them, so the extent h5policy computed for such a selection matched nothing
+   libhdf5 would ever compute.  */
+fun h5policy_selection_enc_ok = (uint<64> enc) int:
+{
+    return (enc == 2UL || enc == 4UL || enc == 8UL) ? 1 : 0;
+}
+
+/* Report and reject one bad selection header field.  Always returns 0 so the
+   sizer's callers keep their existing "0 means malformed" contract.  */
+fun h5policy_selection_reject = (string code, off64 loc, string object,
+                                 string message, H5Evidence ev) uint<64>:
+{
+    h5policy_vds_selection_reported = 1;
+    h5policy_emit_error_ev(code, "corrupt", loc, object, message, ev);
+    return 0UL;
+}
+
+/* Unknown flag bits.  H5S_SELECT_FLAG_BITS is H5S_HYPER_REGULAR alone
+   (0x01, src/H5Spkg.h), and libhdf5 refuses anything outside it:
+     if (flags & ~H5S_SELECT_FLAG_BITS) HGOTO_ERROR(... "unknown flag ...")
+   Hyperslab versions 2 and 3 only -- version 1 has no flags byte, and point
+   selections have none at any version.  The bit matters beyond hygiene: 0x01
+   selects between the regular and the block-list payload encodings, so an
+   unknown neighbour riding alongside it is a signal that the byte is not what
+   the writer thought it was.  */
+fun h5policy_selection_flags_ok = (uint<64> flags, off64 loc,
+                                   string object) int:
+{
+    if ((flags & 0xfeUL) == 0UL)
+        return 1;
+    var ignored = h5policy_selection_reject(
+        "H5_CORRUPT_VDS_SELECTION_FLAGS", loc, object,
+        "serialized selection sets unknown flag bits",
+        H5Evidence {
+            field = "vds.selection_flags",
+            actual = flags,
+            expected = 1UL,
+            comparison = "at_most",
+            has_loc1 = 1, loc1_role = "actual",
+            loc1 = loc, loc1_len = 1UL
+        });
+    return 0;
+}
+
+/* rank must be 1..H5S_MAX_RANK.  libhdf5 states it once per deserializer, in
+   both cases immediately after decoding the rank and before any rank-dependent
+   work:
+     if (0 == rank || rank > H5S_MAX_RANK) HGOTO_ERROR(...)
+   The zero case is the half h5policy used to miss entirely: a rank-0 regular
+   hyperslab sizes its payload as 4 * 0 * enc == 0, so it passed as a
+   well-formed 14-byte selection.  */
+fun h5policy_selection_rank_ok = (uint<64> rank, off64 loc,
+                                  string object) int:
+{
+    if (rank != 0UL && rank <= H5S_MAX_RANK)
+        return 1;
+    var ignored = h5policy_selection_reject(
+        "H5_CORRUPT_VDS_SELECTION_RANK", loc, object,
+        "serialized selection rank is outside 1..H5S_MAX_RANK",
+        H5Evidence {
+            field = "vds.selection_rank",
+            actual = rank,
+            expected = H5S_MAX_RANK,
+            comparison = "at_most",
+            has_loc1 = 1, loc1_role = "actual",
+            loc1 = loc, loc1_len = 4UL
+        });
+    return 0;
+}
+
 /* Size one serialized H5S selection using only bounded scalar reads. */
 fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
                                     off64 off, uint<64> available,
@@ -112,14 +207,61 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
     if ((st == 1UL || st == 2UL) && ver == 1UL)
         {
             if (available < 16UL) return 0UL;
+            /* Version 1 has no flags and no encoded size: libhdf5 skips eight
+               bytes after the version and pins enc_size to 4, so the only
+               header field left to check is the rank, which sits just past the
+               skipped remainder.  */
+            if (available >= 20UL
+                && !h5policy_selection_rank_ok(
+                        h5policy_msg_u64_at(ios, profile, off + 16#B, 4UL),
+                        off + 16#B, object))
+                return 0UL;
             var len1 = h5policy_msg_u64_at(ios, profile, off + 12#B, 4UL);
             return len1 <= available - 16UL ? 16UL + len1 : 0UL;
         }
     if (st == 2UL && ver == 2UL)
         {
-            if (available < 13UL) return 0UL;
-            var len2 = h5policy_msg_u64_at(ios, profile, off + 9#B, 4UL);
-            return len2 <= available - 13UL ? 13UL + len2 : 0UL;
+            /* Version 2 carries a flags byte but no encoded size: libhdf5 pins
+               enc_size to 8 and SKIPS four bytes of header remainder, so the
+               rank sits at +13 and the payload starts at +17.
+
+               h5policy used to read those four skipped bytes as a length and
+               return 13 + that value.  They are not a length -- libhdf5 never
+               looks at them -- so the size was wrong by the whole payload, the
+               mapping cursor desynchronised, and the NEXT selection in the
+               block was reported as malformed.  That is the mechanism behind
+               the false positive in
+               registry/cases/vds-selection-rank-oracle-false-positive.yml: the
+               rejected file was valid, and the rank was never the problem.  */
+            if (available < 17UL) return 0UL;
+            var flags2 = h5policy_msg_u64_at(ios, profile, off + 8#B, 1UL);
+            var rank2 = h5policy_msg_u64_at(ios, profile, off + 13#B, 4UL);
+            if (!h5policy_selection_flags_ok(flags2, off + 8#B, object))
+                return 0UL;
+            if (!h5policy_selection_rank_ok(rank2, off + 13#B, object))
+                return 0UL;
+            if ((flags2 & 1UL) != 0UL)
+                {
+                    var payload2 = h5policy_checked_mul_u64(4UL * rank2, 8UL,
+                                                           0xffffffffffffffffUL,
+                                                           "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                           "corrupt", off, object,
+                                                           "VDS hyperslab selection size overflow");
+                    return payload2 <= available - 17UL ? 17UL + payload2 : 0UL;
+                }
+            if (available < 25UL) return 0UL;
+            var blocks2 = h5policy_msg_u64_at(ios, profile, off + 17#B, 8UL);
+            var unit2 = h5policy_checked_mul_u64(2UL * rank2, 8UL,
+                                                 0xffffffffffffffffUL,
+                                                 "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                 "corrupt", off, object,
+                                                 "VDS hyperslab selection size overflow");
+            var bytes2 = h5policy_checked_mul_u64(unit2, blocks2,
+                                                  0xffffffffffffffffUL,
+                                                  "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                  "corrupt", off, object,
+                                                  "VDS hyperslab selection size overflow");
+            return bytes2 <= available - 25UL ? 25UL + bytes2 : 0UL;
         }
     if (st == 2UL && ver == 3UL)
         {
@@ -127,7 +269,25 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
             var flags = h5policy_msg_u64_at(ios, profile, off + 8#B, 1UL);
             var enc = h5policy_msg_u64_at(ios, profile, off + 9#B, 1UL);
             var ndims = h5policy_msg_u64_at(ios, profile, off + 10#B, 4UL);
-            if (enc == 0UL || enc > 8UL || ndims > H5S_MAX_RANK) return 0UL;
+            /* libhdf5's own order: flags, then enc_size, then rank.  Kept
+               because the first failure is what a reader comparing h5policy's
+               finding against an HDF5 error stack will see.  */
+            if (!h5policy_selection_flags_ok(flags, off + 8#B, object))
+                return 0UL;
+            if (!h5policy_selection_enc_ok(enc))
+                return h5policy_selection_reject(
+                    "H5_CORRUPT_VDS_SELECTION_ENC_SIZE", off + 9#B, object,
+                    "serialized selection uses an unsupported offset encoding size",
+                    H5Evidence {
+                        field = "vds.selection_enc_size",
+                        actual = enc,
+                        expected = 8UL,
+                        comparison = "at_most",
+                        has_loc1 = 1, loc1_role = "actual",
+                        loc1 = off + 9#B, loc1_len = 1UL
+                    });
+            if (!h5policy_selection_rank_ok(ndims, off + 10#B, object))
+                return 0UL;
             if ((flags & 1UL) != 0UL)
                 {
                     var payload = h5policy_checked_mul_u64(4UL * ndims, enc,
@@ -156,8 +316,24 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
             if (available < 14UL) return 0UL;
             var encp = h5policy_msg_u64_at(ios, profile, off + 8#B, 1UL);
             var ndimsp = h5policy_msg_u64_at(ios, profile, off + 9#B, 4UL);
-            if (encp == 0UL || encp > 8UL || ndimsp > H5S_MAX_RANK
-                || encp > available - 13UL) return 0UL;
+            /* Point selections carry no flags byte at any version, so the two
+               header fields are the encoding size and the rank, in that
+               order.  */
+            if (!h5policy_selection_enc_ok(encp))
+                return h5policy_selection_reject(
+                    "H5_CORRUPT_VDS_SELECTION_ENC_SIZE", off + 8#B, object,
+                    "serialized selection uses an unsupported point encoding size",
+                    H5Evidence {
+                        field = "vds.selection_enc_size",
+                        actual = encp,
+                        expected = 8UL,
+                        comparison = "at_most",
+                        has_loc1 = 1, loc1_role = "actual",
+                        loc1 = off + 8#B, loc1_len = 1UL
+                    });
+            if (!h5policy_selection_rank_ok(ndimsp, off + 9#B, object))
+                return 0UL;
+            if (encp > available - 13UL) return 0UL;
             var points = h5policy_msg_u64_at(ios, profile, off + 13#B, encp);
             var point_unit = h5policy_checked_mul_u64(ndimsp, encp,
                                                  0xffffffffffffffffUL,
@@ -334,25 +510,34 @@ fun h5policy_validate_vds_layout = (int ios, H5PolicyProfile profile,
                         }
                     cur = cur + dn;
                 }
+            /* The generic finding is the fallback for "this did not size", not
+               a second report.  When the sizer identified the defective header
+               field it has already emitted a specific finding at that field's
+               own offset, which is strictly better evidence than a generic one
+               anchored at the start of the selection.  */
+            h5policy_vds_selection_reported = 0;
             var ss = h5policy_vds_selection_size(ios, profile,
                                                  ref.data_off + cur#B,
                                                  end - cur, object);
             if (ss == 0UL)
                 {
-                    h5policy_emit_error("H5_CORRUPT_VDS_SELECTION", "corrupt",
-                                        ref.data_off + cur#B, object,
-                                        "VDS source selection is malformed or overruns the mapping block");
+                    if (!h5policy_vds_selection_reported)
+                        h5policy_emit_error("H5_CORRUPT_VDS_SELECTION", "corrupt",
+                                            ref.data_off + cur#B, object,
+                                            "VDS source selection is malformed or overruns the mapping block");
                     return;
                 }
             cur = cur + ss;
+            h5policy_vds_selection_reported = 0;
             var vs = h5policy_vds_selection_size(ios, profile,
                                                  ref.data_off + cur#B,
                                                  end - cur, object);
             if (vs == 0UL)
                 {
-                    h5policy_emit_error("H5_CORRUPT_VDS_SELECTION", "corrupt",
-                                        ref.data_off + cur#B, object,
-                                        "VDS virtual selection is malformed or overruns the mapping block");
+                    if (!h5policy_vds_selection_reported)
+                        h5policy_emit_error("H5_CORRUPT_VDS_SELECTION", "corrupt",
+                                            ref.data_off + cur#B, object,
+                                            "VDS virtual selection is malformed or overruns the mapping block");
                     return;
                 }
             cur = cur + vs;

@@ -14,7 +14,8 @@ schema_version: 1
 id: vds-selection-rank-oracle-false-positive
 title: h5policy rejects a valid rank-3 VDS selection because it cannot identify
   the hyperslab rank invariant that libhdf5 now enforces
-status: oracle-defect            # NOT oracle-hardened -- see oracle_false_positive
+status: oracle-hardened          # RESOLVED 2026-08-16; was oracle-defect --
+                                 # see oracle_false_positive_resolved
 disclosure: >-
   n/a -- local analysis only.  Advisory text was deliberately not retrieved and
   no identifier was looked up; evidence is the local specimen, source history
@@ -67,6 +68,49 @@ libhdf5_residual: >-
   the error path.  Not investigated further.
 
 # -- The open item is ours ----------------------------------------------------
+oracle_false_positive_resolved: >-
+  RESOLVED 2026-08-16, and the cause was NOT what this record assumed.
+  The record attributed the false positive to h5policy having "no bounded VDS
+  selection decoder" and therefore failing closed on the whole mapping.  There
+  IS a decoder, and the rank was never what it tripped over.  The defect was one
+  wrong field offset in the VERSION 2 hyperslab arm of
+  h5policy_vds_selection_size (h5policy/pickles/h5_vds.pk).
+  Serialized hyperslab version 2 carries a flags byte and then FOUR BYTES OF
+  HEADER REMAINDER THAT libhdf5 SKIPS -- `pp += 4` in H5S__hyper_deserialize,
+  with enc_size pinned to 8 -- so the rank sits at +13 and the payload starts at
+  +17.  h5policy read those four skipped bytes as a LENGTH and returned
+  13 + that value as the selection size.  They are not a length.  The size came
+  out short by the entire payload, the mapping cursor desynchronised, and the
+  NEXT selection in the block was reported malformed.  The finding was
+  H5_CORRUPT_VDS_SELECTION at an offset in a perfectly good selection, which is
+  exactly the "not detection, refusal" symptom recorded below.
+  The bundle's specimens are all version 2, which is why this reproduced there
+  and nowhere else: h5py writes version 3 selections, so every VDS fixture in
+  the corpus exercised the arm that was already correct.  A synthetic rank-3 VDS
+  built with h5py was accepted by h5policy both before and after this fix -- it
+  could never have caught the bug, and briefly suggested the false positive had
+  already gone away.  The bundle variants are what settle it.
+  MEASURED against all seven bundle files, h5policy under `legacy` versus
+  h5dump -H, after the fix:
+    variant_rank_0     reject_corrupt H5_CORRUPT_VDS_SELECTION_RANK   h5dump 1
+    variant_rank_1     ACCEPT (advisories only)                       h5dump 0
+    variant_rank_3     ACCEPT (advisories only)                       h5dump 0
+    variant_rank_32    reject_corrupt H5_CORRUPT_VDS_SELECTION        h5dump 1
+    variant_rank_33    reject_corrupt H5_CORRUPT_VDS_SELECTION_RANK   h5dump 1
+    variant_rank_255   reject_corrupt H5_CORRUPT_VDS_SELECTION_RANK   h5dump 1
+    input.h5           reject_corrupt H5_CORRUPT_VDS_SELECTION_RANK   h5dump 1
+  Full agreement on all seven.  variant_rank_3 and variant_rank_1 -- the valid
+  controls this record called "the most important file in the case" and "the
+  acceptance test for any fix" -- are ACCEPTED.  variant_rank_32 keeps the
+  generic finding correctly: the bundle built it with an intentionally
+  too-short rank-3 payload, so it is genuinely malformed and libhdf5 rejects it
+  too; only its rank field is legal.
+  The rank rule landed at the same time and is now its own finding,
+  H5_CORRUPT_VDS_SELECTION_RANK on invariant vds.selection_rank, covering BOTH
+  ends of 1..H5S_MAX_RANK.  So the loosening and the rule did land together, as
+  this record and the layout-v5 precedent both required -- just not for the
+  reason either predicted.
+
 oracle_false_positive: >-
   h5policy REJECTS A VALID FILE.  variant_rank_3.h5 is a well-formed VDS that
   differs from the specimen only in the rank field, is accepted by libhdf5, and
@@ -157,6 +201,9 @@ containment:
     Done -- src/H5Shyper.c:4341.  Nothing further is proposed here beyond the
     minor pre-guard allocation noted under libhdf5_residual.
   h5policy: >-
+    DONE 2026-08-16 -- see oracle_false_positive_resolved for what the defect
+    actually was, and coverage_gaps for the one piece of this paragraph that is
+    still outstanding (a TRACKED version-2 fixture).  Originally written as:
     OUTSTANDING, and it is the real work of this record.  Build a bounded
     serialized-selection decoder: validate the rank against 1..H5S_MAX_RANK
     before any fixed-array use, then prove the exact coordinate-tuple extent
@@ -169,19 +216,50 @@ systemic:
     the bounded serialized hyperslab selection and its VDS mapping envelope:
     validate rank before H5S_create or any fixed-array use, then prove the exact
     coordinate tuple extent before decoding it.
-  status: open_in_oracle
+  status: closed_in_oracle       # 2026-08-16
   owner: h5policy VDS decoder
   description: >-
     Unusually, the bounded path is the one that is NOT closed.  h5policy fails
     closed and is therefore safe, but it is imprecise in a way that costs a
     valid file -- and being safe by refusing everything is not the property this
     oracle is meant to have.
-  landed_changes: []             # none -- this record is the gap
+  landed_changes:
+    - h5policy/pickles/h5_vds.pk -- version-2 hyperslab header offsets corrected
+      (rank at +13, payload at +17, enc_size pinned to 8), which is what fixed
+      the false positive
+    - >-
+      h5policy/pickles/h5_vds.pk -- three serialized-selection header rules,
+      each with its own finding: rank range, enc_size membership, unknown flag
+      bits
+    - registry/findings/catalog/virtual_dataset.yml (H5_CORRUPT_VDS_SELECTION_RANK,
+      H5_CORRUPT_VDS_SELECTION_ENC_SIZE, H5_CORRUPT_VDS_SELECTION_FLAGS)
+    - registry/validation-coverage.yml (vds.selection_rank,
+      vds.selection_enc_size, vds.selection_flags)
+    - tools/message_routing.py (h5policy_selection_reject declared as an emit
+      site so its call sites stay statically routable)
 
 # -- Reproducers --------------------------------------------------------------
 reproducers:
   integration_poc: cases/cc6998c76f0b9566a211b18d04ae16e5/input.h5
-  direct_fixtures: []            # NONE, and deliberately -- see oracle_false_positive
+  direct_fixtures:
+    # ADDED 2026-08-16.  These are VERSION 3 selections, because h5py writes
+    # version 3 and the generator byte-patches what h5py wrote.  They cover the
+    # three header rules; they do NOT cover the version-2 arm this record's
+    # false positive lived in.  See coverage_gaps.
+    - h5policy/tests/malformed/vds_selection_rank_zero.h5
+    - h5policy/tests/malformed/vds_selection_enc_size.h5
+    - h5policy/tests/malformed/vds_selection_unknown_flag.h5
+    - h5policy/tests/policy/vds_hyperslab.h5   # valid hyperslab control
+  direct_fixture_generators: >-
+    h5policy-gencorpus _make_vds_selection_rank_zero / _enc_size /
+    _unknown_flag, all via _patch_vds_selection, which locates the virtual
+    selection by WALKING the mapping block (version, count, two NUL-terminated
+    names, source selection) rather than by hard-coded offsets, patches one
+    header byte and repairs the block's Jenkins checksum.  The base is
+    policy/vds_hyperslab.h5, a new fixture that maps PART of the virtual extent
+    -- the existing policy/vds_absolute_source.h5 maps a whole extent, so both
+    of its selections serialize as H5S_SEL_ALL and no selection-header rule is
+    reachable through it.
   valid_control: >-
     variant_rank_3.h5 in the bundle.  This is the most important file in the
     case and the one that cannot currently be tracked: libhdf5 accepts it,
@@ -282,6 +360,33 @@ open_questions:
     HDF5 shutdown warning from the malformed direct witness, which is the
     signature of an unreleased object.  Minor, but it is a real observation left
     uninvestigated.
+
+coverage_gaps:
+  - >-
+    NO TRACKED FIXTURE EXERCISES THE VERSION-2 SELECTION ARM, which is the arm
+    the false positive lived in.  The four fixtures added 2026-08-16 are all
+    VERSION 3, because they are byte-patched from what h5py writes and h5py
+    writes version 3.  The only version-2 witnesses are the bundle's variants,
+    and cases/ is gitignored, so none of them can be tracked.
+    A version-2 fixture is not a patch away: converting a version-3 selection
+    changes the header shape (flags+enc+rank becomes flags+skip+rank) AND
+    re-encodes every payload field from enc_size 2 to 8, so the selection grows
+    and the global-heap object size, the collection size and the block checksum
+    all have to move with it.  That is a generator, not an edit.
+    Until it exists, the regression that this record is about -- a valid
+    version-2 VDS rejected as corrupt -- would not be caught by the suite.  It
+    is caught today only by running h5policy against the bundle by hand.  This
+    is the single most valuable follow-up in the record.
+  - >-
+    THE VERSION-1 ARM IS UNVERIFIED IN THE SAME WAY, and for the same reason.
+    It still sizes as `16 + <u32 at +12>`, reading those bytes as a length.
+    libhdf5 SKIPS eight bytes after the version in version 1 and pins enc_size
+    to 4, exactly as it skips four in version 2 -- so the version-1 arm has the
+    same shape as the bug that was just fixed, and may well be wrong in the
+    same way.  It was left alone deliberately: there is no version-1 witness in
+    the tree or in the bundle to check a change against, and correcting a
+    decoder by reasoning alone is what produced the original false positive.
+    The rank check added in that arm is bounded and safe regardless.
 
 provenance:
   found_by: >-
