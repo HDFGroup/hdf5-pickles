@@ -13,7 +13,29 @@ fun h5policy_vds_ref_none = H5PolicyVdsHeapRef:
                                 data_size = 0UL };
 }
 
-/* Find one indexed object in a GCOL while validating every cursor advance. */
+/* Find one indexed object in a GCOL while validating every cursor advance.
+ *
+ * The walk deliberately does NOT stop at the wanted object.  A global heap has
+ * no per-object access path: H5HG__cache_heap_deserialize parses the whole
+ * collection into the metadata cache before any single object can be read, so
+ * a defect anywhere in the collection blocks the open just as surely as one in
+ * the object the VDS layout names.  Returning early -- which this walker used
+ * to do, both at the wanted index and at the first free-space object -- left
+ * everything past that point unexamined, and libhdf5 rejects (or, for a
+ * zero-length free-space object, hangs on) files h5policy therefore accepted.
+ *
+ * Two rules from the post-parse block are modelled here and one is not:
+ *
+ *   - obj[0] 8-alignment (H5HGcache.c:373) IS modelled; it is reachable when
+ *     an explicit free-space object advances the cursor by an unaligned amount
+ *     and a second one closes the collection.
+ *   - "partially decoded global heap" (:371) is NOT modelled: every advance is
+ *     already bounded by the overrun guard below, so the cursor can only land
+ *     exactly on the end of the collection.  The same reasoning applies to
+ *     libhdf5, whose H5_IS_BUFFER_OVERFLOW guard bounds p identically -- the
+ *     check appears to be unreachable there too, and no construction we tried
+ *     reached it.
+ */
 fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
                                       uint<64> heap_addr, uint<64> wanted,
                                       off64 loc, string object) H5PolicyVdsHeapRef:
@@ -43,21 +65,70 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
             return h5policy_vds_ref_none;
         }
     var coll_size = h5policy_msg_u64_at(ios, profile, heap_addr#B + 8#B, l);
-    if (coll_size < hdr_size
-        || !h5policy_checked_addr_range(heap_addr, coll_size, file_size,
-                                        "VDS global heap collection outside file",
-                                        loc, object))
+    /* H5HG__hdr_deserialize refuses a collection that declares itself smaller
+       than H5HG_MINSIZE before it parses a single object, so this is a header
+       fault rather than an object one.  hdr_size alone -- the old bound -- let
+       through every collection between 16 bytes and 4 KiB.  */
+    if (coll_size < H5_FORMAT_GCOL_MIN_COLLECTION_SIZE)
+        {
+            h5policy_emit_error_ev("H5_CORRUPT_GLOBAL_HEAP_HEADER", "corrupt",
+                                   heap_addr#B + 8#B, object,
+                                   "VDS global heap collection size is below the format minimum",
+                                   H5Evidence {
+                                       field = "vds.global_heap_collection_size",
+                                       actual = coll_size,
+                                       expected = H5_FORMAT_GCOL_MIN_COLLECTION_SIZE,
+                                       comparison = "at_least",
+                                       has_loc1 = 1, loc1_role = "actual",
+                                       loc1 = heap_addr#B + 8#B, loc1_len = l,
+                                   });
+            return h5policy_vds_ref_none;
+        }
+    if (!h5policy_checked_addr_range(heap_addr, coll_size, file_size,
+                                     "VDS global heap collection outside file",
+                                     loc, object))
         return h5policy_vds_ref_none;
     var pos = hdr_size;
+    var found = 0UB;
+    var found_off = 0UL#B;
+    var found_size = 0UL;
+    /* obj[0] is the collection's free space.  It is recorded rather than
+       returned so the post-parse alignment rule can see it, and so a second
+       one is caught the way libhdf5 catches it.  */
+    var free_seen = 0UB;
+    var free_size = 0UL;
+    var free_len_off = heap_addr#B + 8#B;
     while (pos < coll_size)
         {
             h5policy_walk_tick(1UL);
             if (hdr_size > coll_size - pos)
-                break;                  /* permitted short trailing padding */
+                {
+                    /* Tail too small to hold an object header: libhdf5 takes it
+                       as the free-space object.  If an explicit index-0 object
+                       already claimed that role the header is inconsistent
+                       ("object 0 should not be set", H5HGcache.c:280).  */
+                    if (free_seen != 0UB)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT",
+                                                "corrupt", heap_addr#B + pos#B,
+                                                object,
+                                                "VDS global heap has a trailing free-space region after an explicit free-space object");
+                            return h5policy_vds_ref_none;
+                        }
+                    free_seen = 1UB;
+                    free_size = coll_size - pos;
+                    free_len_off = heap_addr#B + pos#B;
+                    pos = coll_size;
+                    break;
+                }
             var oh = heap_addr#B + pos#B;
             var idx = h5policy_msg_u64_at(ios, profile, oh, 2UL);
             var reserved = h5policy_msg_u64_at(ios, profile, oh + 4#B, 4UL);
             var data_size = h5policy_msg_u64_at(ios, profile, oh + 8#B, l);
+            /* A zero length is the denial-of-service shape: for index 0 the
+               parse advance IS the length, so libhdf5 re-reads the same header
+               forever.  Reached through a VDS layout this happens at H5Dopen,
+               not only in an orphaned collection.  */
             if (reserved != 0UL || data_size == 0UL)
                 {
                     h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT", "corrupt",
@@ -67,31 +138,67 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
                 }
             if (idx == 0UL)
                 {
+                    /* The free-space object is sized to its whole extent, the
+                       header included, and is never padded -- so it advances
+                       the cursor by exactly its length.  */
                     if (data_size > coll_size - pos)
-                        h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT",
-                                            "corrupt", oh, object,
-                                            "VDS global heap free-space object overruns the collection");
-                    return h5policy_vds_ref_none;
-                }
-            var padded = align8(data_size);
-            var span = h5policy_checked_add_u64(hdr_size, padded,
-                                                0xffffffffffffffffUL,
-                                                "H5_CORRUPT_LENGTH_OVERFLOW",
+                        {
+                            h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT",
                                                 "corrupt", oh, object,
-                                                "VDS global heap object size overflow");
-            if (span > coll_size - pos)
-                {
-                    h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT", "corrupt",
-                                        oh, object,
-                                        "VDS global heap object overruns the collection");
-                    return h5policy_vds_ref_none;
+                                                "VDS global heap free-space object overruns the collection");
+                            return h5policy_vds_ref_none;
+                        }
+                    free_seen = 1UB;
+                    free_size = data_size;
+                    free_len_off = oh + 8#B;
+                    pos = pos + data_size;
                 }
-            if (idx == wanted)
-                return H5PolicyVdsHeapRef { found = 1UB,
-                                            data_off = oh + hdr_size#B,
-                                            data_size = data_size };
-            pos = pos + span;
+            else
+                {
+                    var padded = align8(data_size);
+                    var span = h5policy_checked_add_u64(hdr_size, padded,
+                                                        0xffffffffffffffffUL,
+                                                        "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                        "corrupt", oh, object,
+                                                        "VDS global heap object size overflow");
+                    if (span > coll_size - pos)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT",
+                                                "corrupt", oh, object,
+                                                "VDS global heap object overruns the collection");
+                            return h5policy_vds_ref_none;
+                        }
+                    if (idx == wanted && found == 0UB)
+                        {
+                            found = 1UB;
+                            found_off = oh + hdr_size#B;
+                            found_size = data_size;
+                        }
+                    pos = pos + span;
+                }
         }
+
+    /* Post-parse: the free-space object's length is the one quantity libhdf5
+       requires to be 8-aligned once the whole collection has been read.  */
+    if (free_seen != 0UB && free_size != align8(free_size))
+        {
+            h5policy_emit_error_ev("H5_CORRUPT_GLOBAL_HEAP_OBJECT", "corrupt",
+                                   free_len_off, object,
+                                   "VDS global heap free-space object length is not 8-aligned",
+                                   H5Evidence {
+                                       field = "vds.global_heap_free_space_alignment",
+                                       actual = free_size,
+                                       expected = 8UL,
+                                       comparison = "multiple_of",
+                                       has_loc1 = 1, loc1_role = "actual",
+                                       loc1 = free_len_off, loc1_len = l,
+                                   });
+            return h5policy_vds_ref_none;
+        }
+    if (found != 0UB)
+        return H5PolicyVdsHeapRef { found = 1UB,
+                                    data_off = found_off,
+                                    data_size = found_size };
     h5policy_emit_error("H5_CORRUPT_VDS_HEAP_OBJECT_MISSING", "corrupt",
                         loc, object,
                         "VDS layout references a missing global heap object");
