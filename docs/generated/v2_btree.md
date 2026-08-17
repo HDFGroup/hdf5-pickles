@@ -27,6 +27,9 @@ The global variables `global_bt2_*` must be set correctly before
 mapping any node. `print_v2_btree(addr#B)` handles this automatically
 by reading the header first.
 
+The decoder verifies the lookup3 metadata checksum on each header,
+leaf, and internal node before accepting its fields.
+
 ## Version 2 B-tree Header
 
 Pickle type: `bt2_hdr`.

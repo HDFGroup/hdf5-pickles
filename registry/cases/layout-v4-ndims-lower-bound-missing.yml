@@ -1,0 +1,386 @@
+# The v4-and-later chunked-layout decoder bounds dimensionality only from above,
+# so it accepts ndims == 0 where the two older decoders in the same function
+# reject it. A zero there leaves the chunk dimension array unpopulated, and a
+# later consumer divides by it.
+#
+# Promoted from one working bundle (gitignored h5cve scratch; the specimen is
+# identified by provenance.input_sha256 below).
+#
+# THIS RECORD IS THE FIRST IN THIS DIRECTORY WHOSE INVARIANT-A EXPLANATION IS
+# "MASKED". The other three explanations in use -- never loaded, unguarded,
+# assert-only -- all describe a check that does not run. Here the check runs,
+# belongs to an unrelated defect, and hides this one. See masking_note.
+schema_version: 1
+
+id: layout-v4-ndims-lower-bound-missing
+title: the v4+ chunked-layout decoder accepts zero dimensionality that the v1/v2
+  and v3 decoders in the same function reject, and a later consumer divides by
+  the unpopulated chunk dimensions
+status: oracle-hardened          # h5policy rejects and names the dimensionality
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: dataset_layout_filter_fill
+versions: [4, 5]                 # layout message versions with the missing bound
+root_cause_classification: local_decode
+violated_invariant:
+  - layout.dimensionality
+validation_closure: >-
+  the complete dataset description -- the v4/v5 layout message together with the
+  dataspace -- so that chunked dimensionality is nonzero, bounded, and agrees
+  with the dataspace rank BEFORE chunk geometry is computed.  The layout message
+  alone does not close it: the crash comes from the layout's ndims and the
+  dataspace's rank disagreeing, which neither record establishes by itself.
+activation_before_validation:
+  - native_construction
+  - cache_publication
+  - public_id
+entry_points:
+  - h5policy (oracle) -- rejects and names the dimensionality
+  - "libhdf5 H5Dopen2 -> H5D__layout_oh_read -> H5O__layout_decode (src/H5Olayout.c:335)"
+  - "libhdf5 H5Dopen2 -> H5D__chunk_init (src/H5Dchunk.c:1055) -> H5D__chunk_set_info_real (:733)"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  THE HEADLINE IS AN INCONSISTENCY, not an omission: one function decodes the
+  same field three ways and the NEWEST path is the least strict.
+    v1/v2, src/H5Olayout.c:114
+        if (!ndims || ndims > H5O_LAYOUT_NDIMS)
+            HGOTO_ERROR(... "dimensionality is out of range");
+    v3, src/H5Olayout.c:278-281
+        if (mesg->u.chunk.ndims > H5O_LAYOUT_NDIMS)
+            HGOTO_ERROR(... "dimensionality is too large");
+        if (mesg->u.chunk.ndims < 2)
+            HGOTO_ERROR(... "bad dimensions for chunked storage");
+    v4+, src/H5Olayout.c:335
+        if (mesg->u.chunk.ndims > H5O_LAYOUT_NDIMS)
+            HGOTO_ERROR(... "dimensionality is too large");
+        /* and nothing else */
+  So the lower bound exists in both older paths and was not carried into the
+  newest one.  v3 is the strictest of the three, rejecting 0 AND 1.
+  WHAT ZERO COSTS.  The per-dimension decode loop runs ndims times, so with
+  ndims == 0 it never runs, layout->u.chunk.dim[] is never populated, and the
+  dim[u] == 0 guard that lives INSIDE that loop never runs either.  An
+  unpopulated dim[] then reaches the chunk-geometry code.
+  THE CONSUMER DIVIDES BEFORE IT CHECKS.  H5D__chunk_set_info_real:
+      for (unsigned u = 0; u < ndims; u++) {
+          layout->chunks[u] =
+              ((curr_dims[u] + layout->dim[u]) - 1) / layout->dim[u];   /* :733 DIVIDE */
+          if (H5S_UNLIMITED == max_dims[u])
+              layout->max_chunks[u] = H5S_UNLIMITED;
+          else {
+              if (layout->dim[u] == 0)                                  /* :738 GUARD */
+                  HGOTO_ERROR(... "dimension size must be > 0" ...);
+  The guard at :738 is inside the loop, AFTER the division at :733, and only in
+  the non-UNLIMITED branch.  It cannot prevent the division it is written to
+  prevent.  That is a second, independent ordering defect -- it would bite any
+  zero chunk dimension, not only one arriving via ndims == 0.
+  AND THE ndims IT LOOPS ON IS THE WRONG ONE.  H5D__chunk_set_info_real is
+  called with dset->shared->ndims -- the DATASPACE rank (src/H5Dchunk.c:776) --
+  while layout->dim[] was sized by the LAYOUT's ndims.  Its own `if (ndims == 0)`
+  guard at :725 therefore checks the dataspace rank, which is perfectly
+  nonzero, and says nothing about the layout.  The two counts are conflated.
+
+third_arithmetic_flaw: >-
+  NOT IN THE BUNDLE; found at promotion by reading H5D__chunk_init.  Its
+  dimension sanity loop is:
+      for (u = 0; u < layout->u.chunk.ndims - 1; u++) {      /* src/H5Dchunk.c:1055 */
+          if (0 == layout->u.chunk.dim[u])
+              HGOTO_ERROR(... "chunk size must be > 0, dim = %u ", u);
+  `u` and `ndims` are unsigned, so with ndims == 0 the bound `ndims - 1`
+  UNDERFLOWS TO UINT_MAX.  The loop is nominally ~4 billion iterations over
+  layout->u.chunk.dim[], a fixed array of H5O_LAYOUT_NDIMS entries.
+  It survives only by luck: dim[0] is zero for exactly the same reason the
+  decode loop never ran, so the body errors out on iteration 0 with "chunk size
+  must be > 0, dim = 0".  The underflowed bound is never reached because the
+  first element happens to be the sentinel.  Change anything that leaves dim[0]
+  nonzero while ndims is 0 and this loop walks off the array.
+  Contrast src/H5Dchunk.c:1147, which gets the same job right -- it iterates
+  dset->shared->ndims and checks dim[u] == 0 BEFORE dividing at :1150.  So this
+  file contains a correctly ordered version of the check twenty lines from an
+  incorrectly ordered one.
+
+# -- Why libhdf5 does not crash on the pristine specimen ----------------------
+masking_note: >-
+  The specimen carries FOUR independent defects, and one of them protects the
+  others.  The bundle proved their independence by repairing each in turn and
+  observing the rest still report:
+    D1  local heap reserved byte nonzero            @ 103
+    D2  unknown object-header message type 0xcf     @ 992
+    D3  layout version 5 with ndims == 0            @ 1072
+    D4  zeroed tail NIL header: 22 messages present against 6 declared @ 0x450
+  libhdf5's object-header message-count check (src/H5Ocache.c:306) rejects the
+  file on D4, during H5O__cache_deserialize, before the layout message is ever
+  decoded.  So the pristine specimen is SAFE BY ACCIDENT: stock libhdf5 refuses
+  it, and a naive reading of that refusal would conclude the layout defect is
+  handled.  It is not -- it is merely unreachable on this file.
+  Repairing D4 alone -- eight bytes, unrelated to the layout -- removes the mask
+  and stock libhdf5 2.3.0 then takes a SIGFPE from public H5Dopen2
+  (variant_nilrepair.h5, probe outcome=crashed signal=8).  The control that
+  isolates the version is variant_ohrepair.h5: the same bytes at layout version
+  3 reject cleanly at src/H5Olayout.c:281, because v3 has the lower bound.
+  THIS IS A FOURTH EXPLANATION FOR INVARIANT A.  The registry's other records
+  use three -- the check was never loaded, the check is absent, or the check is
+  assert-only.  All three describe a check that does not run.  "Masked" is
+  different: the check runs, it is correct, it belongs to an UNRELATED defect,
+  and it hides this one.  It matters for remediation in a way the others do not,
+  because fixing the masking check would EXPOSE a crash rather than remove one.
+  Any multi-defect specimen is a candidate for the same effect, and this is the
+  only record so far that names it.
+
+# -- The oracle had a false positive here, and it is fixed --------------------
+oracle_false_positive_resolved: >-
+  This case also caught h5policy being WRONG, which is worth recording as
+  plainly as the libhdf5 side.
+  At the time of the bundle, h5policy refused layout version 5 outright via a
+  version gate, and therefore rejected as reject_corrupt a valid filtered and
+  chunked file that libhdf5 itself had written -- verified readable by h5dump
+  with data intact.  A false positive on a valid file is the most damaging kind
+  of oracle defect, and the specimen surfaced it incidentally.
+  The bundle attached a specific warning to the fix: admitting version 5 is a
+  LOOSENING, and it must land together with the v4 dimensionality and rank
+  checks, or variant_nilrepair.h5 turns from a rejection into a false ACCEPT --
+  because at that time the version gate, not the dimensionality rule, was what
+  stopped it.
+  THE WARNING WAS HEEDED.  Both landed together, and the corpus now pins both
+  halves: valid/layout_v5_chunked.h5 and valid/layout_v5_single_filtered.h5 are
+  ACCEPTED, while malformed/layout_v5_zero_ndims.h5 is rejected with
+  H5_CORRUPT_LAYOUT_DIMENSIONALITY.  That fixture's expectation states the
+  coupling in its own words -- "admitting version 5 means the rejection now has
+  to come from the dimensionality check, and this fixture is what proves it
+  does".
+  Recorded because the pattern generalises: when an oracle rule is a version
+  gate, relaxing the gate silently transfers responsibility to whatever rule
+  sits behind it, and if nothing does, a rejection becomes an acceptance.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    Everything under `measured` is the bundle's, recorded against libhdf5 2.3.0
+    at h5policy 9ee1194, and was NOT re-measured at promotion -- this session
+    could not execute the oracle or the probes.  The SOURCE claims in `defect`
+    and `third_arithmetic_flaw` WERE read from the 2.3.0 tree at promotion and
+    are current.
+    Note the bundle's libhdf5 measurements are already 2.3.0, so unlike several
+    sibling records there is no version skew to close here.
+  oracle_as_recorded: >-
+    reject_corrupt, H5_CORRUPT_LOCAL_HEAP_RESERVED @ 96 on / -- which is D1, the
+    heap defect, NOT the layout defect this record is about.  h5policy stops at
+    the first non-accept finding and the heap comes first in the walk.
+    h5policy rejects EVERY ONE of the six variants built for this case; no false
+    accept anywhere in the matrix.
+  libhdf5_as_recorded: >-
+    Pristine specimen: rejected_in_traversal on both stock and ASan 2.3.0, with
+    both family canaries reporting `unexercised` -- which the bundle correctly
+    calls the honest answer rather than a pass, since the rejection comes from
+    D4 and the layout family was never exercised.  comparison: inconclusive.
+    variant_nilrepair.h5 (D4 repaired): stock CRASHES, signal 8 (SIGFPE), from
+    public H5Dopen2.
+    variant_ohrepair.h5 (same bytes at layout v3): clean rejection at
+    src/H5Olayout.c:281.
+  divergent_outcome_on_the_tracked_fixture: >-
+    WORTH KNOWING BEFORE ANYONE CITES THIS RECORD FOR A CRASH.  The tracked
+    fixture malformed/layout_v5_zero_ndims.h5 does NOT reproduce the SIGFPE.
+    Its expectation records libhdf5 refusing it cleanly in H5D__chunk_init with
+    "chunk size must be > 0" -- which matches the src/H5Dchunk.c:1055 loop
+    erroring on iteration 0, as described in third_arithmetic_flaw.
+    So the corpus fixture proves the ORACLE rule and the bundle's
+    variant_nilrepair.h5 proves the libhdf5 CRASH, and they are different files
+    reaching different libhdf5 code.  Exactly which structural difference routes
+    one to :1055 and the other to :733 is NOT established -- it was not measured
+    here and cannot be from source alone.  See coverage_gaps.
+  width: >-
+    NOT measured at 32 bits.  A division by zero is not width-dependent, but the
+    `ndims - 1` underflow at :1055 produces UINT_MAX at any width and the
+    consequences of walking a fixed array differ by ABI.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: rejected_in_traversal (pristine) / crashed SIGFPE (D4 repaired)
+  libhdf5_version: 2.3.0
+  classification: verdict-aligned but reason-divergent
+  note: >-
+    Both implementations refuse the pristine specimen, so there is no
+    invariant-A disagreement and NO entry in
+    registry/h5policy-diff-tolerances.yml is warranted or present.  But the
+    agreement is superficial and the record exists to say so: h5policy rejects
+    on the heap reserved bytes, libhdf5 rejects on the object-header message
+    count, and NEITHER of those is the layout defect.  Two implementations
+    refusing a file for two unrelated reasons is not evidence that a third
+    problem in it is handled.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Three changes, in increasing order of scope.
+    (1) Add the missing lower bound at src/H5Olayout.c:335 -- `|| ndims == 0`,
+    matching what :114 already does for v1/v2.  A strict tightening: no
+    conforming writer emits a zero-dimensional chunked layout.  This alone
+    closes the reported crash.
+    (2) Reorder H5D__chunk_set_info_real so the dim[u] == 0 guard at :738
+    precedes the division at :733, and move it out of the non-UNLIMITED branch
+    so it runs on every iteration.  Independent of (1) and worth doing anyway:
+    it protects against any zero chunk dimension, however it arrives.
+    (3) Fix the unsigned underflow at src/H5Dchunk.c:1055 -- `ndims - 1` on an
+    unsigned with ndims == 0 is UINT_MAX.  With (1) in place ndims cannot be
+    zero on that path, so this is defence in depth rather than a live fix, but
+    the expression is wrong on its own terms and src/H5Dchunk.c:1147 shows the
+    correct shape twenty lines away.
+    Do NOT rely on the message-count check at src/H5Ocache.c:306 as containment.
+    It is what masks this defect today, it is unrelated to layout, and a file
+    that satisfies it reaches the crash directly.
+systemic:
+  semantic_boundary: >-
+    the complete dataset description -- layout message plus dataspace --
+    validated so that chunked dimensionality is nonzero, bounded, and consistent
+    with the dataspace rank before any chunk geometry is computed from it.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder, landed); libhdf5 decoder and consumer open
+  description: >-
+    h5policy decodes the layout message and rejects a zero dimensionality by
+    name, with no chunk geometry computed and no native state, so neither the
+    division nor the underflow can arise.  Layout v5 is now supported, so the
+    rejection comes from the dimensionality rule rather than a version gate --
+    see oracle_false_positive_resolved.
+    The remaining work is entirely libhdf5's, and it is in two files.
+  landed_changes:
+    - h5policy/pickles (layout v4/v5 support; layout.dimensionality;
+      H5_CORRUPT_LAYOUT_DIMENSIONALITY)
+    - h5policy/tests/malformed/layout_v5_zero_ndims.h5 + expectation
+    - h5policy/tests/valid/layout_v5_chunked.h5,
+      h5policy/tests/valid/layout_v5_single_filtered.h5 -- the false-positive
+      controls, both accepted
+    - registry/findings/catalog (H5_CORRUPT_LAYOUT_DIMENSIONALITY)
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: >-
+    the promoted specimen; an untracked working file, identified by
+    provenance.input_sha256
+  direct_fixtures:
+    - h5policy/tests/malformed/layout_v5_zero_ndims.h5     # oracle rule; NOT a crash repro
+  expectations:
+    - h5policy/tests/expected/malformed-layout_v5_zero_ndims.yml
+  control_fixtures:
+    # Both accepted -- these are what stop the v5 loosening from becoming a
+    # false accept, and what proves the earlier false positive is gone.
+    - h5policy/tests/valid/layout_v5_chunked.h5
+    - h5policy/tests/valid/layout_v5_single_filtered.h5
+  crash_witness: >-
+    variant_nilrepair.h5 in the bundle -- the pristine specimen with D4 (the
+    tail NIL header) repaired, which removes the mask and yields a stock SIGFPE
+    from public H5Dopen2.  NOT TRACKED; see coverage_gaps.  Its sibling
+    variant_ohrepair.h5 is the version control: identical bytes at layout v3,
+    rejected cleanly, which is what pins the defect to the v4+ path rather than
+    to the byte pattern.
+  generator: >-
+    Deterministic and recorded: make-layout-direct-fixture.c copies input.h5,
+    repairs byte 103 to 0x00 and byte 992 to 0x05 and restores the NIL header at
+    0x450, leaving only layout version 5 with ndims 0.  Result sha256
+    c55bb0dc641e94807163c70470aa7ae9ed20f19a32eee5e0abf360e091dc39a2.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unmeasured
+    no_legacy_fallback: true
+
+backports: []
+
+fuzz_seed: >-
+  The layout message's ndims byte is a clean single-field axis with well-defined
+  boundaries at 0, 1, 2 and H5O_LAYOUT_NDIMS, and the three decoders disagree
+  across exactly that range -- 0 is accepted by v4+ only, 1 is accepted by
+  v1/v2 and v4+ but not v3.  A version-crossed sweep of that one byte is a
+  cheap and unusually well-targeted fuzz family.
+
+compatibility_backport_risks: >-
+  libhdf5 side: adding `|| ndims == 0` at src/H5Olayout.c:335 is a strict
+  tightening and rejects no file a conforming writer produces.  The reorder in
+  H5D__chunk_set_info_real changes only which error a malformed file gets, not
+  whether it is rejected.
+  h5policy side, already taken: admitting layout v5 was a LOOSENING for valid
+  files and had to land with the dimensionality check, or a previously rejected
+  file would have become accepted.  See oracle_false_positive_resolved.  Any
+  future relaxation of a version gate in this codebase carries the same hazard.
+
+sibling_audit: >-
+  Within libhdf5: the three layout decoders in src/H5Olayout.c are the audited
+  set and the inconsistency between them is the finding.  NOT audited -- whether
+  the same ndims-versus-rank confusion is reachable through H5Ocopy or a
+  chunk-index resize, both of which recompute chunk geometry; and the 1.14.x and
+  1.10.x branches.
+  src/H5Dchunk.c contains at least eight "chunk size must be > 0" guards; two
+  were read here (:1055 wrong bound, :1147 correct), the rest were not, and the
+  file demonstrably contains both orderings.
+  Within h5policy: the dimensionality rule covers v4 and v5 through one path.
+  Whether a v3 layout with ndims == 1 -- legal to v1/v2 and v4+, rejected by v3
+  -- is handled consistently by the oracle was not checked, and is the obvious
+  neighbouring question.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured live on 2.3.0 by the bundle, and the
+    missing lower bound at src/H5Olayout.c:335 plus both arithmetic flaws in
+    src/H5Dchunk.c were verified present in the 2.3.0 tree at promotion.  No
+    archaeology was run.
+  note: >-
+    Layout version 4 introduced the encoding this path handles, so the missing
+    bound is likely as old as v4 support -- but that is an inference from
+    feature history, not a measurement.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    THE CRASH WITNESS IS NOT TRACKED.  variant_nilrepair.h5 is the only file
+    that reproduces the SIGFPE, and it lives in a gitignored bundle.  The
+    tracked fixture proves the oracle rule but is refused by libhdf5 through a
+    different route (see measured.divergent_outcome_on_the_tracked_fixture), so
+    the corpus currently contains no regression test for the crash itself.
+    Its generator is recorded and deterministic, so this is cheap.
+  - >-
+    THE ROUTING DIFFERENCE IS UNEXPLAINED.  The tracked fixture reaches
+    src/H5Dchunk.c:1055 and errors cleanly; variant_nilrepair.h5 reaches :733
+    and divides by zero.  What structural difference selects between them is not
+    established, and it should be before either file is cited as representative.
+  - >-
+    NOTHING WAS RE-MEASURED AT PROMOTION (source claims excepted) -- see
+    measured.NOT_REMEASURED_AT_PROMOTION.
+  - >-
+    No 32-bit measurement, and the :1055 underflow is the part most likely to
+    behave differently there.
+  - >-
+    The other six "chunk size must be > 0" guards in src/H5Dchunk.c were not
+    audited for guard-after-use ordering.
+open_questions:
+  - >-
+    Is ndims == 1 handled consistently?  v3 rejects it, v1/v2 and v4+ accept it,
+    and h5policy's behaviour across that split was not checked.  If the oracle
+    follows v3 it will reject files libhdf5 accepts; if it follows v4 it will
+    accept files libhdf5's v3 path rejects.  Either is a divergence and neither
+    is currently recorded.
+  - >-
+    Does any writer emit layout v4/v5 with ndims == 1?  That determines whether
+    the previous question is academic or a live compatibility issue.
+
+provenance:
+  found_by: >-
+    a supplied specimen, triaged through the h5cve bundle workflow in
+    an untracked working bundle; promoted 2026-08-15.  The
+    src/H5Dchunk.c:1055 unsigned underflow and the masking taxonomy were both
+    found at promotion by reading the source, not from the bundle.
+  input_sha256: a367cf2f822ce159529525c4a51c0f9e1c979e33e0e70d8d6259a1641a46e7b9
+  hdf5_build: >-
+    HDF5 2.3.0; baseline Release and candidate RelWithDebInfo
+    -fsanitize=address, both rejecting the pristine specimen in traversal;
+    stock SIGFPE on variant_nilrepair.h5.  Source verified against the 2.3.0
+    tree at promotion.  Workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

@@ -240,10 +240,63 @@ fun h5patch_add_action = (string kind, string structure, uint<64> target_off,
     h5patch_action_confidences += [confidence];
 }
 
+/* Read a WIDTH-byte little-endian file address at OFF exactly as stored, with
+   no base translation: this runs while locating the superblock, before any
+   base address is known, so the raw field is the only meaningful value.
+   Returns the undefined-address sentinel when the field is undefined or does
+   not lie wholly inside the image, so callers can treat "not a usable address"
+   uniformly.  */
+fun h5patch_raw_addr_at = (int ios, offset<uint<64>,B> off,
+                           uint<64> width) uint<64>:
+{
+    if ((off/#B + width) > iosize(ios)/#B)
+        return 0xffffffffffffffffUL;
+    var raw = byte[width] @ ios : off;
+    if (h5policy_msg_addr_is_undef(raw))
+        return 0xffffffffffffffffUL;
+    return bytes_to_u64_le(raw);
+}
+
+/* The two address fields every superblock version carries, at the version's own
+   field positions: the stored base address and the root object header's stored
+   address.  A genuine superblock records its own location as the base address
+   and points the root somewhere after itself, so this pair discriminates a real
+   superblock body from bytes that merely happen to hold plausible version and
+   width values.  Both come back in the stored, base-relative address space. */
+fun h5patch_super_base_and_root = (int ios, offset<uint<64>,B> off,
+                                   uint<8> version, uint<64> width) uint<64>[]:
+{
+    if (version < 2UB)
+        {
+            /* v0 ends its fixed prefix at 24; v1 inserts the indexed-storage
+               internal-node K and its reserved field first.  The root lives in
+               the embedded symbol-table entry, past the four file addresses,
+               after the entry's own link-name offset. */
+            var prefix = (version == 1UB) ? 28UL : 24UL;
+            return [h5patch_raw_addr_at(ios, off + prefix#B, width),
+                    h5patch_raw_addr_at(ios,
+                                        off + (prefix + (5UL * width))#B,
+                                        width)];
+        }
+
+    return [h5patch_raw_addr_at(ios, off + 12#B, width),
+            h5patch_raw_addr_at(ios, off + (12UL + (3UL * width))#B, width)];
+}
+
 /* A missing signature at byte 0 can still leave enough superblock body fields
-   to identify the file.  This predicate only checks fixed, low-risk fields
-   that differ across random data: version bytes, reserved bytes, and supported
-   offset/length widths.
+   to identify the file.  This predicate checks fixed, low-risk fields that
+   differ across random data -- version bytes, reserved bytes, and supported
+   offset/length widths -- and then requires the body's own address fields to be
+   self-consistent: the recorded base address must name this candidate's
+   location, and the root object header must live after it and inside the image.
+
+   That last pair is what keeps the byte-0 fallback away from a user block.  A
+   user block holds arbitrary application bytes, and version/width bytes alone
+   are a weak enough signal that its content can satisfy them; a signature
+   written over that content destroys application data and still does not
+   produce a readable file.  Requiring the base to name the candidate's own
+   offset, plus a usable root address, makes the fallback demand a superblock
+   body rather than a lucky byte pattern.
 
    Returning true here does not repair anything by itself.  It only permits a
    later signature action if the candidate is at the canonical byte-0 location.
@@ -254,30 +307,48 @@ fun h5patch_plausible_superblock_at = (int ios, offset<uint<64>,B> off) int:
         return 0;
 
     var version = byte @ ios : off + 8#B;
+    var off_size = 0UB;
+    var len_size = 0UB;
+
     if (version == 0UB || version == 1UB)
         {
             var free_vers = byte @ ios : off + 9#B;
             var root_vers = byte @ ios : off + 10#B;
             var reserved = byte @ ios : off + 11#B;
             var shared_vers = byte @ ios : off + 12#B;
-            var off_size = byte @ ios : off + 13#B;
-            var len_size = byte @ ios : off + 14#B;
+            off_size = byte @ ios : off + 13#B;
+            len_size = byte @ ios : off + 14#B;
 
-            return free_vers == 0UB && root_vers == 0UB && reserved == 0UB
-                   && shared_vers == 0UB
-                   && h5policy_width_supported(off_size)
-                   && h5policy_width_supported(len_size);
+            if (!(free_vers == 0UB && root_vers == 0UB && reserved == 0UB
+                  && shared_vers == 0UB))
+                return 0;
         }
-
-    if (version == 2UB || version == 3UB)
+    else if (version == 2UB || version == 3UB)
         {
-            var off_size2 = byte @ ios : off + 9#B;
-            var len_size2 = byte @ ios : off + 10#B;
-            return h5policy_width_supported(off_size2)
-                   && h5policy_width_supported(len_size2);
+            off_size = byte @ ios : off + 9#B;
+            len_size = byte @ ios : off + 10#B;
         }
+    else
+        return 0;
 
-    return 0;
+    if (!h5policy_width_supported(off_size)
+        || !h5policy_width_supported(len_size))
+        return 0;
+
+    var addrs = h5patch_super_base_and_root(ios, off, version,
+                                            off_size as uint<64>);
+    var base = addrs[0];
+    var root = addrs[1];
+    var candidate = (off/#B) as uint<64>;
+    var file_size = iosize(ios)/#B;
+
+    /* base is the superblock's own location; root is relative to it, so the
+       root's physical offset is base + root.  Both fields are attacker-visible
+       bytes, so bound the sum before comparing it against the image. */
+    if (base != candidate || root >= file_size - candidate)
+        return 0;
+
+    return root > 0UL;
 }
 
 /* Locate the HDF5 superblock using the same legal positions h5policy uses:
@@ -992,8 +1063,8 @@ fun h5patch_fshd_serial_count_confirmed = (
                 {
                     if (cur > limit || off_size + 1UL > limit - cur)
                         return 0;
-                    var section_addr = bytes_to_u64_le(
-                        byte[off_size] @ ios : cur#B);
+                    var section_addr = hdf5_addr_to_file_u64(
+                        bytes_to_u64_le(byte[off_size] @ ios : cur#B));
                     var section_type = byte @ ios : (cur + off_size)#B;
                     if ((section_type as uint<64>) >= nclasses
                         || section_addr > file_size
@@ -1246,7 +1317,8 @@ fun h5patch_snod_entry_plausible = (int ios, uint<64> eoff) int:
     if (h5policy_msg_addr_is_undef(ohdr_raw))
         return 0;
 
-    return h5patch_object_header_signature_at(ios, bytes_to_u64_le(ohdr_raw));
+    return h5patch_object_header_signature_at(
+               ios, hdf5_addr_to_file_u64(bytes_to_u64_le(ohdr_raw)));
 }
 
 /* Count only the contiguous live-looking prefix of a SNOD.  Stopping at the
@@ -1351,7 +1423,7 @@ fun h5patch_plan_one_depth0_bthd_count = (int ios, uint<64> hdr_addr,
     var record_size = bytes_to_u64_le(byte[2] @ ios : (hdr_addr + 10UL)#B);
     var depth = bytes_to_u64_le(byte[2] @ ios : (hdr_addr + 12UL)#B);
     var root_raw = byte[o] @ ios : (hdr_addr + 16UL)#B;
-    var root_addr = bytes_to_u64_le(root_raw);
+    var root_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(root_raw));
     var num_root = bytes_to_u64_le(byte[2] @ ios : (hdr_addr + 16UL + o)#B);
     var total_off = hdr_addr + 18UL + o;
     var total_bytes = byte[el] @ ios : total_off#B;

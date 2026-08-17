@@ -85,26 +85,39 @@ records:
           recipe: cont_overlap_source_start
           mutation: continuation target == source chunk start
           asserts: continuation.no_source_overlap
+          verification:
+            reference_semantics_cases: [self_reference, overlap]
         - status: built
           recipe: cont_overlap_source_inside
           mutation: continuation target a few bytes inside the source chunk
           asserts: continuation.no_source_overlap
+          verification:
+            reference_semantics_cases: [self_reference, overlap]
         - status: built
           recipe: cont_overlap_source_end
           mutation: continuation target on the source chunk's last byte
           asserts: continuation.no_source_overlap
+          verification:
+            reference_semantics_cases: [self_reference, overlap]
         - status: built
           recipe: cont_zero_size
           mutation: continuation with zero declared size
           asserts: continuation.nonzero_extent
+          verification:
+            count_and_extent_boundaries: [zero]
         - status: built
           recipe: cont_out_of_file
           mutation: continuation target past end of file
           asserts: continuation.target_in_file
+          verification:
+            count_and_extent_boundaries: [out_of_file]
         - status: built
           recipe: cont_alias_prior_chunk
           mutation: continuation aliases an already-decoded chunk
           asserts: continuation.no_chunk_alias
+          verification:
+            deep_nesting_and_non_progress: [non_progress]
+            reference_semantics_cases: [duplicate_reference]
         - status: planned                     # needs a deeper seed / synthesised chain
           mutation: pending-node back edges, short and long cycles
         - status: planned
@@ -231,6 +244,31 @@ records:
         finding: H5_CORRUPT_VDS_MAPPING_TRAILING_BYTES
       - id: vds.selection_valid
         finding: H5_CORRUPT_VDS_SELECTION
+      # A VDS mapping block holds the only FILE-RESIDENT serialized H5S
+      # selections there are, two per mapping. libhdf5 validates three header
+      # fields before any rank-dependent work, in H5S__hyper_deserialize
+      # (src/H5Shyper.c) and H5S__point_deserialize (src/H5Spoint.c); each gets
+      # its own invariant here so the finding names the field rather than the
+      # selection. vds.selection_valid remains the fallback for a selection
+      # that fails to size for any other reason.
+      #
+      # Rank must be 1..H5S_MAX_RANK. The zero end is the half that was missed:
+      # a rank-0 regular hyperslab sizes its payload as 4 * 0 * enc == 0, so it
+      # used to pass as a well-formed 14-byte selection.
+      - id: vds.selection_rank
+        finding: H5_CORRUPT_VDS_SELECTION_RANK
+      # enc_size is set membership {2,4,8}, NOT a mask and NOT a range. libhdf5
+      # filters it twice and the filters disagree: the `& ~ENC_SIZE_BITS` test
+      # admits any subset of those bits (0, 6, 10, 12, 14 included) and the
+      # switch that follows rejects everything but 2, 4 and 8 via its default
+      # arm. The switch is the effective gate.
+      - id: vds.selection_enc_size
+        finding: H5_CORRUPT_VDS_SELECTION_ENC_SIZE
+      # H5S_SELECT_FLAG_BITS is H5S_HYPER_REGULAR alone (0x01). Hyperslab
+      # versions 2 and 3 only -- version 1 has no flags byte and point
+      # selections have none at any version.
+      - id: vds.selection_flags
+        finding: H5_CORRUPT_VDS_SELECTION_FLAGS
       - id: vds.source_name_bounded
         strategy: "§1 — bounded string decode"
         finding: H5_CORRUPT_VDS_SOURCE_NAME
@@ -462,7 +500,7 @@ records:
   - record: cache_image_dependency_graph
     section: "III.G — Metadata cache images and dependency graphs"
     scope: reference_graph
-    semantic_boundary: cache-image extents and dependency-graph closure/order
+    semantic_boundary: cache-image envelopes, checksums, body replay, and dependency-graph closure/order
     invariants:
       - id: mdci.entry_count
         finding: H5_CORRUPT_MDCI_ENTRY_COUNT
@@ -478,18 +516,48 @@ records:
       - {id: mdci.block_version_supported, finding: H5_CORRUPT_MDCI_BLOCK_VERSION}
       - {id: mdci.block_flags_valid, finding: H5_CORRUPT_MDCI_BLOCK_FLAGS}
       - {id: mdci.entry_header_valid, finding: [H5_CORRUPT_MDCI_ENTRY_ADDRESS, H5_CORRUPT_MDCI_ENTRY_FLAGS, H5_CORRUPT_MDCI_ENTRY_LENGTH]}
+      # Entry file addresses must be unique. libhdf5 keys reconstructed entries by
+      # address and its duplicate check fails reconstruction mid-build, unwinding a
+      # pinned flush-dependency graph through a double-free/NULL-deref cleanup.
+      # §5 — the three single-byte enums in an entry header are in range.
+      # libhdf5 bounds them on the READ path (H5C__reconstruct_cache_entry);
+      # the write-side H5C__decode_cache_image_entry only asserts.  type_id
+      # selects a cache client class on both sides, so it is a dispatch
+      # selector, not a label.  Ring 0 is excluded: the read path bounds only
+      # the top of that range, so libhdf5 opens it.
+      - {id: mdci.entry_class_valid, finding: H5_CORRUPT_MDCI_ENTRY_CLASS}
+      - {id: mdci.entry_addr_unique, finding: H5_CORRUPT_MDCI_DUPLICATE_ENTRY_ADDRESS}
+      # An entry's signed lru_rank must agree with its IN_LRU flag (0x02): in the LRU
+      # implies rank >= 0, out of it implies rank == -1. libhdf5 only asserts this
+      # (H5Cimage.c:2813), so a Release reconstruction proceeds on an inconsistent
+      # LRU description; poc_dos.h5's entry 0 (rank 2816, IN_LRU clear) is this case.
+      - {id: mdci.entry_lru_consistent, finding: H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT}
+      # Every flush-dependency parent address must name an entry present in the image.
+      # A dangling parent reaches libhdf5's "fd parent not in cache?!?" failure
+      # (H5Cimage.c:2533), which unwinds a partially built, pinned graph through the
+      # same unsafe cleanup; poc_dos.h5's parent 0x18000000 is this route.
+      - {id: mdci.parent_addr_resolvable, finding: H5_CORRUPT_MDCI_PARENT_ADDR_UNRESOLVED}
+      # A parent address that names the entry's OWN address is a distinct defect:
+      # it always resolves, so parent_addr_resolvable can never see it. libhdf5
+      # rejects it one layer later, at H5Centry.c:3836 ("Child entry flush
+      # dependency parent can't be itself") via H5Cimage.c:2547 -- a different
+      # diagnostic from the dangling case, hence a separate invariant. Longer
+      # cycles need no invariant: parents resolve only against entries already
+      # decoded, so a 2-cycle's forward reference is already unresolvable.
+      - {id: mdci.parent_addr_not_self, finding: H5_CORRUPT_MDCI_PARENT_ADDR_SELF}
       - {id: mdci.no_trailing_bytes, finding: H5_CORRUPT_MDCI_TRAILING_BYTES}
+      - {id: mdci.checksum_valid, finding: H5_CORRUPT_BAD_CHECKSUM}
       # Every address or extent this family decodes must lie inside the file.
       - {id: mdci.address_in_file, finding: [H5_CORRUPT_OFFSET_OUT_OF_FILE, H5_CORRUPT_LENGTH_OVERFLOW]}
       # The on-disk magic of every structure this family decodes must match.
       - {id: mdci.signature_valid, finding: H5_CORRUPT_BAD_SIGNATURE}
       # Size and offset arithmetic must stay inside the validator's domain.
       - {id: mdci.size_arithmetic, finding: H5_CORRUPT_LENGTH_OVERFLOW}
-      # The validator DECODES this family's structures rather than skipping
-      # them; the finding fires where coverage stops.
-      - {id: mdci.decode_coverage, finding: H5_UNSUPPORTED_PICKLE_COVERAGE_GAP}
+      # An MDCI body must be reached by a type-aware decoder before the walk can
+      # complete. Unhandled cache-client classes remain an explicit refusal.
+      - {id: mdci.body_reached, finding: H5_UNSUPPORTED_PICKLE_COVERAGE_GAP}
     backlog:
-      validator: h5policy MDCI/cache-image envelope validator
+      validator: h5policy MDCI/cache-image envelope and replay decoder
       stable_findings:
         - H5_CORRUPT_MDCI_ENTRY_COUNT
         - H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE
@@ -499,15 +567,23 @@ records:
       fixtures:
         - h5policy/tests/expected/valid-cache_image.yml
         - h5policy/tests/expected/cve-mdci_entry_offby_header.yml
+        - h5policy/tests/expected/malformed-cache_image_body_bad_ohdr.yml
+        - h5policy/tests/expected/malformed-cache_image_bad_checksum.yml
       source_cases:
         - corpus seed 29
       entry_point_driver: h5cve H5Fget_mdc_image_info/H5Fget_mdc_size bounded image and object traversal canary
-      ci_checks: entry-count/extent checks, dependency-order validation, timeout, and no-crash assertions
+      ci_checks: entry-count/extent/checksum checks, body replay, dependency-order validation, timeout, and no-crash assertions
     tests:
       - {path: h5policy/tests/expected/valid-cache_image.yml, asserts: mdci.entry_extent}
       - {path: h5policy/tests/expected/cve-mdci_entry_offby_header.yml, asserts: mdci.entry_extent}
+      - {path: h5policy/tests/expected/malformed-cache_image_body_bad_ohdr.yml, asserts: mdci.body_reached}
+      - {path: h5policy/tests/expected/malformed-cache_image_bad_checksum.yml, asserts: mdci.checksum_valid}
+      - {path: h5policy/tests/expected/malformed-mdci_duplicate_entry_address.yml, asserts: mdci.entry_addr_unique}
+      - {path: h5policy/tests/expected/malformed-mdci_entry_lru_inconsistent.yml, asserts: mdci.entry_lru_consistent}
+      - {path: h5policy/tests/expected/malformed-mdci_parent_addr_unresolved.yml, asserts: mdci.parent_addr_resolvable}
+      - {path: h5policy/tests/expected/malformed-mdci_parent_addr_self.yml, asserts: mdci.parent_addr_not_self}
       - {path: h5policy/tests/expected/valid-empty.yml, asserts: cache_image_dependency_graph.bypass_unexercised}
-    validators: {h5policy: partial, hdf5: enforced}
+    validators: {h5policy: partial, hdf5: partial}
     coverage_status: partial
     migration_status: oracle-partial
 
@@ -579,6 +655,10 @@ records:
       # The validator DECODES this family's structures rather than skipping
       # them; the finding fires where coverage stops.
       - {id: address.decode_coverage, finding: H5_UNSUPPORTED_PICKLE_COVERAGE_GAP}
+      # h5policy's library-compatibility target deliberately refuses a legal
+      # 16-byte on-disk length width because the selected libhdf5 target cannot
+      # decode it safely.  This is not a structural-corruption claim.
+      - {id: address.library_compatibility, finding: H5_UNSUPPORTED_PICKLE_COVERAGE_GAP}
     backlog:
       validator: h5policy address/EOA validator
       stable_findings: [H5_CORRUPT_OFFSET_OUT_OF_FILE]
@@ -594,7 +674,8 @@ records:
       - {path: h5policy/tests/expected/malformed-inflated_eoa_ext_addr.yml, asserts: address_space_bounds.unexercised_on_open_reject}
       - {path: h5policy/tests/expected/malformed-ext_addr_aliases_root.yml, asserts: address.no_extension_alias}
       - {path: h5policy/tests/expected/malformed-root_object_not_group.yml, asserts: address.root_object_group}
-    validators: {h5policy: enforced, hdf5: enforced}
+      - {path: h5policy/tests/expected/valid-wide_length_one.yml, asserts: address.library_compatibility}
+    validators: {h5policy: enforced, hdf5: partial}
     coverage_status: partial
     migration_status: oracle-partial
 
@@ -619,6 +700,10 @@ records:
       - {id: chunk.extensible_array_geometry, finding: [H5_CORRUPT_EXTENSIBLE_ARRAY_GEOMETRY, H5_CORRUPT_EXTENSIBLE_ARRAY_INDEX_ADDRESS]}
       - {id: chunk.extensible_array_version, finding: H5_CORRUPT_UNSUPPORTED_EXTENSIBLE_ARRAY_VERSION}
       - {id: chunk.fixed_array_client, finding: H5_CORRUPT_FIXED_ARRAY_CLIENT_ID}
+      # A fixed array is pre-sized once, from the dataspace's maximum extent,
+      # and never grown; libhdf5 recomputes that capacity from the file on the
+      # copy path without ever checking it against the stored one.
+      - {id: chunk.fixed_array_capacity, finding: H5_CORRUPT_FIXED_ARRAY_EXTENT_MISMATCH}
       - {id: chunk.fixed_array_version, finding: H5_CORRUPT_UNSUPPORTED_FIXED_ARRAY_VERSION}
       # Every address or extent this family decodes must lie inside the file.
       - {id: chunk.address_in_file, finding: [H5_CORRUPT_OFFSET_OUT_OF_FILE, H5_CORRUPT_LENGTH_OVERFLOW]}
@@ -646,7 +731,7 @@ records:
       - {path: h5policy/tests/expected/valid-chunk_v2_btree.yml, asserts: chunk.record_layout}
       - {path: h5policy/tests/expected/malformed-bad_chunk_v2_btree_child_address.yml, asserts: chunk.child_address}
       - {path: h5policy/tests/expected/valid-simple_dataset.yml, asserts: chunk_index.bypass_unexercised}
-    validators: {h5policy: enforced, hdf5: enforced}
+    validators: {h5policy: enforced, hdf5: partial}
     coverage_status: partial
     migration_status: oracle-partial
 
@@ -739,6 +824,12 @@ records:
       - {id: heap.attribute_info_addresses, finding: [H5_CORRUPT_ATTRIBUTE_INFO_ADDRESS_PAIR, H5_CORRUPT_ATTRIBUTE_INFO_CORDER_ADDRESS]}
       - {id: heap.fractal_id_width, finding: H5_CORRUPT_FRACTAL_HEAP_ID_WIDTH}
       - {id: heap.fractal_version_supported, finding: H5_CORRUPT_UNSUPPORTED_FRACTAL_HEAP_VERSION}
+      # §5 — every fractal-heap block names the header that owns it.  libhdf5
+      # enforces it in both deserializers (H5HFcache.c, "incorrect heap header
+      # address for direct block"); without it a heap ID resolves through a
+      # block belonging to another heap, so records are decoded with this
+      # heap's geometry over that heap's bytes.
+      - {id: heap.fractal_block_owner, finding: H5_CORRUPT_FRACTAL_HEAP_BACKPOINTER}
       - {id: heap.local_reserved_zero, finding: H5_CORRUPT_LOCAL_HEAP_RESERVED}
       - {id: heap.local_version_supported, finding: H5_CORRUPT_UNSUPPORTED_LOCAL_HEAP_VERSION}
       - {id: heap.btree_node_header, finding: H5_CORRUPT_V2_BTREE_NODE_HEADER}
@@ -795,6 +886,8 @@ records:
       ci_checks: segment extents, free-list progress, ID bounds, timeout, and no-crash assertions
     tests:
       - {path: h5policy/tests/expected/valid-dense_attribute.yml, asserts: heap.fractal_id_valid}
+      - {path: h5policy/tests/expected/malformed-bad_dense_fhdb_owner.yml, asserts: heap.fractal_block_owner}
+      - {path: h5policy/tests/expected/malformed-bad_dense_fhib_owner.yml, asserts: heap.fractal_block_owner}
       - {path: h5policy/tests/expected/malformed-bad_dense_attr_corder_leaf_checksum.yml, asserts: heap_structures.oracle_rejection}
       - {path: h5policy/tests/expected/valid-userblock_earliest.yml, asserts: heap_structures.bypass_unexercised}
     validators: {h5policy: enforced, hdf5: partial}
@@ -862,8 +955,9 @@ records:
       - {id: sohm.checksum_valid, finding: H5_CORRUPT_BAD_CHECKSUM}
       # Size and offset arithmetic must stay inside the validator's domain.
       - {id: sohm.size_arithmetic, finding: H5_CORRUPT_LENGTH_OVERFLOW}
-      # The validator DECODES this family's structures rather than skipping
-      # them; the finding fires where coverage stops.
+      # Managed, tiny, and unfiltered huge SOHM bodies are dispatched through
+      # their normal message decoders. The finding is now reserved for a
+      # filtered heap body or another explicitly bounded resolution edge.
       - {id: sohm.decode_coverage, finding: H5_UNSUPPORTED_PICKLE_COVERAGE_GAP}
       - {id: sohm.traversal_budget, finding: H5_RESOURCE_BTREE_DEPTH}
       - {id: sohm.btree_entry_count, finding: H5_CORRUPT_BTREE_NODE_ENTRY_COUNT}
@@ -878,6 +972,8 @@ records:
       ci_checks: reference-count closure, version handling, padding checks, and no-crash assertions
     tests:
       - {path: h5policy/tests/expected/valid-shared_attr_datatype.yml, asserts: shared.storage_address}
+      - {path: h5policy/tests/expected/coverage-sohm_huge_btree.yml, asserts: sohm.huge_object}
+      - {path: h5policy/tests/expected/coverage-sohm_tiny.yml, asserts: sohm.decode_coverage}
       - {path: h5policy/tests/expected/malformed-bad_sohm_btree_child_address.yml, asserts: sohm.child_address}
       - {path: h5policy/tests/expected/valid-userblock_latest.yml, asserts: shared_messages_legacy.bypass_unexercised}
     validators: {h5policy: enforced, hdf5: partial}
@@ -974,6 +1070,16 @@ records:
       - {id: control.btree_k_placement, finding: H5_CORRUPT_BTREEK_PLACEMENT}
       - {id: control.driver_info_encoding, finding: [H5_CORRUPT_DRVINFO_LENGTH, H5_CORRUPT_DRVINFO_MESSAGE_TOO_SMALL, H5_CORRUPT_UNSUPPORTED_DRVINFO_VERSION]}
       - {id: control.driver_info_placement, finding: H5_CORRUPT_DRVINFO_PLACEMENT}
+      # v0/v1 files carry driver info in a standalone block at the superblock's
+      # driver-info address rather than in a superblock-extension message, so
+      # its length has no containing object header to be bounded against. The
+      # block's whole extent -- address + 16-byte header + declared length --
+      # must lie within the ceiling. libhdf5 bounds the length against nothing:
+      # it extends the EOA to cover itself and then sizes the cache allocation,
+      # so every downstream EOA check is satisfied by construction. This is the
+      # invariant registry/cases/driver-info-block-fields-unbounded.yml carried
+      # as the placeholder name `driver_info.len_bounded`.
+      - {id: control.driver_info_extent, finding: H5_CORRUPT_DRVINFO_BLOCK_EXTENT}
       - {id: control.fsinfo_complete, finding: H5_CORRUPT_FSINFO_MESSAGE_TOO_SMALL}
       - {id: control.fsinfo_version_supported, finding: H5_CORRUPT_UNSUPPORTED_FSINFO_VERSION}
       - {id: control.free_space_page_size, finding: H5_CORRUPT_FREE_SPACE_PAGE_SIZE}
@@ -992,7 +1098,7 @@ records:
       # this is the distinct invariant that the extent the record *describes*
       # lies within the file. Both address-range codes are shared, so the
       # mapping is resolved by message via the grouped route rules.
-      - {id: control.fsm_section_extent, finding: [H5_CORRUPT_OFFSET_OUT_OF_FILE, H5_CORRUPT_LENGTH_OVERFLOW]}
+      - {id: control.fsm_section_extent, finding: [H5_CORRUPT_FSM_SECTION_EXTENT, H5_CORRUPT_OFFSET_OUT_OF_FILE, H5_CORRUPT_LENGTH_OVERFLOW]}
       - {id: control.fsm_version_supported, finding: H5_CORRUPT_UNSUPPORTED_FSM_VERSION}
       - {id: control.superblock_k_values, finding: H5_CORRUPT_SUPERBLOCK_K_VALUE}
       - {id: control.superblock_reserved_zero, finding: H5_CORRUPT_SUPERBLOCK_RESERVED}
@@ -1011,6 +1117,9 @@ records:
       fixtures: [h5policy/tests/expected/integration-walk_operation_budget.yml]
       entry_point_driver: bounded file open and coordinator budget canary
       ci_checks: address, FSM, profile, and budget assertions
+    tests:
+      - {path: h5policy/tests/expected/valid-sohm_list.yml, asserts: control.fsm_section_extent}
+      - {path: h5policy/tests/expected/malformed-bad_frhp_fsm_section_extent.yml, asserts: control.fsm_section_extent}
     validators: {h5policy: enforced, hdf5: partial}
     coverage_status: partial
     migration_status: oracle-partial

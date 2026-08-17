@@ -1,0 +1,289 @@
+# Dataspace dimensions are multiplied into a 64-bit element count with no
+# overflow check, on two independent paths. A product of 2**65 + 8 wraps to 8,
+# which then agrees with an eight-byte compact payload -- so the wrap is what
+# makes the file look self-consistent.
+#
+# Promoted from two working bundles (gitignored h5cve scratch) that hold THE
+# SAME FILE: identical input_sha256 (9661498c...) and identical 179-byte size.
+# They were triaged twice from two differently-named external paths that turned
+# out to be byte-identical, and each bundle records the other as a duplicate.
+# Recorded explicitly so the pair is never mistaken for two independent
+# confirmations.
+schema_version: 1
+
+id: dataspace-nelem-product-unchecked
+title: dataspace dimensions multiply into hsize_t unchecked on both the file
+  decoder and the public extent constructor, and the wrapped count is what makes
+  a contradictory compact dataset look consistent
+status: oracle-hardened          # h5policy rejects; libhdf5 accepts on both builds
+disclosure: >-
+  n/a -- local analysis only.  Advisory text was deliberately not retrieved and
+  no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: dataspace_dimension
+versions: [1, 2]                 # simple dataspace message versions
+root_cause_classification: local_decode
+violated_invariant:
+  - dataspace.nelem_product
+validation_closure: >-
+  the complete simple-dataspace record -- rank, current dimensions, maxima, and
+  the EXACT element-count product -- together with the dataset's datatype and
+  layout, before any native H5S_extent_t is returned or cached.  The product
+  must be checked before it is stored, because once wrapped it is
+  indistinguishable from a legitimate small count.
+activation_before_validation:
+  - native_construction        # dataspace and dataset
+  - public_id                  # file and dataset identifiers
+  - data_read                  # traversal and I/O proceed
+entry_points:
+  - h5policy (oracle) -- untrusted-strict and forensic both reject
+  - "libhdf5 H5Fopen -> H5O__sdspace_decode (src/H5Osdspace.c:214-215)"
+  - "libhdf5 public API -> H5S_set_extent_simple (src/H5S.c:1285-1288)"
+  - "libhdf5 H5Dopen2 -> H5D__cache_dataspace_info -> H5D__compact_init"
+  - "h5dump -d /dset -- the stock TOOL crashes"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  The same unchecked loop appears twice, on two paths that need fixing
+  independently.
+  FILE DECODE, H5O__sdspace_decode:
+      for (i = 0, sdim->nelem = 1; i < sdim->rank; i++)
+          sdim->nelem *= sdim->size[i];              /* src/H5Osdspace.c:214-215 */
+  PUBLIC CONSTRUCTOR, H5S_set_extent_simple:
+      for (u = 0, nelem = 1; dims && (u < space->extent.rank); u++) {
+          space->extent.size[u] = dims[u];
+          nelem *= dims[u];                          /* src/H5S.c:1285-1288 */
+      }
+      space->extent.nelem = nelem;
+  Neither checks the product.  The second matters as much as the first: an
+  application can reach the same contradictory native state through the public
+  API with no malformed file involved, so a decode-only fix leaves half the
+  exposure.
+  THE GUARD THAT EXISTS CANNOT HELP.  Compact-layout initialisation does check
+  `nelmts * dt_size` -- but it consumes the ALREADY WRAPPED nelem.  By then
+  2**65 + 8 has become 8, and 8 elements against an eight-byte compact payload
+  is a perfectly ordinary dataset.  The check cannot distinguish the specimen's
+  true product from a valid eight-element dataspace, because the information
+  needed to tell them apart was destroyed one function earlier.  That is the
+  shape of this record: the wrap does not merely evade a check, it manufactures
+  agreement with the rest of the file.
+  AND THE TOOLS REPEAT IT.  h5dump's init_acc_pos derives row strides by
+  unchecked multiplication at tools/lib/h5tools.c:1727 and crashes on the
+  accepted contradictory state.  So even a libhdf5 fixed at both library sites
+  would leave h5dump crashing unless the tool arithmetic is hardened too -- the
+  library boundary is not the last boundary here.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    Everything under `measured` is the bundles', captured 2026-07-24 at h5policy
+    07ad5e7 against libhdf5 2.3.0 (source 4b1ffa68a84), and was NOT re-measured
+    at promotion -- this session could not execute the oracle or the probes.
+    The SOURCE claims in `defect` were read from the 2.3.0 tree at promotion and
+    are current.  Bundle measurements are already 2.3.0; no version skew.
+  oracle_as_recorded: >-
+    reject_corrupt under untrusted-strict AND forensic,
+    H5_CORRUPT_DATASPACE_NELEM_OVERFLOW @ 59 on /dset, "dataspace element count
+    overflows a 64-bit product".  All oracle boundary flags false -- no libhdf5,
+    materialization, filter loading, decompression, external access, repair,
+    write or application deserialization.
+  libhdf5_as_recorded: >-
+    ACCEPTS, on BOTH builds -- baseline Release and ASan candidate alike.  This
+    is a genuine invariant-A divergence, not an agreement reached by different
+    routes, and ASan reports nothing because no out-of-bounds access occurs
+    inside the library: the wrapped count is internally consistent.
+    The observable failure is in the TOOL: h5dump -d /dset crashes on the
+    baseline build.
+  boundary_matrix: >-
+    Five checksum-valid neighbours from the bundle's build-variants.py, which
+    together pin the wrap rather than the magnitude:
+      variant_fit                        [1, 8] -- valid, accepted by oracle,
+                                         probes and h5dump alike
+      variant_product_below_u64          2**64-2 -- no count overflow, but a
+                                         compact-size mismatch
+      variant_product_exact_u64          2**64 -- decoded count wraps to ZERO
+      variant_product_above_u64          2**64+2 -- wraps to two
+      variant_no_overflow_layout_mismatch [1, 2] -- an ordinary compact-size
+                                         mismatch, no wrap
+    The specimen itself is 2**65 + 8, wrapping to exactly the eight-byte payload
+    -- the only residue in the set that produces agreement instead of a
+    detectable mismatch.
+  width: >-
+    WIDTH-INDEPENDENT, and unusually this is established rather than assumed.
+    hsize_t is typedef uint64_t (src/H5public.h:321) and the product is stored
+    in hsize_t, not size_t, so the overflow and the chosen residue are identical
+    on ILP32, LP64, LLP64 and x32.  A compiled witness confirms sizeof(hsize_t)
+    == 8 and evaluates [2**62+1, 8] as 8.
+    NOT measured: end-to-end behaviour on a real 32-bit libhdf5 build, which was
+    unavailable.  No width-dependent safety claim is made.
+  truncation: >-
+    Complete: 180 prefixes each for the specimen and all five variants, with no
+    escaped, internal or no-verdict violations.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: accepted (both builds)
+  libhdf5_version: 2.3.0
+  classification: A -- a real invariant-A disagreement
+  note: >-
+    libhdf5 accepts a file h5policy rejects, on both builds, so this is a
+    genuine invariant-A divergence.  It is NOT currently carried by an entry in
+    registry/h5policy-diff-tolerances.yml and does not need one: the tracked
+    fixture malformed/dataspace_nelem_overflow.h5 reports WARN rather than a
+    hard failure in the differential harness, so nothing is failing that would
+    need excusing.
+    Worth knowing WHY the tracked fixture and the bundle specimen differ: the
+    specimen's residue was chosen to AGREE with its compact payload, which is
+    what makes libhdf5 accept it outright.  A fixture whose residue produces a
+    detectable mismatch is refused for that mismatch instead.  So the corpus
+    proves the oracle rule while the bundle specimen carries the acceptance --
+    the same split this registry has now seen three times.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Checked multiplication at BOTH sites, before the product is stored:
+    src/H5Osdspace.c:214-215 for the file decoder and src/H5S.c:1285-1288 for
+    the public extent constructor.  Fixing only the decoder leaves an
+    application able to construct the same state through H5Sset_extent_simple.
+    The check must precede storage.  Any check placed after -- including the
+    existing compact-layout `nelmts * dt_size` guard -- is operating on a value
+    that has already lost the information needed to detect the problem.
+    HARDEN THE TOOLS TOO, or the fix is incomplete in practice:
+    tools/lib/h5tools.c:1727 repeats the unchecked multiplication when deriving
+    row strides, and crashes on states the library has accepted.  A backport
+    that stops at the library boundary leaves h5dump crashing.
+    Compatibility: the rejection tightens only records whose exact dimension
+    product does not fit uint64_t.  No conforming writer can require the current
+    behaviour, since it depends on a wrapped residue coinciding with a stored
+    byte count.  Validate v1 and v2 messages, fixed- and variable-length address
+    widths, and every public extent-setter entry point on supported releases.
+systemic:
+  semantic_boundary: >-
+    the complete simple-dataspace record, decoded into inert scalar values, with
+    the exact element count checked-multiplied against UINT64_MAX and the
+    current/maximum dimensions validated, BEFORE the native extent is
+    materialised -- and with the same checked product used by the public extent
+    constructor and by the tools.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 decoder, constructor and tools open
+  description: >-
+    h5policy checks before multiplying (h5policy/pickles/h5_dataspace.pk), so
+    the wrapped state cannot be constructed and the contradiction stays visible.
+    The bundle's sibling audit calls it the sole measured hardened sibling in
+    the workspace.
+    The remaining work is libhdf5's, and it is in three places rather than one:
+    the file decoder, the public constructor, and the tools.
+  landed_changes:
+    - h5policy/pickles/h5_dataspace.pk (checked product before multiplication)
+    - registry/findings/catalog (H5_CORRUPT_DATASPACE_NELEM_OVERFLOW)
+    - registry/validation-coverage.yml (dataspace_dimension / dataspace.nelem_product)
+    - h5policy/tests/malformed/dataspace_nelem_overflow.h5 + expectation
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/dataspace_nelem_overflow.h5
+  direct_fixtures:
+    - h5policy/tests/malformed/dataspace_nelem_overflow.h5
+  expectations:
+    - h5policy/tests/expected/malformed-dataspace_nelem_overflow.yml
+  control_fixture: >-
+    variant_fit.h5 in bundle -a -- dimensions [1, 8] over the same eight-byte
+    compact payload, accepted by the oracle, both probes and h5dump.  Essential
+    here because the containment rejects a class of files, so a positive control
+    is what shows the rule is not over-broad.
+  variant_engine: >-
+    build-variants.py in bundle -a -- case-local, produces the five
+    checksum-valid dimensional neighbours listed under measured.boundary_matrix.
+    NOT a tracked generator; see coverage_gaps.
+  assertions:
+    stable_finding: true
+    oracle_fails_before_materialization: true
+    libhdf5_fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_write: true
+    no_user_callback: unverified_internal_only
+    no_legacy_fallback: unverified_internal_only
+
+backports: []
+
+fuzz_seed: >-
+  The 179-byte specimen is a seed for a future bounded dataspace raw-decoder
+  target, and the dimension vector is an unusually well-structured axis: the
+  interesting values are not "large" but SPECIFIC -- residues that coincide with
+  the stored compact byte count.  The five neighbours already cover valid,
+  below/exact/above 2**64 and ordinary-mismatch outcomes.  No dedicated
+  in-memory fuzz target exists.
+
+compatibility_backport_risks: >-
+  See containment.  The one non-obvious risk is scope creep in the wrong
+  direction: hardening the library without the tools produces a partial fix that
+  still crashes h5dump, and hardening only the decoder without the public
+  constructor leaves an API route to the same state.
+
+sibling_audit: >-
+  Within libhdf5: two unchecked multiplication sites are established
+  (src/H5Osdspace.c:215 decode, src/H5S.c:1288 public constructor) plus one in
+  the tools (tools/lib/h5tools.c:1727).  The compact-layout guard was examined
+  and found unable to help for the reason given in `defect`.  NOT audited: other
+  layout classes' initialisation paths, which consume the same nelem and may
+  have their own post-hoc guards with the same weakness.
+  Within h5policy: h5_dataspace.pk is the measured hardened sibling.  Whether
+  every other product in the pickles is likewise checked-before-multiply is
+  asserted from convention, not verified.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured live on 2.3.0 and both unchecked loops
+    verified present in the 2.3.0 tree at promotion.  No archaeology was run.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    THE VARIANT MATRIX IS NOT TRACKED.  build-variants.py is case-local, so the
+    five residue neighbours -- which are what distinguish this defect from an
+    ordinary oversized dataspace -- have no gencorpus generator.  The
+    exact-u64 (wraps to zero) and above-u64 (wraps to two) cases are the most
+    valuable, since a zero element count is a different downstream hazard again.
+  - >-
+    THE TOOL CRASH HAS NO FIXTURE.  h5dump -d crashing at
+    tools/lib/h5tools.c:1727 is the only OBSERVABLE failure on a stock build --
+    libhdf5 itself accepts silently -- and nothing in the corpus exercises it.
+  - >-
+    NOTHING WAS RE-MEASURED AT PROMOTION (source claims excepted).
+  - >-
+    No end-to-end 32-bit measurement.  The arithmetic is proven
+    width-independent, but h5dump's behaviour there is not.
+open_questions:
+  - >-
+    Do other layout classes have the same post-hoc guard weakness as compact?
+    The compact check fails not because it is absent but because it runs on the
+    wrapped value; contiguous and chunked initialisation consume the same nelem
+    and were not examined.
+  - >-
+    Is a wrapped count of ZERO (variant_product_exact_u64) handled anywhere?
+    A zero element count is arguably worse than a small wrong one -- it is the
+    shape that produces zero-size allocations elsewhere in this registry -- and
+    that variant is measured only for its oracle verdict.
+
+provenance:
+  found_by: >-
+    a supplied specimen triaged TWICE, through the h5cve bundle workflow, into
+    two separate working bundles; the two are byte-identical (input_sha256
+    9661498c0f58a02c982d3412ab2f0b4b19eb2d5db4d22ed2870f9809c24a873b, 179
+    bytes) and each records the other as a duplicate.  Promoted jointly
+    2026-08-15 as one record.
+  input_sha256: 9661498c0f58a02c982d3412ab2f0b4b19eb2d5db4d22ed2870f9809c24a873b
+  input_bytes: 179
+  hdf5_build: >-
+    HDF5 2.3.0 (source 4b1ffa68a84); baseline Release and candidate
+    RelWithDebInfo -fsanitize=address, BOTH accepting.  h5dump -d crashes on the
+    baseline.  Workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

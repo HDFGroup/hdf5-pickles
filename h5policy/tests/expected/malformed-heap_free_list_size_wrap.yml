@@ -1,0 +1,76 @@
+# The local-heap free-list bound written as an ADDITION, and the file that gets
+# through it.  Distinct from bad_heap_free_list.h5 next to it, and the
+# distinction is the entire point of having both.
+#
+# That fixture puts the free-list HEAD outside the data segment, which libhdf5
+# catches.  This one keeps the head legal (offset 32) and makes the free block's
+# SIZE 2**64-1, which libhdf5 does NOT catch:
+#
+#     if ((fl->offset + fl->size) > heap->dblk_size)      /* H5HLcache.c:258 */
+#
+# is an addition on size_t, so 32 + (2**64-1) sums to 31 -- comfortably inside
+# any real dblk_size -- and a free block claiming the entire address space is
+# published into heap->freelist.  h5policy bounds the same relation by
+# SUBTRACTION after an explicit `offset > dblk_size` gate, so it cannot wrap.
+#
+# The same expression appears a second time at H5HLdbg.c:82, in the local-heap
+# debug dump; both copies need the gated-subtraction form or the additive one
+# survives for the next reader to copy.
+#
+# TWO TRAPS for anyone editing the generator:
+#   * H5HL_FREE_NULL is 1, NOT 0 and not all-ones.  The next-offset field must be
+#     1 to terminate the chain; a literal 0 is rejected outright ("free block
+#     size is zero?") and an all-ones next-offset builds a different specimen
+#     that never reaches the size check at all.
+#   * sizeof_lengths sits at superblock byte 14 in the VERSION 0 superblock that
+#     libver="earliest" produces -- not byte 10, where it lives in v2/v3.  The
+#     generator asserts the superblock version so a libver change fails loudly.
+#
+# WHAT THIS FIXTURE CAN AND CANNOT ASSERT.  The libhdf5 consequence is
+# RDWR-ONLY: a read-only traversal never acts on the admitted node, and the ASAN
+# heap-buffer-overflow WRITEs appear in H5HL__fl_serialize (H5HLcache.c:308) and
+# H5HL_insert (H5HL.c:690) via an ordinary H5Gcreate2.  This matrix is read-only
+# by design, so the fixture can only assert that h5policy rejects the file; it
+# cannot observe the defect it encodes, and a regression in libhdf5 here would
+# be invisible to the harness.  That gap is recorded, not accidental.
+#
+# Note `analysis.walk_completed` is false: untrusted-strict stops at the first
+# non-accept finding, and this one arrives while walking the root group's heap.
+# Nothing is truncated -- stop_reason is "rejection", not a budget.
+#
+# INVARIANT A DIVERGES ON THIS FIXTURE, deliberately, and it is carried by a
+# per-fixture entry in registry/h5policy-diff-tolerances.yml rather than by a
+# code-scoped A~ predicate.  libhdf5 opens the file (the additive bound wraps),
+# so h5policy-diff reports "libhdf5 opens => not reject_corrupt" as a tracked
+# FAIL.  The tolerance must stay per-fixture: bad_heap_free_list.h5 emits the
+# SAME finding code and libhdf5 correctly catches it, so a code-scoped
+# predicate would wrongly excuse that one too.  Removing the tolerance entry
+# turns this back into a hard failure with no code change -- which is what
+# should happen if libhdf5 ever fixes H5HLcache.c:258.
+#
+# The libhdf5 defect is recorded in
+# registry/cases/local-heap-free-list-bound-wraps.yml.  Promoted from
+# variant_ovf.h5 in the seed-981f08d8 bundle; that bundle's specimen also
+# carried an unrelated superblock driver-info defect, which this fixture
+# deliberately OMITS so it tests one thing.
+#
+# NO h5cve BLOCK YET, deliberately.  bad_heap_free_list.h5 next to it is a file
+# libhdf5 rejects; this is a file libhdf5 ACCEPTS on a read-only open, so its
+# canary status is not the sibling's and has not been measured.  Measure with
+# h5policy-probe --exercise heap_structures, and note the probe reported
+# `unexercised` rather than a pass on the bundle's specimen -- a read-only
+# traversal never loads the heap data block -- so `unexercised` may well be the
+# honest answer here too.
+file: malformed/heap_free_list_size_wrap.h5
+profile: untrusted-strict
+expected_decision: reject_corrupt
+expected_exit: 2
+required_findings: [H5_CORRUPT_LOCAL_HEAP_FREE_LIST]
+expected_analysis:
+  complete: false
+  walk_started: true
+  walk_completed: false
+  stop_reason: rejection
+  continue_after_rejection: false
+  findings_truncated: false
+forbidden: [crash, timeout, external_open, plugin_load, write]

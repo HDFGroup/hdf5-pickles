@@ -20,19 +20,6 @@
 # needed.
 schema_version: 1
 tolerances:
-  - fixture: valid/wide_length_one.h5
-    invariant: A'
-    case: wide-length-16-decode-gap
-    reason: >-
-      libhdf5's H5_DECODE_LENGTH_LEN/H5_ENCODE_LENGTH_LEN macros have no case
-      for the 16-byte sizeof_lengths that H5Pset_sizes() itself accepts as
-      legal, so the reference either aborts (assertions compiled in) or
-      silently misdecodes the length field (compiled out); introspect_isolated
-      reads either outcome as "libhdf5 rejects it". The fixture is genuinely
-      valid HDF5 and h5policy's independent decoder reads the 16-byte length
-      correctly -- the defect is in the reference decoder, not the file or
-      h5policy. See registry/cases/wide-length-16-decode-gap.yml.
-
   - fixture: malformed/attr_reference_size_under.h5
     invariant: A
     case: datatype-size-not-final
@@ -48,3 +35,135 @@ tolerances:
       this harness cannot observe through exit statuses alone. The vlen sibling
       needs no entry: its data path errors out, so it already demotes to A+.
       See registry/cases/datatype-size-not-final.yml.
+
+  - fixture: malformed/heap_free_list_size_wrap.h5
+    invariant: A
+    case: local-heap-free-list-bound-wraps
+    reason: >-
+      The local heap's free-list bound is written as an ADDITION on size_t --
+      `if ((fl->offset + fl->size) > heap->dblk_size)` (H5HLcache.c:258) -- so
+      this fixture's offset 32 plus size 2**64-1 sums to 31, comfortably inside
+      the data segment, and a free block claiming the entire address space is
+      admitted into heap->freelist. libhdf5 therefore OPENS the file and
+      reports success: a read-only traversal never acts on the admitted node,
+      h5dump and h5ls exit 0, and no tool return code corroborates the
+      rejection, so the A+ evidence path finds nothing.
+      The evidence this harness cannot observe is directional. The consequence
+      is RDWR-ONLY: the admitted node reaches the write path and ASan reports
+      heap-buffer-overflow WRITEs in H5HL__fl_serialize (H5HLcache.c:308) and
+      H5HL_insert (H5HL.c:690), the latter through an ordinary H5Gcreate2. The
+      differential opens read-only by construction, so it is structurally
+      incapable of seeing this one -- not merely unlucky in what it measured.
+      WHY A PER-FIXTURE ENTRY AND NOT A CODE-SCOPED A~ PREDICATE, which is the
+      usual preference and is wrong here. H5_CORRUPT_LOCAL_HEAP_FREE_LIST is
+      also emitted by malformed/bad_heap_free_list.h5, whose free-list HEAD
+      points outside the data segment -- and that one libhdf5 genuinely CATCHES,
+      so the differential already agrees on it and it needs no entry. A
+      predicate keyed to the finding code would excuse both, including the
+      fixture where libhdf5 is correct, which is exactly the over-broad
+      exemption the code-scoped form is meant to avoid. The two fixtures are a
+      deliberate pair -- one file libhdf5 catches, one it does not -- and only
+      the second is tolerable.
+      No exploitability claim is made; the write primitive was observed under
+      ASan on a 2.2.0 build and is not characterised further.
+      See registry/cases/local-heap-free-list-bound-wraps.yml.
+
+  - fixture: malformed/mdci_entry_lru_inconsistent.h5
+    invariant: A
+    case: mdci-lru-rank-assert-only
+    reason: >-
+      The cache-image entry's IN_LRU flag and its signed lru_rank contradict each
+      other. libhdf5 states that relation only as
+      `assert((in_lru && lru_rank >= 0) || (!in_lru && lru_rank == -1))`
+      (H5Cimage.c:2813) -- compiled out under NDEBUG -- while every neighbouring
+      field in the same decoder gets a real HGOTO_ERROR. So the stock Release
+      build OPENS the file and reports success: h5dump -H exits 0 and prints the
+      whole structure, h5stat exits 0, and no tool return code corroborates the
+      rejection. The asserts-enabled build aborts at that exact line with exit 134,
+      which is the evidence this harness cannot observe through stock exit
+      statuses alone. Note this is an assertion abort, not an ASan report: no
+      memory error is demonstrated on this fixture, and the tolerance rests on the
+      build-to-build divergence rather than on a memory-safety claim. That
+      divergence is now explained rather than merely observed: lru_rank has NO
+      non-debug reader on the read path -- reconstruction appends entries in image
+      -buffer order (H5Cimage.c:2517) and every use of the field is an assert or
+      sits inside `#ifndef NDEBUG`. So a Release build does not evaluate the
+      relation at all, and h5policy is strictly the stricter of the two by design.
+      See resolved_questions in the case record. The
+      parent-address sibling needs no entry -- a dangling flush-dependency parent
+      hits a genuine check (`fd parent not in cache?!?`, H5Cimage.c:2533), so
+      libhdf5 rejects it on both builds and the differential already agrees.
+      See registry/cases/mdci-lru-rank-assert-only.yml.
+
+  - fixture: malformed/cache_image_bad_checksum.h5
+    invariant: A
+    case: mdci-image-checksum-unverified
+    reason: >-
+      The cache image's trailing Jenkins checksum does not authenticate the
+      image, but libhdf5 never evaluates it. Every checksum reference in
+      H5Cimage.c is inside the WRITER, H5C__construct_cache_image_buffer
+      (computed :302, encoded :304, round-trip self-asserted :392); the read path
+      -- H5C__load_cache_image (:615) -> H5C__read_cache_image (:549) ->
+      H5C__reconstruct_cache_contents (:2446) -- contains no checksum code at
+      all. So stock libhdf5 opens the file and reports success (h5dump -H and
+      h5stat both exit 0), and unlike the LRU sibling the asserts-on build is no
+      help: it also exits 0, because there is no guard on either build. This is
+      NOT the lazy-structure story the A~ exemption on this record covers -- the
+      image really is loaded and replayed, confirmed by H5Fget_mdc_image_info
+      reporting the identical image (addr=2080 len=690) for the fixture and the
+      valid control, and by the body-corruption sibling faulting inside
+      H5C__deserialize_prefetched_entry (H5Centry.c:1891). Integrity-detection
+      gap only; no memory-safety or exploitability claim is made.
+      See registry/cases/mdci-image-checksum-unverified.yml.
+
+  - fixture: malformed/drvinfo_block_len_past_eof.h5
+    invariant: A
+    case: driver-info-block-fields-unbounded
+    reason: >-
+      The v0/v1 driver information block declares 1 MiB of driver-specific bytes
+      in a ~2 KB file, and libhdf5 never bounds that length against anything. It
+      is decoded straight out of the image and used to compute a minimum EOA,
+      which is then EXTENDED to cover it
+      (`min_eoa = driver_addr + H5F_DRVINFOBLOCK_HDR_SIZE + drvrinfo->len`,
+      src/H5Fsuper_cache.c) -- so the length AUTHORISES ITSELF, and the same
+      callback hands it back as the cache entry's allocation size. Every
+      downstream EOA-relative test is satisfied by construction, including
+      H5C__verify_len_eoa, whose entire purpose is to catch oversized entries.
+      The only size guard on the path is an assert against H5C_MAX_ENTRY_SIZE
+      that NDEBUG compiles out. So libhdf5 OPENS the file and reports success:
+      h5dump -H exits 0 and h5py lists it, and no tool return code corroborates
+      the rejection.
+      This is the LENGTH half of the case record and it is still live. The
+      ADDRESS half was fixed at 2.3.0 by bounding driver_addr against
+      stored_eof, which bounds ONE OPERAND of that sum and leaves the other
+      free -- exactly the failure mode the record's why_one_record section named
+      in advance.
+      WHY A PER-FIXTURE ENTRY AND NOT A CODE-SCOPED A~ PREDICATE:
+      H5_CORRUPT_DRVINFO_BLOCK_EXTENT is also emitted by
+      malformed/drvinfo_block_header_truncated.h5, which diverges for a
+      different reason (sec2's zero-fill past EOF, not an unbounded length), so
+      a code-scoped predicate would excuse two distinct explanations under one
+      claim. The sibling has its own entry below.
+      See registry/cases/driver-info-block-fields-unbounded.yml.
+
+  - fixture: malformed/drvinfo_block_header_truncated.h5
+    invariant: A
+    case: driver-info-block-fields-unbounded
+    reason: >-
+      The driver-info address points 8 bytes before EOF, so the block's 16-byte
+      header cannot fit. The ADDRESS is in the file, so the 2.3.0 bound
+      (driver_addr against stored_eof) does not intercept it -- the EXTENT is
+      what escapes. libhdf5 issues the 16-byte read anyway and the sec2 driver
+      ZERO-FILLS past EOF, so the fabricated tail decodes as a structurally
+      valid empty block (version 0, length 0, all-NUL driver id) and the file
+      opens silently: h5dump -H exits 0 and h5py lists it.
+      This is the SAME zero-fill mechanism that made a wild driver-info address
+      silently acceptable before 2.3.0, reached from inside the file rather than
+      from beyond it, which is why the address fix does not cover it. The case
+      record's sibling_audit already notes that the zero-fill is a VFD property
+      rather than a driver-info one, so any structure whose extent escapes the
+      file gets the same treatment; this fixture is the first tracked instance.
+      NO memory-safety claim: nothing over-allocates and nothing faults. The
+      divergence is a corruption-detection gap -- libhdf5 accepts a block that
+      is not in the file.
+      See registry/cases/driver-info-block-fields-unbounded.yml.

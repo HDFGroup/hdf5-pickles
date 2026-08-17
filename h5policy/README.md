@@ -6,7 +6,11 @@ a security profile, and emits a stable JSON decision.
 
 Files with an HDF5 user block are supported. The superblock is discovered at a
 legal boundary and base-relative HDF5 addresses are translated to physical file
-offsets before metadata is mapped.
+offsets before metadata is mapped. This includes the addresses a metadata cache
+image records for the entries it shadows: they are base-relative like any other
+file address, and the corpus covers a user block and a cache image together
+(`valid/userblock_cache_image.h5`) because only their combination reaches that
+translation.
 
 The tool is intentionally a metadata-only boundary:
 
@@ -62,7 +66,8 @@ Exit codes are part of the interface:
 
 `unsupported_coverage_gap` is a bounded answer, not a silent accept. It means the
 file reached a recognized HDF5 feature that is not yet decoded deeply enough for
-the selected policy.
+the selected policy, or a legal representation the h5policy compatibility target
+conservatively declines to pass to the selected `libhdf5`.
 
 JSON output includes:
 
@@ -147,28 +152,29 @@ Current coverage includes:
   bounds, and reachable object traversal with visited sets.
 - Dataspace, datatype, layout, filter pipeline, fill value, link, attribute,
   both modification-time forms, B-tree K override, reference-count,
-  free-space info, and metadata cache image message/container envelopes.
-  Cached metadata bodies remain outside decode coverage, as described in
-  [Metadata cache-image hard boundary](#metadata-cache-image-hard-boundary).
-  Driver-info envelopes are validated and then explicitly refused because
+  free-space info, and metadata cache image message/container envelopes and
+  replayed cached bodies. Driver-info envelopes are validated and then explicitly refused because
   their VFD bodies can name member files outside the single-file validation
   boundary.
 - Compact hard links, dense link storage, dense attribute storage, old-style
   group metadata, and chunk-index metadata. Dense storage covers both the name
   indexes and recursive type-6/type-9 creation-order B-trees, including
-  checksums, subtree totals, heap-ID resolution, and cross-index identity;
+  checksums, subtree totals, managed fractal-heap-ID resolution, and
+  cross-index identity;
   chunk coverage includes recursive raw-data v2 B-trees and complete
   extensible-array block graphs.
 - File-global Shared Object Header Message metadata: `SMTB` directories,
-  `SMLI` record lists, recursive type-7 v2 B-trees, managed-message heap-ID
-  resolution, fractal-heap envelopes, and complete huge-object index trees.
+  `SMLI` record lists, recursive type-7 v2 B-trees, and managed, tiny, and
+  unfiltered huge-message heap-ID resolution. Fractal-heap envelopes and
+  complete huge-object index trees are validated before a body is dispatched.
   Every recursive SOHM node is independently bounded by range, checksum,
   visited-node, depth, operation/time, and accounted-metadata limits.
 - File-global free-space managers named by the file-space-info message: each
   `FSHD` header and its `FSSE` serialized section list are range-checked,
   checksummed, and metadata-accounted, and every free section's extent and
-  class type is validated.  Fractal-heap (non-file) managers, reached from a
-  heap header rather than the file-space-info message, remain a coverage gap.
+  class type is validated. Fractal-heap managers named by `FRHP` headers are
+  likewise walked as metadata; their sections are checked against the heap's
+  logical managed-space extent rather than against file offsets.
 - Logical dataset byte accounting kept separate from raw storage accounting, so
   datatype semantics can be compared against `libhdf5` while layout checks still
   use on-disk storage size. Datatype validation accepts message versions 1–5,
@@ -182,31 +188,25 @@ Its entries can shadow the ordinary bytes at the same logical file addresses,
 so parsing those backing bytes as if they were still live can manufacture false
 corruption findings.
 
-h5policy validates the cache-image message and the bounded container information
-needed to traverse it safely: the image extent, block signature/version/flags,
-declared length, entry count, entry envelopes, dependency counts and list
-sizes, body extents, and trailing layout. It records each validated
-`(address, length)` shadow range. It does **not** decode the cached entry bodies
-or validate their metadata semantics.
+h5policy validates the cache-image message and bounded container information:
+the image extent, block signature/version/flags, declared length, entry count,
+entry envelopes, dependency counts and list sizes, body extents, trailing
+layout, and the image checksum. It then replays all validated cached entry bodies
+through the ordinary bounded metadata decoder at its logical `(address, length)`
+range. This replaces the shadowed backing ranges through an in-memory read overlay over the original file: it never
+writes the input, opens an external file, or materializes a whole-file copy.
 
-That missing body decoder is a hard coverage boundary shared by every profile,
-not an `allow_*` feature policy:
+Consequently, a structurally valid cache image can return exit `0` and
+`accept`; `analysis.complete` and `analysis.walk_completed` are `true`. Cached
+object headers, trees, heaps, and indexes receive the same semantic and
+cross-reference checks as their ordinary on-disk counterparts. A corrupt MDCI
+envelope, checksum, or replayed body produces `reject_corrupt`.
+If an internal cache-client body cannot be reached by a type-aware decoder,
+h5policy retains an explicit `unsupported_coverage_gap` rather than approving
+the image.
 
-- a structurally valid file containing a cache image returns exit `5` with
-  decision `unsupported_coverage_gap` and finding
-  `H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`;
-- `analysis.complete` and `analysis.walk_completed` are `false`;
-- the default fail-fast profiles report `analysis.stop_reason: "rejection"`;
-- with continuation enabled (including the `forensic` default), the walk skips
-  shadowed addresses, continues checking reachable unshadowed metadata, and
-  finishes with `analysis.stop_reason: "cache_image_coverage_gap"`; and
-- `--continue-after-rejection` changes diagnostic traversal only. It never
-  decodes the cached bodies and never converts this refusal into an acceptance.
-
-Corruption found in the decoded message or container envelope can still produce
-`reject_corrupt`, which outranks the unsupported finding. In either case,
-consumers must not treat the file as preflight-approved while cached bodies
-remain unvalidated.
+`--continue-after-rejection` still controls only diagnostic traversal. It does
+not weaken cache-image validation or alter an acceptance decision.
 
 Checksum coverage includes the HDF5 Jenkins checksums used by:
 
@@ -225,19 +225,18 @@ Some defects live strictly beyond a metadata-only boundary and are reported as
 `unsupported_coverage_gap` rather than `reject_corrupt`, even when `libhdf5`
 crashes on them:
 
-- **Metadata cache-image bodies.** The message, container, entry envelopes, and
-  shadow ranges are validated, but each cached entry body remains opaque. This
-  is the [hard boundary described above](#metadata-cache-image-hard-boundary):
-  continuation can preserve findings from unshadowed metadata but cannot make
-  the analysis complete.
+- **16-byte superblock length fields.** HDF5 permits `sizeof_lengths = 16`,
+  and h5policy can independently narrow representable values. The selected
+  `libhdf5` target's shared length decoder does not support that width, however,
+  so h5policy refuses it at superblock preflight with
+  `H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`. This target-specific compatibility
+  guard is not a claim that the file is corrupt.
 
-- **Encoded SOHM message bodies.** h5policy completely walks the type-7 shared
-  index and the heap's huge-object index, validating record layouts, object
-  extents, filter masks, checksums, and traversal budgets. Shared wrappers are
-  currently resolved only when their eight-byte ID names an unfiltered managed
-  heap object. A wrapper naming a huge, tiny, or filter-encoded heap object is
-  refused as unsupported because validating its message payload would require
-  an additional body decoder (and, for filtered objects, decompression).
+- **Filtered SOHM message bodies.** h5policy resolves managed, tiny, and
+  unfiltered huge heap IDs, then dispatches the recovered body through the
+  ordinary message validator. A wrapper whose heap declares an I/O filter
+  pipeline remains unsupported: recovering that body would require reversing
+  the pipeline (decompressing untrusted bytes).
 
 - **Filtered dense link/attribute fractal heaps.** When a dense group's or
   object's fractal heap declares an I/O filter pipeline, the link/attribute
@@ -254,6 +253,13 @@ crashes on them:
   not process the file. The differential harness accepts that explicit refusal
   under invariant A' while retaining a classification warning when libhdf5
   rejects the same file as corrupt.
+
+- **Non-managed dense fractal-heap IDs.** Dense link and attribute indexes are
+  resolved when their records use managed fractal-heap IDs. Huge and tiny IDs
+  are recognized but not resolved, so the validator returns
+  `unsupported_coverage_gap` rather than accepting links or attributes whose
+  record bodies it has not inspected. This remains a metadata-only decoder gap;
+  it does not require decompression.
 
 - **Vlen and reference data global heaps.** A dataset's variable-length or
   reference elements point into a global heap collection (`GCOL`) through heap

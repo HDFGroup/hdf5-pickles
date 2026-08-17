@@ -123,6 +123,12 @@ add_custom_target(docs-check
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tutorial.py"
     COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_quickstart.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_hygiene.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_advisory_draft.py"
+    COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_cache_image_docs.py"
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/check_docs.py"
@@ -133,9 +139,11 @@ add_custom_target(docs-check
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_tool_overview.py"
     COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_hygiene.py"
+    COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/.devcontainer/check.py"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    COMMENT "Checking generated docs, commands, policy boundaries, summaries, tool map, and devcontainer"
+    COMMENT "Checking generated docs, commands, policy boundaries, summaries, tool map, hygiene, and devcontainer"
     VERBATIM
     USES_TERMINAL
 )
@@ -248,6 +256,36 @@ if(POKE_EXECUTABLE)
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
     set_tests_properties(pickle_mdci_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
+    add_test(
+        NAME pickle_checksum_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_checksums.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(pickle_checksum_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
+    add_test(
+        NAME pickle_range_reference_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_ranges_refs.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(pickle_range_reference_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
+    add_test(
+        NAME pickle_ref_enc_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_ref_enc.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(pickle_ref_enc_regression PROPERTIES
         TIMEOUT 30
         ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
     )

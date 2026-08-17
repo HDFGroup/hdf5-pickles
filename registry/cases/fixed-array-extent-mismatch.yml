@@ -1,0 +1,185 @@
+# A fixed-array chunk index is pre-sized once, from the dataset's maximum
+# extent, and never grown.  Nothing re-checks the stored capacity against that
+# extent when the file is read back, so one edited `Dim Max` field makes
+# libhdf5 recompute a capacity from the file's own bytes and build native state
+# from it.  Promoted from an h5cve working bundle (gitignored scratch): the
+# oracle accepted the specimen before this case landed.
+schema_version: 1
+
+id: fixed-array-extent-mismatch
+title: fixed-array chunk index capacity is never checked against the dataspace it indexes
+status: oracle-hardened          # h5policy rejects; no upstream report made
+disclosure: "n/a -- local finding from this repo's own crash fuzzing; not
+  reported to the HDF Group, no CVE, no advisory consulted"
+
+# ── Triage (§11.2) ────────────────────────────────────────────────────────────
+record: chunk_index
+versions: [4, 5]                 # data layout message versions carrying idx_type
+entry_points:
+  - h5policy (oracle) -- untrusted-strict, now rejects
+  - "libhdf5 H5Ocopy -> H5O__copy -> H5D__chunk_copy -> H5D__chunk_set_info_real
+     -> H5D__farray_idx_create -> H5FA__dblock_create -> H5AC_insert_entry"
+  - "shipped tools: h5repack (any object copy of the dataset). NOT reached by
+     H5Fopen + H5Dopen + H5Dread: reading uses the index as found."
+root_cause_classification: aggregate_object
+violated_invariant: chunk.fixed_array_capacity
+validation_closure: >-
+  the dataspace message's maximum extent and the data layout message's chunk
+  grid and index type, for one object, against the capacity stored in that
+  object's FAHD header -- no single message establishes it.
+activation_before_validation:
+  # Native construction: a destination data block is sized, and its
+  # page-initialization bitmask allocated, from the recomputed capacity before
+  # anything questions it.
+  - native_construction
+
+# ── The defect, read out of the source tree (HDF5 2.3.0 @e4b6a964723) ─────────
+defect: >-
+  H5D__chunk_set_info_real (H5Dchunk.c:729-745) computes
+  max_chunks[u] = ceil(max_dims[u] / chunk_dim[u]) and accumulates
+  max_nchunks over the dimensions, with no bound on the result.
+  H5D__farray_idx_create (H5Dfarray.c:850) passes that product straight to
+  H5FA_create as cparam.nelmts, which is the capacity a fixed array is pre-sized
+  with: H5FA__dblock_create derives the data block's page count and its
+  page-initialization bitmask (ceil(npages / 8) bytes) from it, and
+  H5FA__cache_dblock_image_len reports the result as the cache entry's size.
+  On the read path the stored capacity is used as found and never compared with
+  the extent it was derived from, so the two can disagree by any amount.
+  The writer's index choice is what makes the disagreement detectable:
+  H5D__chunk_init (H5Dchunk.c:955-1035) picks the fixed array whenever no
+  dimension is H5S_UNLIMITED, and always sizes it from max_dims -- so for a
+  file libhdf5 itself wrote, capacity == the product above, unconditionally.
+
+boundary_note: >-
+  The invariant is the index CAPACITY, not curr_dims == max_dims.  A bounded
+  but growable dataset -- maxshape (100, 10) over shape (10, 10) -- is
+  legitimately fixed-array indexed, with a capacity of 40 for four chunks of
+  data; the case bundle's first reading of this defect proposed
+  curr_dims == max_dims as the rule, which would have rejected that valid file.
+  valid/chunk_fixed_array_maxdims.h5 is the control that pins the difference.
+  H5S_UNLIMITED is the one maximum no capacity can match, and it is reported
+  through the same finding rather than a separate one.
+
+# ── Measured behaviour ────────────────────────────────────────────────────────
+measured:
+  oracle_before: >-
+    accepted the specimen with zero findings (decision: accept), under every
+    profile including forensic -- a soundness gap: it validated the dataspace
+    and the fixed-array header separately and never related them.
+  oracle_after: >-
+    rejects malformed/bad_fixed_array_extent_mismatch.h5 with
+    H5_CORRUPT_FIXED_ARRAY_EXTENT_MISMATCH (actual capacity 4, expected
+    347033357522), while still accepting valid/chunk_fixed_array.h5,
+    valid/chunk_fixed_array_paged.h5 and the growable-maxshape control
+    valid/chunk_fixed_array_maxdims.h5.
+  libhdf5_read_path: >-
+    opens and reads the file without a diagnostic -- h5py, h5dump -pBH,
+    h5dump -pB (data) and h5debug all exit 0.  Reading never rebuilds an index.
+  libhdf5_assert_build: >-
+    h5repack aborts the process: "H5Centry.c:2208: H5C_insert_entry: Assertion
+    `entry_ptr->size > 0 && entry_ptr->size < H5C_MAX_ENTRY_SIZE' failed",
+    exit 134.  The recomputed capacity (~3.5e11 chunks) gives a page-init
+    bitmask of ~42 MB, over the 32 MB H5C_MAX_ENTRY_SIZE ceiling.  Measured on
+    the tracked fixture with the candidate build (2.3.0, asserts enabled), and
+    originally on 2.2.0 with the case bundle's specimen.
+  libhdf5_release_build: >-
+    with that assert compiled out, h5repack reports SUCCESS (exit 0) and writes
+    a 2 777 664 825 817-byte output file -- 2.8 TB, sparse -- from a 2448-byte
+    input.  Measured on the baseline build (2.3.0 Release).  A one-field edit of a small
+    file is therefore a ~10^9x storage amplification on a shipped build, which
+    is a worse outcome than the abort, not a milder one.
+  unmeasured: >-
+    32-bit builds.  The products above are computed in hsize_t but the cache
+    entry size is a size_t; whether a 32-bit build wraps to a small, plausible
+    entry size (and so copies real bytes into an undersized allocation) instead
+    of tripping the ceiling was not tested -- a local 32-bit build exists but no
+    32-bit h5repack run is recorded here.
+
+# ── Divergence from the selected build (this is why the fixture may diverge) ──
+divergence:
+  oracle: reject_corrupt
+  libhdf5: accepted
+  libhdf5_version: 2.3.0
+  classification: legitimate
+  note: >-
+    libhdf5 validates on the path that rebuilds the structure, not at open, so
+    the h5cve canary (H5Dopen/H5Dread) and h5policy-diff's read probes all
+    report acceptance.  h5policy is eager where libhdf5 is lazy.  h5policy-diff
+    carries this as the A~ predicate fixed_array_capacity_mismatch_only rather
+    than a per-fixture tolerance, because the reasoning is about the finding's
+    code path and not about one specimen; the harness deliberately does not run
+    h5repack to produce A+ evidence, since doing so would write the 2.8 TB
+    output above for every corrupt fixture it probes.
+
+# ── Containment vs systemic remediation (§11.5) ───────────────────────────────
+containment:
+  status: planned
+  description: >-
+    libhdf5 side, not proposed upstream by this repo: bound the recomputed
+    max_nchunks in H5D__chunk_set_info_real, and reject rather than assert when
+    an entry image exceeds H5C_MAX_ENTRY_SIZE in H5C_insert_entry.  Checking the
+    stored FAHD capacity against the dataspace at H5Dopen time would contain the
+    whole family at the point of decode.
+systemic:
+  semantic_boundary: >-
+    the chunked-dataset aggregate -- dataspace extent, chunk grid and chunk
+    index validated as one object before any capacity is derived from them.
+  status: landed          # in h5policy; the libhdf5 side is untouched
+  owner: n/a
+  description: >-
+    h5policy_finalize_ohdr_dataset (h5policy/pickles/h5_validate.pk) performs
+    the cross-check after the whole object header is walked, so a layout message
+    placed before its dataspace cannot evade it.  The sibling extensible-array
+    check (h5_layout.pk, H5_CORRUPT_CHUNK_INDEX_WITHOUT_UNLIMITED_DIM) is still
+    inline and does carry that ordering weakness -- a follow-up, not a
+    regression introduced here.
+
+# ── Reproducers (§11.4) ───────────────────────────────────────────────────────
+reproducers:
+  direct_fixture: h5policy/tests/malformed/bad_fixed_array_extent_mismatch.h5
+  generator: >-
+    h5policy-gencorpus _make_bad_fixed_array_extent_mismatch (inflates
+    Dim Max[0] of valid/chunk_fixed_array.h5 from 10 to 867583393802 and
+    repairs the v2 object-header checksum; nothing else changes)
+  expectation: h5policy/tests/expected/malformed-bad_fixed_array_extent_mismatch.yml
+  control_fixture: h5policy/tests/valid/chunk_fixed_array_maxdims.h5
+  integration_poc: >-
+    the h5repack cache-entry-size specimen -- an untracked working file,
+    input_sha256
+    21212a45c3b7d453e0e0bcad6d115af870ec9b4a9620b53216e06a8e20159df7, run as
+    `h5repack input.h5 out.h5`; the tracked fixture reproduces it byte-for-byte
+    in its mutated field.
+  assertions:
+    stable_finding: true
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+
+sibling_audit: >-
+  The unchecked computation in H5D__chunk_set_info_real is shared by all three
+  real chunk-index types and by every entry point that reaches it (H5Dset_extent
+  and other H5Ocopy callers included); only the fixed array pre-sizes an on-disk
+  structure from the result, which is why it is the one that faults.  The
+  extensible array and the v2 B-tree grow lazily and legitimately carry
+  H5S_UNLIMITED maxima, so the same edit there has no fixed capacity to
+  contradict -- not confirmed safe, not confirmed vulnerable, untested.
+  h5policy's own coverage of index type 2 (implicit) estimates a chunk count
+  from the dataspace without a stored capacity to compare against, so no
+  symmetric check exists there.
+
+coverage_manifest_change: >-
+  validation-coverage.yml chunk_index gains chunk.fixed_array_capacity;
+  findings/catalog/chunk_index.yml gains H5_CORRUPT_FIXED_ARRAY_EXTENT_MISMATCH
+  (scope aggregate_object, non-shared, so no route rule).
+
+provenance:
+  found_by: >-
+    h5policy-crashfuzz --seed 42 --iters 3000, struct strategy, bred from
+    h5policy/tests/valid/chunk_fixed_array.h5 at iteration 1676; triaged in
+    an untracked working bundle (CASE.md, source-audit.md)
+  hdf5_build: >-
+    abort first seen on 2.2.0 (libhdf5.so.320, a distribution package no longer
+    installed here); re-measured 2026-08-13 on HDF5 2.3.0 @e4b6a964723 --
+    baseline Release (silent 2.8 TB write) and candidate RelWithDebInfo with
+    asserts (abort at H5Centry.c:2208). Both are workstation-local installs;
+    paths not recorded.

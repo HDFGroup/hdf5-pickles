@@ -1,0 +1,302 @@
+# The cache-image cursor advances past the image header, but the remaining
+# length is then re-assigned from the FULL image size -- so every entry bound
+# afterwards is generous by exactly the header size.
+#
+# Promoted from one working bundle (gitignored h5cve scratch; the specimen is
+# identified by provenance.input_sha256 below).
+#
+# Note what this is NOT: the bound is present and is applied. The defect is that
+# the value it is applied against was rebased. That distinguishes it from the
+# unguarded and assert-only records elsewhere in this directory -- here the
+# check runs, on every entry, and is simply given the wrong end pointer.
+schema_version: 1
+
+id: mdci-entry-extent-rebased-after-header
+title: the metadata cache image's remaining extent is re-assigned from the full
+  image after the header has been consumed, so entry bounds overshoot by the
+  header size
+status: oracle-hardened          # h5policy rejects; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The bundle carries an
+  "UNCONFIRMED offline" note of its own, which is not reproduced as a claim.
+
+# -- Triage -------------------------------------------------------------------
+record: cache_image_dependency_graph
+versions: [0]                    # MDCI block version
+root_cause_classification: local_decode
+violated_invariant:
+  - mdci.entry_extent
+validation_closure: >-
+  the MDCI image header, each entry's header/body/parent-list extent, the
+  terminal checksum, and -- the part that fails here -- the cursor's EXACT
+  remaining byte extent carried across the transition from header decode to
+  entry decode.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - "h5policy (oracle) -- superblock extension -> MDCI envelope"
+  - "libhdf5 H5Fopen -> cache-image reconstruction -> H5Ovisit3"
+  - "libhdf5 H5C__load_cache_image -> H5C__reconstruct_cache_contents (src/H5Cimage.c:2481) -> H5C__reconstruct_cache_entry (:2714)"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  The two decoders disagree about who owns the remaining length, and the
+  signatures say so.
+  The ENTRY decoder takes it by pointer and maintains it correctly:
+      H5C__reconstruct_cache_entry(const H5F_t *f, H5C_t *cache_ptr,
+                                   hsize_t *buf_size, const uint8_t **buf)  /* :2701 */
+      const uint8_t *p_end = *buf + *buf_size - 1;                          /* :2714 */
+      ...
+      *buf_size -= (hsize_t)(p - *buf);                                     /* :2884 */
+  so across successive entries the cursor and the remaining length stay in step.
+  The HEADER decoder takes it BY VALUE:
+      H5C__decode_cache_image_header(const H5F_t *f, H5C_t *cache_ptr,
+                                     const uint8_t **buf, size_t buf_size)  /* :1295 */
+  It advances the caller's cursor through `**buf`, but it structurally CANNOT
+  decrement the caller's length -- there is no pointer to decrement.
+  And the caller does not compensate.  H5C__reconstruct_cache_contents:
+      p = (uint8_t *)cache_ptr->image_buffer;
+      H5C__decode_cache_image_header(f, cache_ptr, &p, cache_ptr->image_len + 1);  /* :2471 */
+      assert((size_t)(p - (uint8_t *)cache_ptr->image_buffer) < cache_ptr->image_len);
+      ...
+      image_len = cache_ptr->image_len;                                            /* :2481 */
+      for (u = 0; u < cache_ptr->num_entries_in_image; u++)
+          H5C__reconstruct_cache_entry(f, cache_ptr, &image_len, &p);              /* :2487 */
+  Line :2481 is the defect.  `p` has already advanced past the image header, and
+  `image_len` is then assigned the FULL image size rather than what remains.  So
+  inside the entry decoder `p_end = p + image_len - 1` lands exactly
+  HEADER_SIZE bytes beyond the real end of the buffer, and stays that generous
+  for every entry, since the subsequent decrements are relative to a base that
+  was already wrong.
+  The bound at :2867 then does its job faithfully against a wrong limit:
+      if (H5_IS_BUFFER_OVERFLOW(p, pf_entry_ptr->size, p_end))
+          HGOTO_ERROR(... "ran off end of input buffer while decoding");
+      H5MM_memcpy(pf_entry_ptr->image_ptr, p, pf_entry_ptr->size);          /* :2869 */
+  Note also the `+ 1` fudge at :2471 and the assert at :2473: the length passed
+  to the header decoder is `image_len + 1`, evidently compensating for the
+  `- 1` in the p_end idiom, and the only statement that the cursor stayed inside
+  the image is an assert, compiled out under NDEBUG.
+
+arithmetic: >-
+  The bundle's witness measured the specimen's geometry directly
+  (mdci-entry-extent-witness.c), and the numbers close exactly once the two
+  different "overrun" quantities are kept apart -- they are easy to conflate.
+    image_size            256
+    image_header_bytes     18
+    entry_header_bytes     30
+    checksum_bytes          4
+    declared_body_bytes   226
+    usable_body_bytes     204   = 256 - 18 - 30 - 4
+  After the header, `p` is at 18 and `p_end` is computed as 18 + 256 - 1 = 273,
+  whereas the last valid byte is 255 -- over by 18, the header size.
+  The entry header takes `p` to 48.  The bound then tests
+  48 + 226 - 1 = 273 against p_end = 273 and PASSES, exactly at the limit.
+  The memcpy reads 226 bytes from offset 48, ending at 274.
+  So there are two distinct figures and both are correct:
+    22 bytes  the entry claims beyond what is legitimately available for a body
+              (226 - 204), of which 4 belong to the checksum -- inside the
+              buffer, but reserved
+    18 bytes  read genuinely PAST THE BUFFER (274 - 256), which is the header
+              size and the actual memory-safety quantity
+  ASan reports "READ of size 226" because that is the memcpy length, not the
+  overrun.  All three numbers describe the same event.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    Everything under `measured` is the bundle's, recorded at h5policy 07ad5e7
+    against libhdf5 2.3.0 (source 4b1ffa68a840), and was NOT re-measured at
+    promotion -- this session could not execute the oracle or the probes.  The
+    SOURCE claims in `defect` were read from the 2.3.0 tree at promotion and are
+    current.  The bundle's libhdf5 measurements are already 2.3.0, so there is
+    no version skew to close.
+  oracle_as_recorded: >-
+    reject_corrupt, H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE @ 137 on
+    /<superblock-extension>, rejected before any cached-body decoding,
+    allocation or activation.  Truncation sweep exhaustive over 376 prefixes,
+    all reject_corrupt, no violations.
+  libhdf5_as_recorded: >-
+    Release 2.3.0: rejected_in_traversal -- H5Fopen SUCCEEDED and H5Ovisit3
+    failed twice.  No forbidden activation observed.
+    ASan 2.3.0: CRASHED, heap-buffer-overflow READ of size 226 in
+    H5C__reconstruct_cache_entry at src/H5Cimage.c:2869.
+    comparison recorded as "divergent by build configuration; do not treat the
+    Release outcome as proof of memory safety" -- which is the right reading:
+    the Release build's later failure is downstream of the over-read, not a
+    bound that prevented it.
+  width: >-
+    NOT measured at 32 bits.  All the operative on-disk values (204, 226, 256,
+    375) fit conventional 32-bit and 64-bit domains, so this is not a
+    width-wrap defect -- but cursor arithmetic, allocator layout and sanitizer
+    behaviour differ, and a 32-bit build was not available.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: rejected_in_traversal (Release) / crashed (ASan)
+  libhdf5_version: 2.3.0
+  classification: agreement-on-verdict, divergence-on-safety
+  note: >-
+    Both sides refuse the file, so there is no invariant-A disagreement and NO
+    entry in registry/h5policy-diff-tolerances.yml is warranted -- and none
+    is present.  But the Release build refuses it only AFTER reading 18 bytes
+    past its buffer, which is why the bundle's comparison field says the Release
+    outcome is not proof of memory safety.  h5policy refuses at the envelope,
+    before any body is copied.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    One line.  At src/H5Cimage.c:2481, subtract what the header consumed instead
+    of discarding it:
+        image_len = cache_ptr->image_len
+                    - (size_t)(p - (uint8_t *)cache_ptr->image_buffer);
+    The cursor `p` is already in hand two lines above, and the assert at :2473
+    computes the very same difference -- so the value needed is not merely
+    available, it is already being calculated and then thrown away.
+    Two supporting changes, both cheap:
+    give H5C__decode_cache_image_header a `size_t *buf_size` so it decrements
+    like its sibling and the asymmetry that caused this cannot recur; and drop
+    the `+ 1` fudge at :2471 once the length is honest, since it exists to
+    paper over the off-by-one in the p_end idiom.
+    Strict tightening -- rejecting an entry before its body is copied cannot
+    reject a well-formed image, because a conforming writer never emits an entry
+    extending past the image it wrote.
+    ONE COMPATIBILITY DISTINCTION TO PRESERVE, from the bundle: the 204-byte
+    boundary reaches the opaque-cache-body coverage gap rather than proving the
+    cached metadata valid.  A fix must not be read as validating cached bodies.
+systemic:
+  semantic_boundary: >-
+    a bounded MDCI envelope-to-entry cursor transition: the remaining extent
+    must be carried, not recomputed, across the header/entry boundary, and every
+    entry decode must consume from that bounded slice -- before any native entry
+    allocation, body copy, cache insertion, dependency reconstruction or
+    publication.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 reconstruction open
+  description: >-
+    h5policy decodes the MDCI envelope with an extent that is carried across
+    every field boundary, so an entry claiming more than the image holds is
+    rejected at the envelope with no allocation and no body copy.  The class of
+    defect cannot arise: there is no second base to rebase from.
+    The remaining work is entirely libhdf5's, and it is one assignment.
+  landed_changes:
+    - h5policy/pickles (mdci.entry_extent; H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE)
+    - h5policy/tests/cve/mdci_entry_offby_header.h5 + expectation
+    - registry/findings/catalog/cache_image_dependency_graph.yml
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/cve/mdci_entry_offby_header.h5
+  direct_fixtures:
+    # ALREADY TRACKED, and byte-identical to the bundle's specimen -- so unlike
+    # most records here the corpus fixture IS the reproducer, not a stand-in.
+    - h5policy/tests/cve/mdci_entry_offby_header.h5
+  expectations:
+    - h5policy/tests/expected/cve-mdci_entry_offby_header.yml
+  direct_witness: >-
+    mdci-entry-extent-witness.c in the bundle reads only the MDCI envelope field
+    geometry and prints the numbers in `arithmetic` above; it does not invoke
+    libhdf5.  Transcript: mdci-entry-extent-witness.txt.
+  variant_engine: >-
+    build-variants.py in the bundle changes ONLY the uint64 little-endian body
+    length at file offset 159.  It does not use gencorpus, so the boundary
+    neighbours are not reproducible from this repo alone -- see coverage_gaps.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []
+
+fuzz_seed: >-
+  The uint64 body length at offset 159 is a clean single-field axis, and the
+  boundary is unusually sharp: 226 passes the bound EXACTLY (48 + 226 - 1 ==
+  p_end), so 225 and 227 sit either side of an off-by-one that is itself the
+  defect.  A three-value probe there is worth more than a broad sweep.
+
+compatibility_backport_risks: >-
+  Low.  Rejecting an entry before its body is copied is a strict safety
+  tightening and cannot reject an image libhdf5 wrote.  Two things to test:
+  all supported sizeof_addr/sizeof_size combinations, since the image layout
+  uses file-size widths; and that the fix does not disturb the opaque-cache-body
+  coverage-gap distinction noted under containment.
+
+sibling_audit: >-
+  Within libhdf5: only the ONE-ENTRY, NO-PARENT path is measured.  The bundle
+  names the rest and they remain unaudited -- multi-entry cursor advancement
+  (where the rebased base compounds across iterations), parent-list
+  multiplication and decode, terminal checksum accounting, duplicate insertion,
+  and cleanup after a partly reconstructed image.  The multi-entry case is the
+  most interesting: `*buf_size -= (p - *buf)` at :2884 is correct arithmetic on
+  an incorrect base, so the generosity persists rather than accumulating.
+  Related and separately recorded: the cleanup path this decoder falls into on
+  failure is itself unsafe -- see
+  registry/cases/mdci-reconstruct-cleanup-unsafe.yml.  A malformed entry extent
+  is one more route into that cleanup.
+  Within h5policy: the envelope extent is carried by one mechanism for all MDCI
+  fields, so the coverage is broader than the single measured path; that breadth
+  is asserted from the implementation, not measured per field.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured live on 2.3.0 and the rebase at
+    src/H5Cimage.c:2481 verified present in the 2.3.0 tree at promotion.  No
+    archaeology was run.
+  note: >-
+    The by-value/by-pointer asymmetry between the two decoders looks like an
+    original design rather than a regression, which would make this as old as
+    cache-image support -- but that is an inference from code shape.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    THE BOUNDARY NEIGHBOURS ARE NOT REPRODUCIBLE FROM THIS REPO.  The variants
+    come from a bundle-local build-variants.py rather than gencorpus, so the
+    225/226/227 boundary -- which is where the off-by-one actually lives -- has
+    no tracked fixture.  A gencorpus generator patching the uint64 at offset 159
+    would close it cheaply, and the tracked specimen is already byte-identical
+    to the bundle input, so the base file is in hand.
+  - >-
+    ONLY THE ONE-ENTRY PATH IS MEASURED.  Multi-entry images, parent lists and
+    the terminal checksum all consume from the same rebased extent and none is
+    measured; see sibling_audit.
+  - >-
+    NOTHING WAS RE-MEASURED AT PROMOTION (source claims excepted).
+  - >-
+    No 32-bit measurement.
+open_questions:
+  - >-
+    Does the generosity persist or compound across a multi-entry image?  The
+    decrement at :2884 is correct arithmetic on an incorrect base, which
+    suggests it persists at a constant HEADER_SIZE rather than growing -- but
+    that is a reading of the code, not a measurement, and a two-entry specimen
+    would settle it.
+  - >-
+    Why does the header decoder take buf_size by value at all?  If it never
+    needed to report consumption, the caller was always going to have to
+    recompute it -- and :2481 is what recomputing wrong looks like.  Whether any
+    other caller of that function makes the same mistake was not checked.
+
+provenance:
+  found_by: >-
+    a supplied specimen, triaged through the h5cve bundle workflow in
+    an untracked working bundle; promoted 2026-08-15.  The
+    by-value/by-pointer asymmetry and the :2481 assignment were identified at
+    promotion by reading the source; the bundle described the effect
+    ("rebased remaining length") without naming the mechanism.
+  input_sha256: 5f1847ba2f48655c6f3d90257ad2b2ccffa3a5d54d6e92b49d00eb82c61b538e
+  hdf5_build: >-
+    HDF5 2.3.0 (source 4b1ffa68a840); baseline Release --
+    rejected_in_traversal; candidate RelWithDebInfo -fsanitize=address --
+    heap-buffer-overflow READ of size 226 at src/H5Cimage.c:2869.
+    Workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

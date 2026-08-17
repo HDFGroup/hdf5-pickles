@@ -20,6 +20,7 @@ Registry files plus a case directory, one schema version:
 | [`lazy-validation.json`](lazy-validation.json) | **Generated.** Measurement that validation cost tracks metadata rather than data volume, with physical-file endpoints, a sensitivity control, and the explicit latest-format/timestamps-disabled fixture policy. |
 | [`truncation-sweep.json`](truncation-sweep.json) | **Generated.** Result of the §12 truncation sweep: every prefix of each seed, and whether coverage was exhaustive or sampled. |
 | [`verification-coverage.yml`](verification-coverage.yml) | **Generated.** Which of the [§12](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) verification requirements each record family demonstrably meets. |
+| [`ssp-control-evidence.yml`](ssp-control-evidence.yml) | Checked, deliberately narrow mapping from selected HDF5 SSP controls to record/invariant/finding, fixture, canary, and exact-build measurement. It is technical evidence, not complete control attestation. |
 | [`cve-case.yml`](cve-case.yml) | The annotated **template** for a per-case record. Its fields are the §11.5 containment/systemic tracking block. |
 | [`cases/`](cases/) | Real per-case records: two oracle-hardened memory-safety cases, one proactive hardening case, and six libhdf5 divergence records, including one open backlog of uninvestigated items. |
 
@@ -89,13 +90,10 @@ Finding and routing counts are derived rather than copied into this document:
 python3 tools/finding_registry.py stats
 ```
 
-There are currently 128 expectations with an `h5cve` contract out of 180, and
-15 of 16 record families have an exact-build canary.
-
-`validation_controls` is the family without a canary, by design: it covers
-budgets, base address, free-space managers and profile validity, which have no
-single traversal surface to exercise. Its fixtures state `coverage_gap` in
-`allowed_statuses` rather than claiming a canary ran.
+The exact-build canary inventory covers every record family. Its count is
+derived and checked by `tools/check_quickstart.py`; see the
+[tool guide](../docs/TOOLS.md#exact-build-canary-matrix) for the current,
+machine-checked inventory and its malformed-fixture contract.
 
 Of the 52 uncontracted expectations, 51 are fixtures the oracle **accepts**. A
 family cannot be derived mechanically for those: the only findings present are
@@ -126,8 +124,7 @@ Current verdicts, against libhdf5 2.2.0:
 | verdict | families |
 |---|---|
 | `enforced` | 10 |
-| `partial` — some invariants enforced, some not | 5 |
-| `unmeasured` — no canary (`validation_controls`) | 1 |
+| `partial` — some invariants enforced, some not | 6 |
 
 Only `reject_corrupt` specimens count toward a verdict. Activation events
 (`external_open`) and crashes are recorded separately, since a build can enforce

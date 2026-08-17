@@ -1,0 +1,324 @@
+# The local-heap free-list bounds check is written as an ADDITION on size_t, so
+# a free block claiming 2**64-1 bytes wraps the sum and is admitted into a
+# 48-byte heap.
+#
+# Promoted from one working bundle (gitignored h5cve scratch; the specimen is
+# identified by provenance.input_sha256 below).
+# That specimen carries TWO independent defects.  The other one -- the
+# superblock driver-info address -- is recorded separately in
+# registry/cases/driver-info-block-fields-unbounded.yml.  They share a file and
+# nothing else: different structure, different decoder, different consumer,
+# different impact.  The bundle's own notes call them "two independent defects
+# in one specimen", and splitting the records follows that.
+schema_version: 1
+
+id: local-heap-free-list-bound-wraps
+title: the local-heap free-list bound is an addition on size_t, so an
+  oversized free block wraps past it and is published into the heap free list
+status: oracle-hardened          # h5policy rejects; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: heap_structures
+versions: [0]                    # local heap
+root_cause_classification: local_decode
+violated_invariant:
+  - heap.free_list_valid
+validation_closure: >-
+  the local heap's data segment together with its whole free-list chain: every
+  node's offset and size bounded against the segment as a SET, before any node
+  is published into heap->freelist.  A node-at-a-time check is enough only if
+  it cannot wrap, which is exactly what fails here.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - h5policy (oracle) -- rejects under untrusted-strict and forensic
+  - "libhdf5 H5HL_protect -> H5HL__cache_dblk_deserialize -> H5HL__fl_deserialize (src/H5HLcache.c)"
+  - "reached from H5Lget_name_by_idx -> H5G__stab_get_name_by_idx -> H5HL_protect (src/H5Gstab.c)"
+  - "the WRITE consequence needs RDWR: H5HL__fl_serialize and H5HL_insert, reached from H5Gcreate2"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  H5HL__fl_deserialize walks the free-list chain and bounds each node like this:
+    H5_DECODE_LENGTH_LEN(image, fl->size, heap->sizeof_size);
+    if ((fl->offset + fl->size) > heap->dblk_size)                /* H5HLcache.c:258 */
+        HGOTO_ERROR(H5E_HEAP, H5E_BADRANGE, FAIL, "bad heap free list");
+  The check is correct in intent and wrong in form.  `fl->offset` and
+  `fl->size` are both size_t and both come from the file, so the ADDITION wraps.
+  With offset 32 and size 2**64-1 the sum is 31, which is comfortably less than
+  a 48-byte dblk_size, and the node is admitted -- a free block claiming the
+  entire address space is published into heap->freelist.
+  The fix is a subtraction, and it is one line:
+    if (fl->offset > heap->dblk_size || fl->size > heap->dblk_size - fl->offset)
+  This is exactly the form h5policy uses, and it cannot wrap because the
+  subtraction is gated by the preceding comparison.
+  CONSEQUENCE IS DIRECTIONAL, and that is the interesting part.  Read-only use
+  is clean: a traversal that only reads the heap never acts on the bogus node.
+  Under RDWR the admitted node reaches the write path and ASan reports
+  heap-buffer-overflow WRITEs in H5HL__fl_serialize (src/H5HLcache.c:308) and
+  H5HL_insert (src/H5HL.c:690), the latter reached from an ordinary
+  H5Gcreate2.  So creating a group in a file that merely OPENED cleanly is what
+  triggers memory corruption.
+  A NOTE ON THE SENTINEL, because it is a trap for anyone building variants:
+  H5HL_FREE_NULL is 1, not 0 or all-ones.  variant_flnull.h5 (next-offset
+  all-ones) and variant_ovf.h5 (next-offset 1, i.e. the actual terminator) are
+  both rejected by h5policy with the same two findings, but only variant_ovf
+  reaches the libhdf5 hole.  Guessing the terminator wrong produces a specimen
+  that looks equivalent and tests nothing.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  REMEASURED: >-
+    2026-08-15, at HEAD.  The ORACLE side is confirmed; the probe side of the
+    bundle sweep does NOT speak to this record, and that limitation is worth
+    stating rather than glossing.
+    Oracle, forensic on the shared specimen: reject_corrupt with
+    H5_CORRUPT_OFFSET_OUT_OF_FILE @ 0 first and
+    H5_CORRUPT_LOCAL_HEAP_FREE_LIST @ 2112 second, complete walk.  That 2112 is
+    exactly the free-list head location the bundle's generation recipe names, so
+    the finding lands where the recipe puts the corruption.  untrusted-strict
+    stops at the driver-info defect with stop_reason prewalk_rejection and never
+    reaches the heap -- as this record already said, and now measured.
+    Probe: NOT EVIDENCE FOR THIS RECORD.  The sweep ran the shared specimen
+    under --exercise address_space, for the driver-info record, so its result
+    (stock rejected_at_open) describes the superblock defect and says nothing
+    about the heap free list.  A heap_structures exercise on this specimen would
+    also be confounded, because the superblock defect stops the open first.
+    THE BETTER EVIDENCE IS NOW THE TRACKED FIXTURE, which isolates the heap
+    defect from the superblock one: malformed/heap_free_list_size_wrap.h5 is
+    measured by the differential harness on every run, where libhdf5 OPENS it
+    and h5policy rejects it -- the invariant-A divergence carried by the
+    tolerance entry.  That is a cleaner measurement of this record's claim than
+    the bundle specimen can give, and it re-runs automatically.
+  oracle_as_recorded: >-
+    reject_corrupt.  In the shared specimen this is the SECOND finding --
+    H5_CORRUPT_LOCAL_HEAP_FREE_LIST, "local heap free block extends outside the
+    data segment" -- and untrusted-strict never reaches it, because the strict
+    profile stops at the first non-accept finding, which on that file is the
+    driver-info address.  Forensic reports both.  Anyone re-measuring this
+    trigger specifically must use forensic or a specimen without the superblock
+    defect.
+  libhdf5_as_recorded: >-
+    ACCEPTS.  The heap_structures family probe reports outcome=accepted on both
+    the stock and the ASan 2.2.0 builds, with canary status `unexercised` --
+    and that status is the point, not a pass: a read-only traversal never loads
+    the heap data block, so the probe had nothing to exercise.  The bundle's
+    targeted probes are what cover it.  This is the same class of false negative
+    recorded for h5cve verify's "accepted".
+  write_path_as_recorded: >-
+    Under RDWR, ASan reports heap-buffer-overflow WRITEs in H5HL__fl_serialize
+    (src/H5HLcache.c:308) and H5HL_insert (src/H5HL.c:690, reached from
+    H5Gcreate2).  Read-only use is clean.
+  width: >-
+    NOT measured at 32 bits, and the wrap is inherently width-dependent: the
+    residue depends on SIZE_MAX, so a 32-bit build needs a different size field
+    to reach the same admitted-node state.  A specimen tuned for 64-bit does
+    not necessarily reproduce at 32-bit and vice versa.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: accepted
+  libhdf5_version: 2.2.0 (measured); additive check still present at 2.3.0 (source-verified)
+  classification: A -- a real invariant-A disagreement
+  note: >-
+    libhdf5 accepts the file and h5policy rejects it, so this is a genuine
+    invariant-A divergence.  Read-only acceptance carries no information here,
+    for the same reason the fill-value case's does: the defect surfaces on the
+    WRITE path, which a metadata preflight and a read-only differential harness
+    both structurally cannot see.
+    CARRIED BY A PER-FIXTURE TOLERANCE, added 2026-08-15:
+    registry/h5policy-diff-tolerances.yml, fixture
+    malformed/heap_free_list_size_wrap.h5, invariant A.
+    CORRECTION -- an earlier revision of this record said the opposite, that a
+    finding-code-scoped A~ predicate over H5_CORRUPT_LOCAL_HEAP_FREE_LIST was
+    the right shape and a tolerance was not.  That was wrong, and the test run
+    that surfaced the hard failure is what settled it.  The usual preference for
+    a code-scoped predicate holds only when the explanation is code-shaped, i.e.
+    when EVERY fixture hitting that code deserves the exemption.  Here it does
+    not: the same finding is emitted by malformed/bad_heap_free_list.h5, whose
+    out-of-segment free-list head libhdf5 genuinely catches and where the
+    differential already agrees.  A code-scoped predicate would excuse that one
+    too, which is precisely the over-broad exemption the form exists to avoid.
+    The pair is deliberate -- one file libhdf5 catches, one it does not -- and
+    only the second is tolerable, which is what a per-fixture entry expresses.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Rewrite src/H5HLcache.c:258 as a gated subtraction:
+      if (fl->offset > heap->dblk_size || fl->size > heap->dblk_size - fl->offset)
+    This is a STRICT TIGHTENING and cannot reject a previously-valid file: any
+    free block that genuinely fits satisfies both clauses, and any that does not
+    was already meant to be rejected by the additive form.  It is the lowest-risk
+    containment in this registry -- one line, no behaviour change on conforming
+    files, no compatibility argument needed.
+    TWO COPIES, and both must change together.  src/H5HLdbg.c:82 carries the
+    identical expression in the local-heap debug dump.  Fixing only the cache
+    copy leaves the same wrap reachable through h5debug and, worse, leaves the
+    additive form in the tree for the next reader to copy.
+    The fractal-heap equivalents were swept and are NOT the same defect --
+    see sibling_audit.
+systemic:
+  semantic_boundary: >-
+    heap segments, free lists, IDs, offsets and extents -- the free-list closure
+    must clear its bounds gate as a set before any node is published into
+    heap->freelist.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 heap decode still open
+  description: >-
+    h5policy bounds each free-list node against the data segment by SUBTRACTION
+    rather than addition, so it cannot wrap at any target width, and no node is
+    published before the whole chain clears.  No oracle change was required by
+    this case -- heap.free_list_valid was already correct.
+    The remaining work is entirely libhdf5's.
+  landed_changes:
+    - h5policy/pickles (heap.free_list_valid, subtraction-based bound)
+    - registry/findings/catalog (H5_CORRUPT_LOCAL_HEAP_FREE_LIST)
+    - registry/validation-coverage.yml (heap_structures)
+    - h5policy/tests/malformed/bad_heap_free_list.h5 and its expectation
+    - h5policy/tools/h5policy-gencorpus (_make_heap_free_list_size_wrap) and
+      h5policy/tests/expected/malformed-heap_free_list_size_wrap.yml, added
+      2026-08-15 -- the wrap witness itself
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/heap_free_list_size_wrap.h5
+  direct_fixtures:
+    # The PAIR is the point: one file libhdf5 catches, one it does not.
+    - h5policy/tests/malformed/bad_heap_free_list.h5        # head out of segment -- caught
+    - h5policy/tests/malformed/heap_free_list_size_wrap.h5  # size wraps the bound -- NOT caught
+  expectations:
+    - h5policy/tests/expected/malformed-bad_heap_free_list.yml
+    - h5policy/tests/expected/malformed-heap_free_list_size_wrap.yml
+  wrap_witness: >-
+    malformed/heap_free_list_size_wrap.h5, tracked since 2026-08-15 and built by
+    h5policy-gencorpus _make_heap_free_list_size_wrap -- next-offset 1
+    (== H5HL_FREE_NULL, the real terminator) with size 2**64-1 behind a legal
+    head at offset 32.  Derived from variant_ovf.h5 in the bundle, minus that
+    specimen's unrelated driver-info patch.
+    Its sibling variant_flnull.h5 (next-offset all-ones) stays in the bundle as
+    the control showing that picking the wrong terminator produces a specimen
+    which proves nothing; it is not worth tracking.
+  generator: >-
+    Recorded recipe, not yet a generator: from a valid superblock-v0 file,
+    write next-offset 0xffffff0000004545 and size 0xffffffffffffffff at the root
+    heap's free-list head (file offset 2112).  Note the recorded recipe patches
+    the superblock driver-info address at byte 55 as well -- that is the OTHER
+    defect and should be omitted when building a fixture for this one alone.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []          # nothing to backport in h5policy.
+
+fuzz_seed: >-
+  The free-list head is a good mutation axis: offset and size are adjacent
+  size_t fields with a non-obvious terminator sentinel (H5HL_FREE_NULL == 1).
+  The interesting boundaries are size == dblk_size - offset (valid),
+  + 1 (rejected by both), and the wrap residues near SIZE_MAX - offset, which
+  differ per target width.
+
+compatibility_backport_risks: >-
+  Effectively none.  The subtraction form is a strict tightening: every free
+  block that fits still passes, and the only files newly rejected are those the
+  additive check was already trying to reject and failed to.  No writer emits a
+  free block claiming more than its heap.
+
+sibling_audit: >-
+  SWEPT 2026-08-15; full results in
+  registry/cases/decoder-bound-shape-sweeps.yml.
+  ONE NEW SITE, and it is a duplicate of this very expression: src/H5HLdbg.c:82
+  reads `if ((freelist->offset + freelist->size) > h->dblk_size)` character for
+  character, in the local-heap DEBUG dump.  Same wrap, lower severity -- it is a
+  diagnostic path, so reaching it means running h5debug on a hostile file.  Fix
+  it in the SAME change as src/H5HLcache.c:258, or the subtraction form lands in
+  one copy and not the other and the next reader concludes the expression is
+  fine because one instance of it is.
+  FRACTAL HEAP: audited, and NOT an equivalent -- this closes the open item this
+  field previously carried.  src/H5HFman.c:395 and :605 look identical, but
+  `obj_len` is bounded three ways right after it is decoded from the heap ID
+  (:326 nonzero, :328 max_direct_size, :330 max_man_size), so it cannot approach
+  SIZE_MAX and the addition cannot wrap on its own.  The residual hazard is
+  narrower: `blk_off` at :387 is computed by a subtraction guarded only by an
+  assert (:386, compiled out under NDEBUG), so a corrupt indirect structure
+  yielding obj_off < block_off could underflow it and then the additive check
+  could wrap.  Two-step and assert-gated rather than the direct one-field wrap
+  here; unmeasured, no specimen, low priority.
+  Also cleared: src/H5Znbit.c:1212 is GUARDED (an explicit `used_size <=
+  prev_used_size` wrap detector runs two lines earlier), and
+  src/H5Tcompound.c:420 is the API insert path rather than raw decode.
+  Still NOT audited: the 1.14.x and 1.10.x branches.
+  Within h5policy: heap.free_list_valid uses the subtraction form; whether every
+  other extent check in the pickles does likewise is asserted from convention,
+  not verified.
+  NOT part of this record: the superblock driver-info defect in the same
+  specimen.  See registry/cases/driver-info-block-fields-unbounded.yml.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured on 2.2.0; the additive check is still
+    present in the 2.3.0 tree, verified directly at promotion.  1.14.x and
+    1.10.x are explicitly NOT audited -- the bundle names them as open.
+  label: partially established (two points, not a range)
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    CLOSED 2026-08-15.  This item read "the wrap witness is not tracked".
+    variant_ovf.h5 is now the tracked fixture
+    malformed/heap_free_list_size_wrap.h5, built by
+    _make_heap_free_list_size_wrap and measured: reject_corrupt with EXACTLY
+    ONE finding, H5_CORRUPT_LOCAL_HEAP_FREE_LIST @ 744 on /.  It keeps the
+    free-list head legal at offset 32 and sets the block SIZE to 2**64-1, so the
+    additive bound sums to 31 and passes -- which is what bad_heap_free_list.h5
+    beside it cannot show, since that one is caught.
+    As specified, it OMITS the unrelated superblock driver-info patch the
+    bundle's recipe carried, so it tests one thing.
+    RESIDUAL: no h5cve block yet -- libhdf5 ACCEPTS this on a read-only open, so
+    the sibling's status does not transfer, and the probe reported `unexercised`
+    on the bundle specimen because a read-only traversal never loads the heap
+    data block.  Measure before asserting.
+  - >-
+    NO WRITE-PATH COVERAGE IN THE TEST MATRIX.  The consequence is RDWR-only,
+    and the corpus and probes are read-only by design.  Whatever asserts this
+    defect has to open RDWR and call H5Gcreate2, which nothing currently does --
+    so a regression here would be invisible to the existing harness.
+  - >-
+    CLOSED 2026-08-15 for the oracle side -- see measured.REMEASURED.  The
+    bundle-specimen PROBE remains uninformative here by construction (the
+    superblock defect stops the open first); the tracked fixture is the better
+    measurement and re-runs with every suite invocation.
+  - >-
+    No 32-bit measurement, and the wrap residue is width-dependent, so a
+    32-bit specimen would need different field values (see measured.width).
+  - >-
+    Fractal-heap equivalents and the 1.14.x/1.10.x branches are unaudited.
+open_questions:
+  - >-
+    ANSWERED 2026-08-15, see registry/cases/decoder-bound-shape-sweeps.yml.
+    Both shape sweeps were run to completion.  This one found one new site
+    (src/H5HLdbg.c:82, the duplicate of this expression) and cleared the rest;
+    the fractal-heap question is answered in the negative.  See sibling_audit.
+
+provenance:
+  found_by: >-
+    a supplied specimen, triaged through the h5cve bundle workflow in
+    an untracked working bundle; promoted 2026-08-15, split from the
+    driver-info defect in the same specimen because the two share only a file.
+  input_sha256: c8e84efd7b6b2df761981b176216a96f9926d866c5dcd64663228c8b5ac3dc52
+  hdf5_build: >-
+    HDF5 2.2.0 (source 4d666721f42); baseline Release and candidate
+    RelWithDebInfo -fsanitize=address, both accepting read-only, with the ASan
+    WRITE overflows appearing only under RDWR.  Source verified against the
+    2.3.0 tree at promotion.  Workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

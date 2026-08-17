@@ -252,12 +252,15 @@ fun h5policy_validate_attribute_payload = (int ios,
                                                                attr_ctx,
                                                                dspace_ref.payload_off,
                                                                dspace_ref.msg_size,
-                                                               object);
+                                                               0, object);
         }
     else
+        /* record_dataset_shape=0: an attribute's dataspace describes the
+           attribute, not the dataset, and must not seed the object's
+           fixed-array capacity cross-check.  */
         attr_ctx = h5policy_validate_dataspace_payload(ios, profile, attr_ctx,
                                                        dspace_off, dspace_size,
-                                                       object);
+                                                       0, object);
 
     var attr_data_size = msg_size - total;
     if (profile.resources.max_single_value_bytes != 0UL
@@ -727,14 +730,14 @@ fun h5policy_walk_fspace_manager = (
                                     "free-space manager tracks serialized sections but stores no section list");
             return ctx;
         }
-    /* Only the file client (1) has zero-tail section classes; a fractal-heap
-       free-space manager would need client-specific section decoding, which is
-       reached from a heap header rather than the file-space-info message. */
+    /* This entry point is the file-space-info address vector, so only the file
+       client (1) is structurally valid here. Fractal-heap client 0 is decoded
+       from its FRHP edge by h5_frhp_fspace.pk. */
     if (client != 1UL)
         {
             h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
                                 "unsupported", hdr_addr#B + 5#B, object,
-                                "non-file free-space manager section decoding is not covered yet");
+                                "file-space info names a non-file free-space manager client");
             return ctx;
         }
     return h5policy_walk_fspace_sections(
@@ -856,9 +859,26 @@ fun h5policy_validate_fsinfo_payload = (int ios,
     return ctx;
 }
 
-/* Metadata cache image messages name a cached metadata image.  h5policy bounds
-   the image extent but does not decode the cache image contents, which are a
-   separate metadata serialization format.  */
+/* Enum ceilings for the three single-byte fields in a cache-image entry
+   header.  They are libhdf5 build constants rather than format-spec values, so
+   they live with this validator instead of h5_format_constants.pk:
+
+     H5AC_NTYPES                       H5ACprivate.h -- one past the last cache
+                                       client class id (currently
+                                       H5AC_PREFETCHED_ENTRY_ID = 29)
+     H5C_RING_NTYPES                   H5Cprivate.h  -- one past H5C_RING_SB
+     H5AC__CACHE_IMAGE__ENTRY_AGEOUT__MAX  H5ACpublic.h
+
+   A libhdf5 that adds a client class raises H5AC_NTYPES and would make this
+   bound stale in the strict direction (h5policy rejecting an id that build
+   accepts), so the differential harness is what catches a bump here.  */
+var H5AC_NTYPES = 30UL;
+var H5C_RING_NTYPES = 6UL;
+var H5AC_CACHE_IMAGE_ENTRY_AGEOUT_MAX = 100UL;
+
+/* Metadata cache image messages name a cached metadata image.  The first pass
+   bounds and authenticates each entry, then a second pass routes normal reads
+   at cached logical addresses to the entry bodies. */
 fun h5policy_validate_mdci_payload = (int ios,
                                       H5PolicyProfile profile,
                                       offset<uint<64>,B> payload_off,
@@ -900,7 +920,8 @@ fun h5policy_validate_mdci_payload = (int ios,
                of decoding their stale backing bytes (e.g. the root object
                header) as live metadata. Unshadowed metadata can still be
                checked when continuation is enabled. */
-            h5policy_cache_image_boundary = 1;
+            if (h5policy_mdci_replay_mode == 0)
+                h5policy_cache_image_boundary = 1;
 
             var ok = h5policy_checked_addr_range_at(image_addr, image_size,
                                                     h5policy_ceiling(ios),
@@ -980,6 +1001,24 @@ fun h5policy_validate_mdci_payload = (int ios,
                 }
             var cur = image_header;
             var i = 0UL;
+            /* Entry addresses must be unique: libhdf5 keys reconstructed entries
+               by file address (H5C__check_for_duplicates, H5Cimage.c) and fails
+               reconstruction on a repeat -- but that failure unwinds a partially
+               built, pinned flush-dependency graph through a cleanup that frees a
+               still-referenced parent (double-free / NULL deref).  Reject the
+               duplicate here, before any of that native state would exist. */
+            var seen_addrs = uint<64>[]();
+            /* Every flush-dependency parent address a child declares must name an
+               entry that actually appears in this image.  libhdf5 looks each
+               parent up in the reconstruction index and fails with "fd parent not
+               in cache?!?" (H5Cimage.c:2533) when it is absent -- but that failure
+               unwinds a partially built, pinned dependency graph through the same
+               unsafe cleanup as the duplicate-address case.  Collect the declared
+               parents here and resolve them against the full address set once the
+               loop has seen every entry (a parent may be defined later than the
+               child that references it). */
+            var parent_addrs = uint<64>[]();
+            var parent_offs = uint<64>[]();
             while (i < nentries)
                 {
                     h5policy_walk_tick(1UL);
@@ -992,7 +1031,78 @@ fun h5policy_validate_mdci_payload = (int ios,
                             return;
                         }
                     var eoff = image_addr#B + cur#B;
+                    var type_id = h5policy_msg_u64_at(ios, profile, eoff, 1UL);
                     var eflags = h5policy_msg_u64_at(ios, profile, eoff + 1#B, 1UL);
+                    var ring = h5policy_msg_u64_at(ios, profile, eoff + 2#B, 1UL);
+                    var age = h5policy_msg_u64_at(ios, profile, eoff + 3#B, 1UL);
+
+                    /* Three single-byte enums libhdf5 range-checks on the READ
+                       path, in H5C__reconstruct_cache_entry (H5Cimage.c) -- not
+                       in H5C__decode_cache_image_entry, which is the write-side
+                       verification path and only asserts.  Checked here in
+                       libhdf5's own order, before the flag/count consistency
+                       rules below, because the first of them selects a
+                       deserializer.
+
+                       type_id is not an inert label: it indexes the cache
+                       client class table, and h5policy records it per entry
+                       (h5policy_mdci_body_types) to decide which bodies the
+                       replay pass decodes as object headers.  An out-of-range
+                       id therefore steers dispatch on both sides.  */
+                    if (type_id >= H5AC_NTYPES)
+                        {
+                            h5policy_emit_error_ev(
+                                "H5_CORRUPT_MDCI_ENTRY_CLASS", "corrupt",
+                                eoff, object,
+                                "metadata cache image entry names an unknown cache client type",
+                                H5Evidence {
+                                    field = "mdci.entry_class_valid",
+                                    actual = type_id,
+                                    expected = H5AC_NTYPES - 1UL,
+                                    comparison = "at_most",
+                                    has_loc1 = 1, loc1_role = "actual",
+                                    loc1 = eoff, loc1_len = 1UL
+                                });
+                            return;
+                        }
+                    /* Ring 0 (H5C_RING_UNDEFINED) is deliberately NOT rejected:
+                       the read path bounds only the top of the range, so a zero
+                       ring is accepted by a Release build and merely trips an
+                       assert in a debug one.  Rejecting it here would make
+                       h5policy refuse a file libhdf5 opens.  */
+                    if (ring >= H5C_RING_NTYPES)
+                        {
+                            h5policy_emit_error_ev(
+                                "H5_CORRUPT_MDCI_ENTRY_CLASS", "corrupt",
+                                eoff + 2#B, object,
+                                "metadata cache image entry names an unknown cache ring",
+                                H5Evidence {
+                                    field = "mdci.entry_class_valid",
+                                    actual = ring,
+                                    expected = H5C_RING_NTYPES - 1UL,
+                                    comparison = "at_most",
+                                    has_loc1 = 1, loc1_role = "actual",
+                                    loc1 = eoff + 2#B, loc1_len = 1UL
+                                });
+                            return;
+                        }
+                    if (age > H5AC_CACHE_IMAGE_ENTRY_AGEOUT_MAX)
+                        {
+                            h5policy_emit_error_ev(
+                                "H5_CORRUPT_MDCI_ENTRY_CLASS", "corrupt",
+                                eoff + 3#B, object,
+                                "metadata cache image entry age exceeds the ageout policy maximum",
+                                H5Evidence {
+                                    field = "mdci.entry_class_valid",
+                                    actual = age,
+                                    expected = H5AC_CACHE_IMAGE_ENTRY_AGEOUT_MAX,
+                                    comparison = "at_most",
+                                    has_loc1 = 1, loc1_role = "actual",
+                                    loc1 = eoff + 3#B, loc1_len = 1UL
+                                });
+                            return;
+                        }
+
                     var child_count = h5policy_msg_u64_at(ios, profile,
                                                           eoff + 4#B, 2UL);
                     var dirty_child_count = h5policy_msg_u64_at(ios, profile,
@@ -1009,6 +1119,24 @@ fun h5policy_validate_mdci_payload = (int ios,
                                                 "metadata cache image entry flags and dependency counts are inconsistent");
                             return;
                         }
+                    /* The IN_LRU flag (0x02) and the signed 32-bit lru_rank must
+                       agree: libhdf5 asserts (in_lru && lru_rank >= 0) ||
+                       (!in_lru && lru_rank == -1) (H5Cimage.c:2813) -- an assert
+                       compiled out under NDEBUG, so a Release reconstruction
+                       proceeds on an inconsistent LRU description.  lru_rank is a
+                       signed int32: -1 is 0xffffffff and "non-negative" is the
+                       sign bit (0x80000000) clear. */
+                    var lru_raw = h5policy_msg_u64_at(ios, profile,
+                                                      eoff + 10#B, 4UL);
+                    var in_lru = (eflags & 2UL) != 0UL;
+                    if (!((in_lru && (lru_raw & 0x80000000UL) == 0UL)
+                          || (in_lru == 0 && lru_raw == 0xffffffffUL)))
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT",
+                                                "corrupt", eoff + 10#B, object,
+                                                "metadata cache image entry LRU rank is inconsistent with its IN_LRU flag");
+                            return;
+                        }
                     var entry_addr_raw = h5policy_msg_bytes(ios, profile,
                                                             eoff + 14#B, o);
                     if (h5policy_msg_addr_is_undef(entry_addr_raw))
@@ -1018,6 +1146,24 @@ fun h5policy_validate_mdci_payload = (int ios,
                                                 "metadata cache image entry has an undefined address");
                             return;
                         }
+                    /* Cache-image entry addresses are ordinary HDF5 file
+                       addresses, so they are base-relative.  Translate once,
+                       here: every consumer below compares them against walk
+                       addresses, which are physical.  Left untranslated, a
+                       file with a user block shifts the shadow ranges by the
+                       base and h5policy_addr_is_shadowed stops matching, so
+                       the walk decodes the stale on-disk bytes the image
+                       shadows and reports the root header as corrupt. */
+                    var entry_addr = hdf5_addr_to_file_u64(
+                                         bytes_to_u64_le(entry_addr_raw));
+                    if (h5policy_seen_u64(seen_addrs, entry_addr))
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_DUPLICATE_ENTRY_ADDRESS",
+                                                "corrupt", eoff + 14#B, object,
+                                                "metadata cache image has two entries at the same file address");
+                            return;
+                        }
+                    seen_addrs += [entry_addr];
                     var body_len = h5policy_msg_u64_at(ios, profile,
                                                        eoff + (14UL + o)#B, el);
                     if (body_len == 0UL)
@@ -1051,14 +1197,60 @@ fun h5policy_validate_mdci_payload = (int ios,
                                                 "metadata cache image entry extends beyond the declared cache image");
                             return;
                         }
+                    /* Collect this entry's flush-dependency parent addresses.  The
+                       parent list sits between the entry header and the cached
+                       body, i.e. at eoff + entry_header; the overrun check above
+                       has already confirmed parents_size fits inside the image. */
+                    var parents_base = eoff + entry_header#B;
+                    var pi = 0UL;
+                    while (pi < parent_count)
+                        {
+                            h5policy_walk_tick(1UL);
+                            var praw = h5policy_msg_bytes(ios, profile,
+                                                          parents_base + (pi * o)#B, o);
+                            var praddr = hdf5_addr_to_file_u64(
+                                             bytes_to_u64_le(praw));
+                            /* An entry naming its own address is a self-loop in
+                               the dependency graph.  It is checked here rather
+                               than in the deferred pass below because a
+                               self-reference always RESOLVES -- the address is
+                               present, it is merely this entry's own -- so
+                               parent_addr_resolvable can never catch it, and the
+                               entry's address is already in scope here.  libhdf5
+                               rejects the same shape at H5Centry.c:3836
+                               ("Child entry flush dependency parent can't be
+                               itself"), reached from H5Cimage.c:2547; a longer
+                               cycle cannot be built, because parents resolve
+                               against entries already inserted, so a forward
+                               reference fails at H5Cimage.c:2533 first. */
+                            if (praddr == entry_addr)
+                                {
+                                    h5policy_emit_error("H5_CORRUPT_MDCI_PARENT_ADDR_SELF",
+                                                        "corrupt",
+                                                        ((parents_base / #B) + pi * o)#B,
+                                                        object,
+                                                        "metadata cache image entry names itself as its own flush-dependency parent");
+                                    return;
+                                }
+                            parent_addrs += [praddr];
+                            parent_offs += [(parents_base / #B) + pi * o];
+                            pi = pi + 1UL;
+                        }
                     /* Record what this entry shadows.  The walk skips exactly
                        these ranges and vets everything else; see
                        h5policy_addr_is_shadowed.  Recorded only after the entry
                        header has been validated above, so the range comes from
                        fields already checked. */
-                    h5policy_mdci_shadow_addrs
-                        += [bytes_to_u64_le(entry_addr_raw)];
-                    h5policy_mdci_shadow_lens += [body_len];
+                    if (h5policy_mdci_replay_mode == 0)
+                        {
+                            h5policy_mdci_shadow_addrs += [entry_addr];
+                            h5policy_mdci_shadow_lens += [body_len];
+                            h5policy_mdci_body_addrs += [entry_addr];
+                            h5policy_mdci_body_lens += [body_len];
+                            h5policy_mdci_body_sources
+                                += [(eoff/#B) + entry_header + parents_size];
+                            h5policy_mdci_body_types += [type_id];
+                        }
                     cur = cur + entry_span;
                     i = i + 1UL;
                 }
@@ -1071,8 +1263,41 @@ fun h5policy_validate_mdci_payload = (int ios,
                                         "metadata cache image has unclaimed trailing bytes");
                     return;
                 }
-            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
-                                "unsupported", payload_off, object,
-                                "metadata cache image contents are not decoded by Phase 2");
+            var image_checksum = lookup3_hashlittle(
+                h5policy_msg_bytes(ios, profile, image_addr#B,
+                                   image_size - 4UL), 0);
+            var stored_checksum = lookup3_u32_le(
+                h5policy_msg_bytes(ios, profile,
+                                   image_addr#B + (image_size - 4UL)#B, 4UL));
+            if (image_checksum != stored_checksum)
+                {
+                    h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM", "corrupt",
+                                        image_addr#B + (image_size - 4UL)#B,
+                                        object,
+                                        "metadata cache image checksum mismatch");
+                    return;
+                }
+            /* Reference-graph closure: every declared flush-dependency parent
+               must resolve to one of the entry addresses collected above.  A
+               dangling parent reaches libhdf5's H5Cimage.c:2533 failure and the
+               unsafe reconstruction cleanup; reject it before any native state
+               would be built.  seen_addrs now holds every entry address (the loop
+               returns early on the first duplicate, so reaching here means all
+               nentries were recorded). */
+            var pj = 0UL;
+            while (pj < parent_addrs'length)
+                {
+                    h5policy_walk_tick(1UL);
+                    if (!h5policy_seen_u64(seen_addrs, parent_addrs[pj]))
+                        {
+                            h5policy_emit_error("H5_CORRUPT_MDCI_PARENT_ADDR_UNRESOLVED",
+                                                "corrupt", parent_offs[pj]#B, object,
+                                                "metadata cache image flush-dependency parent address does not name any entry in the image");
+                            return;
+                        }
+                    pj = pj + 1UL;
+                }
+            if (h5policy_mdci_replay_mode == 0)
+                h5policy_mdci_replay_ready = 1;
         }
 }

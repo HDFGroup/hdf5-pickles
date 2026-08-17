@@ -96,15 +96,36 @@ def corrupt_first_snod_count(path):
         fh.write(raw)
 
 
+def locate_superblock(raw):
+    """The superblock's byte offset: 0, or the user block boundary holding it.
+
+    Mirrors libhdf5's H5FD_locate_signature and h5policy's own scan, so a
+    fixture written with a user block can be addressed the same way as one
+    without.  The returned offset is also the file's base address, which every
+    stored metadata address is relative to.
+    """
+    pos = 0
+    while pos + 8 <= len(raw):
+        if raw[pos:pos + 8] == b"\x89HDF\r\n\x1a\n":
+            return pos
+        pos = 512 if pos == 0 else pos * 2
+    raise AssertionError("fixture has no HDF5 signature")
+
+
 def corrupt_depth0_bthd_total_count(path):
     raw = bytearray(open(path, "rb").read())
-    off_size = raw[9]
-    len_size = raw[10]
+    base = locate_superblock(raw)
+    if raw[base + 8] < 2:
+        raise AssertionError("expected a v2/v3 superblock")
+    off_size = raw[base + 9]
+    len_size = raw[base + 10]
     off = raw.find(b"BTHD")
     while off >= 0:
         if off + 22 + off_size + len_size <= len(raw):
             depth = int.from_bytes(raw[off + 12:off + 14], "little")
-            root = int.from_bytes(raw[off + 16:off + 16 + off_size], "little")
+            # Stored addresses are base-relative; add the base to reach bytes.
+            root = base + int.from_bytes(
+                raw[off + 16:off + 16 + off_size], "little")
             if depth == 0 and raw[root:root + 4] == b"BTLF":
                 total_off = off + 18 + off_size
                 total = int.from_bytes(raw[total_off:total_off + len_size], "little")
@@ -563,6 +584,92 @@ def test_userblock_files_need_no_repairs(tmp):
         assert spec["actions"] == [], spec
 
 
+def test_userblock_snod_symbol_count_repair(tmp):
+    """The same repair as test_snod_symbol_count_repair, behind a user block.
+
+    Both fixtures reach the repair through h5patch_snod_entry_plausible, which
+    follows a symbol-table entry's stored object-header address to look for an
+    OHDR signature.  That address is base-relative, so with a user block an
+    untranslated read lands a base short of the header, every entry looks dead,
+    and the repair is silently never offered.
+    """
+    src = os.path.join(CORPUS, "valid", "userblock_earliest.h5")
+    damaged = os.path.join(tmp, "ub_bad_snod_count.h5")
+    repaired = os.path.join(tmp, "ub_snod_count_repaired.h5")
+    plan = os.path.join(tmp, "ub_snod_count.plan.json")
+    shutil.copyfile(src, damaged)
+    corrupt_first_snod_count(damaged)
+
+    run([H5PATCH, "plan", damaged, "-o", plan])
+    spec = json.load(open(plan))
+    assert spec["input"]["superblock_offset"] == 512, spec
+    assert any(
+        a["target"]["structure"] == "symbol_table_node" for a in spec["actions"]
+    ), spec
+
+    run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+    assert_accept(repaired)
+
+
+def test_userblock_depth0_btree_total_count_repair(tmp):
+    """test_depth0_btree_total_count_repair behind a user block.
+
+    The v2 B-tree header's root-node address is base-relative too; read as a
+    physical offset it misses the BTLF signature check, so the record-count
+    repair is skipped instead of planned.
+    """
+    src = os.path.join(CORPUS, "valid", "userblock_latest.h5")
+    damaged = os.path.join(tmp, "ub_bad_bthd_total_count.h5")
+    repaired = os.path.join(tmp, "ub_bthd_total_count_repaired.h5")
+    plan = os.path.join(tmp, "ub_bthd_total_count.plan.json")
+    shutil.copyfile(src, damaged)
+    corrupt_depth0_bthd_total_count(damaged)
+
+    run([H5PATCH, "plan", damaged, "-o", plan])
+    spec = json.load(open(plan))
+    assert spec["input"]["superblock_offset"] == 512, spec
+    assert any(
+        a["target"]["structure"] == "v2_btree_header"
+        and a["kind"] == "set_uint_le"
+        for a in spec["actions"]
+    ), spec
+
+    run([H5PATCH, "apply", damaged, plan, "--output", repaired])
+    assert_accept(repaired)
+
+
+def test_userblock_content_is_never_mistaken_for_a_superblock(tmp):
+    """A user block must not attract the byte-0 missing-signature fallback.
+
+    When no signature is found at any legal offset, h5patch may still restore
+    one at byte 0 if the bytes there look like a superblock body.  In a user
+    block those bytes are application data.  The version and width fields alone
+    are a weak signal -- the content below satisfies all of them -- so the
+    fallback must also require the body's own address fields to be coherent.
+    Getting this wrong overwrites eight bytes of application data with a
+    signature and still does not produce a readable file.
+    """
+    src = os.path.join(CORPUS, "valid", "userblock_latest.h5")
+    damaged = os.path.join(tmp, "ub_content_looks_like_superblock.h5")
+    raw = bytearray(open(src, "rb").read())
+    assert locate_superblock(raw) == 512, "fixture lost its user block"
+    # Destroy the real signature so the fallback is the only candidate left.
+    raw[512:520] = b"\x00" * 8
+    # User block content that passes the version/reserved/width screen: a v3
+    # superblock version byte and two supported address widths.
+    content = bytes(range(8)) + bytes([3, 8, 8, 0]) + b"\x00" * 4
+    raw[0:len(content)] = content
+    with open(damaged, "wb") as fh:
+        fh.write(raw)
+
+    proc = run([H5PATCH, "plan", damaged])
+    spec = json.loads(proc.stdout)
+    assert spec["input"]["superblock_offset"] is None, spec
+    assert spec["actions"] == [], spec
+    # And the user block's bytes are still the user's.
+    assert open(damaged, "rb").read()[0:len(content)] == content
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="h5patch-test-") as tmp:
         test_signature_repair(tmp)
@@ -577,6 +684,9 @@ def main():
         test_fshd_section_count_repair(tmp)
         test_reached_metadata_checksum_repairs(tmp)
         test_userblock_files_need_no_repairs(tmp)
+        test_userblock_snod_symbol_count_repair(tmp)
+        test_userblock_depth0_btree_total_count_repair(tmp)
+        test_userblock_content_is_never_mistaken_for_a_superblock(tmp)
     print("h5patch tests passed")
 
 

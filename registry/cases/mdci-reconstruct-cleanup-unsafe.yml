@@ -1,0 +1,534 @@
+# When cache-image reconstruction fails partway through, the cleanup that
+# unwinds it is not memory safe.
+#
+# Promoted from two working bundles (gitignored h5cve scratch) that turned out
+# to describe ONE libhdf5 defect reached by two different detectors.  Each is
+# named by its specimen's input_sha256, given in full under `triggers`:
+#   specimen 3126b374...   (NULL-deref DoS)
+#   specimen e52bb93f...   (double free / heap corruption)
+# They are recorded together deliberately.  The failing code, the semantic
+# boundary and the fix are identical; only the trigger that forces the FAIL
+# differs, and the two triggers give two different impacts.  Splitting the
+# record would duplicate the entire defect analysis and hide the fact that one
+# cleanup fix closes both.
+schema_version: 1
+
+id: mdci-reconstruct-cleanup-unsafe
+title: cache-image reconstruction failure unwinds a partially built pinned
+  flush-dependency graph through a memory-unsafe cleanup
+status: oracle-hardened          # h5policy rejects both specimens; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  Both specimens were produced by a generator script
+  held outside this repository; the specimens themselves live in two gitignored
+  working bundles, and their sha256s are recorded under `triggers` below.  No
+  advisory database was consulted, no advisory text was retrieved, and no
+  identifier was looked up;
+  the bundles' "affected/fixed version" claims are therefore NOT reproduced here
+  (see coverage_gaps).
+
+# -- Triage -------------------------------------------------------------------
+record: cache_image_dependency_graph
+versions: [0]                    # MDCI block version
+root_cause_classification: reference_graph
+violated_invariant:
+  - mdci.entry_lru_consistent    # fd-parent route, first field violated at HEAD
+  - mdci.entry_header_valid      # fd-parent route, second
+  - mdci.parent_addr_resolvable  # fd-parent route, the dangling edge itself
+  - mdci.entry_addr_unique       # duplicate-address route
+validation_closure: >-
+  the complete cache-image dependency graph -- every entry envelope, every entry
+  address, and every flush-dependency edge those entries declare -- established
+  before ANY prefetched entry or dependency edge is constructed.  No single
+  entry establishes it: address uniqueness and parent resolvability are both
+  properties of the entry set as a whole.
+activation_before_validation:
+  # Prefetched entries are inserted and pinned into the live metadata cache, and
+  # flush-dependency edges built between them, while the graph is still being
+  # decoded.  The duplicate/dangling detectors then fire mid-construction.
+  - native_construction
+entry_points:
+  - h5policy (oracle) -- untrusted-strict and legacy, rejects both specimens
+  - "libhdf5 H5Fopen -> H5C_protect (H5Centry.c:3033) -> H5C__load_cache_image
+     (H5Cimage.c:652) -> H5C__reconstruct_cache_contents (H5Cimage.c)"
+  - "shipped tools: every tool that opens the file.  h5dump -H is enough."
+
+# -- The defect, read out of the source tree (HDF5 2.3.0 @e4b6a964723) ---------
+defect: >-
+  H5C__reconstruct_cache_contents builds native state as it decodes: each entry
+  becomes a prefetched H5C_cache_entry_t inserted into the live cache, and
+  IS_FD_PARENT entries are PINNED so their children can point at them.  Only
+  after that construction has begun do the two real validity checks run --
+  H5C__check_for_duplicates (H5Cimage.c:2418, a genuine HGOTO_ERROR) and the
+  parent lookup that fails with "fd parent not in cache?!?" (H5Cimage.c:2533).
+  Either one returns FAIL into a `done:` block (H5Cimage.c:2635-2668) that must
+  now dismantle a half-built pinned graph, and that block is where the defect
+  lives.  It iterates the reconstruction hash table and, per entry, unprotects,
+  unpins, and calls H5AC_expunge_entry (:2657); on expunge failure it frees
+  entry_ptr->image_ptr (:2659), entry_ptr->fd_parent_addrs (:2661) and the entry
+  struct itself via H5FL_FREE (:2662), then frees the table node (:2667).
+  Two things make that unsafe.  First, ORDER: the loop frees entries in hash
+  order, not dependency order, so a parent can be expunged and freed while a
+  child processed later still lists it in flush_dep_parent[].  Expunging that
+  child drives H5C__prefetched_entry_notify (H5Cprefetched.c:233-244), which
+  walks flush_dep_parent[] and calls H5C_destroy_flush_dependency on each --
+  including the dead one.  Second, OWNERSHIP: H5FL_FREE at :2662 releases the
+  entry struct, but nothing clears the pointers other entries hold to it, and
+  recon_entry->entry_ptr keeps the stale value until :2666.  The freed entry is
+  reachable again.
+  Everything that would have caught the malformed graph earlier is an assert.
+  H5C__reconstruct_cache_entry states the flags/count and LRU relations only as
+  `assert((is_fd_child && fd_parent_count > 0) || (!is_fd_child &&
+  fd_parent_count == 0))` (H5Cimage.c:2806) and `assert((in_lru && lru_rank >= 0)
+  || (!in_lru && lru_rank == -1))` (:2813) -- compiled out under NDEBUG, and
+  mirrored on the encode side at :1460/:1464.  Every neighbouring field in the
+  same decoder gets a real HGOTO_ERROR.
+  H5C_destroy_flush_dependency's own guards are asserts too: assert(cache_ptr)
+  (H5Centry.c:3958) and assert(cache_ptr == child_entry->cache_ptr) (:3959),
+  right after `cache_ptr = parent_entry->cache_ptr` (:3957).  With those
+  compiled out, a torn-down parent's NULL cache_ptr flows to
+  H5C__unpin_entry_real(cache_ptr, parent_entry, true) (:3995), which
+  dereferences it in H5C__UPDATE_RP_FOR_UNPIN (:175).
+
+boundary_note: >-
+  The duplicate-address and dangling-parent checks are NOT missing -- libhdf5
+  really does detect both, and on a minimal specimen it rejects the file
+  cleanly.  The tracked fixture mdci_duplicate_entry_address.h5 (two entries, no
+  pinned parents, no spray) produces a tidy libhdf5 error stack and no crash.
+  What makes the cleanup fault is the PINNED-PARENT STRUCTURE present when the
+  detector fires: the specimens carry IS_FD_PARENT entries that children already
+  depend on, so the unwind has a real dependency graph to get wrong.  A fix that
+  only moves the duplicate check earlier would close one trigger and leave the
+  cleanup unsafe for the other; both halves are needed.
+
+# -- The two triggers ---------------------------------------------------------
+triggers:
+  dangling_fd_parent:
+    specimen: 8935 bytes, input_sha256
+      3126b3748e359178ac277700a97c4e3bbe6b234c4d9da0d1bde4f9511be89ba4
+    how: >-
+      A child entry names a flush-dependency parent address (0x18000000) that no
+      entry in the image defines.  The parent lookup fails at H5Cimage.c:2533 and
+      drops into the cleanup.  Entry 0 is independently malformed -- flags 0x00
+      (IN_LRU clear) with lru_rank 2816 -- and entry 1 has flags 0x10 (an
+      undefined bit, IS_FD_CHILD clear) with fd_parent_count 6.
+    impact: >-
+      NULL-pointer dereference -> SIGSEGV.  Denial of service, not a controllable
+      write on this route: the faulting address is 0x801f8, the near-NULL offset
+      of the replacement-policy field H5C__UPDATE_RP_FOR_UNPIN touches inside a
+      H5C_t.
+    crash_path: >-
+      H5C__unpin_entry_real (H5Centry.c:175, cache_ptr=0x0)
+      <- H5C_destroy_flush_dependency (H5Centry.c:3995)
+      <- H5C__prefetched_entry_notify (H5Cprefetched.c:244)
+      <- H5C__flush_single_entry (H5Centry.c:659)
+      <- H5C_expunge_entry (H5Centry.c:4107)
+      <- H5AC_expunge_entry (H5AC.c:593)
+      <- H5C__reconstruct_cache_contents (H5Cimage.c:2657, addr=48)
+      <- H5C__load_cache_image (H5Cimage.c:652)
+      <- H5C_protect (H5Centry.c:3033)
+    oracle_finding: H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT @ 5407
+    tracked_fixtures:
+      - malformed/mdci_entry_lru_inconsistent.h5      # the flags/rank defect, isolated
+      - malformed/mdci_parent_addr_unresolved.h5      # the dangling-parent route, isolated
+  duplicate_entry_address:
+    specimen: 2350001 bytes, input_sha256
+      e52bb93f31f6057435aec3131627345dc884fd609e22847e1c47a7bf6655a3d8
+    how: >-
+      Two entries share one file address.  H5C__check_for_duplicates
+      (H5Cimage.c:2418) detects it and drops into the same cleanup.  The specimen
+      additionally carries four IS_FD_PARENT (flags 0x04) pinned parents, two
+      IS_FD_CHILD (flags 0x08) children referencing them, and a 3000-entry spray
+      to groom the heap.
+    impact: >-
+      Double free / invalid free detected by glibc -- heap corruption.  A
+      stronger primitive than the DoS sibling, though no exploitability claim is
+      made here and none was attempted.
+    crash_path: >-
+      free <- H5MM_xfree (H5MM.c:201, mem=0x55555565fc20)
+      <- H5C__reconstruct_cache_contents (H5Cimage.c:2667)
+    oracle_finding: H5_CORRUPT_MDCI_DUPLICATE_ENTRY_ADDRESS @ 1221225
+    tracked_fixtures:
+      - malformed/mdci_duplicate_entry_address.h5
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  remeasured: 2026-08-15 at h5policy b568381, hdf5 tree e4b6a964723
+  oracle_after: >-
+    both specimens reject_corrupt (exit 2) under untrusted-strict, and all three
+    tracked fixtures reject under legacy:
+    mdci_entry_lru_inconsistent.h5 @ 2092 (H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT),
+    mdci_duplicate_entry_address.h5 @ 4142 (H5_CORRUPT_MDCI_DUPLICATE_ENTRY_ADDRESS),
+    mdci_parent_addr_unresolved.h5 @ 4158 (H5_CORRUPT_MDCI_PARENT_ADDR_UNRESOLVED).
+    No native state is constructed on any of them.
+  libhdf5_stock: >-
+    LIVE ON BOTH SPECIMENS.  Baseline build (2.3.0 Release, NDEBUG):
+    h5dump -H on the fd-parent specimen -> SIGSEGV (rc 139);
+    h5dump -H on the duplicate-address specimen -> "munmap_chunk(): invalid
+    pointer", SIGABRT (rc 134; run-to-run also SIGSEGV -- heap-layout dependent).
+  libhdf5_asserts_on: >-
+    Candidate build (RelWithDebInfo, asserts live, -fsanitize=address).  Both
+    abort earlier, at an assert, before the unsafe cleanup is reached:
+    fd-parent specimen -> H5Cimage.c:2813 lru_rank assert (entry 0 is the first
+    inconsistent field decoded); duplicate-address specimen -> H5Centry.c:3959
+    `cache_ptr == child_entry->cache_ptr` inside the teardown itself.
+    Note both are ASSERTION aborts, not ASan reports.  ASan produced no
+    heap-buffer-overflow or use-after-free report on either specimen, because
+    the assert fires first; the memory-safety evidence is the STOCK build's
+    glibc invalid-free and NULL fault, not a sanitizer diagnostic.
+  minimal_witness_does_not_crash: >-
+    dup_addr_witness.h5 (from the duplicate-address working bundle, built
+    by make_dup_addr_witness.py) -- two entries, correct image_data_len, valid
+    trailing checksum, NO pinned parents and no spray -- makes libhdf5 reject
+    cleanly via the H5C__check_for_duplicates error stack with no crash.  That
+    is the control that isolates the pinned-parent structure as the necessary
+    ingredient, and it is why the tracked fixtures reject in the oracle without
+    being crash reproducers.
+  no_amplification: >-
+    Explicitly measured and NEGATIVE, correcting an earlier working assumption.
+    Neither specimen amplifies memory: uncapped h5dump (-H and full) on the
+    fd-parent specimen peaks under 10 MB RSS before faulting, at every address
+    -space cap from 2 to 6 GiB and with no cap at all.  The multi-GiB h5dump
+    growth that prompted the original claim belongs to an unrelated
+    driver-info-block specimen held outside this repository (60 bytes -> ~4 GiB
+    and still climbing), not to this case.
+  width: >-
+    NOT measured at 32 bits.  The defect is pointer lifetime and teardown order,
+    not arithmetic, so a width dependence is not expected -- but the local 32-bit
+    build was not exercised on either specimen.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: crashed
+  libhdf5_version: 2.3.0
+  classification: agreement
+  note: >-
+    The oracle and libhdf5 AGREE that these files must not be accepted, so there
+    is no invariant-A disagreement and NO entry in
+    registry/h5policy-diff-tolerances.yml is warranted or present.  h5policy
+    reaches the verdict by decoding; libhdf5 reaches it by faulting.  The
+    tracked fixtures derived from this case are ordinary corpus fixtures that
+    both sides reject, which is why they need no exemption of any kind.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: planned          # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Two linked changes, both required.
+    (1) Promote the assert-only guards to real errors: H5Cimage.c:2806 and :2813
+    (and their encode-side twins at :1460/:1464) become HGOTO_ERROR, so a
+    self-inconsistent entry is rejected before a prefetched entry exists.  The
+    reject path must free partial entries WITHOUT entering
+    H5C_destroy_flush_dependency.
+    (2) Make the H5Cimage.c:2635-2668 cleanup memory safe regardless of what
+    forced the FAIL: tear down flush dependencies before freeing any parent, or
+    free in reverse dependency order; clear owning pointers after each free
+    (recon_entry->entry_ptr, and the flush_dep_parent[] slots of surviving
+    children) so no freed entry stays reachable.
+    Neither can reject a file libhdf5 itself wrote: a well-formed cache image
+    always satisfies is_fd_child<->fd_parent_count and in_lru<->lru_rank, and
+    never repeats an entry address.
+    BACKPORT SCOPE, corrected 2026-08-15 -- the two halves differ, and an earlier
+    revision of this record wrongly gave both the same reach ("every branch that
+    decodes MDCI version 0, 1.10.1+").
+    (2), the cleanup repair, is needed ONLY where the cleanup exists: 2.0.0
+    through HEAD.  The 1.14.x line has no `done:` cleanup at all and must not
+    have one grafted on as a "backport" -- doing so would import this defect into
+    a line that does not have it.  See version_range.
+    (1), promoting the assert-only guards, does apply broadly, since the asserts
+    are old; but note it is defence in depth rather than a crash fix, because on
+    1.14.x the same malformed images already fail without crashing.
+systemic:
+  semantic_boundary: >-
+    the cache-image dependency graph as one aggregate -- entry envelopes, entry
+    -address uniqueness, and flush-dependency edge resolvability all established
+    before the first prefetched entry is inserted into the cache.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 native cleanup still open
+  description: >-
+    h5policy validates the whole MDCI payload with no native construction at
+    all, so the class of defect cannot arise there: there is no partially built
+    graph to unwind.  h5policy_validate_mdci_payload (h5_messages.pk) decodes
+    every entry header, tracks seen entry addresses through h5policy_seen_u64,
+    checks the flags/count and IN_LRU/lru_rank relations per entry, and defers
+    flush-dependency parent resolution until every entry address is known --
+    then reports any unresolved parent.  All four invariants above are enforced
+    before the replay pass and before the trailing-checksum pass.
+    The remaining work is entirely libhdf5's; the oracle rejecting the metadata
+    does not make the native cleanup safe.
+  landed_changes:
+    - h5policy/pickles/h5_messages.pk (duplicate-address, LRU-consistency and
+      deferred parent-resolvability checks in h5policy_validate_mdci_payload)
+    - registry/findings/catalog/cache_image_dependency_graph.yml
+      (H5_CORRUPT_MDCI_DUPLICATE_ENTRY_ADDRESS,
+       H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT,
+       H5_CORRUPT_MDCI_PARENT_ADDR_UNRESOLVED)
+    - registry/validation-coverage.yml (mdci.entry_addr_unique,
+      mdci.entry_lru_consistent, mdci.parent_addr_resolvable + test rows)
+    - h5policy/tools/h5policy-gencorpus (_make_mdci_duplicate_entry_address,
+      _make_mdci_entry_lru_inconsistent, _make_mdci_parent_addr_unresolved)
+    - h5policy/tests/expected/malformed-mdci_{duplicate_entry_address,
+      entry_lru_inconsistent,parent_addr_unresolved}.yml
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc:
+    # Untracked working specimens, named by the input_sha256 under `triggers`.
+    - specimen 3126b374...      # dangling flush-dependency parent
+    - specimen e52bb93f...      # duplicate entry address
+  direct_fixtures:
+    - h5policy/tests/malformed/mdci_entry_lru_inconsistent.h5
+    - h5policy/tests/malformed/mdci_parent_addr_unresolved.h5
+    - h5policy/tests/malformed/mdci_duplicate_entry_address.h5
+  expectations:
+    - h5policy/tests/expected/malformed-mdci_entry_lru_inconsistent.yml
+    - h5policy/tests/expected/malformed-mdci_parent_addr_unresolved.yml
+    - h5policy/tests/expected/malformed-mdci_duplicate_entry_address.yml
+  control_fixture: h5policy/tests/valid/cache_image.h5
+  regression_witness: >-
+    h5policy/tests/cve/mdci_dup_addr_witness.h5 -- a PROVEN h5policy
+    false-accept before 7f928c9 (oracle exit 0, libhdf5 reject); at HEAD it
+    rejects, so it now witnesses the committed fix.
+    TRACKED SINCE 2026-08-15.  It previously existed only as
+    dup_addr_witness.h5 inside a gitignored working bundle -- so this record's
+    only regression guard against reopening a soundness hole was a file git
+    would not have restored.  Its
+    builder is now h5policy/tests/cve/make_mdci_dup_addr_witness.py, invoked
+    from h5policy-gencorpus (_make_mdci_dup_addr_witness), and the resulting
+    seed is checked byte-for-byte by run.sh's tracked-fixture reproducibility
+    step.
+    Measured at HEAD on promotion: reject_corrupt,
+    H5_CORRUPT_MDCI_DUPLICATE_ENTRY_ADDRESS @ 4142 on /<superblock-extension>,
+    single finding, stop_reason rejection.  Contracted by
+    h5policy/tests/expected/cve-mdci_dup_addr_witness.yml.
+    Note the offset coincides with the one measured_after records for
+    malformed/mdci_duplicate_entry_address.h5 -- both are grafted onto an h5py
+    base of the same shape, so the MDCI block lands in the same place.  It is a
+    coincidence of construction, not evidence that the two files are the same;
+    they differ in size (6232 bytes here) and in purpose.
+  generators: >-
+    The two integration specimens come from a generator script held outside this
+    repository (entry-building routines for the DoS and heap-corruption shapes
+    respectively); each bundle records the resulting file and its sha256, which is
+    what this record relies on.  The witness is built by make_dup_addr_witness.py
+    inside the dup-addr bundle, and the tracked fixtures by h5policy-gencorpus --
+    both reproducible from this repo alone.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true   # rejected while decoding the MDCI payload,
+                                         # before the replay pass touches any body
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: true
+
+backports: []          # nothing to backport in h5policy. On the libhdf5 side the
+                       # cleanup repair is needed on 2.0.0..HEAD only -- 1.14.x has
+                       # no cleanup to repair. Corrected 2026-08-15; see
+                       # version_range and containment.
+
+fuzz_seed: >-
+  Both specimens and dup_addr_witness.h5 are seeds for the cache_image bounded
+  decoder.  The witness is the direct seed for the mdci.entry_addr_unique check;
+  the fd-parent specimen is a seed for the entry-flags/LRU mutation
+  neighbourhood.
+
+compatibility_backport_risks: >-
+  Low on both halves of the containment.  A cache image libhdf5 itself wrote
+  always satisfies is_fd_child<->fd_parent_count and in_lru<->lru_rank and never
+  repeats an entry address, so promoting the asserts rejects no valid file.  The
+  cleanup reordering is invisible to valid files, which never take the failure
+  path at all.  The one real risk is behavioural rather than compatibility: a
+  file that today opens "successfully" on a Release build with a silently
+  corrupt reconstructed cache would begin failing at open.  That is the intended
+  outcome, but it will surface as a new error on files some users currently
+  consider readable.
+
+sibling_audit: >-
+  Within libhdf5: the encode-side sanity path (H5Cimage.c:1460/:1464) carries the
+  identical assert pair and is equally unguarded, so a writer fed a corrupt
+  in-memory graph has the same blind spot.  Every route that returns FAIL out of
+  H5C__reconstruct_cache_contents after construction has begun reaches the same
+  cleanup, so the two triggers documented here are unlikely to be the only ones;
+  H5C__make_space_in_cache failing at H5Cimage.c:2631 is a third, untested.
+  Within h5policy: the aggregate LRU-ordering rules libhdf5 asserts at
+  H5Cimage.c:2586-2613 (no rank 0, strict ordering, bounded holes) are NOT
+  modelled -- see the open question below.
+
+coverage_manifest_change: >-
+  No new record.  cache_image_dependency_graph gains no rows from this
+  promotion; all three findings and all three invariants were already landed by
+  7f928c9 and the commits that followed it.  This record documents the libhdf5
+  divergence those changes were built against.
+
+# -- Affected versions --------------------------------------------------------
+# THE HEADLINE, established 2026-08-15: this is a REGRESSION, and the regressing
+# change was itself a security fix. Both crash routes exist only because a
+# failure-cleanup path was added; before it, the same specimens were rejected
+# cleanly.
+version_range:
+  introduced_by: >-
+    libhdf5 commit 18297c1923b, 2025-11-04, whose subject line in the local tree
+    reads "Fix a crash when duplicate addesses occur (related to CVE-2025-6269)
+    (#5924)".  126 insertions, 1 deletion, all in src/H5Cimage.c.  It added the
+    H5C_recon_entry_t uthash table, H5C__check_for_duplicates, AND the `done:`
+    cleanup loop at H5Cimage.c:2635-2668 that this record is about.  The
+    identifier is quoted from the local commit message only; no advisory was
+    consulted and nothing is claimed about its contents.
+  before_the_commit: >-
+    H5C__reconstruct_cache_contents had NO failure cleanup whatsoever.  Its
+    entire `done:` block was `FUNC_LEAVE_NOAPI(ret_value)`.  A FAIL therefore
+    returned the error and leaked the partially built prefetched entries -- no
+    expunge, no frees, and so no double-free and no flush-dependency teardown to
+    NULL-deref.  Leaks, but does not crash.
+  affected: >-
+    2.0.0 (2025-11-10, the first tag containing 18297c1923b) through HEAD
+    e4b6a964723 (2.3.0 develop, 2026-08-13), where both crashes are still live.
+    Tags containing the commit: 2.0.0, 2.1.0, 2.1.1, 2.2.0, 2.2.0-rc1.
+  not_affected: >-
+    The entire 1.14.x line.  1.14.5 (2024-09-30) and 1.14.6 (2025-02-04) both
+    predate 18297c1923b, and 1.14.6's H5Cimage.c contains no reference to
+    recon_table or H5C__check_for_duplicates at all.
+  fix_claim_refuted: >-
+    The originating bundles carried a claim of an upstream fix at 2.1.1 / 1.14.6.
+    That claim is now REFUTED on two independent grounds.  1.14.6 (Feb 2025)
+    predates the code the defect lives in, so it cannot contain a fix for it.
+    2.1.1 (2026-03-23) postdates the introducing commit and precedes HEAD, where
+    the defect is measured live -- so no fix landed there either.  Whatever the
+    claim referred to, it was not this defect.
+  measured: >-
+    1.14.6 built locally from the hdf5_1.14.6 tag (RelWithDebInfo, NDEBUG,
+    shared, tools on) and compared against the 2.3.0 baseline on the same
+    specimens:
+      fd-parent PoC          1.14.6 rc=1 (clean error)  | 2.3.0 rc=139 SIGSEGV
+      duplicate-address PoC  1.14.6 rc=1 (clean error)  | 2.3.0 rc=134 SIGABRT
+    So the fix turned two clean rejections into a NULL-deref and a heap
+    double-free.
+  what_the_commit_did_fix: >-
+    A real gap, and this record does not dispute it.  On 1.14.6 a duplicate entry
+    address is ACCEPTED SILENTLY: dup_addr_witness.h5 and the tracked fixture
+    malformed/mdci_duplicate_entry_address.h5 both open with rc=0, while 2.3.0
+    rejects both with rc=1.  So 18297c1923b closed a genuine
+    accepts-a-corrupt-image hole and introduced a worse primitive on the failure
+    path it added to do so.  The right conclusion is that the cleanup needs
+    repairing, NOT that the commit should be reverted.
+  cross_version_control: >-
+    malformed/mdci_parent_addr_unresolved.h5 and malformed/mdci_parent_addr_self.h5
+    reject on BOTH 1.14.6 and 2.3.0, and valid/cache_image.h5 plus
+    malformed/mdci_entry_lru_inconsistent.h5 are accepted by both -- the latter
+    consistent with the assert-only LRU finding in
+    registry/cases/mdci-lru-rank-assert-only.yml.  Those four pin that the
+    1.14.6 build is behaving normally and that only the two crash routes moved.
+  label: source-derived (git archaeology) and measured (built 1.14.6)
+
+# -- Resolved -----------------------------------------------------------------
+resolved_questions:
+  - question: >-
+      Is the reverse-order teardown in `containment` actually sufficient?  A
+      malformed image might declare CYCLES among flush-dependency parents, and a
+      cyclic graph has no safe free order at all -- which would make the
+      recommendation unsound and force edge-teardown-before-free instead.
+    answer: >-
+      The recommendation is SOUND.  A reconstructed flush-dependency graph is
+      necessarily acyclic, for a structural reason plus one real runtime check.
+      STRUCTURAL: flush dependencies are resolved INSIDE the per-entry loop,
+      immediately after the entry is inserted into the index
+      (H5C__INSERT_IN_INDEX at H5Cimage.c:2510; the fd loop at :2524 resolves
+      each parent with H5C__SEARCH_INDEX).  A child can therefore only name a
+      parent that already appears at or before it in the image buffer.  A cycle
+      of length >= 2 needs A to name B and B to name A, which requires each to
+      precede the other -- impossible.  Whichever is decoded first fails with
+      "fd parent not in cache?!?" (:2533).
+      THE ONE SURVIVING CASE is a self-loop, where an entry names its own
+      address: the entry IS in the index by the time its parents are resolved,
+      so the search succeeds.  That is caught by a genuine runtime check --
+      `if (child_entry == parent_entry) HGOTO_ERROR(... "Child entry flush
+      dependency parent can't be itself")` in H5C_create_flush_dependency
+      (H5Centry.c:3836) -- not an assert, so it holds on a Release build.
+      Both rejections land in the H5Cimage.c:2635-2668 cleanup this record
+      documents, making them a third and fourth route into it, but neither is a
+      crash route on its own: the specimens carry no pinned parents, so the
+      unwind has no partially built graph to get wrong.
+    measured: >-
+      Two specimens built with the gencorpus _mdci_assemble/_mdci_entry helpers.
+      Self-loop (one entry, IS_FD_CHILD, parent address == its own): H5Fopen
+      succeeds, H5Gopen2 fails -- the image loads on first protect -- with
+      #011 H5Cimage.c:2547 "Can't restore flush dependency" ->
+      #012 H5Centry.c:3836 "Child entry flush dependency parent can't be
+      itself".  Two-cycle (A names B, B names A, both in-file): rejected at
+      #011 H5Cimage.c:2533 "fd parent not in cache?!?", confirming the forward
+      -reference argument above.  Both exit non-zero on the baseline and on the
+      asserts-on build, with no assert, no ASan report and no crash.
+    label: source-derived, confirmed by measured libhdf5 error stacks
+    side_effect: >-
+      Settling this exposed a PROVEN ORACLE FALSE-ACCEPT, now CLOSED.  h5policy
+      accepted the self-loop specimen -- exit 0, zero findings, under all four
+      profiles -- while libhdf5 rejected it on both builds.  A soundness gap, and
+      the reverse of every other divergence in this family, where h5policy is the
+      stricter side.  Cause: mdci.parent_addr_resolvable asks only whether a
+      declared parent address matches SOME entry, and a self-reference resolves
+      perfectly well -- the address is present, it is merely the entry's own.
+      Closed by a new invariant mdci.parent_addr_not_self and finding
+      H5_CORRUPT_MDCI_PARENT_ADDR_SELF, checked inline in the entry loop of
+      h5policy_validate_mdci_payload (the entry's own address is in scope there,
+      and no deferral is needed because resolvability is not the question).
+      Kept separate from parent_addr_resolvable deliberately: the two defects have
+      different libhdf5 diagnostics (H5Centry.c:3836 vs H5Cimage.c:2533), so
+      folding them would make the fixture assert a misleading cause.
+      Tracked as malformed/mdci_parent_addr_self.h5 (generator
+      _make_mdci_parent_addr_self); both sides now reject it, so no diff
+      tolerance is needed.
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    RESOLVED 2026-08-15 -- see version_range below.  This item previously read
+    "AFFECTED-VERSION RANGE IS UNVERIFIED".  It now is verified, by archaeology
+    plus a built 1.14.6, and the answer inverted the case: the crashes are a
+    REGRESSION introduced by a fix, not a long-standing defect.
+  - >-
+    No 32-bit measurement on either specimen (see measured.width).
+  - >-
+    Forensic profile times out on the duplicate-address specimen: the
+    3007-entry / ~2.35 MB spray exceeds the 50s forensic wall clock
+    (H5_UNSUPPORTED_WALK_TIMEOUT), so forensic returns
+    unsupported_coverage_gap on that file by SIZE, not by a decode gap.  The
+    definitive verdict comes from untrusted-strict, which rejects at 1221225
+    well inside budget.
+open_questions:
+  - >-
+    h5policy does not model the AGGREGATE LRU invariants libhdf5 asserts at
+    H5Cimage.c:2586-2613 -- no entry may have rank 0, ranks must be strictly
+    ordered, and holes are bounded.  A file whose per-entry IN_LRU/lru_rank
+    relations are all individually consistent but whose ranks violate the
+    ordering is presumably still accepted by the oracle.  No fixture built, so
+    this is untested rather than known-bad.  Shared with
+    registry/cases/mdci-lru-rank-assert-only.yml.
+    RESOLVED AS LOW PRIORITY 2026-08-15: that block is inside `#ifndef NDEBUG`
+    (:2555-:2615), and lru_rank has no non-debug reader anywhere -- reconstruction
+    appends entries in image-buffer order (:2517), so the stored ranks cannot
+    influence Release behaviour.  Modelling the aggregate rules buys agreement
+    with the debug build only.  It does NOT bear on this record's defect: the
+    unsafe cleanup is reached through the duplicate-address and dangling-parent
+    detectors, neither of which involves lru_rank.
+  # (the cycle question that stood here is answered in resolved_questions --
+  #  the graph is necessarily acyclic, so the containment above is sound)
+  - >-
+    The expunge-failure branch reports HDONE_ERROR "unable to expunge driver
+    info block" (H5Cimage.c:2663) -- a copy-paste message from unrelated code.
+    Cosmetic, but it means the diagnostic a user sees on this path names the
+    wrong structure entirely.
+
+provenance:
+  found_by: >-
+    locally generated specimens, triaged through the h5cve bundle workflow
+    2026-08-14 in two untracked working bundles (CASE.md, source-audit.md
+    in each); promoted 2026-08-15
+  hdf5_build: >-
+    HDF5 2.3.0 @e4b6a964723 (final_autotools_develop-607); baseline Release
+    (NDEBUG) -- SIGSEGV and glibc invalid-free respectively; candidate
+    RelWithDebInfo -fsanitize=address with asserts live -- SIGABRT at
+    H5Cimage.c:2813 and H5Centry.c:3959 respectively.  Both are
+    workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

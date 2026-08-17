@@ -205,6 +205,27 @@ var h5policy_pipeline_decode_nelmts_offset = 0UL;
 var h5policy_pipeline_decode_size = 0UL;
 var h5policy_pipeline_has_decode_size = 0UB;
 var h5policy_pipeline_decode_size_offset = 0UL;
+/* A fixed-array chunk index is pre-sized once, at creation, from the dataset's
+   MAXIMUM extent: libhdf5 stores prod(ceil(max_dims[i] / chunk_dim[i])) in the
+   FAHD header and never grows it.  Nothing on the read path checks the stored
+   capacity against the dataspace it indexes, so the three facts are recorded
+   here -- the effective maximum extent, the chunk grid, and the stored
+   capacity -- and cross-checked once the whole object header has been walked
+   (h5policy_finalize_ohdr_dataset).  Finalization, not the layout message,
+   because object-header messages arrive in any order: a layout placed before
+   its dataspace would otherwise evade an inline check.
+
+   Only the object's own dataset messages record here.  An attribute carries a
+   dataspace of its own and is validated against a throwaway context copy, so
+   its shape must not seed a dataset's cross-check; the same holds for a
+   duplicate dataspace message, which the dispatch parses for corruption but
+   does not let replace the first one.  */
+var h5policy_dataspace_max_dims = uint<64>[]();
+var h5policy_dataspace_max_dim_offsets = uint<64>[]();
+var h5policy_chunk_grid_dims = uint<64>[]();
+var h5policy_fixed_array_nelmts = 0UL;
+var h5policy_fixed_array_nelmts_offset = 0UL;
+var h5policy_has_fixed_array_index = 0UB;
 var h5policy_super_stab_leaf_k = 4UL;
 var h5policy_super_stab_internal_k = 16UL;
 var h5policy_super_indexed_internal_k = 32UL;
@@ -487,6 +508,15 @@ fun h5policy_count_chunks = (H5WalkContext ctx,
 fun h5policy_map_msg_prefix = (int ios, H5PolicyProfile profile,
                                offset<uint<64>,B> off) msg_prefix:
 {
+    var size = global_version == 1 ? 5UL
+               : (global_crt_tracked != 0 ? 6UL : 4UL);
+    var source = h5policy_mdci_replay_source(off/#B, size);
+    if (source != 0xffffffffffffffffUL)
+        {
+            if (h5policy_run_options.nonstrict_mapping != 0UB)
+                return msg_prefix @! ios : source#B;
+            return msg_prefix @ ios : source#B;
+        }
     if (h5policy_run_options.nonstrict_mapping != 0UB)
         return msg_prefix @! ios : off;
     return msg_prefix @ ios : off;
@@ -495,9 +525,19 @@ fun h5policy_map_msg_prefix = (int ios, H5PolicyProfile profile,
 fun h5policy_map_cont = (int ios, H5PolicyProfile profile,
                          offset<uint<64>,B> off) oh_msg_cont:
 {
-    if (h5policy_run_options.nonstrict_mapping != 0UB)
-        return oh_msg_cont @! ios : off;
-    return oh_msg_cont @ ios : off;
+    var size = (global_sizeof_offsets as uint<64>)
+               + (global_sizeof_lengths as uint<64>);
+    var source = h5policy_mdci_replay_source(off/#B, size);
+
+    /* The shared pickle rejects zero extents and targets past declared EOF.
+       The continuation dispatcher must instead receive these raw fields so it
+       can emit H5_CORRUPT_ZERO_CONTINUATION_CHUNK or
+       H5_CORRUPT_OFFSET_OUT_OF_FILE before deciding whether to follow the
+       target.  Keep this exception local to the payload: ordinary message
+       prefixes and all other mappings retain the profile-selected strictness. */
+    if (source != 0xffffffffffffffffUL)
+        return oh_msg_cont @! ios : source#B;
+    return oh_msg_cont @! ios : off;
 }
 
 fun h5policy_msg_bytes = (int ios, H5PolicyProfile profile,
@@ -505,6 +545,13 @@ fun h5policy_msg_bytes = (int ios, H5PolicyProfile profile,
                           uint<64> size) byte[]:
 {
     h5policy_walk_tick(size + 1UL);   /* account the bytes touched, not just the call */
+    var source = h5policy_mdci_replay_source(off/#B, size);
+    if (source != 0xffffffffffffffffUL)
+        {
+            if (h5policy_run_options.nonstrict_mapping != 0UB)
+                return byte[size] @! ios : source#B;
+            return byte[size] @ ios : source#B;
+        }
     if (h5policy_run_options.nonstrict_mapping != 0UB)
         return byte[size] @! ios : off;
     return byte[size] @ ios : off;

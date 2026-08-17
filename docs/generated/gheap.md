@@ -20,6 +20,9 @@ header occupy `align8(8 + sizeof_lengths)` bytes on disk.
 
 A global heap object is referenced from elsewhere by a Global Heap ID
 (`gheap_id`): the collection's file address plus a 1-based object index.
+Lookup rejects index 0, which is free space rather than reference data, and
+reports the selected object's exact unpadded data size so reference decoders
+can verify a separately encoded payload length before reading it.
 
 All fields are stored in little-endian byte order.
 

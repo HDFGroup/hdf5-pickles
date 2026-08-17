@@ -25,6 +25,27 @@ controlled outcome; a change that alters any decision is surfaced for review.
   states intent, not observation — a fixture permitted to report `violation`
   carries a comment saying why, and the reason is recorded in
   `../../registry/cases/`.
+
+  A fixture may name more than one exercised family with `families:` instead of
+  `family:`. This is required when one valid file is evidence for more than one
+  semantic boundary.
+
+  Fixtures and typed `fuzz_targets.recipes` can also carry a `verification`
+  mapping for the §12 assurance categories. The supported keys are
+  `count_and_extent_boundaries`, `integer_overflow_and_allocation_budget`,
+  `deep_nesting_and_non_progress`, and `reference_semantics_cases`. Each value
+  is a list of reviewed category names, for example:
+
+  ```yaml
+  verification:
+    count_and_extent_boundaries: [zero, n, n_plus_one]
+    deep_nesting_and_non_progress: [non_progress]
+    reference_semantics_cases: [self_reference, overlap]
+  ```
+
+  `h5cve verification` consumes these annotations and lists their source
+  fixtures or recipes. Missing required categories remain `partial` or
+  `not_assessed`; an annotation never upgrades coverage by itself.
 - `unit_datatype.pk` — synthetic checks for the bounded, depth-guarded
   datatype validator (recursion cap and truncation handling), run under poke.
 - `unit_messages.pk` — fixed-envelope and dispatch checks for old/new mtime,
@@ -212,7 +233,9 @@ its checksum covers one used record while metadata accounting charges all 50
 configured record slots. A separate set of 24 oversized shared compound
 datatypes forces a depth-one type-1 huge-object tree; its own checksum, child
 range, cycle, object-extent, depth, and metadata-ceiling cases cover the heap's
-second recursive index independently of wrapper-body decoding.
+second recursive index, while the accepting base resolves indirect unfiltered
+huge bodies. A second accepting fixture shares a one-byte fill value through a
+tiny ID, proving that the inline body is dispatched without heap-data access.
 
 Legacy chunk-index cases cover the subtler finite-ceiling boundary directly.
 A four-chunk v1 B-tree distinguishes equality from overflow within one leaf;
@@ -242,11 +265,11 @@ inspecting attributes, reading small datasets, or running optional `libhdf5`
 tools; those eager catches are security-useful, not hard false positives. The
 similarly narrow `A~` warning covers file-global SOHM/free-space metadata that
 read-only libhdf5 paths leave unopened, and findings confined to dense
-secondary creation-order indexes. It also covers the generated wide-length
-controls whose impossible contiguous-data extents libhdf5 leaves lazy. Current
-libhdf5 can enumerate the primary name index without authenticating every
-type-6/type-9 block, and can report those controls' scalar datasets without
-checking their physical extents; h5policy intentionally validates both.
+secondary creation-order indexes. Current libhdf5 can enumerate the primary
+name index without authenticating every type-6/type-9 block; h5policy
+intentionally validates those structures eagerly. Legal 16-byte superblock
+length fields are instead h5policy compatibility refusals: libhdf5's shared
+length decoder does not support the width, so h5policy stops at preflight.
 
 The logical-**bytes** comparison is warning-level rather than a hard failure:
 h5policy now tracks logical dataset bytes separately from raw storage bytes, so

@@ -1,0 +1,376 @@
+# An external link's value is handed to strlen() with its length in scope and
+# explicitly discarded, so an unterminated target file name reads off the end
+# of a three-byte allocation -- and libhdf5 then tries to OPEN what it found.
+#
+# Promoted from one working bundle (gitignored h5cve scratch; the specimen is
+# identified by provenance.input_sha256 below).
+#
+# An earlier revision of this record also claimed the tracked registry falsely
+# reports libhdf5 as enforcing this invariant.  That claim was WRONG and is
+# retracted -- see registry_reading_note, which explains what the row actually
+# means and why no change is warranted.
+schema_version: 1
+
+id: external-link-value-strlen-unbounded
+title: external-link traversal discards the value length it is given and calls
+  strlen on an unterminated target file name, then attempts to open the result
+status: oracle-hardened          # h5policy rejects under every profile; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The bundle's supplied
+  directory and file names are identifiers, not advisory evidence, and are not
+  reproduced as claims here.
+
+# -- Triage -------------------------------------------------------------------
+record: external_link
+versions: [1]                    # external link value version
+root_cause_classification: local_decode
+violated_invariant:
+  - elink.value_terminated
+validation_closure: >-
+  one complete version-1 compact object-header link message -- envelope,
+  payload, name, and the declared external value, with BOTH required
+  NUL-terminated strings proven to end inside that value.  Record-local: no
+  secondary file region is needed, which is what makes the missing check so
+  cheap to add.
+activation_before_validation:
+  # All three, and this is the part that makes it more than an over-read: the
+  # malformed value reaches a user-defined traversal callback and then an
+  # actual external file open.
+  - native_construction
+  - callback
+  - external_open
+entry_points:
+  - h5policy (oracle) -- untrusted-strict, forensic, legacy and trusted-fast all reject
+  - "libhdf5 H5Fopen -> H5Lvisit2 -> H5Oopen (external_link canary)"
+  - "libhdf5 H5G__traverse_ud (src/H5Gtraverse.c) -> H5L__extern_traverse (src/H5Lexternal.c)"
+  - "libhdf5 H5O__link_decode (src/H5Olink.c), which stores the value length and never checks termination"
+  - "shipped tools: stock h5dump -H reports it cannot unpack the value -- after the fact"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  The bound is available at every step and is thrown away at the one step that
+  needs it.
+  H5O__link_decode accepts the value on a minimum-length test alone:
+    if (lnk->type == H5L_TYPE_EXTERNAL && len < 3)   /* src/H5Olink.c:250 */
+        ...error...
+    lnk->u.ud.size = len;                            /* :252 -- the length IS retained */
+  Three bytes is enough for a version/flags byte plus two empty strings, so a
+  value of exactly three bytes with no NUL anywhere passes.  Nothing here
+  establishes that either string terminates.
+  H5L__extern_traverse then receives that length and declares it unused in its
+  own signature:
+    static hid_t H5L__extern_traverse(..., const void *_udata,
+                     size_t H5_ATTR_UNUSED udata_size, ...)   /* src/H5Lexternal.c:96 */
+  and reads the strings unbounded:
+    file_name = (const char *)p;
+    fname_len = strlen(file_name);                    /* :132 -- no bound */
+    obj_name  = (const char *)p + fname_len + 1;      /* :133 -- derived from it */
+  So `fname_len` is however far strlen runs past the allocation, and `obj_name`
+  is a pointer computed from that -- already outside the buffer before anything
+  else happens.
+  Its SIBLING in the same file gets this right.  H5L__extern_query
+  (src/H5Lexternal.c:274) takes the same `udata_size` parameter without the
+  H5_ATTR_UNUSED marking and honours it:
+    if (udata_size < buf_size)                        /* :291 */
+        buf_size = udata_size;                        /* :292 */
+    ...
+    ret_value = (ssize_t)udata_size;                  /* :299 */
+  One of a pair of functions marks the bound unused; the other uses it.
+
+pattern_note: >-
+  This is the SECOND record in this registry whose root cause is a bound passed
+  into a function and declared H5_ATTR_UNUSED in its own signature, where a
+  sibling function in the same file uses the same parameter correctly.  The
+  other is registry/cases/fill-value-size-unchecked-in-new-decoder.yml, where
+  H5O__fill_new_decode marks `open_oh` unused while H5O__fill_old_decode uses
+  it to fetch the datatype.
+  A read-only sweep of the local source tree on 2026-08-15 turned this from a
+  coincidence into a class.  A THIRD instance is
+  registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml, where both
+  offending consumers take the metadata cache's image length and mark it unused
+  -- H5B2__cache_leaf_verify_chksum (src/H5B2cache.c:954) and
+  H5B2__cache_leaf_deserialize (:994), with the internal-node twins at :553 and
+  :594 -- and derive their extent from a file-controlled count instead.
+  CORRECTED 2026-08-15.  An earlier revision of this record called the marking
+  "endemic across metadata-cache client callbacks".  That was over-stated, from
+  a grep truncated at 40 lines whose visible output was dominated by `serialize`
+  functions -- the write path, where a discarded length is not a defect.  The
+  completed sweep is in registry/cases/decoder-bound-shape-sweeps.yml: on the
+  READ path the count is FIVE, all in src/H5B2cache.c, plus two deliberate
+  no-op stub clients and one CORRECT implementation.
+  That correct one is the useful find.  H5SM__cache_list_verify_chksum
+  (src/H5SMcache.c:477) discards `len` exactly the same way but bounds the
+  file-controlled count against capacity first, which shows that discarding
+  `len` is not itself the defect -- deriving an extent from an unvalidated file
+  count is.  H5_ATTR_UNUSED marks a place to look, not a defect.
+
+# -- Registry finding (not about libhdf5) -------------------------------------
+registry_reading_note: >-
+  CORRECTED 2026-08-15.  An earlier revision of this record, under the heading
+  `registry_claim_contradicted`, asserted that the `hdf5: enforced` claim for
+  elink.value_terminated was CONTRADICTED by this case and that the evidence
+  file "disagrees with itself".  THAT WAS INCORRECT, and it is retracted here
+  rather than quietly deleted.
+  The evidence file does not disagree with itself; it reports two different
+  facts in two fields, on purpose.  tools/h5cve documents `verdict` as scoped to
+  `reject_corrupt` specimens and meaning "every comparable specimen reaching the
+  family surface is rejected by libhdf5", and states that "activation_observed
+  and crashes_on are reported separately: a build can enforce an invariant and
+  still crash or activate reaching it."  libhdf5 DOES reject this file -- after
+  three external opens -- so `enforced` is correct under that definition, and
+  the external_open is correctly recorded in `activation_observed`.
+  The activation is also picked up where it belongs: h5cve derives
+  `no_activation_on_validation_failure`, which goes to `partial` when a
+  rejecting fixture activates, naming the fixture.  Nothing is hidden.
+  WHAT A READER SHOULD TAKE FROM THE ROW: `validators.hdf5: enforced` means
+  "libhdf5 rejects the comparable specimens", NOT "libhdf5 validates before
+  acting".  For an invariant whose whole point is that nothing may be opened
+  before the value is proven terminated, the interesting field is
+  `activation_observed`, not `verdict` -- and it says exactly the right thing.
+  No change to validation-coverage.yml or libhdf5-evidence.yml is warranted,
+  and none was made.
+  The substantive finding of this record is unaffected: libhdf5 reads out of
+  bounds and attempts three external opens on a malformed value.  Only the
+  claim about the REGISTRY was wrong.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  REMEASURED: >-
+    2026-08-15, at HEAD.  NO DRIFT, and the most load-bearing claim in this
+    record is now a measurement rather than a bundle transcript.
+    Oracle: reject_corrupt under all four profiles with
+    H5_CORRUPT_EXTERNAL_LINK_VALUE_NOT_TERMINATED @ 94 on / -- the same offset
+    under untrusted-strict, forensic, legacy AND trusted-fast, confirming the
+    "corrupt outranks the policy finding under every profile" claim.  Strict and
+    forensic additionally report H5_POLICY_EXTERNAL_LINK @ 87; legacy and
+    trusted-fast report the corrupt finding alone.  Walks complete.
+    Probe: stock rejected_in_traversal WITH `activation: {external_open: 3}`.
+    That is the record's central point -- libhdf5 attempts three external opens
+    on a name derived from an out-of-bounds read before failing -- and it is now
+    observed at HEAD, in the probe's own activation counter, rather than carried
+    over from the bundle.  ASan crashed (signal 6).
+  oracle_as_recorded: >-
+    reject_corrupt under all four profiles at the same offset 94, finding
+    H5_CORRUPT_EXTERNAL_LINK_VALUE_NOT_TERMINATED, object /.  untrusted-strict,
+    forensic, legacy and trusted-fast agree -- unusual, and it is because the
+    value is structurally malformed rather than merely pointing somewhere
+    hostile, so `corrupt` outranks the external-link policy finding under every
+    profile including the permissive ones.  Truncation sweep exhaustive over
+    102 prefixes, all reject_corrupt, no violations.
+  specimen_bytes: >-
+    101-byte file, superblock v2, root object header at 48.  Link message type
+    6, envelope [83,97), payload [87,97), link version 1, flags 8, link type 64
+    (external), name "x".  External value at [94,97): 3 bytes, version/flags
+    byte 0, then the two raw bytes 0x41 0x41 ("AA") and nothing else -- the
+    target file name is unterminated and the target object path is absent
+    entirely.  The object-header chunk checksum follows immediately at 97,
+    which is what strlen runs into first.
+  libhdf5_stock_as_recorded: >-
+    rejected_in_traversal -- but with THREE external_open attempts for "AA"
+    before H5Oopen fails.  The rejection is not a bound; it is what happens
+    after the library has already read out of bounds and tried to open files
+    named from the result.  probe_reported_violations records [external_open].
+  libhdf5_asan_as_recorded: >-
+    CRASHED.  heap-buffer-overflow, READ of size 3, in strlen called from
+    H5L__extern_traverse.  Canary status `violation`.  Note the ASan run shows
+    external_open 0 while the Release run shows 3 -- the sanitizer aborts at
+    the over-read before traversal gets as far as opening anything, so the two
+    builds expose different halves of the same sequence and BOTH are needed to
+    see the whole defect.
+  direct_consumer: >-
+    stock h5dump -H reports it cannot unpack the malformed external-link value.
+    That is a clean-looking message produced downstream of the over-read, not
+    evidence of validation.
+  width: >-
+    NOT measured at 32 bits.  All encoded extents are below 2^32 so the missing
+    bound is not width-dependent, but strlen behaviour, allocator layout and
+    the callback ABI differ, so how far the read runs is unmeasured there.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: crashed (ASan) / rejected-after-activation (Release)
+  libhdf5_version: 2.3.0
+  classification: agreement-on-verdict, divergence-on-boundary
+  note: >-
+    Both sides refuse the file, so there is no invariant-A disagreement and NO
+    entry in registry/h5policy-diff-tolerances.yml is warranted or present.
+    But the agreement is only about the final answer.  h5policy rejects the
+    value at decode with no callback, no external open and no libhdf5; libhdf5
+    reaches the answer after an out-of-bounds read and three attempts to open a
+    file whose name it derived from that read.  For this invariant the boundary
+    is the whole point, and the field that captures it is `activation_observed`
+    in registry/libhdf5-evidence.yml, not `verdict` -- see
+    registry_reading_note.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    The smallest supported-branch fix is local to H5L__extern_traverse: drop
+    the H5_ATTR_UNUSED from `udata_size` (src/H5Lexternal.c:96) and use bounded
+    searches for both NULs -- memchr over the remaining extent rather than
+    strlen -- failing before `obj_name` is derived, before any callback runs,
+    and before H5F_prefix_open_file is reached.  The length is already there;
+    H5O__link_decode stored it at src/H5Olink.c:252.
+    Better, and the systemic version: reject at decode.  H5O__link_decode
+    currently tests only `len < 3`; requiring both terminators to fall inside
+    the value there means no malformed value ever reaches ANY external-link
+    traversal path, including link expansion during object copy.  That is where
+    h5policy puts the check.
+    A defensive consumer-side bound is not sufficient on its own, because
+    obj_name is computed from the unbounded fname_len before any consumer sees
+    it.
+systemic:
+  semantic_boundary: >-
+    record-local external-link value validation during object-header link raw
+    decode: decode an inert external reference and require both terminators
+    within the declared value before materialising H5O_link_t or handing the
+    reference to traversal.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 traversal and decode still open
+  description: >-
+    h5policy enforces the invariant under every profile with string searches
+    bounded by their encoded region, performing no libhdf5 call, no callback,
+    no external open and no plugin load.  The class of defect cannot arise: no
+    pointer is ever derived from an unbounded length.
+    The remaining work is entirely libhdf5's.
+  landed_changes:
+    - h5policy/pickles/h5_dense_links.pk (bounded terminator search;
+      H5_CORRUPT_EXTERNAL_LINK_VALUE_NOT_TERMINATED)
+    - registry/findings/catalog/external_link.yml
+    - registry/validation-coverage.yml (elink.value_terminated); on how to read
+      its hdf5 validator row, see registry_reading_note
+    - h5policy/tools/h5policy-gencorpus (wipes the NUL terminators in a valid
+      external link's value)
+    - h5policy/tests/expected/malformed-external_link_unterminated_value.yml
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/external_link_unterminated_value.h5
+  direct_fixtures:
+    - h5policy/tests/malformed/external_link_unterminated_value.h5
+  expectations:
+    - h5policy/tests/expected/malformed-external_link_unterminated_value.yml
+  control_fixture: h5policy/tests/valid/... (external-link policy fixtures under
+    h5policy/tests/policy/ exercise well-formed external links; a well-formed
+    link with a hostile TARGET is a policy matter, not corruption -- that
+    distinction is the control for this record)
+  direct_witness: >-
+    external-link-byte-layout.md in the bundle retains the 10-byte link payload
+    at [87,97) verbatim.  It is a deterministic reconstruction recipe, and the
+    smallest raw witness -- but not executable, since no public local API
+    decodes an isolated raw external-link payload.  input.h5 is the executable
+    one.
+  generators: >-
+    The tracked fixture is generator-produced and reproducible from this repo.
+    The bundle's specimen is a supplied 101-byte find whose original generator
+    is unavailable locally, and it is NOT byte-identical to the tracked
+    fixture -- so the two are independent shapes, not copies.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: false           # FALSE on libhdf5, and that is the point
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []          # nothing to backport in h5policy.
+
+fuzz_seed: >-
+  h5policy/tests/malformed/external_link_unterminated_value.h5 seeds the external-link value
+  neighbourhood.  The untested boundary is the SECOND string: this specimen
+  omits the target object path entirely, so the case where the file name
+  terminates correctly and the object path does not is unexercised on both
+  sides.  h5mutate produced zero variants -- its recipes are continuation-only
+  and none applies to a link value.
+
+compatibility_backport_risks: >-
+  Low.  Two in-range NUL terminators are a hard structural requirement of the
+  format, not a path policy, so no conforming file is affected and no
+  path-handling behaviour changes.  The three-byte extent does not exercise any
+  width narrowing.  The one thing to verify per branch is the error-stack
+  contract: files that today produce "cannot unpack external link value" after
+  the fact would begin failing earlier and with a different message, and any
+  consumer matching on that text would see the change.
+
+sibling_audit: >-
+  Within libhdf5: H5G__traverse_ud passes both udata and udata_size to
+  user-defined traversal callbacks, so the size reaches every such callback --
+  H5L__extern_traverse is the one audited here and the one that discards it.
+  Its query sibling H5L__extern_query uses the size correctly and does not
+  derive filename/object pointers at all.  Because H5O__link_decode accepts any
+  external value of length >= 3, malformed values can reach ALL external-link
+  traversal paths, link expansion during object copy included; only the
+  H5Lvisit2/H5Oopen path is measured.  Non-external user-defined link classes
+  are NOT established safe -- they receive the same udata/udata_size pair and
+  were not audited.
+  Within h5policy: the bounded terminator search covers the object-header link
+  message.  Whether the same value shape arriving through a DENSE link
+  (fractal-heap-stored) takes the same validated path is asserted from the
+  shared implementation, not separately measured.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED, and deliberately not asserted.  Measured live on 2.3.0 against
+    a local source tree at 4b1ffa68a840.  No archaeology was run on
+    H5Lexternal.c and no older tag was built.
+  note: >-
+    The H5_ATTR_UNUSED marking on udata_size suggests the parameter was
+    introduced for the callback signature and never used by this implementation,
+    which would make the defect as old as the external-link class -- but that is
+    an inference from code shape, not a measurement.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    WITHDRAWN 2026-08-15.  This item claimed the registry falsely reports
+    libhdf5 as enforcing this invariant, and that the generator's verdict logic
+    needed revisiting.  Both claims were wrong -- the term is narrower than the
+    earlier reading assumed, and the activation is tracked in
+    `activation_observed` and in `no_activation_on_validation_failure`.  See
+    registry_reading_note.  Nothing to fix.
+  - >-
+    CLOSED 2026-08-15 -- see measured.REMEASURED.  No drift, and the three
+    external opens are now measured at HEAD through the probe's activation
+    counter rather than carried from the bundle.
+  - >-
+    No 32-bit measurement (see measured.width).
+  - >-
+    The second string is unexercised: no specimen has a correctly terminated
+    file name followed by an unterminated object path.
+  - >-
+    No exact-build canary asserts that decode rejection precedes callback and
+    external-open activity.  Today the canary records the crash; it does not
+    assert the boundary, which is the property this invariant is actually about.
+open_questions:
+  - >-
+    ANSWERED 2026-08-15, see registry/cases/decoder-bound-shape-sweeps.yml.
+    This item asked how many other H5_ATTR_UNUSED size/context parameters hide
+    the same defect.  The refined sweep found NO new defects: the read-path
+    membership is exactly the v2 B-tree cache client, already fully recorded.
+    H5FAcache.c, H5EAcache.c and H5Bcache.c appeared only in the write-path
+    (`serialize`) half and are not candidates.
+  - >-
+    Do non-external user-defined link classes have the same exposure?  They
+    receive the same udata/udata_size pair through H5G__traverse_ud and were
+    not audited.
+
+provenance:
+  found_by: >-
+    a supplied specimen, triaged through the h5cve bundle workflow in
+    an untracked working bundle; promoted 2026-08-15.  The registry
+    contradiction was found at promotion, by checking the bundle's
+    coverage_manifest_change note against validation-coverage.yml and
+    libhdf5-evidence.yml.
+  input_sha256: 69310280200eb85fa73fab4f6bff2e055a4b9e2e5107581e81cfcb7c707fe61a
+  hdf5_build: >-
+    HDF5 2.3.0, local source tree at commit 4b1ffa68a840; baseline Release --
+    rejected in traversal after three external opens; candidate RelWithDebInfo
+    -fsanitize=address -- heap-buffer-overflow READ of size 3 in strlen.  Both
+    are workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

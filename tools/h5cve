@@ -34,8 +34,8 @@ schema.  It DUPLICATES none of them -- it shells out and collects.
 A bundle is a directory under cases/<id>/ holding case.yml plus the collected
 artifacts (h5policy-forensic.json, h5policy-strict.json, markers.json,
 explain-transcript.txt, baseline/candidate-result.json, tool-and-build-
-provenance.json).  cases/ is working scratch; `promote` is what lands tracked
-artifacts in tests/ and registry/.
+provenance.json, github-advisory.md).  cases/ is working scratch; `promote` is
+what lands tracked artifacts in tests/ and registry/.
 """
 import argparse
 import datetime
@@ -55,6 +55,23 @@ except ImportError:  # pragma: no cover
 from finding_registry import RegistryError, load_findings
 
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def portable_path(path):
+    """An absolute path rewritten to something meaningful off this machine.
+
+    Case bundles get read, quoted into registry/cases/ records, and shared, so
+    they must not carry one workstation's directory layout.  Inside the repo a
+    path becomes repo-relative; outside it collapses to a basename -- which is
+    all the provenance a foreign path can honestly offer anyway, since the
+    specimen's real identity is the sha256 recorded beside it in input.sha256.
+    """
+    if not isinstance(path, str) or not path:
+        return path
+    real = os.path.realpath(path) if os.path.exists(path) else path
+    if real.startswith(REPO + os.sep):
+        return os.path.relpath(real, REPO)
+    return os.path.basename(real.rstrip(os.sep)) or real
 H5POLICY = os.path.join(REPO, "h5policy", "tools", "h5policy")
 H5PROBE = os.path.join(REPO, "h5policy", "tools", "h5policy-probe")
 H5MUTATE = os.path.join(REPO, "h5policy", "tools", "h5mutate")
@@ -63,6 +80,68 @@ H5MARKERS = os.path.join(REPO, "build", "h5markers")   # optional built binary
 COVERAGE_YML = os.path.join(REPO, "registry", "validation-coverage.yml")
 CASES_ROOT = os.path.join(REPO, "cases")
 EXPECTED_DIR = os.path.join(REPO, "h5policy", "tests", "expected")
+
+GITHUB_ADVISORY_DRAFT = """# Repository security advisory draft
+
+This is a private handoff draft. It is not an authorization to create, invite
+collaborators to, request an identifier for, or publish a repository advisory.
+Before a human submits it, compare these headings with the authenticated
+repository form and resolve any form changes.
+
+## Title
+
+TODO: concise vulnerability title
+
+## CVE identifier
+
+- Choice: TODO: existing identifier or request later
+- Existing identifier: TODO: identifier or n/a
+
+## Description
+
+### Summary
+
+TODO
+
+### Impact
+
+TODO: affected operation, preconditions, and observed consequence
+
+### Patches
+
+TODO: fixed release(s), commit(s), or embargoed fix status
+
+### Workarounds
+
+TODO: safe mitigation, or "none known"
+
+### References
+
+TODO: case-local evidence, public commits, and disclosure references
+
+## Affected products
+
+Repeat this block once for every disjoint vulnerable version range.
+
+- Ecosystem: TODO
+- Package name: TODO
+- Affected versions: TODO: `>= lower, < upper` or another single valid range
+- Patched versions: TODO: first fixed version, or "none"
+- Vulnerable functions: TODO: public entry points, or "not applicable"
+
+## Severity
+
+- Severity: TODO
+- CVSS vector: TODO
+
+## Weaknesses
+
+TODO: CWE identifier(s), or "not yet classified"
+
+## Credits
+
+TODO: optional GitHub accounts or names and their credit types
+"""
 
 # registry scope -> cve-case.yml root_cause_classification (strategy §11.2)
 SCOPE_TO_CLASS = {
@@ -159,9 +238,10 @@ def cmd_init(args):
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "h5policy_commit": git_commit(),
         "poke_version": poke_version(),
-        "poc_source": os.path.abspath(args.poc),
-        "tools": {"h5policy": H5POLICY, "h5probe": H5PROBE,
-                  "h5explain": H5EXPLAIN, "h5markers": H5MARKERS},
+        "poc_source": portable_path(args.poc),
+        "tools": {k: portable_path(v) for k, v in
+                  (("h5policy", H5POLICY), ("h5probe", H5PROBE),
+                   ("h5explain", H5EXPLAIN), ("h5markers", H5MARKERS))},
     }
     with open(os.path.join(cdir, "tool-and-build-provenance.json"), "w") as f:
         json.dump(provenance, f, indent=2)
@@ -205,6 +285,8 @@ def cmd_init(args):
                        "poke_version": provenance["poke_version"]},
     }
     save_case(cdir, case)
+    with open(os.path.join(cdir, "github-advisory.md"), "w") as f:
+        f.write(GITHUB_ADVISORY_DRAFT)
     print(f"initialized {os.path.relpath(cdir)}  (input.sha256 {digest[:16]}…)")
     print("next: h5cve triage " + args.id)
     return 0
@@ -465,6 +547,59 @@ VERIFICATION_REQUIREMENTS = [
     "lazy_validation_performance",
 ]
 
+# Source annotations for the §12 requirements that cannot be responsibly
+# inferred from a finding-code name.  Expectation files and typed mutator
+# recipes use the same compact `verification` mapping.  A category is evidence
+# only when its source fixture/recipe says so explicitly.
+VERIFICATION_ANNOTATION_CATEGORIES = {
+    "count_and_extent_boundaries": {
+        "zero", "max", "n_minus_1", "n", "n_plus_one", "out_of_file",
+    },
+    "integer_overflow_and_allocation_budget": {"integer_overflow", "allocation_budget"},
+    "deep_nesting_and_non_progress": {"deep_nesting", "non_progress"},
+    "reference_semantics_cases": {
+        "self_reference", "overlap", "duplicate_reference", "cycle",
+    },
+}
+
+
+def _verification_annotations(record, fam):
+    """Return requirement -> category -> source for reviewed annotations."""
+    tagged = {req: {} for req in VERIFICATION_ANNOTATION_CATEGORIES}
+
+    def add(source, annotation):
+        if annotation is None:
+            return
+        if not isinstance(annotation, dict):
+            die(f"verification annotation on {source} must be a mapping")
+        for requirement, categories in annotation.items():
+            if requirement not in VERIFICATION_ANNOTATION_CATEGORIES:
+                die(f"verification annotation on {source} has unsupported "
+                    f"requirement {requirement!r}")
+            if not isinstance(categories, list) or not all(isinstance(c, str) for c in categories):
+                die(f"verification annotation on {source}:{requirement} must be a list of strings")
+            allowed = VERIFICATION_ANNOTATION_CATEGORIES[requirement]
+            unknown = set(categories) - allowed
+            if unknown:
+                die(f"verification annotation on {source}:{requirement} has "
+                    f"unsupported categories {', '.join(sorted(unknown))}")
+            for category in categories:
+                tagged[requirement].setdefault(category, set()).add(source)
+
+    for fixture, expectation in fam.items():
+        add(f"h5policy/tests/expected/{fixture}", expectation.get("verification"))
+
+    for recipe in (record.get("fuzz_targets") or {}).get("recipes", []):
+        if recipe.get("status") == "built":
+            source = "h5policy/tools/h5mutate:" + str(recipe.get("recipe", "<unnamed>"))
+            add(source, recipe.get("verification"))
+
+    return tagged
+
+
+def _annotation_evidence(tagged, requirement):
+    return sorted({source for sources in tagged[requirement].values() for source in sources})
+
 
 def _req(status, note, evidence=None):
     entry = {"status": status, "note": note}
@@ -489,6 +624,7 @@ def _verification_for_record(record, exps, evidence, truncation, lazy):
     with_offsets = [n for n, e in fam.items()
                     if e.get("expected_finding_evidence_locations")]
     ev = evidence.get(name, {})
+    tagged = _verification_annotations(record, fam)
 
     out = {}
 
@@ -516,39 +652,80 @@ def _verification_for_record(record, exps, evidence, truncation, lazy):
             "No accepting fixture contracted to this family appears in "
             "registry/truncation-sweep.json.")
 
-    out["count_and_extent_boundaries"] = _req(
-        "not_assessed",
-        "Requires classifying each fixture as a zero/max/N-1/N/N+1 case. Not "
-        "derivable from the corpus as it stands.")
-
-    out["integer_overflow_and_allocation_budget"] = _req(
-        "not_assessed",
-        "Budget coverage is partly visible via reject_resource fixtures, but "
-        "integer-overflow coverage cannot be separated without classifying "
-        "fixtures. Deliberately not inferred from finding-code spelling.")
-
-    out["deep_nesting_and_non_progress"] = _req(
-        "not_assessed",
-        "Same: depth and non-progress fixtures exist for some families but are "
-        "not distinguishable from the corpus without classification.")
-
-    cats = sorted({REFERENCE_SEMANTICS[i["id"]]
-                   for i in record.get("invariants", [])
-                   if i.get("id") in REFERENCE_SEMANTICS})
-    if not cats:
-        out["reference_semantics_cases"] = _req(
-            "not_assessed",
-            "No invariant in this family maps to a reviewed self-reference / "
-            "overlap / duplicate-reference / cycle category. That may be "
-            "correct for a non-reference-bearing family, or the mapping may be "
-            "incomplete.")
+    count_tags = set(tagged["count_and_extent_boundaries"])
+    required_count_tags = {"zero", "max", "n_minus_1", "n", "n_plus_one"}
+    if count_tags:
+        missing = required_count_tags - count_tags
+        out["count_and_extent_boundaries"] = _req(
+            "met" if not missing else "partial",
+            "Reviewed fixture/recipe annotations cover: "
+            + ", ".join(sorted(count_tags)) + "."
+            + (" Missing: " + ", ".join(sorted(missing)) + "." if missing else ""),
+            _annotation_evidence(tagged, "count_and_extent_boundaries"))
     else:
-        missing = {"self_reference", "overlap", "duplicate_reference", "cycle"} - set(cats)
+        out["count_and_extent_boundaries"] = _req(
+            "not_assessed",
+            "Requires classifying each fixture as a zero/max/N-1/N/N+1 case. Not "
+            "derivable from the corpus as it stands.")
+
+    arithmetic_tags = set(tagged["integer_overflow_and_allocation_budget"])
+    if arithmetic_tags:
+        missing = {"integer_overflow", "allocation_budget"} - arithmetic_tags
+        out["integer_overflow_and_allocation_budget"] = _req(
+            "met" if not missing else "partial",
+            "Reviewed fixture/recipe annotations cover: "
+            + ", ".join(sorted(arithmetic_tags)) + "."
+            + (" Missing: " + ", ".join(sorted(missing)) + "." if missing else ""),
+            _annotation_evidence(tagged, "integer_overflow_and_allocation_budget"))
+    else:
+        out["integer_overflow_and_allocation_budget"] = _req(
+            "not_assessed",
+            "Budget coverage is partly visible via reject_resource fixtures, but "
+            "integer-overflow coverage cannot be separated without classifying "
+            "fixtures. Deliberately not inferred from finding-code spelling.")
+
+    progress_tags = set(tagged["deep_nesting_and_non_progress"])
+    if progress_tags:
+        missing = {"deep_nesting", "non_progress"} - progress_tags
+        out["deep_nesting_and_non_progress"] = _req(
+            "met" if not missing else "partial",
+            "Reviewed fixture/recipe annotations cover: "
+            + ", ".join(sorted(progress_tags)) + "."
+            + (" Missing: " + ", ".join(sorted(missing)) + "." if missing else ""),
+            _annotation_evidence(tagged, "deep_nesting_and_non_progress"))
+    else:
+        out["deep_nesting_and_non_progress"] = _req(
+            "not_assessed",
+            "Same: depth and non-progress fixtures exist for some families but are "
+            "not distinguishable from the corpus without classification.")
+
+    reference_tags = set(tagged["reference_semantics_cases"])
+    if reference_tags:
+        missing = {"self_reference", "overlap", "duplicate_reference", "cycle"} - reference_tags
         out["reference_semantics_cases"] = _req(
             "met" if not missing else "partial",
-            f"Categories covered: {', '.join(cats)}."
-            + (f" Not covered: {', '.join(sorted(missing))}." if missing else ""),
-            cats)
+            "Reviewed fixture/recipe annotations cover: "
+            + ", ".join(sorted(reference_tags)) + "."
+            + (" Not covered: " + ", ".join(sorted(missing)) + "." if missing else ""),
+            _annotation_evidence(tagged, "reference_semantics_cases"))
+    else:
+        cats = sorted({REFERENCE_SEMANTICS[i["id"]]
+                       for i in record.get("invariants", [])
+                       if i.get("id") in REFERENCE_SEMANTICS})
+        if not cats:
+            out["reference_semantics_cases"] = _req(
+                "not_assessed",
+                "No invariant in this family maps to a reviewed self-reference / "
+                "overlap / duplicate-reference / cycle category. That may be "
+                "correct for a non-reference-bearing family, or the mapping may be "
+                "incomplete.")
+        else:
+            missing = {"self_reference", "overlap", "duplicate_reference", "cycle"} - set(cats)
+            out["reference_semantics_cases"] = _req(
+                "met" if not missing else "partial",
+                f"Categories covered: {', '.join(cats)}."
+                + (f" Not covered: {', '.join(sorted(missing))}." if missing else ""),
+                cats)
 
     if with_findings and with_offsets:
         out["stable_finding_and_offset_assertions"] = _req(
@@ -592,10 +769,14 @@ def _verification_for_record(record, exps, evidence, truncation, lazy):
         "harness proves nothing about it specifically.", accepts)
 
     ft = record.get("fuzz_targets") or {}
+    built_recipes = [recipe for recipe in ft.get("recipes", [])
+                     if recipe.get("status") == "built"]
     out["in_memory_fuzz_targets"] = _req(
-        "met" if ft.get("recipes") else "absent",
-        f"{len(ft.get('recipes', []))} typed mutation recipes."
-        if ft.get("recipes") else
+        "met" if built_recipes else "absent",
+        f"{len(built_recipes)} built typed mutation recipe(s)"
+        + (f" ({len(ft.get('recipes', [])) - len(built_recipes)} planned)."
+           if len(ft.get("recipes", [])) != len(built_recipes) else ".")
+        if built_recipes else
         "No fuzz_targets declared. h5policy-fuzz mutates whole-file seeds "
         "generically; this requires a dedicated target for the family.",
         [ft.get("seed")] if ft.get("seed") else None)
@@ -944,9 +1125,8 @@ CANARY_BY_RECORD = {
     # Continuation chunks are decoded as part of object-header materialization,
     # which is exactly what the message_envelope exercise drives; the family had
     # no canary at all before, so its fixtures could only ever report
-    # coverage_gap.  validation_controls deliberately has none: it is a controls
-    # family (budgets, base address, free-space managers, profile validity) with
-    # no single traversal surface to exercise.
+    # coverage_gap. validation_controls now uses the free_space exercise,
+    # because H5Fget_free_sections reaches its lazily loaded managers.
     "object_header_continuation": "message_envelope",
     "external_link": "external_link",
     "external_file_list": "external_file_list",

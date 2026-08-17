@@ -62,7 +62,7 @@ The process exit code mirrors the JSON `decision`:
 | 2 | `reject_corrupt` | The metadata is structurally corrupt. |
 | 3 | `reject_policy` | A structurally recognized feature violates policy. |
 | 4 | `reject_resource` | A resource or denial-of-service budget was exceeded. |
-| 5 | `unsupported_coverage_gap` | Safe validation stopped at a recognized but insufficiently covered feature. |
+| 5 | `unsupported_coverage_gap` | Safe validation stopped at a recognized coverage boundary or conservative library-compatibility guard. |
 | 70 | `internal_error` | The oracle itself failed to render a normal decision. |
 
 `unsupported_coverage_gap` is an explicit refusal, not an acceptance. See the
@@ -72,26 +72,27 @@ profile semantics.
 
 ### Metadata cache-image hard boundary
 
-All profiles share the same cache-image decode boundary. h5policy validates the
-`MDCI` message, bounded container and entry envelopes, and records the address
-ranges shadowed by cache entries. It does not decode the cached entry bodies.
-A structurally valid cache-image fixture therefore returns exit `5`,
-`unsupported_coverage_gap`, and
-`H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`; `analysis.complete` and
-`analysis.walk_completed` are `false`.
+All profiles validate the `MDCI` message, bounded container and entry
+envelopes, image checksum, and cached entry bodies. After the container pass,
+h5policy uses an in-memory read overlay to route each shadowed logical range to
+its validated cached body, then runs the ordinary metadata decoder. It does not
+write the input, create a whole-file copy, or open an external file.
 
-`--continue-after-rejection` is not a cache-image enable switch. With
-continuation enabled, h5policy skips only shadowed addresses and continues
-checking reachable unshadowed metadata, then reports
-`analysis.stop_reason: "cache_image_coverage_gap"`. Without continuation, the
-normal fail-fast stop reason is `"rejection"`. Neither mode accepts the file.
+A structurally valid cache-image fixture therefore returns exit `0`, `accept`,
+and `analysis.complete` / `analysis.walk_completed` are `true`. A bad envelope,
+checksum, or cached body is `reject_corrupt`.
+An internal cache-client body that cannot reach a type-aware decoder remains an
+explicit `unsupported_coverage_gap`, never an acceptance.
+
+`--continue-after-rejection` remains a diagnostic traversal control; it does
+not weaken cached-body validation or change a rejection into acceptance.
 
 For example:
 
 ```sh
 ./h5policy/tools/h5policy --profile forensic \
     --continue-after-rejection h5policy/tests/valid/cache_image.h5
-echo $?  # 5
+echo $?  # 0
 ```
 
 The complete coverage description is in the
@@ -173,10 +174,11 @@ Two narrowly defined cases demote an apparent A failure to a warning:
 - **A~** means all corruption findings are confined to active metadata that
   current read-only `libhdf5` paths deliberately leave unopened: file-global
   SOHM search or free-space-manager metadata, or dense secondary
-  creation-order indexes; it also covers the generated wide-length controls
+  creation-order indexes. It also covers the generated wide-length controls
   where `libhdf5` reports a scalar dataset without checking that its declared
-  contiguous-data extent can exist in the physical file. h5policy validates
-  these structures and extents eagerly.
+  contiguous-data extent can exist in the physical file; h5policy's separate
+  16-byte-width compatibility guard now refuses them before that lazy extent
+  comparison is needed.
 
 Both variants remain visible as warnings but do not make the harness exit
 non-zero.

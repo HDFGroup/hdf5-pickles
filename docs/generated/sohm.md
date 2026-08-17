@@ -24,6 +24,9 @@ before mapping `sohm_table_raw`. Each list entry occupies a fixed
 `H5SM_SOHM_ENTRY_SIZE = 5 + MAX(12, 4 + sizeof_offsets)` bytes, so
 entries are padded to that width.
 
+The decoder verifies the lookup3 checksum on both the `SMTB` master table
+and each `SMLI` list before accepting their records.
+
 All fields are stored in little-endian byte order.
 
 ## Shared Object Header Message Master Table

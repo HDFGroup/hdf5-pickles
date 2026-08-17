@@ -15,7 +15,7 @@ untrusted files, a conservative repair planner, and a marker scanner.
 | [`h5explain/`](h5explain/) | Interactive byte-level metadata navigation. |
 | [`src/`](src/) | The `h5markers` scanner implementation. |
 | [`tools/`](tools/) | Command entry points and repository helper scripts. |
-| [`docs/`](docs/) | The [tutorial](docs/TUTORIAL.md), [tool guide](docs/TOOLS.md), [glossary](docs/GLOSSARY.md), [marker reference](docs/MARKERS.md), generated format reference, and [tool map](docs/tool-overview.md). |
+| [`docs/`](docs/) | [First 10 minutes](docs/FIRST_10_MINUTES.md), the [tutorial](docs/TUTORIAL.md), [tool guide](docs/TOOLS.md), [glossary](docs/GLOSSARY.md), [marker reference](docs/MARKERS.md), generated format reference, and [tool map](docs/tool-overview.md). |
 | [`examples/`](examples/) | Sample HDF5 files and GNU poke scripts. |
 | [`emacs/`](emacs/) | An Emacs front end for inspecting HDF5 files. |
 | [`.devcontainer/`](.devcontainer/README.md) | A ready-to-use Codespaces and VS Code Dev Containers environment. |
@@ -46,7 +46,8 @@ ctest --test-dir build --output-on-failure
 cmake --build build --target docs-check
 ```
 
-Continue with the guided [H5Lens tutorial](docs/TUTORIAL.md), or see the
+Continue with [H5Lens in 10 Minutes](docs/FIRST_10_MINUTES.md), the guided
+[H5Lens tutorial](docs/TUTORIAL.md), or see the
 [`h5policy`](h5policy/README.md), [`h5patch`](h5patch/README.md), and
 [`h5explain`](h5explain/README.md) guides for complete command behavior.
 

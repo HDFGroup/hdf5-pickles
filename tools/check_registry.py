@@ -342,9 +342,49 @@ else:
     print(f"NOTE {ROUTING_PATH} absent; message routing unverified "
           f"(run `python3 tools/message_routing.py --write`)")
 
+# registry/cases/ holds the triage records the tolerance file and the finding
+# catalog point at in prose.  Nothing else here reads their CONTENTS, and that
+# is deliberate -- they are narrative, and the fields they carry vary by case.
+# But they are YAML, and until this check existed nothing ever parsed them: two
+# records sat in the tree unparseable for weeks, because the only automated
+# readers treat them as text (check_hygiene.py greps them; h5policy-diff merely
+# checks that the file a tolerance names EXISTS).  A record that does not parse
+# cannot be consumed by any future tooling and, worse, is invisibly malformed to
+# a human reader, since the damage is indentation rather than wording.
+#
+# So this is a shape gate, not a schema gate: it asserts the file is a YAML
+# document and that the document is a mapping, and deliberately says nothing
+# about which keys a case must carry.
+CASES_GLOB = "registry/cases/*.yml"
+case_paths = sorted(glob.glob(CASES_GLOB))
+for path in case_paths:
+    try:
+        doc = yaml.safe_load(open(path))
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = f" line={mark.line + 1} column={mark.column + 1}" if mark else ""
+        problem = getattr(exc, "problem", None) or str(exc).splitlines()[0]
+        print(f"CASE_PARSE_ERROR file={path}{where} {problem}")
+        errors += 1
+        continue
+    # A case record that parses as a bare string or a list is still unusable,
+    # and it is the shape a stray top-level indentation slip produces.
+    if not isinstance(doc, dict):
+        print(f"CASE_NOT_A_MAPPING file={path} "
+              f"parsed_as={type(doc).__name__}")
+        errors += 1
+
 print(f"records={len(records)} findings={len(findings)} "
       f"backlog={len(finding_backlog)} emitted={len(emitted_by)} "
       f"messages={sum(len(v) for v in emitted_messages.values())} "
       f"unrouted={sum(len(v) for v in measured.values())} "
+      f"cases={len(case_paths)} "
       f"missing={len(missing)} errors={errors}")
-sys.exit(1 if errors else 0)
+if errors:
+    sys.exit(1)
+
+# The SSP evidence bridge consumes this registry, the exact-build canary map,
+# and the generated native-library measurement.  Keep it in the same gate so a
+# stale control mapping cannot look like audited evidence.
+import subprocess
+sys.exit(subprocess.run([sys.executable, "tools/check_ssp_control_evidence.py"]).returncode)

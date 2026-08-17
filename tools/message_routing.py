@@ -44,6 +44,11 @@ EMIT_SITES = {
     "h5policy_checked_mul_u64": (3, 7),
     # h5_validate.pk: the shared address-in-file predicate.
     "h5policy_addr_in_file": (2, 5),
+    # h5_vds.pk: the serialized-selection header rejector.  Code and message
+    # both come from the caller, and it exists so the three selection-header
+    # rules share one "report and return 0" shape; its call sites are the emit
+    # sites.
+    "h5policy_selection_reject": (0, 3),
 }
 
 # Helpers that build the message from a caller-supplied `what` and emit a fixed
@@ -69,10 +74,12 @@ COMPOSING_HELPERS = {
         "H5_CORRUPT_BAD_CHECKSUM": [" checksum field outside block",
                                     " checksum mismatch"],
     }),
-    # h5_btree2.pk: the shared geometry check names its B-tree's role.
-    "h5policy_validate_v2_btree_geometry": (4, {
+    # h5_btree2.pk: the shared geometry check names its B-tree's role. The role
+    # is parameter 5 (node_size, record_size, file_size, loc, object, role).
+    "h5policy_validate_v2_btree_geometry": (5, {
         "H5_CORRUPT_V2_BTREE_RECORD_SIZE": [" v2 B-tree record size is zero"],
-        "H5_CORRUPT_V2_BTREE_NODE_SIZE": [" v2 B-tree node cannot hold one record"],
+        "H5_CORRUPT_V2_BTREE_NODE_SIZE": [" v2 B-tree node cannot hold one record",
+                                          " v2 B-tree node size exceeds the file"],
     }),
     # h5_chunkindex.pk: extensible-array block revisit detection.
     "h5policy_ea_mark_block": (2, {
@@ -135,6 +142,10 @@ ROLE_PARAMS = {
     # message and in the header of a filtered fractal heap (dense link, dense
     # attribute, SOHM) -- four clients, four families.
     "h5policy_validate_filter_pipeline_payload": 6,
+    # h5_dense_links.pk: direct and indirect fractal-heap blocks carry the same
+    # owner back-pointer at the same prefix offset, so one comparison serves
+    # both and names which block kind it read.
+    "h5policy_frhp_owner_ok": 4,
 }
 
 

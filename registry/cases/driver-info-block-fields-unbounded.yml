@@ -1,0 +1,564 @@
+# The superblock's driver-info block has two attacker-controlled fields --
+# its address and its length -- and neither is bounded against the file before
+# use.  They meet in one expression, which extends the EOA to cover whatever
+# they claim.
+#
+# Promoted from two working bundles (gitignored h5cve scratch), one per field,
+# each named by its specimen's input_sha256 -- given in full under `triggers`:
+#   specimen c8e84efd...   driver-info ADDRESS outside the file
+#   specimen 2f739e35...   driver-info LENGTH unbounded (~3.95 GiB alloc)
+# They are recorded together because src/H5Fsuper_cache.c:279 computes
+#   min_eoa = udata->driver_addr + H5F_DRVINFOBLOCK_HDR_SIZE + drvrinfo->len;
+# from both of them and then sets the EOA to it.  Bounding one field without
+# the other leaves that expression attacker-controlled.
+#
+# The address specimen carries a SECOND, unrelated defect in the same file
+# (a local-heap free-list bound that wraps).  That one is NOT part of this
+# record -- see registry/cases/local-heap-free-list-bound-wraps.yml.
+schema_version: 1
+
+id: driver-info-block-fields-unbounded
+title: the driver-info block's address and length are both unbounded, and the
+  decoder extends the EOA to cover whatever they claim
+status: partially-fixed-upstream # address half fixed in 2.3.0; length half live
+                                 # -- see address_trigger_fixed_upstream
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: driver_info_block
+versions: [0, 1]                 # superblock v0/v1 driver_addr path
+root_cause_classification: local_decode
+violated_invariant:
+  - address.offset_in_file       # the address field
+  - control.driver_info_extent   # the length field; catalogued 2026-08-16,
+                                 # replacing the `driver_info.len_bounded`
+                                 # placeholder this record used to carry
+validation_closure: >-
+  the driver-info block prefix -- version, reserved bytes, the 4-byte length --
+  together with the driver_addr the superblock supplies, all checked against
+  the physical file geometry BEFORE any VFD read is issued and before the EOA
+  is moved.  Neither field closes it alone, because the EOA extension is
+  computed from both.
+activation_before_validation:
+  - native_construction
+  - cache_publication
+  - public_id
+entry_points:
+  - h5policy (oracle) -- untrusted-strict rejects both specimens at the superblock
+  - "libhdf5 H5Fopen -> H5F_open -> H5F__super_read -> H5AC_protect(H5AC_DRVRINFO)"
+  - "libhdf5 H5F__drvrinfo_prefix_decode (src/H5Fsuper_cache.c:223-286)"
+  - "any reader that opens the file: h5dump -H, h5ls, h5py"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  H5F__drvrinfo_prefix_decode bounds every field against the IMAGE BUFFER it
+  was handed -- version at :241, reserved at :248, length at :253, driver name
+  at :259, each with H5_IS_BUFFER_OVERFLOW.  What it never does is bound any
+  field against the FILE.
+  THE LENGTH is decoded straight out of the image:
+    UINT32DECODE(image, drvrinfo->len);                        /* :254 */
+  and is then used to move the end-of-address marker:
+    min_eoa = udata->driver_addr + H5F_DRVINFOBLOCK_HDR_SIZE + drvrinfo->len;  /* :279 */
+    if (H5_addr_gt(min_eoa, eoa))
+        H5FD_set_eoa(udata->f->shared->lf, H5FD_MEM_SUPER, min_eoa);           /* :282 */
+  THE LENGTH SELF-AUTHORISES, and this is the heart of it.  A later check of
+  the form "is this extent within the EOA?" is satisfied by construction,
+  because the attacker's length is what moved the EOA.  H5C__verify_len_eoa,
+  which exists precisely to catch oversized cache entries, is defeated for this
+  client by an EOA the client itself extended.
+  THE CHAIN CLOSES IN ONE FUNCTION, established 2026-08-15 and sharper than the
+  earlier wording.  H5F__cache_drvrinfo_get_final_load_size -- the cache
+  callback whose entire job is to report how large this entry is -- calls the
+  prefix decoder with extend_eoa TRUE and then hands the decoded length
+  straight back as the allocation size:
+      if (H5F__drvrinfo_prefix_decode(&drvrinfo, NULL, &image, image_len,
+                                      udata, true) < 0)        /* :904, extend_eoa=true */
+          ...
+      *actual_len = H5F_DRVINFOBLOCK_HDR_SIZE + drvrinfo.len;   /* :908 */
+  So the EOA extension at :279 and the allocation size at :908 come from the
+  SAME call on the SAME field.  There is no window in which a bound could be
+  applied by an independent check, because the value authorises itself and
+  sizes the allocation within one callback.  `*actual_len` is what
+  H5C__load_entry allocates.
+  Nothing between :254 and :908 bounds drvrinfo.len.  The only size guard on the
+  whole path remains the NDEBUG-compiled-out assert at src/H5Centry.c:3206.
+  THE ADDRESS is the other input to :279 and is equally unbounded.  A
+  driver_addr past the end of the file is dereferenced rather than rejected:
+  the 981f08d8 specimen sets byte 55 so the address becomes
+  0x3dffffffffffffff, libhdf5 issues a 16-byte read there, the sec2 driver
+  ZERO-FILLS past EOF (src/H5FDsec2.c), and the resulting all-zero prefix
+  decodes as a valid EMPTY driver-info block.  The file is then accepted
+  silently.  Measured identically under sec2, stdio and core.
+  THE ONLY SIZE GUARD ANYWHERE ON THIS PATH IS AN ASSERT.
+  src/H5Centry.c:3206 asserts against H5C_MAX_ENTRY_SIZE (32 MiB) and is
+  compiled out under NDEBUG -- so on a release build nothing limits the
+  allocation at all.  This is the "assert-only" explanation of invariant A for
+  the length, and the "unguarded" explanation for the address; the pair is
+  unusual in carrying both.
+
+why_one_record: >-
+  Line 279 is the argument.  `min_eoa = driver_addr + HDR_SIZE + len` takes
+  both attacker-controlled fields and produces the value that authorises
+  everything downstream.  Bound the length alone and a wild address still
+  reaches a read past EOF that sec2 makes look valid; bound the address alone
+  and a 4 GiB length still moves the EOA and drives the allocation.  The
+  semantic boundary is the driver-info prefix AS A WHOLE against file geometry,
+  which is one check in one place covering both fields.
+  They differ in impact -- silent acceptance versus memory-amplification DoS --
+  and in guard status -- none versus assert-only -- which is why the record
+  keeps them as separate `triggers` rather than merging their evidence.
+
+# -- The two fields -----------------------------------------------------------
+triggers:
+  address_out_of_file:
+    specimen: input_sha256
+      c8e84efd7b6b2df761981b176216a96f9926d866c5dcd64663228c8b5ac3dc52
+    how: >-
+      From a valid superblock-v0 file, byte 55 (the MSB of the driver-info
+      address) is changed 0xff -> 0x3d, giving a driver_addr of
+      0x3dffffffffffffff -- far past EOF.
+    impact: >-
+      SILENT ACCEPTANCE.  libhdf5 2.2.0 accepts the file: the 16-byte read at
+      that address is zero-filled past EOF by the VFD, and an all-zero prefix
+      is a structurally valid empty driver-info block.  No crash, no error, no
+      diagnostic -- the file simply opens.  Measured under sec2, stdio and core,
+      so it is not a quirk of one driver.
+    oracle_finding: H5_CORRUPT_OFFSET_OUT_OF_FILE @ 0, object superblock
+    guard_status: none
+  length_unbounded:
+    specimen: the supplied poc.h5; input_sha256
+      2f739e353e4fa7cbc1e049514e0863243da5030105b571520666708feb404792
+    how: >-
+      A VERSION 1 superblock with driver_addr = 10, which puts the driver-info
+      header's 4-byte length at file offset 14, where the bytes are
+      08 fe 77 fc = 4,235,164,168 (~3.94 GiB).  The EOA extension at :279 then
+      demands that much and :908 allocates it.
+      NOT MINIMISABLE, and the byte layout shows exactly why: at driver_addr 10
+      the length field overlaps sizeof_lengths (14), the trailing reserved byte
+      (15) and group_leaf_k (16-17), so any length-only patch corrupts the
+      superblock instead.  Causality was established with gdb plus an RLIMIT_AS
+      sweep rather than a minimised specimen -- a good pattern to reuse when a
+      field cannot be isolated.
+      Note driver_addr = 10 sits well below this file's stored_eof, so the
+      2.3.0 address bound at :546 does NOT intercept it: the specimen still
+      reaches the length path.  See length_trigger_status.
+    impact: >-
+      MEMORY-AMPLIFICATION DoS.  ~3.95 GiB allocated during H5Fopen, before any
+      object is materialised, from a small input.  Behaviour is build-dependent:
+      an uncapped LP64 release build over-allocates and SUCCEEDS; the ASan build
+      aborts on the debug assert; 32-bit and address-space-capped runs reject
+      via allocation failure.
+    oracle_finding: >-
+      H5_CORRUPT_MAPPING_FAILED @ 0, object metadata.  NOTE the bundle's own
+      caveat: the registry route to shared_messages_legacy/legacy.mapping is a
+      mechanical mis-route, and the real defect is the driver-info length.  Not
+      a false-accept -- h5policy is stricter at the superblock and refuses
+      before the length is ever reached.
+    guard_status: assert-only (src/H5Centry.c:3206, H5C_MAX_ENTRY_SIZE, NDEBUG-out)
+
+measurement_trap: >-
+  READ THIS BEFORE RE-MEASURING THE LENGTH TRIGGER.  h5policy-probe applies a
+  default RLIMIT_AS of 2048 MB, which is SMALLER than the ~3.95 GiB this
+  specimen demands.  Under the probe the allocation therefore fails and the
+  result is reported as `rejected_at_open` -- which looks like libhdf5
+  correctly refusing the file and is the exact opposite of the truth.  The
+  amplification is only visible with a direct, uncapped H5Fopen plus a VmRSS
+  measurement.
+  The converse trap is worse: an UNCAPPED h5dump on this specimen can OOM-kill
+  the entire desktop session, not just the process.  Always run it under an
+  explicit `ulimit -v` when a cap is not the thing being measured, and never
+  run the uncapped variant casually.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  REMEASURED: >-
+    2026-08-15, at HEAD.  The ORACLE side held exactly; the LIBHDF5 side threw
+    up a result this record cannot yet interpret, described under
+    address_trigger_outcome_changed below.
+    Oracle, address trigger (981f08d8): reject_corrupt, untrusted-strict,
+    H5_CORRUPT_OFFSET_OUT_OF_FILE @ 0 on `superblock`, stop_reason
+    prewalk_rejection -- the rejection happens before the walk even starts,
+    which is the strongest possible form of "no activation before validation".
+    Forensic reports the same finding first and then the unrelated local-heap
+    defect, H5_CORRUPT_LOCAL_HEAP_FREE_LIST @ 2112, with a complete walk.  That
+    2112 matches the bundle's recorded free-list head location exactly.
+    Oracle, length trigger (2f739e35): reject_corrupt,
+    H5_CORRUPT_MAPPING_FAILED @ 0 on `metadata`, stop_reason mapping_failed --
+    unchanged, including the mechanical mis-route the bundle flagged.
+    Probe, length trigger: DELIBERATELY NOT RUN, and this is not an omission.
+    Any capped probe reports rejected_at_open on that specimen, which reads as
+    libhdf5 correctly refusing the file and is the opposite of the truth; see
+    measurement_trap.
+  oracle_as_recorded: >-
+    Both specimens reject_corrupt under untrusted-strict at offset 0, at the
+    superblock, before either field is used for anything.  The address
+    specimen additionally carries a second, unrelated finding
+    (H5_CORRUPT_LOCAL_HEAP_FREE_LIST) that the strict profile does not reach
+    because it stops at the first -- forensic reports both.
+  libhdf5_as_recorded: >-
+    ADDRESS trigger: ACCEPTED by both the stock and the ASan build of 2.2.0,
+    with the full address_space canary completing (H5Fopen, H5Ovisit3, H5Oopen,
+    H5Fget_create_plist, H5Pget_userblock, H5Fget_eoa, H5Fget_filesize) and
+    zero post-open call errors.  oracle_alignment: divergent; comparison
+    recorded as `regression`.
+    LENGTH trigger: build-dependent, as described under
+    triggers.length_unbounded.impact.  The uncapped release build succeeding is
+    the security-relevant outcome and the one the probe hides.
+  width: >-
+    The length trigger is width-relevant and partially measured: 32-bit runs
+    reject via allocation failure, which is a different outcome rather than the
+    same one, since a 3.95 GiB request cannot be satisfied in a 32-bit address
+    space.  The address trigger is not width-dependent -- 0x3dffffffffffffff is
+    past EOF at any width -- but was not measured at 32 bits.
+
+length_trigger_status: >-
+    CONFIRMED LIVE AT 2.3.0, BY SOURCE, NOT BY EXECUTION -- and the distinction
+    is stated plainly because the attempt to execute it failed for
+    environmental reasons rather than being skipped.
+    THE SOURCE CHAIN IS COMPLETE, all in the 2.3.0 tree, all quoted in `defect`:
+    the length is decoded unchecked at src/H5Fsuper_cache.c:254; it extends the
+    EOA to cover itself at :279-282; and it becomes the cache entry's allocation
+    size at :908, in the same callback that performed the extension.  No bound
+    exists anywhere on that path, and the address fix at :546 does not touch it.
+    THE SPECIMEN STILL REACHES IT, established by reading its bytes rather than
+    by running it.  The file is a VERSION 1 superblock (byte 8 = 0x01), so the
+    address fields sit four bytes later than in v0: stored_eof at bytes 44-51 is
+    0xffffffffffffff3b, and driver_addr at bytes 52-59 is 10 -- comfortably
+    below stored_eof, so the new :546 bound PASSES and does not intercept this
+    file.  With driver_addr = 10 the driver-info header's 4-byte length lands at
+    file offset 14, where the bytes are 08 fe 77 fc = 4,235,164,168 (~3.94 GiB).
+    That independently reproduces the bundle's recorded "~3.95 GiB" figure from
+    the raw file, and it confirms the bundle's note that the length bytes
+    overlap live superblock fields -- here sizeof_lengths (14), the trailing
+    reserved byte (15) and group_leaf_k (16-17), which is exactly why a
+    length-only variant is not buildable by patching.
+    WHY IT WAS NOT MEASURED: this host refuses RLIMIT_AS from both bash
+    (`ulimit: virtual memory: cannot modify limit: Operation not permitted`) and
+    Python (setrlimit raises inside a preexec_fn).  A capped run is therefore
+    impossible here, and an UNCAPPED run on a specimen that demands ~3.94 GiB is
+    the thing measurement_trap exists to forbid -- an earlier uncapped h5dump on
+    this file returned nothing at all, consistent with being killed.  Two
+    capped-run attempts were made and both failed on the cap, not on the file.
+    WHAT A MEASUREMENT WOULD ADD, on a host where RLIMIT_AS is settable: the
+    peak-RSS amplification figure, and confirmation that the allocation is
+    actually attempted rather than merely computed.  It would not change the
+    verdict -- :908 leaves no room for one -- but the record would prefer
+    measured to derived, and this is the one claim in it that is derived.
+address_trigger_fixed_upstream: >-
+    RESOLVED 2026-08-15: THE ADDRESS HALF IS FIXED UPSTREAM.  This was found
+    only by re-measuring, and it inverts that half of the record.
+    The bundle recorded stock libhdf5 2.2.0 ACCEPTING the address specimen --
+    silent acceptance, the entire point of the trigger.  At HEAD, stock reports
+    `rejected_at_open`.
+    THE CAP EXPLANATION IS RULED OUT.  An uncapped, unsanitised re-run reports
+    the same: outcome rejected_at_open, signal null, timed_out false, H5Fopen
+    called once with zero successes and one failure, and materialization all
+    zeroes -- no objects, no datasets, no reads, no call errors.  Nothing
+    allocated and nothing failed to allocate; the open is simply refused.
+    THE FIX IS LOCATED IN SOURCE, so this does not rest on the probe alone.
+    H5F__cache_superblock_deserialize now bounds the address as it decodes it:
+      H5F_addr_decode(udata->f, (const uint8_t **)&image, &sblock->driver_addr);
+      if (H5_addr_defined(sblock->driver_addr) &&
+          sblock->driver_addr >= udata->stored_eof)     /* src/H5Fsuper_cache.c:546 */
+          ...error...
+      /* Validate base and extension addresses against stored_eof */
+      if (sblock->base_addr >= udata->stored_eof)        /* :550 */
+      if (H5_addr_defined(sblock->ext_addr) &&
+          sblock->ext_addr >= udata->stored_eof)         /* :552 */
+    That is the containment this record proposed for the address half, and it
+    is broader than proposed -- base_addr and ext_addr got the same treatment.
+    It runs in the superblock deserializer, before H5FD_set_eoa and before
+    H5AC_protect(H5AC_DRVRINFO), which is the ordering the containment demanded.
+    THE LENGTH HALF IS NOT FIXED.  The bound is on ONE OPERAND of the
+    src/H5Fsuper_cache.c:279 expression, not on the expression:
+      min_eoa = udata->driver_addr + H5F_DRVINFOBLOCK_HDR_SIZE + drvrinfo->len;
+    `drvrinfo->len` is still decoded unchecked at :254 and still extends the
+    EOA to cover itself, so it still self-authorises and still defeats
+    H5C__verify_len_eoa.  The only size guard remains the NDEBUG-compiled-out
+    assert at src/H5Centry.c:3206.
+    THIS IS WHAT THE JOINT FRAMING PREDICTED.  why_one_record argued that
+    bounding either field alone leaves :279 attacker-controlled, and named
+    "bound the address alone and a 4 GiB length still moves the EOA" as the
+    specific failure mode.  Upstream bounded the address alone.  The record's
+    argument was not rhetorical -- it describes the state the library is
+    actually in.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt on both triggers
+  libhdf5:
+    address: >-
+      2.2.0 accepted silently; 2.3.0 REJECTS AT OPEN.  The divergence on this
+      trigger is CLOSED -- both sides now refuse the file, and h5policy is no
+      longer the stricter one.
+    length: >-
+      still accepts and over-allocates on an uncapped release build (recorded
+      against HEAD 955746b; not re-measured here, deliberately -- see
+      measurement_trap).
+  classification: >-
+    address: agreement (as of 2.3.0).  length: A -- a real invariant-A
+    disagreement, still open.
+  note: >-
+    UPDATED 2026-08-15.  An earlier revision called this "a real invariant-A
+    disagreement on both triggers"; that is now true of the length trigger only.
+    Neither trigger has an entry in registry/h5policy-diff-tolerances.yml and
+    neither needs one.  The address trigger no longer diverges at all.  The
+    length trigger's specimen is not in the differential corpus -- it lives only
+    in a gitignored bundle -- so nothing in the harness is failing on it and
+    there is nothing to excuse.  If it ever becomes a tracked fixture it would
+    need a per-fixture tolerance at that point, not before.
+    UPDATED 2026-08-16: that point arrived, and the prediction held exactly.
+    malformed/drvinfo_block_len_past_eof.h5 and
+    malformed/drvinfo_block_header_truncated.h5 are now tracked fixtures, both
+    fail invariant A (libhdf5 opens, h5policy rejects), and both carry
+    per-fixture tolerance entries against this case.  Two entries rather than
+    one code-scoped A~ predicate, deliberately: they share the finding code
+    H5_CORRUPT_DRVINFO_BLOCK_EXTENT but diverge for different reasons -- an
+    unbounded length versus sec2's zero-fill past EOF -- and a code-scoped
+    predicate would excuse both explanations under one claim.
+    The differential now reports 6 tracked divergences where it reported 4, with
+    0 hard failures.  drvinfo_block_bad_version.h5 needs no entry: libhdf5
+    rejects it too, so that fixture agrees.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: half_implemented_upstream   # address done at 2.3.0; length outstanding
+  address_half: >-
+    DONE UPSTREAM, and done well.  src/H5Fsuper_cache.c:546 bounds
+    sblock->driver_addr against udata->stored_eof during superblock
+    deserialisation, with :550 and :552 giving base_addr and ext_addr the same
+    treatment.  That is earlier than this record asked for -- it precedes both
+    H5FD_set_eoa and the H5AC_protect(H5AC_DRVRINFO) read, so the read past EOF
+    that sec2's zero-fill turned into a plausible empty block never happens.
+    Nothing further is needed here.  Note the compatibility cost this record
+    predicted was real and was evidently accepted upstream: truncated LEGACY
+    files that survived on sec2's zero-fill-past-EOF now fail at open.
+  length_half: >-
+    OUTSTANDING.  In H5F__drvrinfo_prefix_decode, before the extend_eoa block at
+    src/H5Fsuper_cache.c:268-284, require that
+    driver_addr + H5F_DRVINFOBLOCK_HDR_SIZE + drvrinfo->len lies within the
+    PHYSICAL file size, computed with checked arithmetic, and additionally that
+    drvrinfo->len does not exceed H5C_MAX_ENTRY_SIZE.  The second part is
+    promoting the existing assert at src/H5Centry.c:3206 to a real error.
+    The ordering is still the point: the check must precede H5FD_set_eoa, or
+    the length continues to authorise itself and every downstream EOA-relative
+    test remains satisfied by construction.
+    THE ADDRESS FIX DOES NOT HELP HERE, and it is worth being explicit about
+    why: it bounds one operand of the :279 sum, so a legal in-file driver_addr
+    can still be paired with a multi-gigabyte len and move the EOA just as far.
+    Low compatibility risk -- no conforming writer emits a driver-info length
+    exceeding the file, and the 32 MiB assert already encodes the intended
+    ceiling.
+systemic:
+  semantic_boundary: >-
+    the driver-info block prefix validated as one record against file geometry
+    -- address, header size and length together -- before any VFD read is
+    issued and before the EOA is moved.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 superblock read still open
+  description: >-
+    h5policy bounds every superblock-resident address against the effective
+    ceiling and never extends its own view of the file from a decoded length,
+    so neither trigger can arise: there is no EOA to move and no allocation
+    driven by an on-disk size.  Both specimens are refused at offset 0.
+    The remaining work is entirely libhdf5's.
+  landed_changes:
+    - h5policy/pickles (address.offset_in_file over superblock-resident addresses)
+    - registry/findings/catalog (H5_CORRUPT_OFFSET_OUT_OF_FILE)
+    - registry/validation-coverage.yml (address_space_bounds)
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_pocs:
+    # Untracked working specimens, named by the input_sha256 under `triggers`.
+    - specimen c8e84efd...      # address
+    - specimen 2f739e35...      # length
+  # ADDED 2026-08-16.  These are NOT the promoted specimens: they are small,
+  # deterministic, tracked fixtures built by gencorpus that exercise the same
+  # invariant.  The specimens remain the provenance; these are the regression
+  # surface.
+  direct_fixtures:
+    - h5policy/tests/malformed/drvinfo_block_len_past_eof.h5
+    - h5policy/tests/malformed/drvinfo_block_header_truncated.h5
+    - h5policy/tests/malformed/drvinfo_block_bad_version.h5   # agreement control
+    - h5policy/tests/valid/drvinfo_block.h5                   # coverage refusal
+  direct_fixture_generators: >-
+    h5policy-gencorpus _make_drvinfo_block / _bad_version / _len_past_eof /
+    _header_truncated, all via the shared _drvinfo_block and _drvinfo_assemble
+    helpers.  h5py cannot write a driver-info block at all -- it appears only
+    under the family or multi VFD -- so the helper appends one to a plain
+    earliest-format file and repoints the v0 superblock's driver-info address
+    (bytes 48-55) and declared EOF (bytes 40-47).  A v0 superblock carries no
+    checksum, so unlike every v2+ fixture in that generator nothing needs
+    repairing afterwards.
+  direct_fixture_notes: >-
+    THE LENGTH FIXTURE DECLARES 1 MiB, NOT ~4 GiB, and the size is a safety
+    property rather than a convenience.  measurement_trap explains both hazards
+    at the original magnitude: an uncapped run can OOM-kill the desktop session,
+    and a capped one reports `rejected_at_open`, which reads as libhdf5
+    correctly refusing the file and is the opposite of the truth.  1 MiB is four
+    orders of magnitude past that file's EOF, so it exercises the bound fully
+    while being safe to measure on an uncapped host.  It does NOT reproduce the
+    amplification, which is what the promoted specimen is still for.
+    THE TRUNCATED-HEADER FIXTURE IS A NEW TRIGGER SHAPE, not a minimisation of
+    either promoted specimen: the address is INSIDE the file and only the extent
+    escapes, so the 2.3.0 address bound does not intercept it and sec2's
+    zero-fill fabricates a structurally valid empty block.  It is the first
+    tracked instance of the general zero-fill hazard named in sibling_audit.
+    THE AGREEMENT CONTROL MATTERS MORE THAN IT LOOKS.  Both divergent fixtures
+    are files libhdf5 opens, so on their own they cannot distinguish "libhdf5
+    tolerates the defect" from "libhdf5 never read the block".
+    drvinfo_block_bad_version.h5 settles it: h5dump -H exits 1 and h5py raises,
+    so the block IS decoded at open and the sibling divergences are real
+    tolerances rather than dead code.
+  generators: >-
+    ADDRESS: not yet deterministic, but a recorded recipe exists -- from a valid
+    superblock-v0 file, set byte 55 (MSB of the driver-info address)
+    0xff -> 0x3d.  That is a one-byte patch and is a straightforward gencorpus
+    generator; nothing blocks it.
+    LENGTH: NOT minimisable here.  The length bytes at file offset 14 overlap
+    live superblock fields (size-of-lengths, reserved, group-leaf-K), so any
+    length-only edit corrupts the superblock and the specimen stops testing what
+    it claims to test.  Causality was established by gdb plus an RLIMIT_AS
+    sweep instead.  A generator would have to rebuild the superblock, not patch
+    it.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true    # for h5policy; libhdf5 over-allocates
+                                          # during metadata decode, before any
+                                          # object is materialised
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []          # nothing to backport in h5policy.
+
+fuzz_seed: >-
+  Both specimens seed the superblock driver-info neighbourhood.  The length
+  field is the better mutation axis of the two despite not being minimisable --
+  the interesting boundaries are at the physical file size, at
+  H5C_MAX_ENTRY_SIZE (32 MiB), and at the 32-bit address-space limit, and the
+  outcome changes at each.
+
+compatibility_backport_risks: >-
+  The length bound is low risk: no conforming writer emits a driver-info length
+  exceeding the file, and promoting the existing 32 MiB assert to an error
+  rejects nothing a library wrote.
+  The address bound is the risk-bearing half -- see containment.  Truncated
+  legacy files currently survive on the VFD's zero-fill-past-EOF behaviour and
+  would begin failing at open.
+
+sibling_audit: >-
+  Within libhdf5: the 2f739e35 bundle names the right follow-up and it is not
+  done -- audit the other speculative-load cache clients that extend the EOA
+  from an on-disk length, since the self-authorising pattern is a property of
+  that mechanism rather than of the driver-info block specifically.  Related
+  and separately recorded: H5C__load_entry only EOA-checks speculative cache
+  classes, leaving local-heap direct-block and object-header continuation
+  allocations unchecked.
+  The sec2 zero-fill-past-EOF behaviour is a VFD property, not a driver-info
+  one, so any structure whose address escapes the file gets the same treatment
+  -- the address trigger is one instance of a general hazard and the others
+  are unaudited.
+  NOT part of this record: the local-heap free-list wrap that shares the
+  981f08d8 specimen.  See registry/cases/local-heap-free-list-bound-wraps.yml.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  address_trigger:
+    affected: >-
+      2.2.0 and earlier (measured: the bundle's stock 2.2.0 build accepts the
+      specimen silently).
+    fixed_in: >-
+      2.3.0.  MEASURED -- stock 2.3.0 rejects at H5Fopen, uncapped and
+      unsanitised -- and LOCATED in source at src/H5Fsuper_cache.c:546, where
+      the driver-info address is bounded against stored_eof during superblock
+      deserialisation.  Both halves of that evidence agree, which is why this
+      is stated as fixed rather than as an observation.
+    not_established: >-
+      Exactly which release between 2.2.0 and 2.3.0 introduced the bound.  No
+      archaeology was run on H5Fsuper_cache.c and no intermediate tag was built,
+      so "fixed in 2.3.0" means "present at 2.3.0", not "introduced in 2.3.0".
+  length_trigger:
+    affected: >-
+      2.2.0 through HEAD, still live.  The length is decoded unchecked at
+      src/H5Fsuper_cache.c:254 and still extends the EOA at :279; the address
+      fix does not touch it.  Source-verified at 2.3.0 on 2026-08-15.
+    fixed_in: null
+  label: >-
+    address half: measured and source-located.  length half: source-verified
+    live.  Neither is a bisected range.
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    CLOSED 2026-08-16 for the LENGTH trigger, still open for the ADDRESS one.
+    The record previously had no tracked fixture at all, with its evidence
+    living only in gitignored bundles.  It now has four -- see
+    reproducers.direct_fixtures -- covering the length bound, a second extent
+    shape (truncated header), an agreement control and the coverage refusal.
+    THE ADDRESS TRIGGER STILL HAS NO FIXTURE, and its value has changed since
+    this gap was written: the address half is FIXED upstream at 2.3.0, so a
+    fixture would be a regression guard against the fix being reverted rather
+    than evidence of a live defect.  Still cheap (a one-byte patch on byte 55 of
+    a v0 superblock) and still worth doing, but it is no longer the largest gap
+    in the record.
+  - >-
+    CLOSED 2026-08-16.  THE LENGTH INVARIANT NOW HAS A CATALOGUED NAME:
+    `control.driver_info_extent`, emitting H5_CORRUPT_DRVINFO_BLOCK_EXTENT from
+    h5policy_validate_drvinfo_block (h5policy/pickles/h5_validate.pk), routed
+    under the validation_controls record.  This record's old
+    `driver_info.len_bounded` placeholder is retired.
+    NOTE WHAT CHANGED IN THE ORACLE, because it is more than a rename.  h5policy
+    previously bounded the driver-info ADDRESS and stopped there -- it never
+    decoded the block behind it, which is why the promoted specimen reached the
+    oracle through the mechanically mis-routed H5_CORRUPT_MAPPING_FAILED rather
+    than through anything about driver info.  The v0/v1 block body is now
+    decoded and bounded on its own terms.  The mis-route on that specimen is
+    unchanged, since h5policy still refuses it earlier, at the superblock.
+  - >-
+    THE v0/v1 BLOCK AND THE v2+ MESSAGE ARE VALIDATED BY TWO SEPARATE
+    FUNCTIONS, h5policy_validate_drvinfo_block (h5_validate.pk) and
+    h5policy_validate_drvinfo_payload (h5_messages.pk).  That is not obviously
+    wrong -- the encodings genuinely differ, and only the block has an
+    unbounded length -- but the coverage refusal at the end of each is the same
+    policy stated twice, and the two could drift.  Not merged; noted.
+  - >-
+    CLOSED 2026-08-15 -- see measured.REMEASURED,
+    address_trigger_fixed_upstream and length_trigger_status.  The address
+    trigger is FIXED at 2.3.0 (measured + source-located); the length trigger is
+    confirmed live at 2.3.0 by a complete source chain, though not by execution
+    -- see length_trigger_status for why the measurement could not be taken and
+    what it would add.
+  - >-
+    The address trigger is unmeasured at 32 bits, and unmeasured on any VFD
+    beyond sec2/stdio/core.
+open_questions:
+  - >-
+    Which other cache clients extend the EOA from an on-disk length?  The
+    self-authorising pattern defeats H5C__verify_len_eoa for any of them, and
+    only the driver-info block is measured.  This is the highest-value follow-up
+    in the record.
+  - >-
+    Is the sec2 zero-fill-past-EOF behaviour relied upon anywhere legitimate?
+    The containment's address half changes it from "silently valid" to "error",
+    and the compatibility note assumes truncated legacy files are the only
+    affected class.  That assumption is not verified.
+
+provenance:
+  found_by: >-
+    two supplied specimens, triaged through the h5cve bundle workflow into two
+    untracked working bundles, one per field; promoted jointly 2026-08-15 after
+    reading H5F__drvrinfo_prefix_decode and finding that both fields feed the
+    single EOA-extension expression at src/H5Fsuper_cache.c:279.
+  hdf5_build: >-
+    Address trigger measured on HDF5 2.2.0 (source 4d666721f42), baseline
+    Release and candidate ASan, both accepting.  Length trigger measured
+    against HEAD 955746b across uncapped LP64 release, ASan, 32-bit and
+    RLIMIT_AS-capped runs.  Source verified against the 2.3.0 tree at
+    promotion.  Workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

@@ -1,0 +1,301 @@
+# A fractal heap can declare a direct block smaller than the block's own prefix.
+# The checksum verifier then reads at a position derived from header constants,
+# past the allocation the declared size produced.
+#
+# Promoted from one working bundle (gitignored h5cve scratch; the specimen is
+# identified by provenance.input_sha256 below).
+#
+# The specimen is not the interesting part -- both implementations reject it,
+# for different and partly incidental reasons. The interesting part is what
+# isolating the defect on a clean base exposed: a PROVEN h5policy false accept,
+# now closed. See oracle_false_accept.
+schema_version: 1
+
+id: fractal-heap-dblock-size-no-floor
+title: nothing floors a fractal-heap direct block at its own prefix size, so the
+  checksum verifier reads past a block the header declared one byte long
+status: oracle-hardened          # h5policy floors it now; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The bundle carries an
+  "UNCONFIRMED offline" note naming a corpus specimen; that is provenance, not
+  a claim, and is not reproduced here.
+
+# -- Triage -------------------------------------------------------------------
+record: heap_structures
+versions: [1, 2, 3]              # fractal heap header versions carrying the field
+root_cause_classification: local_decode
+violated_invariant:
+  - heap.size_arithmetic
+validation_closure: >-
+  the fractal-heap header's block-size geometry together with the direct block
+  it describes: start_block_size, every doubled row size, the direct-block
+  prefix, and the checksum position -- all established before the cache
+  allocates a block image or reads a checksum out of it.
+activation_before_validation:
+  - none                          # the over-read happens during metadata decode
+entry_points:
+  - h5policy (oracle) -- floors the block before the signature check
+  - "libhdf5 H5HF__cache_dblock_verify_chksum (src/H5HFcache.c:1600) <- H5C__load_entry <- H5C_protect <- H5AC_protect <- H5HF__man_dblock_protect <- H5HF__man_op_real"
+  - "reached from a dense-link walk: H5G__dense_iterate_bt2_cb -> H5HF_op"
+  - "public API: H5Fopen, H5Gopen2, H5Gget_info, H5Lget_name_by_idx"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  The declared block size sizes the allocation, and the checksum position comes
+  from somewhere else entirely -- header constants -- with nothing relating the
+  two.  H5HF__cache_dblock_verify_chksum:
+      chk_size = (size_t)(H5HF_MAN_ABS_DIRECT_OVERHEAD(hdr) - H5HF_SIZEOF_CHKSUM);  /* :1596 */
+      chk_p    = (uint8_t *)read_buf + chk_size;                                    /* :1597 */
+      UINT32DECODE(chk_p, stored_chksum);                                           /* :1600 */
+  `H5HF_MAN_ABS_DIRECT_OVERHEAD(hdr)` is the prefix size implied by the HEADER;
+  `read_buf` is an image whose extent came from the declared start_block_size.
+  Nothing floors the latter against the former, so a header declaring a 1-byte
+  direct block yields a 1-byte region and a read at offset 17 into it.
+  NOTE WHAT IS NOT WRONG HERE, because it distinguishes this from the v2-btree
+  record: `len` is NOT declared H5_ATTR_UNUSED in this function and IS used --
+  for the filtered-path malloc and memcpy, and for
+  H5_checksum_metadata(read_buf, len, 0) at :1608.  The function knows its own
+  image length perfectly well.  It simply never compares that length to the
+  position it computes from the header.  A bound is present, used, and applied
+  to the wrong quantity.
+
+arithmetic: >-
+  The prefix is 5 + sizeof_offsets + block_offset bytes.  On this specimen that
+  is 5 + 8 + 4 = 17, so:
+    minimum legal block size, checksummed heap    21   (17 prefix + 4 checksum)
+    minimum legal block size, unchecksummed heap  17
+    declared by the specimen                       1
+  ASan's report reads "16 bytes after 1-byte region", which places the access at
+  base + 17 -- exactly the prefix -- and the read is 4 bytes wide, the checksum.
+  All three figures agree and pin the defect to the prefix boundary rather than
+  to any general size confusion.
+
+# -- The finding that mattered was on our side --------------------------------
+oracle_false_accept: >-
+  THE SPECIMEN LOOKED ROUTINE AND WAS NOT THE FINDING.  Both implementations
+  reject it, so on its face this was another agreement.  Asking WHY h5policy
+  rejected it showed the rejection was INCIDENTAL: it reported
+  H5_CORRUPT_BAD_SIGNATURE because the root address happens to hold non-FHDB
+  bytes -- a BTHD sits at 238 -- and not because the block is too small.  The
+  size defect was never detected; a symptom was.
+  Isolating the size defect on a clean base settled it.  Taking
+  valid/sohm_list.h5 (a heap whose root IS a direct block) and setting
+  start_block_size 1024 -> 1, with direct-block checksums DISABLED, h5policy
+  ACCEPTED the file outright -- exit 0, zero findings -- while libhdf5 refuses
+  to traverse it.  A clean false accept, and the reverse of this registry's
+  usual direction.
+  Why the checksum flag mattered: h5policy's floor had been a side effect of the
+  checksum-position check, which sits behind an early return for heaps that do
+  not checksum direct blocks.  Turn the flag off and the floor disappeared with
+  it.  That is why the corpus now carries a PAIR --
+  malformed/dblock_size_below_floor.h5 and its _nochecksum sibling -- differing
+  in exactly that flag.  The pair is the regression guard; either alone would
+  have missed this.
+  ORDERING WAS ALSO WRONG, AND NOW MIRRORS LIBHDF5.  libhdf5 verifies the cache
+  entry's checksum BEFORE deserializing, so it meets the size problem before the
+  signature.  h5policy checked the signature first and so reported the symptom
+  above.  With the floor moved ahead of the signature check the specimen's
+  primary finding became H5_CORRUPT_LENGTH_OVERFLOW @ 237 -- the defect libhdf5
+  actually faults on.  Reading a 4-byte signature out of a 1-byte block already
+  looks past the declared extent, so checking the size first is right on its own
+  terms as well as for agreement.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  NOT_REMEASURED_AT_PROMOTION: >-
+    Everything under `measured` is the bundle's, recorded at h5policy 07ad5e7
+    against libhdf5 2.3.0, and was NOT re-measured at promotion -- this session
+    could not execute the oracle or the probes.  The SOURCE claims in `defect`
+    were read from the 2.3.0 tree at promotion and are current.  The bundle's
+    libhdf5 measurements are already 2.3.0, so there is no version skew.
+  oracle_as_recorded: >-
+    reject_corrupt, H5_CORRUPT_LENGTH_OVERFLOW @ 237 on /, message "fractal heap
+    direct block is smaller than its own prefix".  Two further findings on the
+    same specimen from other families -- H5_CORRUPT_UNSUPPORTED_LINK_VERSION
+    (message_envelope) and H5_CORRUPT_LINK_NAME_EMPTY (dense_index) -- which is
+    part of why the specimen alone was a poor isolate.
+  libhdf5_as_recorded: >-
+    ASan 2.3.0: CRASHED.  heap-buffer-overflow READ of size 4 at
+    src/H5HFcache.c:1600 in H5HF__cache_dblock_verify_chksum, "16 bytes after
+    1-byte region", through H5C__load_entry <- H5C_protect <- H5AC_protect <-
+    H5HF__man_dblock_protect <- H5HF__man_op_real.  Canary status `violation`.
+    Release 2.3.0: opens the file; the heap_structures canary stops in traversal
+    with H5Ovisit3/H5Oopen errors.  No forbidden activation observed.
+    comparison: inconclusive.
+  stock_is_quiet: >-
+    WORTH KNOWING BEFORE TRUSTING A STOCK RUN ON THIS FAMILY.  h5ls exits 0 and
+    the bundle's targeted probe exits 0; only h5dump -H reports errors, and none
+    of them faults.  The ASan build is the measurement instrument here, exactly
+    as for the v2-btree checksum-read case.  A stock-only assessment of this
+    family will report "fine".
+  width: >-
+    NOT measured at 32 bits.  The prefix arithmetic depends on sizeof_offsets,
+    so the floor itself is width-dependent (17 here with 8-byte offsets, 13 with
+    4-byte); the defect is not a width wrap but the boundary value moves.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: rejected_in_traversal (Release) / crashed (ASan)
+  libhdf5_version: 2.3.0
+  classification: agreement-on-verdict, divergence-on-safety
+  note: >-
+    Both sides refuse the specimen, so there is no invariant-A disagreement and
+    NO entry in registry/h5policy-diff-tolerances.yml is warranted or present.
+    But note the agreement was partly accidental before the fix -- h5policy was
+    rejecting on a signature symptom -- and the Release build's refusal comes
+    after the over-read rather than instead of it.  Neither side's verdict was
+    evidence that the size was checked.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    A decode precondition: floor start_block_size -- and every doubled row size
+    derived from it -- at the direct-block prefix plus, when the heap
+    checksums direct blocks, the checksum width.  Place it in
+    H5HF__cache_dblock_verify_chksum before :1596, or better at header
+    deserialize so no consumer can be reached with an impossible geometry.
+    The values are all in hand: H5HF_MAN_ABS_DIRECT_OVERHEAD(hdr) is the very
+    quantity the checksum position is computed from, so the comparison needs no
+    new arithmetic -- only that the computed position be tested against `len`,
+    which this function already has and already uses elsewhere.
+    Low risk: no valid heap can declare a direct block shorter than its own
+    prefix, so no legitimate file regresses.
+systemic:
+  semantic_boundary: >-
+    heap segments, free lists, IDs, offsets and extents -- a declared block size
+    validated against the block's own prefix before any image is allocated or
+    any position within it computed.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder, landed); libhdf5 open
+  description: >-
+    h5policy now floors the direct-block size independently of whether the heap
+    checksums direct blocks, and checks it BEFORE the signature -- so the class
+    of defect cannot arise and the reported cause matches the one libhdf5 faults
+    on.  The floor applies to every direct block the oracle validates, not only
+    the root.
+    The remaining work is entirely libhdf5's.
+  landed_changes:
+    - h5policy/pickles (heap.size_arithmetic floor, moved ahead of the signature
+      check and made independent of the checksum flag)
+    - h5policy/tools/h5policy-gencorpus (_make_dblock_size_below_floor, whose
+      keep_checksums argument selects the pair)
+    - h5policy/tests/malformed/dblock_size_below_floor.h5 and
+      dblock_size_below_floor_nochecksum.h5, plus expectations
+    - registry/findings/catalog (H5_CORRUPT_LENGTH_OVERFLOW for this message)
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/dblock_size_below_floor_nochecksum.h5
+  direct_fixtures:
+    # THE PAIR IS THE POINT -- they differ only in the direct-block checksum
+    # flag, which is what selected between "rejected" and "accepted outright"
+    # before the fix.  Do not consolidate them.
+    - h5policy/tests/malformed/dblock_size_below_floor.h5
+    - h5policy/tests/malformed/dblock_size_below_floor_nochecksum.h5
+  expectations:
+    - h5policy/tests/expected/malformed-dblock_size_below_floor.yml
+    - h5policy/tests/expected/malformed-dblock_size_below_floor_nochecksum.yml
+  control_fixture: >-
+    h5policy/tests/valid/sohm_list.h5 -- the clean base both fixtures are cut
+    from, chosen because its heap root IS a direct block.  It is also what made
+    the false accept visible: the specimen was too noisy to isolate on.
+  generator: >-
+    h5policy-gencorpus _make_dblock_size_below_floor, from valid/sohm_list.h5:
+    set start_block_size to 1 and recompute the heap header's Jenkins lookup3
+    checksum.  Deterministic and reproducible from this repo alone.
+  targeted_probe: >-
+    heap-targeted-probe.c in the bundle -- public API only (H5Fopen, H5Gopen2,
+    H5Gget_info, H5Lget_name_by_idx); the dense-link iteration reaches the heap
+    through H5G__dense_iterate_bt2_cb.  MUST be linked against the ASan build to
+    show anything; against stock it exits 0.  See measured.stock_is_quiet.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []
+
+fuzz_seed: >-
+  start_block_size is a clean single-field axis with a sharp, computable
+  boundary: 21 and 17 are the minimum legal values with and without direct-block
+  checksums on an 8-byte-offset file, so 16/17/18 and 20/21/22 are the six
+  values worth probing.  The checksum flag is a second, binary axis and the two
+  interact -- which is exactly what the false accept turned on.
+
+compatibility_backport_risks: >-
+  Low on the libhdf5 side: no valid heap declares a direct block shorter than
+  its own prefix.
+  On the h5policy side the change already made was a TIGHTENING on one shape the
+  oracle previously accepted -- a below-floor block in a heap that does not
+  checksum direct blocks -- which is the intended correction.  Decisions moved
+  only toward reject.
+
+sibling_audit: >-
+  THIS CASE ANSWERS AN OPEN QUESTION IN ANOTHER RECORD.
+  registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml asked
+  whether the unvalidated-size-then-read shape existed beyond the v2-btree cache
+  clients.  It does: this is the fractal-heap instance, reaching the same
+  H5C__load_entry verify-checksum machinery from a different client.
+  But it is NOT the same spelling, and that matters -- see the note added to
+  registry/cases/decoder-bound-shape-sweeps.yml.  The B-tree clients declare
+  `len` H5_ATTR_UNUSED; this one uses `len` and merely fails to bound the
+  computed position against it.  A grep for the former cannot find the latter.
+  NOT audited: indirect blocks (H5HF__cache_iblock_*), whose sizes derive from
+  the same unfloored start_block_size, and the doubled per-row sizes -- only the
+  ROOT DIRECT block was exercised.  On the oracle side the floor already applies
+  to every direct block, so the gap is one-sided.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured live on 2.3.0 and the unfloored checksum
+    position at src/H5HFcache.c:1596-1600 verified present in the 2.3.0 tree at
+    promotion.  No archaeology was run.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    INDIRECT BLOCKS AND DOUBLED ROW SIZES ARE UNAUDITED on the libhdf5 side.
+    Both derive from the same unfloored start_block_size, and only the root
+    direct block was exercised.  This is the largest remaining gap and the
+    generator already produces the base file needed to extend it.
+  - >-
+    NOTHING WAS RE-MEASURED AT PROMOTION (source claims excepted).
+  - >-
+    No 32-bit measurement, and the floor VALUE is width-dependent (17 with
+    8-byte offsets, 13 with 4-byte), so a 32-bit fixture is not the same file.
+  - >-
+    The bundle records `fuzz_seed: null` -- neither fixture is registered as a
+    seed despite the field being an unusually good mutation axis.
+open_questions:
+  - >-
+    Does the same absence extend to the filtered path in this very function?
+    The filtered branch mallocs `len` bytes and runs the pipeline before the
+    checksum position is computed, so a filtered heap with a below-floor block
+    may fail differently -- or not at all.  Unexamined.
+  - >-
+    How many other cache clients compute a position from HEADER constants rather
+    than from their image length?  That is the shape here, and it is distinct
+    from the discarded-length shape already swept for.  No sweep exists for it.
+
+provenance:
+  found_by: >-
+    a supplied corpus specimen, triaged through the h5cve bundle workflow in
+    an untracked working bundle; promoted 2026-08-15.  The oracle
+    false accept was found by the bundle, by asking why a rejection happened
+    rather than accepting that it did -- which is the technique worth copying
+    from this case.
+  input_sha256: 12c483ad714633694771c6394355fc6005fd46d150d8a793be2193d9abfc065b
+  hdf5_build: >-
+    HDF5 2.3.0; baseline Release -- opens, canary stops in traversal; candidate
+    RelWithDebInfo -fsanitize=address -- heap-buffer-overflow READ of size 4 at
+    src/H5HFcache.c:1600.  Workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

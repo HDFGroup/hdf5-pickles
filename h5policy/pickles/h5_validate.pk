@@ -48,9 +48,12 @@ fun h5policy_width_supported = (uint<8> width) int:
     return width == 2UB || width == 4UB || width == 8UB;
 }
 
-/* Lengths may be encoded in 16 bytes.  h5policy accepts the container width
-   and narrows each value only after verifying that its upper 64-bit limb is
-   zero (or that the complete value is the all-ones undefined sentinel). */
+/* The on-disk format admits 16-byte lengths, and h5policy's unsigned-value
+   decoder can represent their narrow subset.  Do not make that independent
+   capability an acceptance promise: the selected libhdf5 target's shared
+   H5_DECODE_LENGTH_LEN primitive has no 16-byte case.  Superblock preflight
+   therefore refuses the width below as a target-specific compatibility guard,
+   before any target decoder reaches such a field. */
 fun h5policy_length_width_supported = (uint<8> width) int:
 {
     return h5policy_width_supported(width) || width == 16UB;
@@ -141,25 +144,42 @@ fun h5policy_preflight_super_widths = (int ios,
                                 "unsupported superblock length width");
             ok = 0;
         }
+    else if (sizeof_lengths == 16UB)
+        {
+            /* This is deliberately a target-compatibility refusal, not a
+               corruption classification.  H5Pset_sizes permits the width,
+               but the current libhdf5 length decoder cannot consume it. */
+            h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                "unsupported", off, "superblock",
+                                "16-byte superblock length fields are conservatively refused for libhdf5 compatibility");
+            ok = 0;
+        }
 
     return ok;
 }
 
-/* Superblock and byte mapping wrappers mirror the message mapping wrappers:
-   strict mapping rejects malformed mappings immediately, while non-strict
-   mapping lets nearby fields still be classified.  */
+/* A policy decision needs a stable finding code, not merely a constraint
+ * exception.  The superblock is therefore always weak-mapped: its fixed
+ * preflight constrains dynamic widths, and h5policy_validate_superblock()
+ * classifies every semantic field before traversal.  Other metadata retains
+ * the profile-selected strict/non-strict mapping behavior below. */
 fun h5policy_map_super = (int ios, H5PolicyProfile profile,
                           offset<uint<64>,B> off) superblock:
 {
-    if (h5policy_run_options.nonstrict_mapping != 0UB)
-        return superblock @! ios : off;
-    return superblock @ ios : off;
+    return superblock @! ios : off;
 }
 
 fun h5policy_map_bytes = (int ios, H5PolicyProfile profile,
                           offset<uint<64>,B> off,
                           uint<64> size) byte[]:
 {
+    var source = h5policy_mdci_replay_source(off/#B, size);
+    if (source != 0xffffffffffffffffUL)
+        {
+            if (h5policy_run_options.nonstrict_mapping != 0UB)
+                return byte[size] @! ios : source#B;
+            return byte[size] @ ios : source#B;
+        }
     if (h5policy_run_options.nonstrict_mapping != 0UB)
         return byte[size] @! ios : off;
     return byte[size] @ ios : off;
@@ -203,6 +223,103 @@ fun h5policy_validate_optional_addr = (byte[] raw, uint<64> file_size,
                                            "H5_CORRUPT_OFFSET_OUT_OF_FILE",
                                            loc, object, message);
         }
+}
+
+/* v0/v1 superblocks carry driver information in a standalone block at the
+   superblock's driver-info address; v2+ moved the same payload into a
+   superblock-extension message (0x0014), which h5policy_validate_drvinfo_payload
+   handles.  The encodings differ, and so do their failure modes.  A message is
+   bounded by the object header that contains it, so its length can be checked
+   against an enclosing extent.  This block has no container: its length is read
+   straight out of the file and bounded by nothing.
+
+   That is the live half of registry/cases/driver-info-block-fields-unbounded.yml.
+   libhdf5 decodes the prefix in H5F__drvrinfo_prefix_decode
+   (src/H5Fsuper_cache.c), which bounds every field against the 16-byte IMAGE
+   BUFFER it was handed and no field against the FILE.  The decoded length then
+   extends the EOA to cover itself and, in the same callback, becomes the cache
+   entry's allocation size -- so it self-authorises, and every downstream
+   EOA-relative check is satisfied by construction.  h5policy has no EOA to move,
+   so it bounds the block against the ceiling the superblock already declared.
+
+   Header layout is [version:1][reserved:3][len:4][driver id:8]; `len` counts
+   only the driver-specific bytes that follow those 16.  */
+fun h5policy_validate_drvinfo_block = (int ios, H5PolicyProfile profile,
+                                       uint<64> addr) void:
+{
+    var object = "/<driver-info-block>";
+    var ceiling = h5policy_ceiling(ios);
+    var loc = addr#B;
+
+    /* The header itself must lie in the file.  libhdf5 reads it speculatively
+       and the sec2 driver zero-fills past EOF, so a header running off the end
+       decodes as an all-zero block rather than failing -- the same zero-fill
+       that made a wild driver-info ADDRESS silently acceptable before 2.3.0
+       bounded it.  Written as subtraction because addr + 16 is attacker-reachable
+       arithmetic.  */
+    if (addr > ceiling || ceiling - addr < 16UL)
+        {
+            h5policy_emit_error_ev(
+                "H5_CORRUPT_DRVINFO_BLOCK_EXTENT", "corrupt", loc, object,
+                "driver-info block header does not fit in the file",
+                H5Evidence {
+                    field = "control.driver_info_extent",
+                    actual = addr,
+                    expected = (ceiling < 16UL) ? 0UL : ceiling - 16UL,
+                    comparison = "at_most",
+                    has_loc1 = 1, loc1_role = "actual",
+                    loc1 = loc, loc1_len = 1UL
+                });
+            return;
+        }
+
+    var version = h5policy_read_u64_le_at(ios, profile, loc, 1UL);
+    if (version != 0UL)
+        {
+            h5policy_emit_error_ev(
+                "H5_CORRUPT_UNSUPPORTED_DRVINFO_VERSION", "corrupt", loc, object,
+                "driver-info block has an unsupported version",
+                H5Evidence {
+                    field = "control.driver_info_encoding",
+                    actual = version,
+                    expected = 0UL,
+                    comparison = "equal",
+                    has_loc1 = 1, loc1_role = "actual",
+                    loc1 = loc, loc1_len = 1UL
+                });
+            return;
+        }
+
+    /* The three reserved bytes are deliberately NOT checked.  libhdf5 skips them
+       without inspection (`image += 3`), so rejecting a nonzero value would make
+       h5policy refuse a file libhdf5 opens.  pickles/drv_info.pk constrains them
+       to zero, but that is the descriptive model of a conforming writer, not the
+       bound this oracle may enforce.  */
+
+    var body_len = h5policy_read_u64_le_at(ios, profile, loc + 4#B, 4UL);
+    if (body_len > ceiling - addr - 16UL)
+        {
+            h5policy_emit_error_ev(
+                "H5_CORRUPT_DRVINFO_BLOCK_EXTENT", "corrupt", loc + 4#B, object,
+                "driver-info block body extends past the end of the file",
+                H5Evidence {
+                    field = "control.driver_info_extent",
+                    actual = body_len,
+                    expected = ceiling - addr - 16UL,
+                    comparison = "at_most",
+                    has_loc1 = 1, loc1_role = "actual",
+                    loc1 = loc + 4#B, loc1_len = 4UL
+                });
+            return;
+        }
+
+    /* The driver identification and the driver-specific bytes after it are
+       consumed by a VFD and can name other files.  As on the message path, an
+       opaque body that decodes cleanly is not a validated one, so a well-formed
+       block stays an explicit coverage refusal rather than an accept.  */
+    h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP", "unsupported",
+                        loc + 8#B, object,
+                        "driver-specific member files are not validated");
 }
 
 /* v0/v1 superblocks have no superblock-extension object header.  Return the
@@ -305,18 +422,30 @@ fun h5policy_validate_superblock = (int ios, superblock sb,
                 h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
                                     "corrupt", super_off, "superblock",
                                     "end-of-file address is beyond the available file image");
-            var ok_root = h5policy_addr_in_file(root, file_size,
+            var ok_root = h5policy_addr_in_file(root, h5policy_ceiling(ios),
                                                 "H5_CORRUPT_OFFSET_OUT_OF_FILE",
                                                 super_off, "/",
-                                                "root object header address is outside the file");
+                                                "root object header address is at or beyond the declared end-of-file");
             h5policy_validate_optional_addr(sb.super.v0_v1.fs_info_addr_raw,
                                             file_size, super_off,
                                             "superblock",
                                             "free-space info address is outside the file");
-            h5policy_validate_optional_addr(sb.super.v0_v1.drv_info_addr_raw,
-                                            file_size, super_off,
-                                            "superblock",
-                                            "driver-info address is outside the file");
+            /* The address bound is the half libhdf5 gained at 2.3.0 (driver_addr
+               against stored_eof, src/H5Fsuper_cache.c).  The block BEHIND that
+               address is still unbounded upstream, so h5policy decodes it here
+               rather than stopping at the pointer.  Only reached when the address
+               is defined and in the file -- a wild address is already a finding,
+               and reading a block at it would be decoding on top of a rejection.  */
+            if (!h5policy_addr_is_undef(sb.super.v0_v1.drv_info_addr_raw))
+                {
+                    var drv_addr = hdf5_addr_to_file_u64(
+                        bytes_to_u64_le(sb.super.v0_v1.drv_info_addr_raw));
+                    if (h5policy_addr_in_file(drv_addr, file_size,
+                                              "H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                              super_off, "superblock",
+                                              "driver-info address is outside the file"))
+                        h5policy_validate_drvinfo_block(ios, profile, drv_addr);
+                }
         }
     else
         {
@@ -353,16 +482,17 @@ fun h5policy_validate_superblock = (int ios, superblock sb,
                 h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
                                     "corrupt", super_off, "superblock",
                                     "end-of-file address is beyond the available file image");
-            var ok_root2 = h5policy_addr_in_file(root2, file_size,
+            var ok_root2 = h5policy_addr_in_file(root2, h5policy_ceiling(ios),
                                                  "H5_CORRUPT_OFFSET_OUT_OF_FILE",
                                                  super_off, "/",
-                                                 "root object header address is outside the file");
+                                                 "root object header address is at or beyond the declared end-of-file");
             h5policy_validate_optional_addr(sb.super.v2_v3.ext_addr_raw,
                                             file_size, super_off,
                                             "superblock",
                                             "superblock extension address is outside the file");
 
-            var checksum_bytes = byte[(sb'size/#B) - 4UL] @ ios : super_off;
+            var checksum_bytes = h5policy_map_bytes(ios, profile, super_off,
+                                                     (sb'size/#B) - 4UL);
             var checksum = lookup3_hashlittle(checksum_bytes, 0);
             if (checksum != sb.super.v2_v3.chksum)
                 h5policy_emit_error("H5_CORRUPT_BAD_CHECKSUM",
@@ -437,6 +567,95 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
                 loc2 = ctx.datatype_size_offset#B, loc2_len = 4UL,
             });
 
+    /* A fixed-array chunk index has one, permanent capacity: libhdf5 computes
+       prod(ceil(max_dims[i] / chunk_dim[i])) over the data dimensions
+       (H5D__chunk_set_info_real, H5Dchunk.c) and stores it in the FAHD header
+       at creation (H5D__farray_idx_create: cparam.nelmts = max_nchunks).  The
+       array is pre-sized from it -- data-block image, page count, and
+       page-initialization bitmask all follow from nelmts -- and it is never
+       grown, which is what distinguishes this index type from the extensible
+       array and the v2 B-tree.
+
+       Nothing re-derives that agreement on the read path.  A dataset whose
+       dataspace declares a maximum extent the index was not sized for makes
+       libhdf5 recompute a capacity from the file's own bytes and build native
+       state from it: H5Ocopy sizes a fresh destination data block that way and
+       aborts the process inside the metadata cache
+       (assert(entry_ptr->size < H5C_MAX_ENTRY_SIZE), H5Centry.c) once the
+       recomputed bitmask alone exceeds the 32 MB per-entry ceiling.
+
+       Note the invariant is the index CAPACITY, not curr_dims == max_dims: a
+       bounded-but-growable dataset (maxshape (100,10), shape (10,10)) is
+       legitimately fixed-array indexed, with a capacity sized from the 100.
+       Only H5S_UNLIMITED sends libhdf5's writer to another index type, which
+       is why an unlimited dimension here can never be reconciled and is
+       reported through the same finding.  */
+    if (h5policy_has_fixed_array_index != 0UB
+        && ctx.has_dataspace != 0UB
+        && h5policy_dataspace_max_dims'length != 0UL
+        && h5policy_dataspace_max_dims'length
+           == h5policy_chunk_grid_dims'length)
+        {
+            var expected_nelmts = 1UL;
+            var expected_ok = 1UB;
+            var d = 0UL;
+            while (d < h5policy_dataspace_max_dims'length)
+                {
+                    var max_dim = h5policy_dataspace_max_dims[d];
+                    var chunk_dim = h5policy_chunk_grid_dims[d];
+                    if (max_dim == 0xffffffffffffffffUL)
+                        /* H5S_UNLIMITED: no finite capacity can match it, and
+                           libhdf5's own writer would never have chosen this
+                           index type.  */
+                        expected_ok = 0UB;
+                    else if (expected_ok != 0UB)
+                        {
+                            /* Ceiling division without libhdf5's (max + dim - 1)
+                               pre-addition, which wraps near the top of the
+                               range; the quotient itself cannot overflow.  */
+                            var chunks = max_dim / chunk_dim;
+                            if (max_dim % chunk_dim != 0UL)
+                                chunks = chunks + 1UL;
+                            if (chunks != 0UL
+                                && expected_nelmts > 0xffffffffffffffffUL / chunks)
+                                /* The true capacity exceeds the 64-bit field the
+                                   header stores, so no stored value can match. */
+                                expected_ok = 0UB;
+                            else
+                                expected_nelmts = expected_nelmts * chunks;
+                        }
+                    d = d + 1UL;
+                }
+            if (expected_ok == 0UB || expected_nelmts != h5policy_fixed_array_nelmts)
+                {
+                    /* Every maximum-extent field is a source of `expected`;
+                       they are all one length field wide.  */
+                    var max_dim_lengths = uint<64>[]();
+                    var s = 0UL;
+                    while (s < h5policy_dataspace_max_dim_offsets'length)
+                        {
+                            max_dim_lengths += [global_sizeof_lengths as uint<64>];
+                            s = s + 1UL;
+                        }
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_FIXED_ARRAY_EXTENT_MISMATCH", "corrupt",
+                        h5policy_fixed_array_nelmts_offset#B, object,
+                        "fixed-array chunk index capacity does not match the dataspace maximum extent",
+                        H5Evidence {
+                            field = "chunk_index.fixed_array_capacity",
+                            actual = h5policy_fixed_array_nelmts,
+                            expected = expected_ok != 0UB
+                                       ? expected_nelmts : 0xffffffffffffffffUL,
+                            comparison = "equal",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = h5policy_fixed_array_nelmts_offset#B,
+                            loc1_len = global_sizeof_lengths as uint<64>,
+                            source_offsets = h5policy_dataspace_max_dim_offsets,
+                            source_lengths = max_dim_lengths,
+                        });
+                }
+        }
+
     /* The superblock's root object is semantically a group, not an arbitrary
        object header.  h5policy does not yet track a positive "group" type bit,
        so enforce the boundary through the message classes that make an object a
@@ -500,6 +719,14 @@ fun h5policy_validate_ohdr_raw = (int ios,
     h5policy_pipeline_decode_size = 0UL;
     h5policy_pipeline_has_decode_size = 0UB;
     h5policy_pipeline_decode_size_offset = 0UL;
+    /* Fresh arrays, not truncations: assigning an existing array would alias
+       it, and the finalize cross-check must see only this object's shape.  */
+    h5policy_dataspace_max_dims = uint<64>[]();
+    h5policy_dataspace_max_dim_offsets = uint<64>[]();
+    h5policy_chunk_grid_dims = uint<64>[]();
+    h5policy_fixed_array_nelmts = 0UL;
+    h5policy_fixed_array_nelmts_offset = 0UL;
+    h5policy_has_fixed_array_index = 0UB;
 
     ctx = h5policy_count_object(ctx, profile, root_off, object);
 
@@ -703,6 +930,27 @@ fun h5policy_walk_reachable_metadata = (int ios,
     h5policy_enqueue_ohdr(profile, root_off/#B, 0UL, "/",
                           root_off, "/");
 
+    /* A cache image is not merely a shortcut for the root graph: every cached
+       object-header client is serialized as a body that libhdf5 can later
+       protect.  Seed those headers too, including entries not otherwise
+       reachable from the current root, so replay cannot accidentally approve
+       an opaque cached OHDR. Other client types are accounted for below by the
+       normal walk's reached-kind record. */
+    if (h5policy_mdci_replay_mode != 0)
+        {
+            var image_entry = 0UL;
+            while (image_entry < h5policy_mdci_body_addrs'length as uint<64>)
+                {
+                    if (h5policy_mdci_body_types[image_entry] == 5UL)
+                        h5policy_enqueue_ohdr(
+                            profile, h5policy_mdci_body_addrs[image_entry], 0UL,
+                            "/<cache-image-entry>",
+                            h5policy_mdci_body_addrs[image_entry]#B,
+                            "/<cache-image-entry>");
+                    image_entry = image_entry + 1UL;
+                }
+        }
+
     /* pending_index advances monotonically through the queue.  New hard links
        discovered while validating an object are appended and picked up later,
        which gives breadth-first traversal without mutating already visited
@@ -777,6 +1025,30 @@ fun h5policy_walk_reachable_metadata = (int ios,
         {
             h5policy_walk_stop_reason = "cache_image_coverage_gap";
             return ctx;
+        }
+
+    /* Do not claim a completed MDCI analysis unless every serialized client
+       body was reached by a type-aware normal decoder.  This keeps unusual
+       internal cache-client IDs a safe coverage refusal rather than silently
+       treating the read overlay itself as validation. */
+    if (h5policy_mdci_replay_mode != 0)
+        {
+            var image_entry = 0UL;
+            while (image_entry < h5policy_mdci_body_addrs'length as uint<64>)
+                {
+                    if (!h5policy_was_reached(h5policy_mdci_body_addrs[image_entry]))
+                        {
+                            h5policy_emit_error(
+                                "H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
+                                "unsupported",
+                                h5policy_mdci_body_addrs[image_entry]#B,
+                                "/<cache-image-entry>",
+                                "metadata cache image entry body was not reached by a type-aware decoder");
+                            h5policy_walk_stop_reason = "cache_image_coverage_gap";
+                            return ctx;
+                        }
+                    image_entry = image_entry + 1UL;
+                }
         }
 
     h5policy_walk_completed = 1;

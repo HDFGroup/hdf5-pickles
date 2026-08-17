@@ -17,6 +17,7 @@
  */
 
 load "h5_format_constants.pk";
+load "lookup3.pk";
 
 fun set_little_endian = void: 
 {
@@ -29,16 +30,56 @@ set_little_endian();
 var global_sizeof_offsets = 0 as uint<8>;
 var global_sizeof_lengths = 0 as uint<8>;
 
+/* H5F__superblock_prefix_decode accepts only these address/length widths.
+ * Keeping the check at the setter prevents a malformed superblock from
+ * turning a later variable-width field into an arbitrary-size map. */
+fun hdf5_field_width_valid = (uint<8> sz) int:
+{
+    return (sz == 2UB || sz == 4UB || sz == 8UB || sz == 16UB || sz == 32UB);
+};
+
 fun set_global_sizeof_offsets = (uint<8> sz) int: 
 {
+    if (!hdf5_field_width_valid(sz)) return 0;
     global_sizeof_offsets = sz;
     return 1;
 };
 
 fun set_global_sizeof_lengths = (uint<8> sz) int: 
 {
+    if (!hdf5_field_width_valid(sz)) return 0;
     global_sizeof_lengths = sz;
     return 1;
+};
+
+/* Variable-width HDF5 integers are represented as byte arrays so that the
+ * format's 16- and 32-byte forms remain mappable.  These predicates avoid
+ * narrowing them merely to test structural zero/nonzero invariants. */
+fun hdf5_bytes_nonzero = (byte[] raw) int:
+{
+    for (b in raw)
+        if (b != 0UB) return 1;
+    return 0;
+};
+
+/* HDF5 metadata checksums are Jenkins lookup3 hashes over the bytes before
+ * the stored uint32.  Taking offsets rather than an already-mapped value lets
+ * the caller verify the original serialized representation. */
+fun hdf5_metadata_checksum_valid = (off64 start, off64 checksum_offset,
+                                    uint<32> stored) int:
+{
+    var payload_len = (checksum_offset - start) /#B;
+    return lookup3_hashlittle(byte[payload_len] @ start, 0U) == stored;
+};
+
+/* Serialize a metadata checksum in the HDF5 little-endian on-disk order.
+ * This keeps synthetic fixtures honest when a checksum constraint is added. */
+fun hdf5_u32_le_bytes = (uint<32> value) byte[]:
+{
+    return [(value & 0xffU) as uint<8>,
+            ((value .>> 8) & 0xffU) as uint<8>,
+            ((value .>> 16) & 0xffU) as uint<8>,
+            ((value .>> 24) & 0xffU) as uint<8>];
 };
 
 fun align8 = (uint<64> x) uint<64>:
@@ -69,11 +110,20 @@ fun is_undef_bytes = (byte[] raw) int:
     return 1;
 };
 
+/* A uint<64> accumulator cannot represent more than 8 little-endian bytes, and
+ * `<<.` throws "out of bounds" once the shift count reaches 64 -- so `n` is
+ * capped at 8 rather than trusted.  This matters beyond defense in depth: a
+ * union's non-matching alternative can still have its fields read (e.g. under
+ * poke's weak/non-strict `@!` mapping, which does not use a constraint to
+ * gate which branch's fields get evaluated), so a width field controlling `n`
+ * here can carry a garbage byte reinterpreted from a different on-disk layout
+ * before any of this validator's own width checks ever run. */
 fun bytes_to_u64_le_at = (byte[] raw, uint<64> off, uint<64> n) uint<64>:
 {
     var acc = 0UL;
     var i   = 0UL;
-    while (i < n) {
+    var lim = n > 8UL ? 8UL : n;
+    while (i < lim) {
         acc = acc | ((raw[off + i] as uint<64>) <<. (i * 8UL));
         i   = i + 1UL;
     }
@@ -89,11 +139,25 @@ fun bytes_to_u64_le = (byte[] raw) uint<64>:
    superblock.  With no user block the base is zero; mapping a superblock updates
    this binding before any referenced metadata is followed. */
 var global_hdf5_base_addr = 0UL;
+var global_hdf5_declared_eof = 0UL;
+var global_hdf5_declared_eof_known = 0UB;
 
 fun reset_global_hdf5_base_addr = void:
 {
     global_hdf5_base_addr = 0UL;
 }
+
+/* The superblock's stored EOF is the only portable upper bound available to
+ * a standalone pickle.  Keep it separate from the actual IOS length: a
+ * driver may expose allocated bytes beyond HDF5's logical end-of-address.
+ * Before a superblock is mapped, range predicates deliberately pass so that
+ * individual metadata records can still be inspected in isolation. */
+fun reset_global_hdf5_declared_eof = int:
+{
+    global_hdf5_declared_eof = 0UL;
+    global_hdf5_declared_eof_known = 0UB;
+    return 1;
+};
 
 fun set_global_hdf5_base_addr = (byte[] raw) int:
 {
@@ -107,6 +171,55 @@ fun hdf5_addr_to_file_u64 = (uint<64> addr) uint<64>:
         return 0xffffffffffffffffUL;
     return global_hdf5_base_addr + addr;
 }
+
+/* HDF5 permits 16- and 32-byte fields, but this pickle's address arithmetic
+ * is uint64-based.  Extended encodings are safe only when their high bytes
+ * are zero; silently truncating them would make a range check meaningless. */
+fun hdf5_bytes_fit_u64 = (byte[] raw) int:
+{
+    var i = 8UL;
+    while (i < raw'length as uint<64>) {
+        if (raw[i] != 0UB) return 0;
+        i = i + 1UL;
+    }
+    return 1;
+};
+
+fun set_global_hdf5_declared_eof = (byte[] raw) int:
+{
+    if (!hdf5_bytes_fit_u64(raw) || is_undef_bytes(raw)) return 0;
+    var eof = hdf5_addr_to_file_u64(bytes_to_u64_le(raw));
+    if (eof <= global_hdf5_base_addr) return 0;
+    global_hdf5_declared_eof = eof;
+    global_hdf5_declared_eof_known = 1UB;
+    return 1;
+};
+
+/* Check a file address against the superblock EOF when known.  `allow_undef`
+ * is for optional pointers; required references pass 0 and therefore reject
+ * HADDR_UNDEF. */
+fun hdf5_addr_in_declared_eof = (byte[] raw, int allow_undef) int:
+{
+    if (is_undef_bytes(raw)) return allow_undef;
+    if (!hdf5_bytes_fit_u64(raw)) return 0;
+    if (!global_hdf5_declared_eof_known) return 1;
+    return hdf5_addr_to_file_u64(bytes_to_u64_le(raw)) < global_hdf5_declared_eof;
+};
+
+/* Check the complete half-open address interval [addr, addr + size), with
+ * overflow avoided by subtracting from the declared EOF. */
+fun hdf5_range_in_declared_eof = (byte[] addr_raw, byte[] size_raw,
+                                  int allow_undef) int:
+{
+    if (is_undef_bytes(addr_raw)) return allow_undef;
+    if (!hdf5_bytes_fit_u64(addr_raw) || !hdf5_bytes_fit_u64(size_raw))
+        return 0;
+    if (!global_hdf5_declared_eof_known) return 1;
+    var addr = hdf5_addr_to_file_u64(bytes_to_u64_le(addr_raw));
+    var size = bytes_to_u64_le(size_raw);
+    if (addr > global_hdf5_declared_eof) return 0;
+    return size <= global_hdf5_declared_eof - addr;
+};
 
 fun bytes_to_off = (byte[] raw) offset<uint<64>,B>:
 {

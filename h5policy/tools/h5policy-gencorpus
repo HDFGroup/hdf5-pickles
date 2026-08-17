@@ -131,8 +131,13 @@ def _write_fsm_persist(path, fn):
         fn(h)
 
 
-def _write_cache_image(path):
-    """Create a valid on-disk metadata cache image through public C APIs."""
+def _write_cache_image(path, userblock=0):
+    """Create a valid on-disk metadata cache image through public C APIs.
+
+    With ``userblock`` set, the file also carries a user block, so every
+    metadata address -- including the cache image's own entry addresses -- is
+    base-relative rather than physical.
+    """
     # realpath, not dirname(__file__): this script is normally invoked through
     # the repo-level symlink tools/h5policy-gencorpus, and __file__ is then the
     # SYMLINK path -- so a bare dirname looks for a tools/probe/ that does not
@@ -142,7 +147,8 @@ def _write_cache_image(path):
     with tempfile.TemporaryDirectory() as build:
         helper = os.path.join(build, "make_cache_image")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        _build_and_run_h5cc_helper(source, helper, [path])
+        args = [path] if not userblock else [path, str(userblock)]
+        _build_and_run_h5cc_helper(source, helper, args)
 
 
 def _base_bytes(build, libver="latest"):
@@ -197,11 +203,20 @@ def _gen_valid(root):
                      _userblock_content)
     _write_userblock(f"{root}/valid/userblock_earliest.h5", "earliest",
                      _userblock_content)
+    # A user block and a cache image together.  The image records the address of
+    # every metadata entry it shadows, and those addresses are base-relative; a
+    # decoder that compares them against physical walk addresses stops matching
+    # and then reads the stale on-disk bytes the image exists to replace.  The
+    # two features are independently covered above and by valid/cache_image.h5 --
+    # only their combination reaches the translation.
+    _write_cache_image(f"{root}/valid/userblock_cache_image.h5",
+                       userblock=1024)
 
     # Regression for a 16-byte sizeof_lengths file whose contiguous-layout
-    # length contains the uninitialized 0xdeadbeef pattern.  Wide lengths with
-    # a zero upper limb are narrowed safely; this lower limb is far beyond the
-    # file and must be rejected rather than treated as unsupported coverage.
+    # length contains the uninitialized 0xdeadbeef pattern.  The h5policy
+    # libhdf5-compatibility target refuses this legal width at preflight; keep
+    # the direct value variants as target-guard controls rather than relying on
+    # libhdf5's unsafe length decoder to reach their later fields.
     wide_length_cve = bytes.fromhex(
         "894844460d0a1a0a020810000000000000000000ffffffffffffffffb1000000"
         "000000007700000000000000b6379ee84f48445202003c010400000200000003"
@@ -414,6 +429,36 @@ def _gen_policy(root):
     _make_vds_nentries_overcount(
         f"{root}/malformed/vds_nentries_overcount.h5",
         f"{root}/policy/vds_absolute_source.h5")
+    # A second VDS base, because vds_absolute_source maps a whole extent and so
+    # serializes H5S_SEL_ALL for BOTH selections -- a 16-byte header with no
+    # flags, no encoding size and no rank.  Selection-header fixtures need a
+    # real hyperslab, which only appears when the mapping covers part of the
+    # virtual extent.
+    def _vds_hyperslab(h):
+        layout = h5py.VirtualLayout(shape=(4, 6), dtype="i4")
+        source = h5py.VirtualSource(
+            "/private/tmp/h5policy/vds_source_outside.h5", "src", shape=(2, 6))
+        layout[1:3, :] = source
+        h.create_virtual_dataset("vds", layout)
+    _write(f"{root}/policy/vds_hyperslab.h5", _vds_hyperslab)
+    _make_vds_selection_rank_zero(
+        f"{root}/malformed/vds_selection_rank_zero.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_selection_enc_size(
+        f"{root}/malformed/vds_selection_enc_size.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_selection_unknown_flag(
+        f"{root}/malformed/vds_selection_unknown_flag.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    # Version 2 selections, which no writer available here emits -- see
+    # _vds_selection_v3_to_v2 for why they have to be built rather than written.
+    _make_vds_selection_v2(
+        f"{root}/policy/vds_selection_v2.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_selection_v2_rank_zero(
+        f"{root}/malformed/vds_selection_v2_rank_zero.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_mdci_dup_addr_witness(f"{root}/cve/mdci_dup_addr_witness.h5")
 
 
 def _gen_resource(root):
@@ -443,6 +488,8 @@ def _gen_resource(root):
         g.create_dataset("beta", data=np.arange(6, dtype="i4"))
         h.create_dataset("top", data=np.arange(3, dtype="i4"))
     _write_earliest(f"{root}/valid/old_style_group.h5", _old_style)
+    # Structurally sound, deliberately not `accept`: see _make_drvinfo_block.
+    _make_drvinfo_block(f"{root}/valid/drvinfo_block.h5")
 
     # Old-format chunked dataset: v3 layout -> v1 (type-1) B-tree chunk index
     # with several leaf entries.  Exercises chunk-index traversal and counting.
@@ -532,6 +579,18 @@ def _gen_resource(root):
     _write(f"{root}/valid/chunk_fixed_array.h5",
            lambda h: h.create_dataset(
                "d", data=np.arange(100, dtype="i4").reshape(10, 10), chunks=(5, 5)))
+
+    # Fixed-array index over a dataset that may still GROW: libhdf5 picks this
+    # index type whenever no dimension is H5S_UNLIMITED, so a bounded maxshape
+    # larger than the current shape is legitimate.  The index is pre-sized from
+    # the maximum extent (ceil(100/5) * ceil(10/5) = 40 elements, not the four
+    # chunks that hold data), which is the control for the capacity check in
+    # h5policy_finalize_ohdr_dataset: it must not read "curr != max" as corrupt.
+    def _fixed_array_maxdims(h):
+        d = h.create_dataset("d", shape=(10, 10), maxshape=(100, 10),
+                             chunks=(5, 5), dtype="i4")
+        d[...] = np.arange(100, dtype="i4").reshape(10, 10)
+    _write(f"{root}/valid/chunk_fixed_array_maxdims.h5", _fixed_array_maxdims)
 
     # Single-chunk index (v4 index type 1): chunk covers the whole dataset, so
     # the layout's address field is the chunk itself (no index structure).
@@ -667,6 +726,27 @@ def _gen_coverage(root):
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.unlink(sohm_huge_src)
 
+    # A repeated one-byte fill value is small enough for the SOHM heap's tiny
+    # ID form: its shared-message body lives in the eight-byte wrapper itself,
+    # rather than in a managed direct block or a huge-object B-tree record.
+    # Keep it separate from the huge case so the resolver must decode both
+    # metadata-only body forms.
+    sohm_tiny_src = f"{root}/coverage/.sohm_tiny_source.h5"
+    def _sohm_tiny_source(h):
+        for i in range(4):
+            h.create_dataset(f"d_{i}", shape=(8,), dtype="u1",
+                             fillvalue=np.uint8(23), track_times=False)
+    _write(sohm_tiny_src, _sohm_tiny_source)
+    subprocess.run([
+        # h5repack configures selected share classes cumulatively.  Sharing all
+        # eligible small messages makes the fill index below materialize its
+        # seven-byte tiny body (rather than leaving a configured-but-empty
+        # fill-only index on this HDF5 release).
+        "h5repack", "-s", "1", sohm_tiny_src,
+        f"{root}/coverage/sohm_tiny.h5"
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.unlink(sohm_tiny_src)
+
 
 def _make_nul_compact_link_name(path):
     """A group whose compact link message stores a single-NUL name.
@@ -748,10 +828,125 @@ def _make_root_object_not_group(path):
     _patch(path, bytes(raw))
 
 
+def _drvinfo_block(version=0, body_len=None, drv_id=b"NCSAtest",
+                   body=b"\x00" * 8):
+    """Encode a v0/v1 driver information block.
+
+    The 16-byte header is [version:1][reserved:3][len:4][driver id:8], followed
+    by `len` driver-specific bytes; `len` counts only those trailing bytes, not
+    the header.  `body_len` defaults to the real body length -- passing it
+    explicitly is how the length fixture claims more than it carries.
+
+    The driver id is deliberately NOT "NCSAfami" or "NCSAmult".  H5FD_sb_load
+    (src/H5FD.c) rejects those two unless the file was opened with the matching
+    VFD, so either would make libhdf5 refuse the well-formed fixture for a
+    reason that has nothing to do with what it is testing.  Any other name
+    reaches H5FD__sb_decode, which is a no-op under sec2 because that driver has
+    no sb_decode callback.
+    """
+    if body_len is None:
+        body_len = len(body)
+    return (bytes([version, 0, 0, 0]) + struct.pack("<I", body_len)
+            + drv_id + body)
+
+
+def _drvinfo_assemble(path, block=b"", addr=None):
+    """Attach a driver information block to a superblock-v0 file.
+
+    h5py cannot write one: the block only appears when the file was created with
+    the family or multi VFD, and then only carrying those drivers' own payloads.
+    So the block is appended to a plain earliest-format file and the
+    superblock's driver-info address (v0 bytes 48-55) is pointed at it, with the
+    declared EOF (bytes 40-47) moved to the new physical end.
+
+    A v0 superblock carries no checksum, so nothing needs repairing afterwards
+    -- unlike every v2+ fixture in this file, where the same edit would have to
+    rewrite the trailing Jenkins sum.
+
+    `addr` defaults to where the block was appended.  Passing it explicitly
+    aims the superblock at somewhere else in the file, which is how the
+    truncated-header fixture is built.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("a", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    assert raw[8] == 0, f"expected a v0 superblock, got version {raw[8]}"
+    block_at = len(raw)
+    raw += block
+    struct.pack_into("<Q", raw, 40, len(raw))          # declared EOF
+    struct.pack_into("<Q", raw, 48,
+                     block_at if addr is None else addr)
+    _patch(path, bytes(raw))
+
+
+def _make_drvinfo_block(path):
+    """A well-formed v0 driver information block: version 0, an 8-byte body,
+    and a driver id no VFD in this build claims.
+
+    Not a malformed fixture.  It exists to pin the COVERAGE REFUSAL -- h5policy
+    decodes the envelope, finds it sound, and still declines to accept, because
+    the driver-specific bytes can name member files it does not validate.  Same
+    treatment the superblock-extension message path gives an equally well-formed
+    0x0014 message.
+    """
+    _drvinfo_assemble(path, _drvinfo_block())
+
+
+def _make_drvinfo_block_bad_version(path):
+    """A driver information block whose version byte is 1.
+
+    HDF5_DRIVERINFO_VERSION_0 is the only value libhdf5 accepts;
+    H5F__drvrinfo_prefix_decode errors with "bad driver information block
+    version number", so this is a genuine agreement case, not a divergence.
+    """
+    _drvinfo_assemble(path, _drvinfo_block(version=1))
+
+
+def _make_drvinfo_block_len_past_eof(path):
+    """A driver information block carrying 8 bytes but declaring 1 MiB.
+
+    This is the LENGTH half of the driver-info record, which is still unbounded
+    upstream: the declared length extends the EOA to cover itself and then sizes
+    the cache allocation, so no downstream EOA check can catch it.
+
+    1 MiB rather than the multi-gigabyte value the original specimen used, and
+    the size is a safety property of the fixture, not an arbitrary choice.  A
+    length near 2**32 makes libhdf5 allocate that much during H5Fopen, and an
+    uncapped h5dump on such a file can OOM-kill the whole desktop session.  1
+    MiB is four orders of magnitude past this file's EOF -- far more than enough
+    to exercise the bound -- while staying harmless to measure.
+    """
+    _drvinfo_assemble(path, _drvinfo_block(body_len=1 << 20))
+
+
+def _make_drvinfo_block_header_truncated(path):
+    """A superblock aiming its driver-info address 8 bytes before EOF, so the
+    16-byte header cannot fit.
+
+    The address itself is in the file, so the address bound libhdf5 gained at
+    2.3.0 does not intercept it; the block is what runs off the end.  libhdf5
+    reads 16 bytes anyway and the sec2 driver ZERO-FILLS past EOF, so the
+    fabricated tail decodes as a structurally valid block -- version 0, length
+    0, an all-NUL driver id.  The eight real bytes are appended as zeros so the
+    fabricated header is deterministic rather than whatever file content
+    happened to land there.
+    """
+    _drvinfo_assemble(path, b"\x00" * 8, addr=None)
+    raw = bytearray(open(path, "rb").read())
+    struct.pack_into("<Q", raw, 48, len(raw) - 8)
+    _patch(path, bytes(raw))
+
+
 def _gen_malformed(root):
     # ---- malformed/ : expected `reject_corrupt`, byte-patched from a base --
     base = f"{root}/valid/empty.h5"
     raw = open(base, "rb").read()
+    _make_drvinfo_block_bad_version(
+        f"{root}/malformed/drvinfo_block_bad_version.h5")
+    _make_drvinfo_block_len_past_eof(
+        f"{root}/malformed/drvinfo_block_len_past_eof.h5")
+    _make_drvinfo_block_header_truncated(
+        f"{root}/malformed/drvinfo_block_header_truncated.h5")
     _patch(f"{root}/malformed/bad_signature.h5",
            bytes([raw[0] ^ 0xFF]) + raw[1:])
     _patch(f"{root}/malformed/truncated.h5", raw[:32])
@@ -770,6 +965,8 @@ def _gen_malformed(root):
         f"{root}/malformed/compound_member_array_bounds.h5")
     _make_compound_member_offset_oob(
         f"{root}/malformed/compound_member_offset_oob.h5")
+    _make_compound_member_array_off12_oob(
+        f"{root}/malformed/compound_member_array_off12_oob.h5")
     _make_scaleoffset_nelmts_mismatch(
         f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
     _make_scaleoffset_size_mismatch(
@@ -807,6 +1004,8 @@ def _gen_malformed(root):
     _make_bad_snod_empty_name(f"{root}/malformed/bad_snod_empty_name.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
+    _make_heap_free_list_size_wrap(
+        f"{root}/malformed/heap_free_list_size_wrap.h5")
     _make_bad_message_flag_combination(
         f"{root}/malformed/bad_message_flag_combination.h5")
     _make_bad_link_info_max_corder(
@@ -846,6 +1045,9 @@ def _gen_malformed(root):
     _make_bad_ext_array_without_unlimited_dim(
         f"{root}/malformed/bad_ext_array_without_unlimited_dim.h5",
         f"{root}/valid/chunk_ext_array.h5")
+    _make_bad_fixed_array_extent_mismatch(
+        f"{root}/malformed/bad_fixed_array_extent_mismatch.h5",
+        f"{root}/valid/chunk_fixed_array.h5")
     _make_bad_ext_array_deep_checksum(
         f"{root}/malformed/bad_ext_array_deep_checksum.h5",
         f"{root}/valid/chunk_ext_array_deep.h5")
@@ -900,6 +1102,9 @@ def _gen_malformed(root):
     _make_bad_fsm_section_bin_range(
         f"{root}/malformed/bad_fsm_section_bin_range.h5",
         f"{root}/valid/fsm_persist.h5")
+    _make_bad_frhp_fsm_section_extent(
+        f"{root}/malformed/bad_frhp_fsm_section_extent.h5",
+        f"{root}/valid/sohm_list.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
     _make_contiguous_data_past_eof(
@@ -959,6 +1164,9 @@ def _gen_malformed(root):
     _make_zero_v2_btree_record_size(
         f"{root}/malformed/zero_v2_btree_record_size.h5",
         f"{root}/valid/dense_links.h5")
+    _make_oversize_v2_btree_node_size(
+        f"{root}/malformed/oversize_v2_btree_node_size.h5",
+        f"{root}/valid/dense_links.h5")
     # One fixture per reader that used to compare the used-byte count only
     # against file_size: the dense-LINK name index (type 5, depth 0 -> the root
     # is a LEAF) and the dense-ATTRIBUTE name index (type 8, depth 1 -> the root
@@ -974,6 +1182,8 @@ def _gen_malformed(root):
     # used to accept.
     _make_fill_value_size_mismatch(
         f"{root}/malformed/fill_value_size_mismatch.h5")
+    _make_fill_value_size_mismatch_v2(
+        f"{root}/malformed/fill_value_size_mismatch_v2.h5")
     _make_nbit_member_offset_wrap(
         f"{root}/malformed/nbit_member_offset_wrap.h5")
     _make_attr_reference_size_under(
@@ -990,6 +1200,26 @@ def _gen_malformed(root):
         f"{root}/malformed/cache_image_unshadowed_btree.h5",
         os.path.join(os.path.dirname(os.path.realpath(__file__)),
                      "probe", "make_cache_image_dense.c"))
+    _make_bad_cache_image_body(
+        f"{root}/malformed/cache_image_body_bad_ohdr.h5",
+        f"{root}/valid/cache_image.h5")
+    _make_bad_cache_image_checksum(
+        f"{root}/malformed/cache_image_bad_checksum.h5",
+        f"{root}/valid/cache_image.h5")
+    _make_mdci_duplicate_entry_address(
+        f"{root}/malformed/mdci_duplicate_entry_address.h5")
+    _make_mdci_entry_lru_inconsistent(
+        f"{root}/malformed/mdci_entry_lru_inconsistent.h5")
+    _make_mdci_entry_bad_type_id(
+        f"{root}/malformed/mdci_entry_bad_type_id.h5")
+    _make_mdci_entry_bad_ring(
+        f"{root}/malformed/mdci_entry_bad_ring.h5")
+    _make_mdci_entry_bad_age(
+        f"{root}/malformed/mdci_entry_bad_age.h5")
+    _make_mdci_parent_addr_unresolved(
+        f"{root}/malformed/mdci_parent_addr_unresolved.h5")
+    _make_mdci_parent_addr_self(
+        f"{root}/malformed/mdci_parent_addr_self.h5")
     _make_filtered_dense_link_no_dblock_checksum(
         f"{root}/malformed/filtered_dense_link_no_dblock_checksum.h5",
         f"{root}/valid/dense_links.h5")
@@ -1002,6 +1232,12 @@ def _gen_malformed(root):
                              "FHDB")
     _make_bad_dense_checksum(f"{root}/malformed/bad_dense_fhib_checksum.h5",
                              "FHIB")
+    _make_bad_dense_block_owner(
+        f"{root}/malformed/bad_dense_fhdb_owner.h5",
+        f"{root}/valid/dense_links.h5", "FHDB")
+    _make_bad_dense_block_owner(
+        f"{root}/malformed/bad_dense_fhib_owner.h5",
+        f"{root}/valid/dense_links.h5", "FHIB")
     _make_bad_dense_checksum(f"{root}/malformed/bad_dense_bthd_checksum.h5",
                              "BTHD")
     _make_bad_dense_checksum(f"{root}/malformed/bad_dense_btlf_checksum.h5",
@@ -1278,6 +1514,39 @@ def _make_compound_member_array_bounds(path):
     # A single 262144-element u8 array in a 16-byte compound element.
     dt = _v1_compound_array_member(16, (262144, 0, 0, 0), 1, 8)
     _splice_compact_datatype(path, dt, 16)
+
+
+def _make_compound_member_array_off12_oob(path):
+    """The v1 embedded-array promotion defect in its REACHABLE shape: a promoted
+    member that is small, but starts late enough to end past its element.
+
+    The sibling fixtures put an enormous or wrapped member at offset 0, which is
+    the right shape for testing the arithmetic and the wrong shape for reaching
+    the consumer: a member at offset 0 whose promoted size wraps to something
+    SMALL cannot be caught by a bounds check, because small means in bounds --
+    and equally, it cannot read out of bounds.  The dangerous geometry needs a
+    NONZERO offset, so that a modest promoted size still lands past the end.
+
+    Here the element is 16 bytes and the single member sits at offset 12 with a
+    [2] array of H5T_STD_U32LE behind it -- promoted footprint 8 bytes, ending
+    at 20.  libhdf5's guards at H5Odtype.c:507/:509 test the 4-byte BASE type
+    before H5T__array_create promotes it at :542 and never re-run, so the file
+    is accepted, and H5T__conv_struct_opt (H5Tconv_compound.c:868) then reads
+    the member at its promoted size during H5Dread: an ASAN heap-buffer-overflow
+    READ of size 8, 0 bytes after a 16-byte region.
+
+    This is the specimen that makes the family a memory-safety defect rather
+    than an acceptance divergence -- see
+    registry/cases/compound-member-array-promotion-unguarded.yml.  It is
+    deliberately width-INdependent: dims [2] give 8 bytes at both 32-bit and
+    64-bit, so unlike its wrap-driven neighbours it reproduces the same way
+    everywhere.
+    """
+    dt = bytearray(_v1_compound_array_member(16, (2, 0, 0, 0), 4, 32))
+    # _v1_compound_array_member hardwires the member byte offset to 0; the field
+    # sits at datatype byte 16 (8-byte header + 8-byte padded name "a").
+    struct.pack_into("<I", dt, 16, 12)
+    _splice_compact_datatype(path, bytes(dt), 16)
 
 
 def _v1_compound_plain_member(elem_size, member_off, base_size, base_precision):
@@ -1683,6 +1952,37 @@ def _jenkins_lookup3():
     return mod.jenkins_lookup3
 
 
+def _make_mdci_dup_addr_witness(path):
+    """The duplicate-entry-address regression witness, built by its own script.
+
+    Two well-formed cache-image entries share one file address (the root object
+    header's), with a correctly sized image block and a valid trailing
+    checksum -- so every other MDCI invariant passes and address uniqueness is
+    the only defect.  That isolation is the point: the case bundle's larger
+    specimen also carries a trailing-byte artifact, and this file separates the
+    two.
+
+    It was a PROVEN h5policy false accept (exit 0, zero findings, while libhdf5
+    rejected) until 7f928c9 added mdci.entry_addr_unique.  It now guards that
+    fix.  See registry/cases/mdci-reconstruct-cleanup-unsafe.yml.
+
+    Delegates to tests/cve/make_mdci_dup_addr_witness.py rather than
+    reimplementing the MDCI grafting here, the same way _jenkins_lookup3 borrows
+    from make_cve_2020_10812.py -- one vetted copy of that encoding, not two.
+    """
+    import importlib.machinery
+    import importlib.util
+    here = os.path.dirname(os.path.realpath(__file__))
+    script = os.path.normpath(
+        os.path.join(here, "..", "tests", "cve", "make_mdci_dup_addr_witness.py"))
+    loader = importlib.machinery.SourceFileLoader("mdci_dup_addr_gc", script)
+    spec = importlib.util.spec_from_loader("mdci_dup_addr_gc", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mod.build(path)
+
+
 def _make_dtype_compound_recursion(path, levels=5000):
     """A single-member compound datatype nested ``levels`` deep in the modern
     (version-3) encoding: each level is a compound with one 1-char-named member
@@ -1796,6 +2096,261 @@ def _make_vds_nentries_overcount(path, base_path):
     struct.pack_into("<I", raw, checksum,
                      _jenkins_lookup3()(bytes(raw[data:checksum])))
     _patch(path, raw)
+
+
+def _vds_virtual_selection_offset(raw):
+    """Locate the VIRTUAL selection header inside a single-mapping VDS block.
+
+    Returns (file_offset_of_selection, data_start, checksum_offset).
+
+    Parsed rather than hard-coded, because every offset in a mapping block sits
+    behind two NUL-terminated names whose lengths change with the fixture.  The
+    walk mirrors h5policy_validate_vds_layout: version, mapping count, source
+    file name, source dataset name, source selection, virtual selection.
+
+    The source selection is asserted to be H5S_SEL_ALL rather than sized
+    generally.  The bases here map a full source extent, so it always is, and
+    an assert is the honest way to say "this generator does not implement a
+    selection sizer" -- if a base ever changes shape, this raises instead of
+    silently patching the wrong bytes.
+    """
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError("generated VDS fixture has no global heap")
+    data = gcol + 32
+    obj_size = struct.unpack_from("<Q", raw, gcol + 24)[0]
+    if obj_size < 13 or data + obj_size > len(raw):
+        raise RuntimeError("generated VDS heap object geometry changed")
+    body = bytes(raw[data:data + obj_size])
+    nentries = struct.unpack_from("<Q", body, 1)[0]
+    if nentries != 1:
+        raise RuntimeError(f"expected a single-mapping VDS base, got {nentries}")
+    pos = 9
+    for _ in range(2):                       # source file, source dataset
+        end = body.index(b"\x00", pos)
+        pos = end + 1
+    sel_type, sel_ver = struct.unpack_from("<II", body, pos)
+    if (sel_type, sel_ver) != (3, 1):        # H5S_SEL_ALL, version 1
+        raise RuntimeError(
+            f"expected an ALL source selection, got type={sel_type} "
+            f"version={sel_ver}")
+    pos += 16
+    return data + pos, data, data + obj_size - 4
+
+
+def _patch_vds_selection(path, base_path, patch):
+    """Byte-patch one field of a VDS virtual selection header and repair the
+    mapping block's trailing Jenkins checksum, so the selection field under
+    test is the only thing wrong with the file."""
+    raw = bytearray(open(base_path, "rb").read())
+    # create_virtual_dataset can't set track_times=False; pin the timestamps so
+    # these fixtures stay byte-reproducible.
+    _pin_ohdr_times(raw)
+    sel, data, checksum = _vds_virtual_selection_offset(raw)
+    sel_type, sel_ver = struct.unpack_from("<II", raw, sel)
+    if (sel_type, sel_ver) != (2, 3):        # H5S_SEL_HYPERSLABS, version 3
+        raise RuntimeError(
+            f"expected a version-3 hyperslab virtual selection, got "
+            f"type={sel_type} version={sel_ver}")
+    patch(raw, sel)
+    struct.pack_into("<I", raw, checksum,
+                     _jenkins_lookup3()(bytes(raw[data:checksum])))
+    _patch(path, raw)
+
+
+def _vds_selection_v3_to_v2(sel):
+    """Re-encode one version-3 REGULAR hyperslab selection as version 2.
+
+    h5py cannot write a version-2 selection -- libhdf5 picks the version from
+    the selection's own properties and modern writers land on 3 -- so the only
+    way to get one into the tracked corpus is to build it.  This is the whole
+    reason the generator exists: version 2 is the arm the false positive in
+    registry/cases/vds-selection-rank-oracle-false-positive.yml lived in, and
+    every h5py-written fixture exercises version 3 instead.
+
+    The two encodings differ in BOTH halves of the selection:
+
+      v3 header  [type:4][version:4][flags:1][enc_size:1][rank:4]
+      v2 header  [type:4][version:4][flags:1][length:4    ][rank:4]
+
+    and v2 has no enc_size field at all, because libhdf5 pins it to 8 (the
+    serializer asserts version 3 for every other size).  So every field of the
+    payload has to be widened from `enc_size` bytes to 8 as well.
+
+    THE UNLIMITED SENTINEL IS WHY THIS IS NOT A PLAIN WIDENING.  libhdf5 writes
+    an all-ones field to mean H5S_UNLIMITED and converts it back on read, per
+    width -- H5S_UINT16_MAX for enc_size 2, H5S_UINT64_MAX for 8.  Zero-extending
+    such a field would turn "unlimited" into the literal 65535.  Only `count`
+    and `block` carry the sentinel; `start` and `stride` never do, so widening
+    them unconditionally is correct.
+
+    The length field is what libhdf5's own v2 encoder stores there: 4 for the
+    rank plus the payload size (src/H5Shyper.c, `UINT32ENCODE(lenp, len)`).
+    Nothing reads it back -- the deserializer skips those four bytes -- and the
+    bundle's real v2 specimens carry a stale 4, which is itself evidence that it
+    is unread.  This writes the correct value anyway, so the fixture is what a
+    libhdf5 of that vintage would have produced.
+    """
+    sel_type, version = struct.unpack_from("<II", sel, 0)
+    flags, enc = sel[8], sel[9]
+    rank = struct.unpack_from("<I", sel, 10)[0]
+    if (sel_type, version) != (2, 3):
+        raise RuntimeError(f"expected hyperslab v3, got type={sel_type} "
+                           f"version={version}")
+    if not flags & 0x01:
+        raise RuntimeError("only REGULAR hyperslabs are re-encoded; the "
+                           "block-list form has a different payload shape")
+    if enc not in (2, 4, 8):
+        raise RuntimeError(f"unsupported source encoding size {enc}")
+    if len(sel) != 14 + 4 * rank * enc:
+        raise RuntimeError(f"v3 selection is {len(sel)} bytes, expected "
+                           f"{14 + 4 * rank * enc}")
+    unlimited = (1 << (8 * enc)) - 1
+    fields = []
+    for i in range(4 * rank):
+        v = int.from_bytes(sel[14 + i * enc:14 + (i + 1) * enc], "little")
+        # Per dimension the order is start, stride, count, block; the sentinel
+        # is only meaningful for the last two.
+        if i % 4 in (2, 3) and v == unlimited:
+            v = (1 << 64) - 1
+        fields.append(v)
+    payload = b"".join(struct.pack("<Q", v) for v in fields)
+    return (struct.pack("<II", sel_type, 2) + bytes([flags])
+            + struct.pack("<I", 4 + len(payload))
+            + struct.pack("<I", rank) + payload)
+
+
+def _vds_rewrite_virtual_selection(path, base_path, rewrite):
+    """Replace a VDS mapping's virtual selection with bytes of a DIFFERENT
+    length, repairing everything the length change invalidates.
+
+    _patch_vds_selection only ever flips a byte in place, so it needs no
+    geometry repair.  Re-encoding a selection does, because the mapping block
+    grows: the global-heap object's size field, its 8-byte padding, and the
+    free-space object that follows it all have to move with it.
+
+    The collection is NOT resized and the file does not grow.  The growth is
+    taken out of the trailing null object, which is what global-heap free space
+    is for -- so the fixture stays the same length as its base and no address
+    outside the collection changes.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    _pin_ohdr_times(raw)
+    sel, data, checksum = _vds_virtual_selection_offset(raw)
+    gcol = raw.find(b"GCOL")
+    coll_size = struct.unpack_from("<Q", raw, gcol + 8)[0]
+    obj_hdr = gcol + 16
+    old_size = struct.unpack_from("<Q", raw, obj_hdr + 8)[0]
+    if data != obj_hdr + 16:
+        raise RuntimeError("VDS heap object is not the first in its collection")
+    # The mapping's virtual selection is the last thing before the block's
+    # trailing checksum, so the old selection is exactly this slice.
+    new_sel = rewrite(bytes(raw[sel:checksum]))
+    body = bytes(raw[data:sel]) + new_sel
+    new_size = len(body) + 4
+    old_pad = ((old_size + 7) // 8) * 8
+    new_pad = ((new_size + 7) // 8) * 8
+    free_hdr = data + old_pad
+    free_idx = struct.unpack_from("<H", raw, free_hdr)[0]
+    free_size = struct.unpack_from("<Q", raw, free_hdr + 8)[0]
+    if free_idx != 0:
+        raise RuntimeError("expected a null free-space object after the VDS "
+                           f"object, got index {free_idx}")
+    grow = new_pad - old_pad
+    if free_size - grow < 16:
+        raise RuntimeError("global-heap free space cannot absorb the re-encoded "
+                           f"selection (need {grow}, have {free_size - 16})")
+    block = bytearray(coll_size)
+    block[0:16] = raw[gcol:gcol + 16]                   # collection header
+    block[16:32] = raw[obj_hdr:obj_hdr + 16]            # object header
+    struct.pack_into("<Q", block, 24, new_size)         # object size
+    block[32:32 + len(body)] = body
+    struct.pack_into("<I", block, 32 + len(body),
+                     _jenkins_lookup3()(body))
+    # Rewrite the trailing null object in its new position; the remaining bytes
+    # of the collection are already zero from the fresh bytearray.
+    struct.pack_into("<Q", block, 32 + new_pad + 8, free_size - grow)
+    raw[gcol:gcol + coll_size] = block
+    _patch(path, raw)
+
+
+def _make_vds_selection_v2(path, base_path):
+    """A VALID VDS whose virtual selection is a VERSION 2 serialized hyperslab.
+
+    The regression guard for
+    registry/cases/vds-selection-rank-oracle-false-positive.yml.  That case was
+    a valid version-2 file rejected as corrupt, because h5policy read the v2
+    header's four-byte length field as if it were the payload and under-sized
+    the selection by the whole payload, desynchronising the mapping cursor.
+    Nothing in the corpus could catch it: h5py writes version 3, and the only
+    version-2 witnesses were in a gitignored bundle.
+    """
+    _vds_rewrite_virtual_selection(path, base_path, _vds_selection_v3_to_v2)
+
+
+def _make_vds_selection_v2_rank_zero(path, base_path):
+    """A version-2 serialized hyperslab declaring rank 0.
+
+    The malformed half of the version-2 pair, proving the rank rule fires on
+    the v2 arm and not only on the v3 arm the other fixtures exercise.  The
+    rank sits at +13 in this encoding rather than +10, so a fixture patched at
+    the v3 offset would have hit the length field instead and tested nothing.
+    """
+    def rewrite(sel):
+        v2 = bytearray(_vds_selection_v3_to_v2(sel))
+        struct.pack_into("<I", v2, 13, 0)
+        return bytes(v2)
+    _vds_rewrite_virtual_selection(path, base_path, rewrite)
+
+
+def _make_vds_selection_rank_zero(path, base_path):
+    """A serialized hyperslab selection declaring rank 0.
+
+    libhdf5 rejects it in H5S__hyper_deserialize (src/H5Shyper.c) with
+    "invalid rank (0) for serialized hyperslab selection", the same condition
+    that catches rank > H5S_MAX_RANK.
+
+    Zero is the interesting end of that range for an oracle: a rank-0 REGULAR
+    hyperslab sizes its payload as 4 * rank * enc_size == 0, so a sizer that
+    only bounds the top of the range accepts it as a well-formed 14-byte
+    selection and walks on.  That is exactly what h5policy used to do.
+    """
+    _patch_vds_selection(
+        path, base_path,
+        lambda raw, sel: struct.pack_into("<I", raw, sel + 10, 0))
+
+
+def _make_vds_selection_enc_size(path, base_path):
+    """A serialized hyperslab selection whose encoding size is 3.
+
+    Legal encoding sizes are exactly 2, 4 and 8.  Three is a good witness
+    because it fails libhdf5's FIRST filter, `enc_size &
+    ~H5S_SELECT_INFO_ENC_SIZE_BITS` -- 3 & ~0x0e is 1, nonzero -- so it is
+    refused before the switch that would have caught it anyway.
+
+    It is also the shape the previous h5policy bound admitted: that test was
+    `enc == 0 || enc > 8`, a range, so 3 passed it and then SIZED the payload
+    as 4 * rank * 3 bytes, an extent libhdf5 would never compute for any
+    input.
+    """
+    _patch_vds_selection(
+        path, base_path,
+        lambda raw, sel: raw.__setitem__(sel + 9, 3))
+
+
+def _make_vds_selection_unknown_flag(path, base_path):
+    """A serialized hyperslab selection setting flag bit 0x02.
+
+    H5S_SELECT_FLAG_BITS is H5S_HYPER_REGULAR (0x01) alone, so libhdf5 rejects
+    anything else with "unknown flag for selection".  The fixture keeps 0x01
+    set as well, so the selection remains a REGULAR hyperslab with a valid
+    payload and the unknown neighbour bit is the only defect -- a file whose
+    flags byte is merely 0x02 would also change the payload encoding and stop
+    testing the flag check alone.
+    """
+    _patch_vds_selection(
+        path, base_path,
+        lambda raw, sel: raw.__setitem__(sel + 8, 0x03))
 
 
 def _fix_sb_checksum(raw):
@@ -2294,6 +2849,59 @@ def _fsm_file_sinfo(raw):
     raise RuntimeError("no file free-space manager with a section list")
 
 
+def _frhp_fsm_sinfo(raw):
+    """Locate a serialized fractal-heap free-space section list.
+
+    Unlike the file client, each section record is only a logical heap offset.
+    Pair the client-0 FSHD with the FRHP that names it so a mutation can test
+    the record's [heap_offset, size) extent against managed space, not EOA.
+    """
+    o, l = raw[9], raw[10]
+    undef = (1 << (8 * o)) - 1
+    i = raw.find(b"FSHD")
+    while i >= 0:
+        client = raw[i + 5]
+        serial = int.from_bytes(raw[i + 6 + 2*l:i + 6 + 3*l], "little")
+        max_bits = struct.unpack_from("<H", raw, i + 12 + 4*l)[0]
+        max_sz = int.from_bytes(raw[i + 14 + 4*l:i + 14 + 5*l], "little")
+        sect_addr = int.from_bytes(
+            raw[i + 14 + 5*l:i + 14 + 5*l + o], "little")
+        used = int.from_bytes(
+            raw[i + 14 + 5*l + o:i + 14 + 6*l + o], "little")
+        if client == 0 and serial > 0 and sect_addr != undef:
+            frhp = raw.find(b"FRHP")
+            fsm_rel = 14 + 2*l + o
+            managed_rel = fsm_rel + o
+            while frhp >= 0:
+                fsm = int.from_bytes(raw[frhp + fsm_rel:frhp + fsm_rel + o],
+                                     "little")
+                if fsm == i:
+                    managed = int.from_bytes(
+                        raw[frhp + managed_rel:frhp + managed_rel + l],
+                        "little")
+                    cnt_size = (max(serial, 1).bit_length() - 1) // 8 + 1
+                    len_size = (max(max_sz, 1).bit_length() - 1) // 8 + 1
+                    off_size = (max_bits + 7) // 8
+                    return dict(sect_addr=sect_addr, used=used,
+                                sect_checksum=sect_addr + used - 4,
+                                first_section=sect_addr + 5 + o + cnt_size + len_size,
+                                off_size=off_size, managed=managed)
+                frhp = raw.find(b"FRHP", frhp + 4)
+        i = raw.find(b"FSHD", i + 4)
+    raise RuntimeError("no fractal-heap free-space manager with a section list")
+
+
+def _make_bad_frhp_fsm_section_extent(path, base_path):
+    """Move a fractal-heap free section past managed space, retaining FSSE hash."""
+    raw = bytearray(open(base_path, "rb").read())
+    fsm = _frhp_fsm_sinfo(raw)
+    raw[fsm["first_section"]:fsm["first_section"] + fsm["off_size"]] = \
+        fsm["managed"].to_bytes(fsm["off_size"], "little")
+    struct.pack_into("<I", raw, fsm["sect_checksum"],
+                     _jenkins_lookup3()(bytes(raw[fsm["sect_addr"]:fsm["sect_checksum"]])))
+    _patch(path, bytes(raw))
+
+
 def _make_bad_fsm_section_list_checksum(path, base_path):
     """Flip a byte in a file FSM's serialized section-list checksum."""
     raw = bytearray(open(base_path, "rb").read())
@@ -2486,6 +3094,50 @@ def _make_bad_dense_checksum(path, block):
     _patch(path, bytes(raw))
 
 
+def _make_bad_dense_block_owner(path, base_path, block):
+    """Point one fractal-heap block's owner back-pointer at the wrong header.
+
+    Every FHDB/FHIB repeats its owning FRHP header's address just after the
+    signature and version, and libhdf5 refuses a block whose copy disagrees
+    (H5HFcache.c, "incorrect heap header address for direct block", in both
+    H5HF__cache_dblock_deserialize and H5HF__cache_iblock_deserialize).  A
+    block that names a different heap is how a heap ID gets resolved with one
+    heap's doubling-table geometry over another heap's bytes.
+
+    The rewritten address stays inside the file and the block's checksum is
+    recomputed, so nothing but the back-pointer is wrong: a bounds finding or a
+    checksum finding here would mean the fixture stopped testing what it names.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    info = _dense_frhp_info(raw)
+    off = raw.find(block.encode())
+    if off < 0:
+        raise RuntimeError(f"could not locate dense fractal heap block {block}")
+    owner = int.from_bytes(raw[off + 5:off + 5 + info["off_size"]], "little")
+    if owner != info["frhp"]:
+        raise RuntimeError(f"{block} owner {owner} is not the heap header "
+                           f"{info['frhp']}; fixture assumptions changed")
+
+    # The superblock is a real structure at a real address that is emphatically
+    # not this heap's header, so the block names a plausible target rather than
+    # a value a range check would reject on its own.
+    struct.pack_into(f"<{'Q' if info['off_size'] == 8 else 'I'}", raw, off + 5, 0)
+
+    if block == "FHDB":
+        # Direct blocks carry the checksum inside the prefix, computed over the
+        # whole block with those four bytes zeroed (H5HF__cache_dblock_*).
+        size = info["start"]
+        csum = off + 5 + info["off_size"] + info["heap_off_size"]
+        body = bytearray(raw[off:off + size])
+        body[csum - off:csum - off + 4] = b"\0\0\0\0"
+        struct.pack_into("<I", raw, csum, _jenkins_lookup3()(bytes(body)))
+    else:
+        size = _dense_iblock_size(info, info["curr_rows"])
+        struct.pack_into("<I", raw, off + size - 4,
+                         _jenkins_lookup3()(bytes(raw[off:off + size - 4])))
+    _patch(path, bytes(raw))
+
+
 def _make_bad_dense_attr_btree_deep(path, base_path):
     """Dense-attribute B-tree with a checksum-valid, absurd declared depth.
 
@@ -2538,6 +3190,26 @@ def _make_zero_v2_btree_record_size(path, base_path):
     raw = bytearray(open(base_path, "rb").read())
     bt = _dense_bthd_info(raw)
     struct.pack_into("<H", raw, bt["bthd"] + 10, 0)
+    struct.pack_into("<I", raw, bt["checksum"],
+                     _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_oversize_v2_btree_node_size(path, base_path):
+    """Dense-link name index whose node_size (0xFFFFFFFF) exceeds the file.
+
+    The record_size stays legitimate (pinned by the record-layout check), so the
+    only malformed field is node_size.  libhdf5's H5B2__hdr_init eagerly memsets
+    a node_size page and fills an nat_off array of (node_size/record_size)
+    entries before any node is read (src/H5B2hdr.c:131-159), so a ~4 GiB node
+    declared in a kilobyte file is a multi-GiB resident-memory amplification even
+    for an empty tree.  h5policy bounds node_size by the file ceiling and rejects
+    it as H5_CORRUPT_V2_BTREE_NODE_SIZE.  See
+    registry/cases/v2-btree-node-size-unbounded-amplification.yml.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    bt = _dense_bthd_info(raw)
+    struct.pack_into("<I", raw, bt["bthd"] + 6, 0xFFFFFFFF)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]])))
     _patch(path, bytes(raw))
@@ -2624,29 +3296,70 @@ def _make_cache_image_shadowed_btree(path, helper_source):
     # entry at the B-tree leaf: the shape the real specimen has
     # (corpus seed 62 caches exactly one entry, the leaf).  Legitimate
     # only because the flush above made on-disk match the cache.  Just the
-    # address bytes change -- entry count, sizes and the trailing checksum
-    # position are untouched, and h5policy does not verify the image checksum
-    # VALUE, so the container stays structurally valid.
+    # address bytes change -- entry count and sizes are untouched.  Repair the
+    # image checksum below so this remains a valid container and exercises the
+    # logical cache-body view rather than merely failing envelope integrity.
     root_oh = int.from_bytes(raw[12 + 3 * o:12 + 4 * o], "little")
     leaf = bt["root"]
-    # Repoint every entry that caches an OBJECT HEADER (or the B-tree header) at
-    # the B-tree leaf instead.  The walk skips shadowed object headers, and
-    # skipping one also drops everything reachable through it -- so an image
-    # caching the root and the group headers would stop the traversal before the
-    # B-tree regardless of the boundary logic, and the fixture would pass either
-    # way.  What is left shadowed is the leaf: a NON-header structure, which is
-    # exactly the specimen's shape and the case the boundary has to get right.
-    blocking = [(a, n, off) for a, n, off in shadow
-                if raw[a:a + 4] == b"OHDR" or (a <= bthd < a + n)]
-    if not blocking:
+    # DROP every entry that caches an object header or the B-tree header from the
+    # image, rather than repointing them onto one address.  Un-shadowing the root
+    # and group headers lets the walk reach the B-tree, and un-shadowing the
+    # B-tree header leaves the corruption below on the UNSHADOWED side -- the
+    # distinction this fixture exists to test.  The leaf keeps its own cache
+    # entry, so it stays shadowed (a NON-header structure, the specimen's shape).
+    # The earlier construction repointed all these entries to the leaf address,
+    # which made several entries share one file address -- a real
+    # mdci.entry_addr_unique violation (H5_CORRUPT_MDCI_DUPLICATE_ENTRY_ADDRESS)
+    # that libhdf5 also rejects.  Dropping keeps the image well formed.
+    lookup3 = _jenkins_lookup3()
+    old_size = int.from_bytes(raw[img + 6:img + 6 + el], "little")
+    entry_header = 14 + o + el
+    kept, cur = [], 10 + el
+    for _ in range(nentries):
+        e = img + cur
+        parents = struct.unpack_from("<H", raw, e + 8)[0]
+        addr = int.from_bytes(raw[e + 14:e + 14 + o], "little")
+        body_len = int.from_bytes(raw[e + 14 + o:e + 14 + o + el], "little")
+        span = entry_header + parents * o + body_len
+        if not (raw[addr:addr + 4] == b"OHDR" or (addr <= bthd < addr + body_len)):
+            kept.append(bytes(raw[e:e + span]))
+        cur += span
+    if len(kept) == nentries:
         raise RuntimeError("cache image caches no object header; the fixture's "
                            "premise no longer holds")
-    for _a, _n, addr_off in blocking:
-        raw[addr_off:addr_off + o] = leaf.to_bytes(o, "little")
+    if not kept:
+        raise RuntimeError("dropping the blocking entries would empty the image")
+
+    # Rebuild the image in place: same block address, smaller declared size.  The
+    # freed tail is left as unreferenced file bytes (the MDCI message's size field
+    # is updated below), so no later address moves.
+    new_block = bytearray(b"MDCI" + bytes([raw[img + 4], raw[img + 5]]))
+    new_size = 10 + el + sum(len(e) for e in kept) + 4
+    new_block += struct.pack("<Q", new_size)
+    new_block += struct.pack("<I", len(kept))
+    new_block += b"".join(kept)
+    new_block += b"\x00" * 4
+    assert len(new_block) == new_size, (len(new_block), new_size)
+    struct.pack_into("<I", new_block, new_size - 4, lookup3(bytes(new_block[:new_size - 4])))
+    raw[img:img + old_size] = bytes(new_block) + b"\x00" * (old_size - new_size)
+
+    # Update the MDCI superblock-extension message's image size, then repair the
+    # extension object header's checksum it invalidates.
+    msg_pat = struct.pack("<Q", img) + struct.pack("<Q", old_size)
+    hits = [i for i in range(len(raw) - len(msg_pat) + 1) if raw[i:i + len(msg_pat)] == msg_pat]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected exactly one MDCI extension message, found {len(hits)}")
+    struct.pack_into("<Q", raw, hits[0] + o, new_size)
+    ext_addr = int.from_bytes(raw[12 + o:12 + 2 * o], "little")
+    if raw[ext_addr:ext_addr + 4] != b"OHDR":
+        raise RuntimeError("superblock extension is not a v2 object header")
+    _fix_v2_ohdr_checksum(raw, ext_addr)
 
     shadow = _mdci_shadow_ranges(raw)
     if not shadow:
         raise RuntimeError("cache image shadows nothing; fixture proves nothing")
+    if len({a for a, _n, _off in shadow}) != len(shadow):
+        raise RuntimeError("rebuilt image still has duplicate entry addresses")
     if any(a <= bthd < a + n for a, n, _ in shadow):
         raise RuntimeError(
             f"dense-link B-tree header at {bthd} is shadowed by the cache image; "
@@ -2659,8 +3372,296 @@ def _make_cache_image_shadowed_btree(path, helper_source):
     nrec = min(0xFFFF, capacity + (150 // bt["record_size"]) + 1)
     struct.pack_into("<H", raw, bthd + 16 + bt["off_size"], nrec)
     struct.pack_into("<I", raw, bt["checksum"],
-                     _jenkins_lookup3()(bytes(raw[bthd:bt["checksum"]])))
+                     lookup3(bytes(raw[bthd:bt["checksum"]])))
     _patch(path, bytes(raw))
+
+
+def _make_bad_cache_image_body(path, base_path):
+    """A checksum-valid MDCI whose cached root-header body has a bad version.
+
+    Its backing bytes are deliberately left alone: the regression proves that
+    h5policy validates the cached body selected by the MDCI, not the stale
+    bytes at the body entry's logical address.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    o, el = raw[9], raw[10]
+    img = raw.find(b"MDCI")
+    if img < 0:
+        raise RuntimeError("cache-image body fixture base has no cache image")
+    nentries = struct.unpack_from("<I", raw, img + 6 + el)[0]
+    root_oh = int.from_bytes(raw[12 + 3 * o:12 + 4 * o], "little")
+    cur = img + 10 + el
+    entry_header = 14 + o + el
+    for _ in range(nentries):
+        parents = struct.unpack_from("<H", raw, cur + 8)[0]
+        body_len = int.from_bytes(raw[cur + 14 + o:cur + 14 + o + el], "little")
+        body = cur + entry_header + parents * o
+        entry_addr = int.from_bytes(raw[cur + 14:cur + 14 + o], "little")
+        if (entry_addr == root_oh and raw[body:body + 4] == b"OHDR"
+                and body_len >= 5):
+            raw[body + 4] = 3
+            image_len = int.from_bytes(raw[img + 6:img + 6 + el], "little")
+            image_end = img + image_len
+            struct.pack_into("<I", raw, image_end - 4,
+                             _jenkins_lookup3()(bytes(raw[img:image_end - 4])))
+            _patch(path, bytes(raw))
+            return
+        cur += entry_header + parents * o + body_len
+    raise RuntimeError("cache-image body fixture found no cached object header")
+
+
+def _make_bad_cache_image_checksum(path, base_path):
+    """Corrupt only an MDCI's trailing checksum field."""
+    raw = bytearray(open(base_path, "rb").read())
+    el = raw[10]
+    img = raw.find(b"MDCI")
+    if img < 0:
+        raise RuntimeError("cache-image checksum fixture base has no cache image")
+    image_len = int.from_bytes(raw[img + 6:img + 6 + el], "little")
+    if image_len < 4 or img + image_len > len(raw):
+        raise RuntimeError("cache-image checksum fixture has invalid image extent")
+    raw[img + image_len - 4] ^= 0x01
+    _patch(path, bytes(raw))
+
+
+def _make_mdci_duplicate_entry_address(path):
+    """A checksum-valid MDCI whose two entries claim the SAME file address.
+
+    Every envelope field is well formed -- correct image_data_len, a valid
+    Jenkins trailing checksum, and per-entry headers that pass the flag,
+    dependency-count and extent checks -- so the only defect is the repeated
+    address.  libhdf5 keys reconstructed entries by file address and its
+    H5C__check_for_duplicates (H5Cimage.c) fails reconstruction on the repeat,
+    but that failure unwinds a partially built, pinned flush-dependency graph
+    through a cleanup that double-frees / dereferences a still-referenced parent.
+    h5policy must reject the duplicate before any of that native state exists.
+
+    Both entries cache the ROOT object header and carry its real body, so the
+    image stays coherent under the MDCI replay pass; the duplicate is caught in
+    the entry loop before replay begins.
+    """
+    lookup3 = _jenkins_lookup3()
+    with tempfile.TemporaryDirectory() as build:
+        base = os.path.join(build, "base.h5")
+        with h5py.File(base, "w", libver="latest") as h:
+            h.create_dataset("a", data=np.arange(4, dtype="i4"), track_times=False)
+        raw = bytearray(open(base, "rb").read())
+
+    o, el = raw[9], raw[10]
+    ext_off, eof_off, chksum_off = 12 + o, 12 + 2 * o, 12 + 4 * o
+    if lookup3(bytes(raw[:chksum_off])) != struct.unpack_from("<I", raw, chksum_off)[0]:
+        raise RuntimeError("mdci duplicate-address base failed the lookup3 self-check")
+
+    root_oh = int.from_bytes(raw[12 + 3 * o:12 + 4 * o], "little")
+    if raw[root_oh:root_oh + 4] != b"OHDR":
+        raise RuntimeError("expected a v2 object header at the root address")
+    oh_body = bytes(raw[root_oh:])          # OH decode uses its own internal lengths
+
+    def entry(addr, image):
+        return (bytes([5, 0x00, 1, 0]) + struct.pack("<HHH", 0, 0, 0)
+                + struct.pack("<i", -1) + struct.pack("<QQ", addr, len(image)) + image)
+
+    entries = entry(root_oh, oh_body) + entry(root_oh, oh_body)   # duplicate address
+    image_size = 10 + el + len(entries) + 4
+    block = (b"MDCI" + bytes([0, 0]) + struct.pack("<Q", image_size)
+             + struct.pack("<I", 2) + entries)
+    block += struct.pack("<I", lookup3(block))
+
+    raw += b"\x00" * ((-len(raw)) % 8)
+    image_addr = len(raw)
+    raw += block
+
+    raw += b"\x00" * ((-len(raw)) % 8)
+    payload = struct.pack("<B", 0) + struct.pack("<Q", image_addr) + struct.pack("<Q", image_size)
+    msg_data = payload + b"\x00" * ((-len(payload)) % 8)
+    msg = struct.pack("<HHB", 0x18, len(msg_data), 0) + b"\x00" * 3 + msg_data
+    ohdr = struct.pack("<BBHII", 1, 0, 1, 1, len(msg)) + b"\x00" * 4 + msg
+    raw += b"\x00" * ((-len(raw)) % 8)
+    ext_addr = len(raw)
+    raw += ohdr
+
+    struct.pack_into("<Q", raw, ext_off, ext_addr)
+    struct.pack_into("<Q", raw, eof_off, len(raw))
+    struct.pack_into("<I", raw, chksum_off, lookup3(bytes(raw[:chksum_off])))
+    _patch(path, bytes(raw))
+
+
+def _mdci_assemble(path, make_entries):
+    """Assemble an HDF5 file carrying a superblock-extension MDCI message that
+    points at a checksum-valid cache image built from ``make_entries``.
+
+    ``make_entries(root_oh, oh_body) -> list[bytes]`` returns fully encoded entry
+    records (header + optional parent-address list + cached body).  Every entry
+    that shadows the root object header should carry ``oh_body`` so the image
+    stays coherent under the MDCI replay pass; witnesses that reject before replay
+    (the LRU and parent-resolvability cases below) only need the checksum and the
+    envelope to be well formed.  Shared with _make_mdci_duplicate_entry_address's
+    layout so all three MDCI witnesses agree on the container encoding.
+    """
+    lookup3 = _jenkins_lookup3()
+    with tempfile.TemporaryDirectory() as build:
+        base = os.path.join(build, "base.h5")
+        with h5py.File(base, "w", libver="latest") as h:
+            h.create_dataset("a", data=np.arange(4, dtype="i4"), track_times=False)
+        raw = bytearray(open(base, "rb").read())
+
+    o, el = raw[9], raw[10]
+    ext_off, eof_off, chksum_off = 12 + o, 12 + 2 * o, 12 + 4 * o
+    if lookup3(bytes(raw[:chksum_off])) != struct.unpack_from("<I", raw, chksum_off)[0]:
+        raise RuntimeError("mdci witness base failed the lookup3 self-check")
+
+    root_oh = int.from_bytes(raw[12 + 3 * o:12 + 4 * o], "little")
+    if raw[root_oh:root_oh + 4] != b"OHDR":
+        raise RuntimeError("expected a v2 object header at the root address")
+    oh_body = bytes(raw[root_oh:])
+
+    entries = make_entries(root_oh, oh_body)
+    payload = b"".join(entries)
+    image_size = 10 + el + len(payload) + 4
+    block = (b"MDCI" + bytes([0, 0]) + struct.pack("<Q", image_size)
+             + struct.pack("<I", len(entries)) + payload)
+    block += struct.pack("<I", lookup3(block))
+
+    raw += b"\x00" * ((-len(raw)) % 8)
+    image_addr = len(raw)
+    raw += block
+
+    raw += b"\x00" * ((-len(raw)) % 8)
+    msg_payload = struct.pack("<B", 0) + struct.pack("<Q", image_addr) + struct.pack("<Q", image_size)
+    msg_data = msg_payload + b"\x00" * ((-len(msg_payload)) % 8)
+    msg = struct.pack("<HHB", 0x18, len(msg_data), 0) + b"\x00" * 3 + msg_data
+    ohdr = struct.pack("<BBHII", 1, 0, 1, 1, len(msg)) + b"\x00" * 4 + msg
+    raw += b"\x00" * ((-len(raw)) % 8)
+    ext_addr = len(raw)
+    raw += ohdr
+
+    struct.pack_into("<Q", raw, ext_off, ext_addr)
+    struct.pack_into("<Q", raw, eof_off, len(raw))
+    struct.pack_into("<I", raw, chksum_off, lookup3(bytes(raw[:chksum_off])))
+    _patch(path, bytes(raw))
+
+
+def _mdci_entry(addr, image, flags=0x00, child=0, dirty=0, lru=-1, parents=(),
+                type_id=5, ring=1, age=0):
+    """Encode one MDCI entry: type_id, then flags/ring/age, the three
+    dependency counts, the signed lru_rank, the entry address and body length,
+    the flush-dependency parent-address list, and the cached body.  Matches the
+    cursor arithmetic in h5policy_validate_mdci_payload (h5_messages.pk).
+
+    The type_id/ring/age defaults are the valid triple every other fixture
+    wants: 5 is H5AC_OHDR_ID (the entry caches an object header, which is what
+    makes the replay pass decode the body), ring 1 is H5C_RING_USER, age 0.
+    """
+    return (bytes([type_id, flags, ring, age])
+            + struct.pack("<HHH", child, dirty, len(parents))
+            + struct.pack("<i", lru) + struct.pack("<QQ", addr, len(image))
+            + b"".join(struct.pack("<Q", p) for p in parents) + image)
+
+
+def _make_mdci_entry_bad_type_id(path):
+    """A checksum-valid MDCI whose sole entry names cache client type 30.
+
+    H5AC_NTYPES is 30 (H5ACprivate.h), so 30 is the first id past the client
+    class table.  libhdf5 rejects it on the read path in
+    H5C__reconstruct_cache_entry ("type id is out of valid range"); the
+    write-side H5C__decode_cache_image_entry does not check it at all.  The id
+    is a dispatch selector on both sides -- it picks the deserializer natively,
+    and h5policy keys its object-header replay off the same byte -- so an entry
+    that survives with an out-of-range id steers both.
+    """
+    _mdci_assemble(
+        path,
+        lambda root_oh, oh_body: [_mdci_entry(root_oh, oh_body, type_id=30)])
+
+
+def _make_mdci_entry_bad_ring(path):
+    """A checksum-valid MDCI whose sole entry names cache ring 6.
+
+    H5C_RING_NTYPES is 6 (H5Cprivate.h), one past H5C_RING_SB, so 6 is the
+    first value the read path refuses ("ring is out of valid range").  Ring 0
+    is deliberately not the fixture value: only the top of that range is a hard
+    check, so a zero ring is opened by a Release build.
+    """
+    _mdci_assemble(
+        path,
+        lambda root_oh, oh_body: [_mdci_entry(root_oh, oh_body, ring=6)])
+
+
+def _make_mdci_entry_bad_age(path):
+    """A checksum-valid MDCI whose sole entry declares age 101.
+
+    H5AC__CACHE_IMAGE__ENTRY_AGEOUT__MAX is 100 (H5ACpublic.h), so 101 is the
+    first value out of policy range ("entry age is out of policy range").
+    """
+    _mdci_assemble(
+        path,
+        lambda root_oh, oh_body: [_mdci_entry(root_oh, oh_body, age=101)])
+
+
+def _make_mdci_entry_lru_inconsistent(path):
+    """A checksum-valid MDCI whose single entry has IN_LRU clear yet a non-(-1)
+    lru_rank.
+
+    Every other envelope field is well formed, so the only defect is the LRU
+    inconsistency.  libhdf5 guards this relation with an assert only
+    (H5Cimage.c:2813: (in_lru && lru_rank >= 0) || (!in_lru && lru_rank == -1)),
+    compiled out under NDEBUG, so a Release reconstruction proceeds on the
+    inconsistent LRU description.  This is exactly poc_dos.h5's entry 0 (lru_rank
+    2816 with IN_LRU clear).  h5policy must reject it in the entry loop, before
+    the replay pass and before any native cache state exists.  The entry caches
+    the ROOT object header and carries its real body so the image stays coherent.
+    """
+    _mdci_assemble(
+        path,
+        lambda root_oh, oh_body: [_mdci_entry(root_oh, oh_body, flags=0x00, lru=5)])
+
+
+def _make_mdci_parent_addr_unresolved(path):
+    """A checksum-valid MDCI whose child entry declares a flush-dependency parent
+    address that names no entry in the image.
+
+    Two well-formed entries: a normal entry caching the root object header, and a
+    flush-dependency child (IS_FD_CHILD, parent_count 1) whose single parent
+    address is a dangling value present nowhere else.  Every envelope field, flag
+    and LRU relation is valid, so the only defect is the unresolvable parent.
+    libhdf5 looks each parent up in the reconstruction index and fails with "fd
+    parent not in cache?!?" (H5Cimage.c:2533); that failure unwinds a partially
+    built, pinned dependency graph through the same unsafe cleanup as the
+    duplicate-address case (this is poc_dos.h5's 0x18000000 parent route).
+    h5policy must reject the dangling reference before any native state exists.
+    """
+    _mdci_assemble(
+        path,
+        lambda root_oh, oh_body: [
+            _mdci_entry(root_oh, oh_body, flags=0x00),
+            _mdci_entry(root_oh + 0x100000, oh_body, flags=0x08,
+                        parents=(0xDEADBEEF,)),
+        ])
+
+
+def _make_mdci_parent_addr_self(path):
+    """A checksum-valid MDCI whose sole entry names its OWN address as its
+    flush-dependency parent -- a self-loop in the dependency graph.
+
+    The sibling above covers a parent address that names nothing; this covers the
+    opposite failure, a parent address that resolves too well.  Every envelope
+    field, flag and LRU relation is valid and the address is present in the image,
+    so the resolvability check passes: the defect is that the entry depends on
+    itself.  libhdf5 rejects the same shape one layer later, in
+    H5C_create_flush_dependency (H5Centry.c:3836, "Child entry flush dependency
+    parent can't be itself") reached from H5Cimage.c:2547.
+
+    A longer cycle needs no fixture and cannot be built: parents are resolved
+    against entries already inserted into the index (H5Cimage.c:2510 then :2524),
+    so a two-cycle's forward reference fails as an unresolvable parent at
+    H5Cimage.c:2533 before any cycle exists.  The self-loop is the only cycle the
+    format admits.
+    """
+    _mdci_assemble(
+        path,
+        lambda root_oh, oh_body: [
+            _mdci_entry(root_oh, oh_body, flags=0x08, parents=(root_oh,)),
+        ])
 
 
 def _patch_dtype_size(raw, header_byte, expect_size, new_size, what):
@@ -2844,6 +3845,84 @@ def _make_fill_value_size_mismatch(path):
         raise RuntimeError("could not locate the 256-byte v3 fill-value message")
     i, pay, msg_size, size = hit
     struct.pack_into("<I", raw, pay + 2, 1)  # declared fill size: 256 -> 1
+    # Repair the enclosing object header's checksum, or libhdf5 refuses the file
+    # before it ever reaches H5D__fill and the fixture proves nothing.
+    ohdr = raw.rfind(b"OHDR", 0, i)
+    if ohdr < 0:
+        raise RuntimeError("fill-value message is not inside a v2 object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_fill_value_size_mismatch_v2(path):
+    """The same defect as _make_fill_value_size_mismatch, on the OTHER branch.
+
+    H5O__fill_new_decode (H5Ofill.c) handles fill message versions 1, 2 and 3 in
+    one function and compares the fill size to the datatype on none of them --
+    it is handed the object header as `open_oh` and marks it H5_ATTR_UNUSED,
+    which is exactly the handle H5O__fill_old_decode uses to enforce the
+    relation.  Versions 1 and 2 take the `fill->version < H5O_FILL_VERSION_3`
+    branch, version 3 takes the other, and the sibling fixture only covers
+    version 3.  This one covers the v1/v2 branch, so a fix that guards one
+    branch and not the other cannot pass the corpus.
+
+    The shape is copied from the /Array_be dataset of the version-2 specimen in
+    the case bundle: an 8-byte declared fill behind a 1032-byte datatype, so
+    H5D__fill over-reads 1024 bytes rather than the sibling's 255.
+
+    Byte-patched because no libver can write it.  H5O_fill_ver_bounds maps
+    EARLIEST to version 1 and every later bound to version 3, so version 2 on
+    disk only ever came from a historical library -- current libhdf5 reaches
+    version 2 solely by normalising the OLD message (H5O__fill_old_decode sets
+    fill->version = H5O_FILL_VERSION_2 in memory).  We therefore write a v3
+    message with h5py and rewrite its payload in place.
+
+    The two payload layouts differ, and the v1/v2 one is two bytes longer:
+        v3      version(1) flags(1)                                size(4) value
+        v1/v2   version(1) alloc_time(1) fill_time(1) defined(1)   size(4) value
+    Rewriting a 1032-byte v3 fill as an 8-byte v2 fill leaves the tail of the
+    message unused.  That is deliberate and harmless: both branches stop after
+    `size` value bytes and never look further, so the slack stays zero-filled
+    rather than being reclaimed by shrinking the message -- which would move
+    every following message and require rebuilding the header.  Keeping the
+    datatype, dataspace and layout exactly as h5py wrote them is what keeps this
+    a single-defect fixture, which the A~ predicate in h5policy-diff requires.
+    """
+    def build(h):
+        dt = h5py.h5t.create(h5py.h5t.OPAQUE, 1032)
+        sid = h5py.h5s.create_simple((1,))
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_fill_value(np.zeros(1, dtype="V1032"))
+        h5py.h5d.create(h.id, b"dset", dt, sid, dcpl=dcpl)
+
+    raw = _base_bytes(build)
+    # Locate the v3 fill message we just wrote, via the v2 object-header message
+    # prefix: type(1), size(2), flags(1).  Same search as the v3 sibling, keyed
+    # on the declared size so a different h5py layout fails loudly.
+    hit = None
+    for i in range(len(raw) - 12):
+        if raw[i] != 0x05:
+            continue
+        msg_size = struct.unpack_from("<H", raw, i + 1)[0]
+        pay = i + 4
+        if raw[pay] != 3 or msg_size < 6 or pay + msg_size > len(raw):
+            continue
+        if struct.unpack_from("<I", raw, pay + 2)[0] == 1032:   # the fill we wrote
+            hit = (i, pay, msg_size)
+            break
+    if hit is None:
+        raise RuntimeError("could not locate the 1032-byte v3 fill-value message")
+    i, pay, msg_size = hit
+    if msg_size < 16:
+        raise RuntimeError(f"fill message is {msg_size} bytes, too short to "
+                           f"hold a v1/v2 payload with an 8-byte value")
+    # alloc_time 2 (H5D_ALLOC_TIME_LATE) and fill_time 2 (H5D_FILL_TIME_IFSET)
+    # are the values the /Array_be specimen carries.  LATE leaves the contiguous
+    # data address undefined, so a read is served entirely from the fill value
+    # and reaches H5D__fill -> H5S_select_fill -> H5VM_array_fill.
+    struct.pack_into("<BBBB", raw, pay, 2, 2, 2, 1)
+    struct.pack_into("<i", raw, pay + 4, 8)        # INT32: declared fill size
+    raw[pay + 8:pay + msg_size] = bytes(msg_size - 8)
     # Repair the enclosing object header's checksum, or libhdf5 refuses the file
     # before it ever reaches H5D__fill and the fixture proves nothing.
     ohdr = raw.rfind(b"OHDR", 0, i)
@@ -3217,6 +4296,64 @@ def _make_bad_heap_free_list(path):
     _patch(path, bytes(raw))
 
 
+def _make_heap_free_list_size_wrap(path):
+    """A local-heap free block whose SIZE wraps the bound meant to reject it.
+
+    Distinct from bad_heap_free_list.h5 next to it, and the distinction is the
+    whole point.  That fixture puts the free-list HEAD outside the data segment,
+    which libhdf5 catches.  This one keeps the head legal and makes the free
+    block's SIZE enormous, which libhdf5 does NOT catch: H5HLcache.c:258 tests
+
+        if ((fl->offset + fl->size) > heap->dblk_size)
+
+    as an ADDITION on size_t, so offset 32 plus size 2**64-1 sums to 31 -- well
+    inside any real dblk_size -- and the node is admitted into heap->freelist.
+    h5policy bounds the same relation by subtraction after an explicit
+    `offset > dblk_size` gate, so it cannot wrap and rejects the node.
+
+    Two traps for anyone editing this:
+      * H5HL_FREE_NULL is 1, NOT 0 and not all-ones.  The next-offset field must
+        be 1 to terminate the chain; the decoder rejects a literal 0 outright
+        ("free block size is zero?"), and an all-ones next-offset builds a
+        different specimen that never reaches the size check.
+      * The consequence is RDWR-ONLY.  A read-only traversal never acts on the
+        admitted node; the ASAN heap-buffer-overflow WRITEs appear in
+        H5HL__fl_serialize (H5HLcache.c:308) and H5HL_insert (H5HL.c:690) via an
+        ordinary H5Gcreate2.  So the corpus and probes, which are read-only,
+        cannot observe the defect this fixture encodes -- they can only assert
+        that h5policy rejects the file.
+
+    See registry/cases/local-heap-free-list-bound-wraps.yml.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    heap = raw.find(b"HEAP")
+    if heap < 0:
+        raise RuntimeError("could not locate the local heap")
+    # HEAP(4) + version(1) + reserved(3), then data-segment size, free-list head
+    # and data-segment address, each one `length` field wide.
+    # sizeof_lengths lives at superblock byte 14 in a VERSION 0 superblock,
+    # which is what libver="earliest" produces -- NOT byte 10, which is where it
+    # sits in v2/v3.  Assert the version so a future libver change fails loudly
+    # instead of silently reading the wrong byte.
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    if raw[14] != 8:
+        raise RuntimeError(f"expected 8-byte lengths, got {raw[14]}")
+    dblk_size = struct.unpack_from("<Q", raw, heap + 8)[0]
+    dblk_addr = struct.unpack_from("<Q", raw, heap + 24)[0]
+    off = 32                                   # free-list head, comfortably legal
+    if off + 16 > dblk_size:
+        raise RuntimeError(
+            f"data segment is {dblk_size} bytes; too small to hold a free-list "
+            f"node at offset {off}")
+    struct.pack_into("<Q", raw, heap + 16, off)                  # head -> our node
+    struct.pack_into("<Q", raw, dblk_addr + off, 1)              # next == H5HL_FREE_NULL
+    struct.pack_into("<Q", raw, dblk_addr + off + 8, 0xFFFFFFFFFFFFFFFF)  # size
+    _patch(path, bytes(raw))
+
+
 def _make_bad_duplicate_dataspace_message(path, base_path):
     """Dataset object header whose layout message type is rewritten as
     dataspace, with the v2 object-header checksum repaired.
@@ -3236,6 +4373,42 @@ def _make_bad_duplicate_dataspace_message(path, base_path):
     if ohdr < 0:
         raise RuntimeError("could not locate containing object header")
     raw[off] = 0x01                                # layout -> dataspace
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_fixed_array_extent_mismatch(path, base_path):
+    """Fixed-array-indexed dataset whose dataspace declares a maximum extent the
+    index was never sized for.
+
+    The index's capacity is fixed at creation from the maximum extent
+    (H5D__farray_idx_create: cparam.nelmts = ceil(max/chunk) product) and never
+    grows, but nothing re-checks the two against each other when the file is
+    read back.  Inflating one `Dim Max` field leaves the FAHD header, every
+    chunk address, and the data itself untouched and internally consistent, yet
+    makes libhdf5 recompute a capacity ~10^11 chunks wide: h5repack (H5Ocopy)
+    sizes a destination data block from it and aborts the process in the
+    metadata cache.  See registry/cases/fixed-array-extent-mismatch.yml.
+
+    The same single-field mutation h5policy-crashfuzz found by chance, done
+    deterministically: the seed's `Dim Max: {10, 10}` becomes
+    {867583393802, 10}, and only the object header's checksum is repaired."""
+    raw = bytearray(open(base_path, "rb").read())
+    # v2 message prefix: type=dataspace(0x01), size=36, flags=0, then
+    # dataspace v2, rank=2, flags=max-dims-present, class=simple, followed by
+    # two 8-byte current dimensions and two 8-byte maximum dimensions.
+    pat = b"\x01\x24\x00\x00\x02\x02\x01\x01"
+    off = raw.find(pat)
+    if off < 0:
+        raise RuntimeError("could not locate the dataspace message prefix")
+    dim_max = off + 8 + 2 * 8
+    if struct.unpack_from("<QQ", raw, off + 8) != (10, 10) or \
+       struct.unpack_from("<QQ", raw, dim_max) != (10, 10):
+        raise RuntimeError("fixed-array seed no longer has 10x10 dimensions")
+    struct.pack_into("<Q", raw, dim_max, 867583393802)
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate containing object header")
     _fix_v2_ohdr_checksum(raw, ohdr)
     _patch(path, bytes(raw))
 

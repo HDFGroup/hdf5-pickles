@@ -28,6 +28,18 @@ serialized selection.
 Serialized dataspace selections use the same wire format as `dspace_enc`
 / `vds`.
 
+The decoder accepts only the source-supported revised reference kinds
+(plus the null form), caps inline token widths at the library's
+16-byte token maximum, and—after a superblock has been mapped—checks
+object and global-heap addresses against the declared EOF. A non-null
+blob reference must hold at least the reference header and token-length
+byte and name a nonzero global-heap object index; index 0 is heap free
+space. When a blob is followed, its declared size must exactly match the
+selected heap object's unpadded data size, and token, string, and
+selection fields are bounded by that size. A legacy region reference also
+checks its resolved dataset address against the declared EOF. It validates
+reachability bounds, not the target object's type or identity.
+
 All fields are stored in little-endian byte order.
 
 ## Reference Header
@@ -70,9 +82,9 @@ An internal object reference contains a token of width `O`; other references con
 | Header | `hdr` | Embedded `ref_enc_hdr` (reference type and flags). |
 | Token Size | `token_size` | Number of valid bytes in the inline object token. Present only for an internal `H5R_OBJECT2` reference. _optional_ |
 | Token | `token` | Opaque object token (`sizeof_offsets` bytes). Present only for an internal `H5R_OBJECT2` reference. _optional_ |
-| Blob Size Raw | `blob_size_raw` | Byte count of the reference blob stored in the global heap (4-byte unsigned integer). Present for all blob-format references. _optional_ |
+| Blob Size Raw | `blob_size_raw` | Byte count of the reference blob stored in the global heap (4-byte unsigned integer). Present for all blob-format references. _Optional for direct references. A non-null blob must contain at least the 2-byte reference header and 1-byte token length, and its declared size must match the selected heap object's data size._ |
 | Heap Address Raw | `heap_addr_raw` | File address of the global heap collection holding the reference blob (`sizeof_offsets` bytes). Present for all blob-format references. _optional_ |
-| Heap Index Raw | `heap_idx_raw` | Object index of the blob within that collection (4-byte unsigned integer). Present for all blob-format references. _optional_ |
+| Heap Index Raw | `heap_idx_raw` | Object index of the blob within that collection (4-byte unsigned integer). Present for all blob-format references. _Optional for direct references. Non-null blobs use a nonzero index; index 0 is the global heap's free-space sentinel._ |
 
 
 <a id="subsec_fmt4_appendixd_encodedp"></a>
@@ -113,4 +125,4 @@ Backward-compatible dataset-region reference element (`H5R_DATASET_REGION1`, Sec
 | Field | Pickle identifier | Description |
 |-------|-------------------|-------------|
 | Heap Address Raw | `heap_addr_raw` | File address of the global heap collection holding the region data (`sizeof_offsets` bytes). |
-| Heap Index Raw | `heap_idx_raw` | Object index of the region data within that collection (4-byte unsigned integer). |
+| Heap Index Raw | `heap_idx_raw` | Object index of the region data within that collection (4-byte unsigned integer). Must be nonzero because index 0 is free space, not a readable heap object. |

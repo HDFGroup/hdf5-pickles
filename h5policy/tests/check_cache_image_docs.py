@@ -34,40 +34,34 @@ DOC_REQUIREMENTS = {
     ROOT / "h5policy/README.md": (
         "cached entry bodies",
         "shadowed",
-        "unshadowed",
-        "exit `5`",
-        "`unsupported_coverage_gap`",
-        "`H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`",
+        "in-memory read overlay",
+        "exit `0`",
+        "`accept`",
         "`analysis.complete`",
         "`analysis.walk_completed`",
-        '`analysis.stop_reason: "rejection"`',
-        '`analysis.stop_reason: "cache_image_coverage_gap"`',
+        "image checksum",
         "`--continue-after-rejection`",
     ),
     ROOT / "h5policy/docs/H5PolicyProfile.md": (
         "cached entry bodies",
         "shadowed",
-        "unshadowed",
-        "exit `5`",
-        "`unsupported_coverage_gap`",
-        "`H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`",
+        "in-memory read overlay",
+        "exit\n`0`",
+        "`accept`",
         "`analysis.complete`",
         "`analysis.walk_completed`",
-        '`analysis.stop_reason` is `"rejection"`',
-        '`analysis.stop_reason` is `"cache_image_coverage_gap"`',
+        "image checksum",
         "`--continue-after-rejection`",
     ),
     ROOT / "h5policy/docs/README.md": (
         "cached entry bodies",
         "shadowed",
-        "unshadowed",
-        "exit `5`",
-        "`unsupported_coverage_gap`",
-        "`H5_UNSUPPORTED_PICKLE_COVERAGE_GAP`",
+        "in-memory read overlay",
+        "exit `0`",
+        "`accept`",
         "`analysis.complete`",
         "`analysis.walk_completed`",
-        '`analysis.stop_reason: "cache_image_coverage_gap"`',
-        '`"rejection"`',
+        "image checksum",
         "`--continue-after-rejection`",
     ),
 }
@@ -128,9 +122,9 @@ def run_h5policy(profile: str, continue_after_rejection: bool = False) -> dict:
     except subprocess.TimeoutExpired:
         fail(f"{profile} cache-image run exceeded 30 seconds")
 
-    if result.returncode != 5:
+    if result.returncode != 0:
         fail(
-            f"{profile} cache-image run exited {result.returncode}, expected 5\n"
+            f"{profile} cache-image run exited {result.returncode}, expected 0\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
     try:
@@ -143,17 +137,16 @@ def check_report(
     report: dict,
     label: str,
     expected_continue: bool,
-    expected_stop_reason: str,
 ) -> None:
-    if report.get("decision") != "unsupported_coverage_gap":
+    if report.get("decision") != "accept":
         fail(f"{label}: decision={report.get('decision')!r}")
 
     analysis = report.get("analysis", {})
     expected_analysis = {
-        "complete": False,
+        "complete": True,
         "walk_started": True,
-        "walk_completed": False,
-        "stop_reason": expected_stop_reason,
+        "walk_completed": True,
+        "stop_reason": "",
         "continue_after_rejection": expected_continue,
         "findings_truncated": False,
     }
@@ -165,15 +158,8 @@ def check_report(
             )
 
     findings = report.get("findings", [])
-    matches = [
-        finding
-        for finding in findings
-        if finding.get("code") == "H5_UNSUPPORTED_PICKLE_COVERAGE_GAP"
-        and finding.get("message")
-        == "metadata cache image contents are not decoded by Phase 2"
-    ]
-    if len(matches) != 1:
-        fail(f"{label}: expected one canonical cache-image coverage finding")
+    if findings:
+        fail(f"{label}: valid cache image emitted findings: {findings!r}")
 
 
 def main() -> int:
@@ -185,16 +171,13 @@ def main() -> int:
 
     for profile in ("legacy", "trusted-fast", "untrusted-strict", "forensic"):
         continued = profile == "forensic"
-        stop_reason = "cache_image_coverage_gap" if continued else "rejection"
-        report = run_h5policy(profile)
-        check_report(report, profile, continued, stop_reason)
+        check_report(run_h5policy(profile), profile, continued)
 
     report = run_h5policy("untrusted-strict", continue_after_rejection=True)
     check_report(
         report,
         "untrusted-strict with continuation",
         expected_continue=True,
-        expected_stop_reason="cache_image_coverage_gap",
     )
 
     print("CACHE-IMAGE DOC CHECK OK: docs match all profile reports")
