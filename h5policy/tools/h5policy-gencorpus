@@ -987,6 +987,10 @@ def _gen_malformed(root):
     _make_root_object_not_group(
         f"{root}/malformed/root_object_not_group.h5")
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
+    _make_dtype_float_normalization(
+        f"{root}/malformed/bad_dtype_float_normalization.h5")
+    _make_dtype_opaque_tag_unaligned(
+        f"{root}/malformed/bad_dtype_opaque_tag_unaligned.h5")
     _make_dtype_float_overlap(
         f"{root}/malformed/bad_dtype_float_overlap.h5")
     _make_dtype_duplicate_member_name(
@@ -4074,6 +4078,63 @@ def _patch_dtype_size(raw, header_byte, expect_size, new_size, what):
                            f"size {expect_size}, found {len(hits)}")
     struct.pack_into("<I", raw, hits[0] + 4, new_size)
     return hits[0]
+
+
+def _make_dtype_float_normalization(path):
+    """An IEEE double whose mantissa normalization field holds the reserved
+    encoding.
+
+    Normalization is a 2-bit field in the class flags with three defined values
+    -- none (0), MSB-set (1) and implied (2).  libhdf5 refuses the fourth
+    ("unknown floating-point normalization").  h5policy read the class flags for
+    the sign bit only and never looked at this field.
+
+    libhdf5 writes 2 (implied) for an IEEE double, so class-flag byte 0x20
+    becomes 0x30.  Nothing else moves: the field is two bits inside a byte the
+    message already has, so every offset behind it is untouched.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.zeros(4, dtype="<f8"),
+                                   track_times=False),
+        libver="earliest")
+    hits = [i for i in range(len(raw) - 16)
+            if raw[i] == 0x11 and struct.unpack_from("<I", raw, i + 4)[0] == 8]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one 8-byte float datatype, found {len(hits)}")
+    dt = hits[0]
+    if (raw[dt + 1] >> 4) & 0x03 != 2:
+        raise RuntimeError("expected the implied-normalization encoding")
+    raw[dt + 1] = (raw[dt + 1] & 0xCF) | 0x30
+    _patch(path, bytes(raw))
+
+
+def _make_dtype_opaque_tag_unaligned(path):
+    """An opaque datatype whose declared tag length is not a multiple of eight.
+
+    The tag is stored NUL-padded to an 8-byte boundary, so its length field is
+    always a multiple of 8, and libhdf5 refuses any other value ("opaque flag
+    field must be aligned").  h5policy used the field to size the tag but never
+    checked it.
+
+    libhdf5 writes tag "tag" as length 8 -- three characters, a terminator and
+    four bytes of padding -- so dropping the declared length to 7 breaks the
+    rule while leaving the tag bytes themselves in place.
+    """
+    def build(h):
+        tid = h5py.h5t.create(h5py.h5t.OPAQUE, 4)
+        tid.set_tag(b"tag")
+        sid = h5py.h5s.create_simple((2,))
+        h5py.h5d.create(h.id, b"o", tid, sid)
+
+    raw = _base_bytes(build, libver="earliest")
+    hits = [i for i in range(len(raw) - 16)
+            if raw[i] == 0x15 and raw[i + 1] == 8
+            and struct.unpack_from("<I", raw, i + 4)[0] == 4
+            and raw[i + 8:i + 12] == b"tag\x00"]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one opaque datatype, found {len(hits)}")
+    raw[hits[0] + 1] = 7
+    _patch(path, bytes(raw))
 
 
 def _make_dtype_float_overlap(path):
