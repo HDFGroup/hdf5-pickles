@@ -987,6 +987,8 @@ def _gen_malformed(root):
     _make_root_object_not_group(
         f"{root}/malformed/root_object_not_group.h5")
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
+    _make_dtype_float_overlap(
+        f"{root}/malformed/bad_dtype_float_overlap.h5")
     _make_dtype_duplicate_member_name(
         f"{root}/malformed/bad_dtype_duplicate_member_name.h5")
     _make_nul_compact_link_name(
@@ -4072,6 +4074,45 @@ def _patch_dtype_size(raw, header_byte, expect_size, new_size, what):
                            f"size {expect_size}, found {len(hits)}")
     struct.pack_into("<I", raw, hits[0] + 4, new_size)
     return hits[0]
+
+
+def _make_dtype_float_overlap(path):
+    """An IEEE double whose exponent range is shifted up by one bit so that it
+    covers the sign bit.
+
+    libhdf5 requires the sign, exponent and mantissa to describe disjoint bit
+    ranges and refuses any overlapping pair ("exponent and sign positions
+    overlap").  h5policy bounds-checked each range against the storage size but
+    never compared them, so an overlapping type was accepted.
+
+    Overlap is not a range error, which is what makes it worth its own check:
+    every field here is individually in bounds.  It makes the datatype
+    self-contradictory -- bit 63 would have to be read as both the sign and the
+    top exponent bit -- so no two consumers can agree on the value.
+
+    libhdf5 writes epos 52, esize 11, mpos 0, msize 52 and sign 63 for a
+    little-endian double.  Raising epos to 53 puts the exponent at bits 53..63,
+    which still fits the 64-bit storage (esize 11 == 64 - 53, the exact bound)
+    and still clears the mantissa at bits 0..51 -- so exactly one of the three
+    pairs overlaps and the fixture isolates it.  Written at the earliest bound:
+    a version-1 object header has no checksum to repair.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.zeros(4, dtype="<f8"),
+                                   track_times=False),
+        libver="earliest")
+    # v1 datatype message: class/version byte 0x11 (version 1, class 1) then
+    # three class-flag bytes and the 4-byte element size.
+    hits = [i for i in range(len(raw) - 16)
+            if raw[i] == 0x11 and struct.unpack_from("<I", raw, i + 4)[0] == 8]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one 8-byte float datatype, found {len(hits)}")
+    dt = hits[0]
+    if (raw[dt + 2], raw[dt + 12], raw[dt + 13], raw[dt + 14], raw[dt + 15]) \
+            != (63, 52, 11, 0, 52):
+        raise RuntimeError("unexpected IEEE double bit layout")
+    raw[dt + 12] = 53                       # exponent position 52 -> 53
+    _patch(path, bytes(raw))
 
 
 def _v1_attr_message(raw, name):
