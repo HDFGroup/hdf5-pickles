@@ -632,6 +632,17 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
             var num = (flags .>> 8) & 0xffffUL;
             var m = 0UL;
 
+            /* Member names seen in THIS compound, for the duplicate check
+               below.  These are locals, so a nested compound gets its own set
+               and never sees its parent's names -- which is right, because each
+               compound is a separate namespace.  Hash first, byte-compare only
+               on a hash-and-length match: a hash collision must never by itself
+               reject a valid file, and comparing every pair outright would be
+               quadratic in a member count an attacker controls.  */
+            var seen_hash = uint<64>[]();
+            var seen_off = uint<64>[]();
+            var seen_len = uint<64>[]();
+
             if (num == 0UL)
                 h5policy_emit_error("H5_CORRUPT_DATATYPE_ZERO_MEMBERS",
                                     "corrupt", blob_off, object,
@@ -639,8 +650,9 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
 
             while (m < num)
                 {
+                    var name_off = blob_off + used#B;
                     var nlen = h5policy_dtype_name_len(ios, profile,
-                                                       blob_off + used#B,
+                                                       name_off,
                                                        avail - used);
                     var adv = (version == 1UL || version == 2UL)
                               ? h5policy_round_up_8(nlen + 1UL)
@@ -648,6 +660,64 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
                     if (!h5policy_dtype_room(adv, avail, used, blob_off, object))
                         return 0UL;
                     used = used + adv;
+
+                    /* libhdf5 strcmps each new field name against every name
+                       already decoded and refuses the datatype on a match
+                       (H5Odtype.c, "duplicated compound field name").  Two
+                       members sharing a name make the type ambiguous: a
+                       by-name lookup resolves to the first while a by-index
+                       walk sees both, so readers disagree about which bytes
+                       the field denotes.  Empty names participate -- strcmp
+                       matches "" against "" -- so nlen 0 is not skipped.  */
+                    var name_hash =
+                        lookup3_hashlittle(h5policy_msg_bytes(ios, profile,
+                                                              name_off, nlen))
+                        as uint<64>;
+                    /* The scan below is linear in the members already seen, so
+                       a wide compound costs quadratic work overall.  Array
+                       indexing ticks nothing by itself, so charge the whole
+                       scan to the operation budget up front: an unbudgeted
+                       quadratic over a member count the file controls is
+                       exactly the shape this validator must not leave open.
+                       A 64 KB message -- libhdf5's own ceiling on one object
+                       header message -- holds about 3250 minimal members, so
+                       the worst case costs roughly 5M operations against the
+                       strict profile's 10M.  */
+                    h5policy_walk_tick(seen_hash'length + 1UL);
+                    var k = 0UL;
+                    var duplicate = 0;
+                    while (k < seen_hash'length)
+                        {
+                            if (seen_hash[k] == name_hash
+                                && seen_len[k] == nlen
+                                && h5policy_msg_bytes(ios, profile, name_off,
+                                                      nlen)
+                                   == h5policy_msg_bytes(ios, profile,
+                                                         seen_off[k]#B, nlen))
+                                {
+                                    duplicate = 1;
+                                    break;
+                                }
+                            k = k + 1UL;
+                        }
+                    if (duplicate)
+                        h5policy_emit_error_ev(
+                            "H5_CORRUPT_DATATYPE_DUPLICATE_MEMBER_NAME",
+                            "corrupt", name_off, object,
+                            "compound datatype repeats a member name",
+                            H5Evidence {
+                                field = "datatype.member_name_unique",
+                                actual = m,
+                                expected = k,
+                                comparison = "not_equal",
+                                has_loc1 = 1, loc1_role = "actual",
+                                loc1 = name_off, loc1_len = nlen,
+                                has_loc2 = 1, loc2_role = "expected",
+                                loc2 = seen_off[k]#B, loc2_len = nlen,
+                            });
+                    seen_hash += [name_hash];
+                    seen_off += [name_off/#B];
+                    seen_len += [nlen];
 
                     var off_w = version >= 3UL
                                 ? h5policy_v3_memb_off_size(elm_size)

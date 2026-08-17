@@ -987,6 +987,8 @@ def _gen_malformed(root):
     _make_root_object_not_group(
         f"{root}/malformed/root_object_not_group.h5")
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
+    _make_dtype_duplicate_member_name(
+        f"{root}/malformed/bad_dtype_duplicate_member_name.h5")
     _make_nul_compact_link_name(
         f"{root}/malformed/nul_compact_link_name.h5")
     _make_compound_member_array_nelem_overflow(
@@ -1172,6 +1174,13 @@ def _gen_malformed(root):
     _make_overflowing_efl_segment(
         f"{root}/malformed/overflowing_efl_segment.h5",
         f"{root}/policy/external_storage.h5")
+    _make_efl_name_empty(
+        f"{root}/malformed/bad_efl_name_empty.h5",
+        f"{root}/policy/external_storage.h5")
+    _make_attr_name_size_one(
+        f"{root}/malformed/bad_attr_name_size_one.h5")
+    _make_attr_name_embedded_nul(
+        f"{root}/malformed/bad_attr_name_embedded_nul.h5")
     _make_bad_dataset_storage_overflow(
         f"{root}/malformed/bad_dataset_storage_overflow.h5")
     _make_bad_ext_address(f"{root}/malformed/bad_ext_address.h5")
@@ -1432,6 +1441,35 @@ def _make_bad_group_btree_child_address(path, base_path):
     len_size = raw[14]
     child0 = tree + 8 + (2 * off_size) + len_size
     struct.pack_into("<Q", raw, child0, 0x2000_0000_0000_0430)
+    _patch(path, bytes(raw))
+
+
+def _make_dtype_duplicate_member_name(path):
+    """A compound datatype whose two members share the name "aa".
+
+    libhdf5 strcmps each new field name against every name already decoded and
+    refuses the datatype on a match ("duplicated compound field name").  The
+    type is genuinely ambiguous: a by-name lookup resolves to the first member
+    while a by-index walk sees both, so two readers disagree about which four
+    bytes the field denotes -- with no size or offset anywhere out of range, so
+    nothing else in the message looks wrong.
+
+    numpy will not build a dtype with repeated field names, so the file is
+    written with "aa" and "bb" and the second name is overwritten afterwards.
+    The two names are the same length, which is the point: every offset, size
+    and nested type behind the name is untouched, leaving the collision as the
+    only defect.  Written at the earliest bound so the datatype sits in a
+    version-1 object header with no checksum to repair.
+    """
+    dt = np.dtype([("aa", "<i4"), ("bb", "<i4")])
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.zeros(2, dtype=dt),
+                                   track_times=False),
+        libver="earliest")
+    if raw.count(b"aa\x00") != 1 or raw.count(b"bb\x00") != 1:
+        raise RuntimeError("compound member names are not uniquely locatable")
+    i = raw.find(b"bb\x00")
+    raw[i:i + 3] = b"aa\x00"
     _patch(path, bytes(raw))
 
 
@@ -3919,6 +3957,87 @@ def _patch_dtype_size(raw, header_byte, expect_size, new_size, what):
     return hits[0]
 
 
+def _v1_attr_message(raw, name):
+    """Locate the version-1 attribute message named ``name`` in a version-1
+    object header, returning its payload offset.
+
+    Version-1 object headers carry no signature and no checksum, so this matches
+    on the message the way ``_v1_pline_message`` does: a v1 message header is
+    type(2) size(2) flags(1) reserved(3), and a v1 attribute body opens with
+    version 1, a reserved zero byte, and the name/type/space sizes.  Requiring
+    the stored name to equal ``name`` makes the match exact.
+    """
+    want = name.encode() + b"\x00"
+    for p in range(len(raw) - 16):
+        if raw[p] != 0x0C or raw[p + 1] != 0x00:
+            continue
+        if raw[p + 5:p + 8] != b"\x00\x00\x00":
+            continue
+        msize = struct.unpack_from("<H", raw, p + 2)[0]
+        mbody = p + 8
+        if msize < 16 or mbody + msize > len(raw):
+            continue
+        if raw[mbody] != 1 or raw[mbody + 1] != 0:
+            continue
+        if struct.unpack_from("<H", raw, mbody + 2)[0] != len(want):
+            continue
+        if raw[mbody + 8:mbody + 8 + len(want)] != want:
+            continue
+        return mbody
+    raise RuntimeError(f"could not locate a version-1 attribute message for {name!r}")
+
+
+def _make_attr_name_size_one(path):
+    """An attribute declaring a name length of 1: room for the terminator alone.
+
+    name_size counts the terminating NUL, so 1 describes the empty string and
+    libhdf5 refuses it with the same test that catches 0 ("decoded name length
+    is invalid").  h5policy only rejected 0, so an attribute with a present but
+    empty name was accepted.
+
+    Version 1 is what makes this a one-field edit: it pads the stored name to an
+    eight-byte boundary, and 1 and 2 both round to 8, so the datatype and
+    dataspace behind the name stay exactly where they were.  Under version 2 or
+    3 the same patch would shift them and the fixture would be testing
+    truncation instead.  A version-1 object header also has no checksum to
+    repair.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("a", np.int32(1))
+    raw = _base_bytes(build, libver="earliest")
+    mbody = _v1_attr_message(raw, "a")
+    struct.pack_into("<H", raw, mbody + 2, 1)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_name_embedded_nul(path):
+    """An attribute whose name ends before its declared length.
+
+    libhdf5 copies name_size - 1 bytes, measures the copy and refuses the
+    message when it comes up short ("attribute name has different length than
+    stored length"), which is a test for an embedded NUL.  Here "abcd\\0"
+    becomes "a\\0cd\\0": the declared length still says 5, so the datatype and
+    dataspace stay at their original offsets and the message is structurally
+    intact -- a C-string consumer simply sees the attribute as "a" while a
+    length-driven one sees "a\\0cd".  Two readers disagree about which attribute
+    this is, and neither sees anything malformed.
+
+    Note the mutation is deliberately *not* placed in the final byte: libhdf5
+    never examines it, so a name running up to the declared length without a
+    terminator is something it accepts, and the check must accept it too.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("abcd", np.int32(1))
+    raw = _base_bytes(build, libver="earliest")
+    mbody = _v1_attr_message(raw, "abcd")
+    raw[mbody + 9] = 0
+    _patch(path, bytes(raw))
+
+
 def _make_attr_reference_size_under(path):
     """An attribute whose reference datatype declares a smaller element than
     the file's addresses actually occupy.
@@ -5392,6 +5511,21 @@ def _make_bad_efl_name_offset(path, base_path):
     _patch_efl(path, base_path,
                lambda raw, off: struct.pack_into("<Q", raw, off + 16,
                                                   0x1000))
+
+
+def _make_efl_name_empty(path, base_path):
+    """An EFL slot whose filename offset resolves to the empty string.
+
+    libhdf5 refuses a slot naming no file ("invalid external file name").
+    Offset 0 is used because a local heap conventionally holds the empty string
+    there, which makes this the shape a zeroed or never-initialised slot
+    actually takes -- but the rule libhdf5 enforces is about the *byte* at the
+    resolved offset, not the offset itself.  (Its explicit offset-0 test lives
+    three lines earlier inside #ifdef H5O_DEBUG and never runs in a release
+    build, so it is not what this exercises.)
+    """
+    _patch_efl(path, base_path,
+               lambda raw, off: struct.pack_into("<Q", raw, off + 16, 0))
 
 
 def _make_overflowing_efl_segment(path, base_path):

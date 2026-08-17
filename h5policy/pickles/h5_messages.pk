@@ -230,10 +230,22 @@ fun h5policy_validate_attribute_payload = (int ios,
                                  payload_off, object,
                                  "attribute count exceeds the selected profile limit");
 
-    if (name_size == 0UL)
-        h5policy_emit_error("H5_CORRUPT_ATTRIBUTE_NAME_EMPTY",
-                            "corrupt", payload_off, object,
-                            "attribute name is empty");
+    /* name_size counts the terminating NUL, so 1 describes the empty string and
+       0 describes nothing at all.  libhdf5 refuses both with one test
+       (H5Oattr.c, "decoded name length is invalid"), so an attribute whose name
+       is present but empty is as invalid as one with no name field at all.  */
+    if (name_size <= 1UL)
+        h5policy_emit_error_ev("H5_CORRUPT_ATTRIBUTE_NAME_EMPTY",
+                               "corrupt", payload_off + 2#B, object,
+                               "attribute name length leaves no room for a name",
+                               H5Evidence {
+                                   field = "attribute.name_size",
+                                   actual = name_size,
+                                   expected = 2UL,
+                                   comparison = "at_least",
+                                   has_loc1 = 1, loc1_role = "actual",
+                                   loc1 = payload_off + 2#B, loc1_len = 2UL,
+                               });
 
     var stored_name_size = version == 1UL ? align8(name_size) : name_size;
     /* Version 1 aligns the name/type/space payload sections; later versions use
@@ -261,6 +273,25 @@ fun h5policy_validate_attribute_payload = (int ios,
                                    payload_off, object,
                                    "attribute header/name/type/space overruns the message"))
         return ctx;
+
+    /* The name must fill its declared length exactly: libhdf5 copies name_size
+       - 1 bytes, measures the copy, and refuses the message when the result is
+       shorter than declared (H5Oattr.c, "attribute name has different length
+       than stored length").  That is a test for an *embedded* NUL, and the only
+       bytes it constrains are the first name_size - 1 -- the final byte is never
+       examined, so a name that runs right up to the declared length without a
+       terminator is something libhdf5 accepts and this must accept too.
+
+       An embedded NUL truncates the name for any consumer using C strings while
+       the declared length keeps the following datatype and dataspace at their
+       original offsets, so two readers disagree about the attribute's identity
+       without either seeing a malformed message.  */
+    if (name_size > 1UL
+        && h5policy_span_has_nul(ios, profile, payload_off + cur#B,
+                                 name_size - 1UL))
+        h5policy_emit_error("H5_CORRUPT_ATTRIBUTE_NAME_EMBEDDED_NUL",
+                            "corrupt", payload_off + cur#B, object,
+                            "attribute name ends before its declared length");
 
     var dtype_off = payload_off + (cur + stored_name_size)#B;
     var dspace_off = dtype_off + stored_dtype_size#B;
