@@ -169,6 +169,24 @@ def _base_bytes(build, libver="latest"):
         os.unlink(base)
 
 
+def _build_dynamic_filter(h):
+    """A chunked dataset whose pipeline is lz4 (32004), shuffle and gzip.
+
+    h5py has no high-level spelling for an unregistered filter ID, so the
+    pipeline is assembled through the property-list API.  H5Z_FLAG_OPTIONAL is
+    what lets libhdf5 encode a filter it cannot find: H5Z_find fails, the name
+    stays NULL, and the descriptor is written with a *present but zero*
+    name-length field -- the distinction this fixture exists to pin down.
+    """
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_chunk((4,))
+    dcpl.set_filter(32004, h5py.h5z.FLAG_OPTIONAL, (1, 2))  # lz4, unregistered
+    dcpl.set_shuffle()
+    dcpl.set_deflate(4)
+    sid = h5py.h5s.create_simple((8,))
+    h5py.h5d.create(h.id, b"d", h5py.h5t.NATIVE_INT32, sid, dcpl=dcpl)
+
+
 def _build_shared_attr(h):
     """A dataset `d` carrying an attribute whose datatype is the committed
     (shared) datatype `t`.  Shared by the valid fixture and the NUL-link-name
@@ -327,6 +345,18 @@ def _gen_valid(root):
            lambda h: h.create_dataset(
                "d", data=np.arange(100, dtype="i4").reshape(10, 10),
                chunks=(5, 5), scaleoffset=0))
+    # A well-formed version-2 pipeline led by a dynamically registered filter.
+    # Version 2 drops the name-length field only for filter IDs below
+    # H5Z_FILTER_RESERVED (256); every dynamic filter -- lz4 (32004) here, as
+    # blosc and zstd would be -- sits above it and keeps the field, so its
+    # descriptor header is eight bytes, not six.  The shuffle and gzip filters
+    # behind it are what make this a regression guard: assuming a flat six-byte
+    # v2 header reads cd_nelmts out of the flags field and shifts every
+    # following descriptor, which silently loses the gzip decode advisory and
+    # invents a phantom filter ID 0.  The filter is declared optional so no
+    # plugin is needed to write it, and no data is written, so none is needed to
+    # read the file either.
+    _write(f"{root}/valid/dynamic_filter_pipeline.h5", _build_dynamic_filter)
     # A well-formed n-bit dataset with a compound datatype.  h5py cannot write
     # n-bit, so repack a normal compound dataset through libhdf5.  Accepted (with
     # the decode advisory); its cd_values type tree is consistent, so the n-bit
@@ -408,6 +438,8 @@ def _gen_policy(root):
     _write(f"{root}/policy/external_link_parent.h5",
            lambda h: h.__setitem__(
                "ext", h5py.ExternalLink("../elink_target.h5", "/secret")))
+    _make_unknown_message_skippable(
+        f"{root}/policy/unknown_message_skippable.h5")
     _write(f"{root}/policy/external_storage.h5",
            lambda h: h.create_dataset(
                "external", shape=(16,), dtype="u1",
@@ -441,6 +473,24 @@ def _gen_policy(root):
         layout[1:3, :] = source
         h.create_virtual_dataset("vds", layout)
     _write(f"{root}/policy/vds_hyperslab.h5", _vds_hyperslab)
+    # Global-heap collection rules.  A VDS is the only read-only open that loads
+    # a global heap, so these are the one place the collection walker is on the
+    # reachable graph rather than in the forensic sweep.
+    _make_vds_gheap_size_too_small(
+        f"{root}/malformed/bad_vds_gheap_size_too_small.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_gheap_free_zero_length(
+        f"{root}/malformed/bad_vds_gheap_free_zero_length.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_gheap_free_short(
+        f"{root}/malformed/bad_vds_gheap_free_short.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_gheap_free_unaligned(
+        f"{root}/malformed/bad_vds_gheap_free_unaligned.h5",
+        f"{root}/policy/vds_hyperslab.h5")
+    _make_vds_gheap_two_free_objects(
+        f"{root}/policy/vds_gheap_two_free_objects.h5",
+        f"{root}/policy/vds_hyperslab.h5")
     _make_vds_selection_rank_zero(
         f"{root}/malformed/vds_selection_rank_zero.h5",
         f"{root}/policy/vds_hyperslab.h5")
@@ -957,8 +1007,26 @@ def _gen_malformed(root):
     _make_root_object_not_group(
         f"{root}/malformed/root_object_not_group.h5")
     _make_bad_compound(f"{root}/malformed/bad_compound.h5")
+    _make_layout_chunk_ndims_one(
+        f"{root}/malformed/bad_layout_chunk_ndims_one.h5")
+    _make_fsinfo_page_size_over_max(
+        f"{root}/malformed/bad_fsinfo_page_size_over_max.h5")
+    _make_dtype_float_normalization(
+        f"{root}/malformed/bad_dtype_float_normalization.h5")
+    _make_dtype_opaque_tag_unaligned(
+        f"{root}/malformed/bad_dtype_opaque_tag_unaligned.h5")
+    _make_dtype_float_overlap(
+        f"{root}/malformed/bad_dtype_float_overlap.h5")
+    _make_dtype_duplicate_member_name(
+        f"{root}/malformed/bad_dtype_duplicate_member_name.h5")
     _make_nul_compact_link_name(
         f"{root}/malformed/nul_compact_link_name.h5")
+    _make_unknown_message_fail_always(
+        f"{root}/malformed/bad_unknown_message_fail_always.h5")
+    _make_link_reserved_flags(
+        f"{root}/malformed/bad_link_reserved_flags.h5")
+    _make_link_type_invalid(
+        f"{root}/malformed/bad_link_type_invalid.h5")
     _make_compound_member_array_nelem_overflow(
         f"{root}/malformed/compound_member_array_nelem_overflow.h5")
     _make_compound_member_array_bounds(
@@ -1111,6 +1179,10 @@ def _gen_malformed(root):
         f"{root}/malformed/contiguous_data_past_eof.h5")
     _make_bad_dataset_missing_layout(
         f"{root}/malformed/bad_dataset_missing_layout.h5")
+    _make_bad_group_missing_link_info(
+        f"{root}/malformed/bad_group_missing_link_info.h5")
+    _make_bad_group_missing_group_info(
+        f"{root}/malformed/bad_group_missing_group_info.h5")
     _make_bad_compact_layout_overrun(
         f"{root}/malformed/bad_compact_layout_overrun.h5")
     _make_bad_dataspace_trailing_bytes(
@@ -1142,13 +1214,31 @@ def _gen_malformed(root):
     _make_overflowing_efl_segment(
         f"{root}/malformed/overflowing_efl_segment.h5",
         f"{root}/policy/external_storage.h5")
+    _make_efl_name_empty(
+        f"{root}/malformed/bad_efl_name_empty.h5",
+        f"{root}/policy/external_storage.h5")
+    _make_attr_name_size_one(
+        f"{root}/malformed/bad_attr_name_size_one.h5")
+    _make_attr_name_embedded_nul(
+        f"{root}/malformed/bad_attr_name_embedded_nul.h5")
     _make_bad_dataset_storage_overflow(
         f"{root}/malformed/bad_dataset_storage_overflow.h5")
+    _make_superblock_v0_status_flags(
+        f"{root}/malformed/bad_superblock_v0_status_flags_high.h5",
+        0x00010000, "width")
+    _make_superblock_v0_status_flags(
+        f"{root}/malformed/bad_superblock_v0_status_flags_reserved.h5",
+        0x08, "reserved bits")
+    _make_superblock_v2_status_flags(
+        f"{root}/malformed/bad_superblock_v2_status_flags.h5")
     _make_bad_ext_address(f"{root}/malformed/bad_ext_address.h5")
     _make_bad_btree_key(f"{root}/malformed/bad_btree_key.h5")
     _make_bad_group_btree_child_address(
         f"{root}/malformed/bad_group_btree_child_address.h5",
         f"{root}/valid/old_style_group.h5")
+    _make_btree_v1_child_level(
+        f"{root}/malformed/bad_btree_v1_child_level.h5",
+        f"{root}/valid/chunked_v1_btree_deep.h5")
     _make_bad_group_btree_declared_size(
         f"{root}/malformed/bad_group_btree_declared_size.h5",
         f"{root}/valid/compact_layout.h5")
@@ -1244,6 +1334,18 @@ def _gen_malformed(root):
                              "BTLF")
     _make_bad_dense_checksum(f"{root}/malformed/bad_dense_btin_checksum.h5",
                              "BTIN")
+    _make_filter_name_length_unaligned(
+        f"{root}/malformed/bad_filter_name_length_unaligned.h5")
+    _make_filter_name_not_terminated(
+        f"{root}/malformed/bad_filter_name_not_terminated.h5")
+    _make_filter_count_over_format_max(
+        f"{root}/malformed/bad_filter_count_over_format_max.h5")
+    _make_ohdr_v1_message_unaligned(
+        f"{root}/malformed/bad_ohdr_v1_message_unaligned.h5")
+    _make_fill_v3_unknown_flags(
+        f"{root}/malformed/bad_fill_v3_unknown_flags.h5")
+    _make_fill_v3_flag_conflict(
+        f"{root}/malformed/bad_fill_v3_flag_conflict.h5")
 
 
 WRITER_RECORD = "CORPUS-WRITER.txt"
@@ -1392,6 +1494,69 @@ def _make_bad_group_btree_child_address(path, base_path):
     len_size = raw[14]
     child0 = tree + 8 + (2 * off_size) + len_size
     struct.pack_into("<Q", raw, child0, 0x2000_0000_0000_0430)
+    _patch(path, bytes(raw))
+
+
+def _make_btree_v1_child_level(path, base_path):
+    """A chunk v1 B-tree whose leaf declares a level three above its real one.
+
+    A v1 B-tree child must sit exactly one level below its parent, and libhdf5
+    threads the expected level into the cache load to enforce it ("level is not
+    as expected, possibly corrupted").  The guard was added after a forged level
+    segfaulted h5dump, and it first shipped in 2.0.0 -- so the 1.14.5 that h5py
+    links does not have it, and this registers as A+ with the h5dump (2.3.0)
+    tool evidence rather than A'.
+
+    The level is what tells a reader whether the entries after each key are
+    child pointers or chunk records, so a forged one makes the reader interpret
+    addresses as chunk offsets: node-type confusion, not a range error.  Nothing
+    else in the node changes -- the entry count, keys and pointers all stay
+    valid -- which is what leaves the parent/child relationship as the only
+    detectable defect.
+
+    The first type-1 leaf (level 0) is raised to level 3; its parent is at level
+    1 and therefore expects 0.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    i = raw.find(b"TREE")
+    target = None
+    while i != -1:
+        if raw[i + 4] == 1 and raw[i + 5] == 0:      # type 1 (chunk), leaf
+            target = i
+            break
+        i = raw.find(b"TREE", i + 1)
+    if target is None:
+        raise RuntimeError("could not locate a chunk v1 B-tree leaf node")
+    raw[target + 5] = 3
+    _patch(path, bytes(raw))
+
+
+def _make_dtype_duplicate_member_name(path):
+    """A compound datatype whose two members share the name "aa".
+
+    libhdf5 strcmps each new field name against every name already decoded and
+    refuses the datatype on a match ("duplicated compound field name").  The
+    type is genuinely ambiguous: a by-name lookup resolves to the first member
+    while a by-index walk sees both, so two readers disagree about which four
+    bytes the field denotes -- with no size or offset anywhere out of range, so
+    nothing else in the message looks wrong.
+
+    numpy will not build a dtype with repeated field names, so the file is
+    written with "aa" and "bb" and the second name is overwritten afterwards.
+    The two names are the same length, which is the point: every offset, size
+    and nested type behind the name is untouched, leaving the collision as the
+    only defect.  Written at the earliest bound so the datatype sits in a
+    version-1 object header with no checksum to repair.
+    """
+    dt = np.dtype([("aa", "<i4"), ("bb", "<i4")])
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.zeros(2, dtype=dt),
+                                   track_times=False),
+        libver="earliest")
+    if raw.count(b"aa\x00") != 1 or raw.count(b"bb\x00") != 1:
+        raise RuntimeError("compound member names are not uniquely locatable")
+    i = raw.find(b"bb\x00")
+    raw[i:i + 3] = b"aa\x00"
     _patch(path, bytes(raw))
 
 
@@ -1653,6 +1818,271 @@ def _make_scaleoffset_size_mismatch(path):
     driving the same out-of-bounds write.  h5policy rejects it because the
     declared element size disagrees with the dataset's datatype size."""
     _scaleoffset_cd_patch(path, 4, 131073)
+
+
+def _v1_object_header(raw, want_type):
+    """Locate a version-1 object header and one of its messages.
+
+    Version-1 headers have no signature, so match on the prefix shape --
+    version 1, a reserved zero byte, plausible message/link counts, a
+    four-byte zero pad -- and then require the message list to walk *exactly*
+    to the end of the chunk with every size already 8-aligned.  That last
+    condition is what makes the match trustworthy: random bytes will not
+    produce a self-consistent message list.
+
+    Returns ``(msg_off, msg_size)`` for the last message of type ``want_type``.
+    """
+    for o in range(len(raw) - 16):
+        if raw[o] != 1 or raw[o + 1] != 0:
+            continue
+        nmesgs = struct.unpack_from("<H", raw, o + 2)[0]
+        nlink = struct.unpack_from("<I", raw, o + 4)[0]
+        osize = struct.unpack_from("<I", raw, o + 8)[0]
+        if not (1 <= nmesgs <= 64 and 1 <= nlink <= 8 and 8 <= osize <= 65536):
+            continue
+        if struct.unpack_from("<I", raw, o + 12)[0] != 0:
+            continue
+        if o + 16 + osize > len(raw):
+            continue
+        p = o + 16
+        end = p + osize
+        found = None
+        seen = 0
+        while p < end - 3 and seen < nmesgs:
+            msize = struct.unpack_from("<H", raw, p + 2)[0]
+            if raw[p + 5:p + 8] != b"\x00\x00\x00" or msize % 8:
+                break
+            if struct.unpack_from("<H", raw, p)[0] == want_type:
+                found = (p, msize)
+            seen += 1
+            p = p + 8 + msize
+        if seen == nmesgs and p == end and found is not None:
+            return found
+    raise RuntimeError(
+        f"could not locate a version-1 object header message of type {want_type:#x}")
+
+
+def _make_ohdr_v1_message_unaligned(path):
+    """A version-1 object header whose last message declares an unaligned size.
+
+    Version 1 pads every message body to an 8-byte boundary, so the stored size
+    is always a multiple of 8, and libhdf5 refuses any other value while
+    deserializing the header ("message not aligned" -- the check added for
+    CVE-2018-17234, so it is present well before the 1.14.5 h5py links).
+    h5policy read the size only to bound the payload and never checked its
+    alignment.
+
+    The NIL message that pads out the header is the target, chosen because it
+    has no payload at all: dropping its size by one breaks the alignment rule
+    without disturbing any field a payload validator would look at, so the
+    fixture isolates the envelope rule from message semantics.  The lost byte
+    does leave a one-byte tail, which h5policy separately (and correctly)
+    reports as a null-message gap.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                                   track_times=False),
+        libver="earliest")
+    msg_off, msg_size = _v1_object_header(raw, 0x0000)   # H5O_NULL_ID
+    if msg_size < 16:
+        raise RuntimeError("NIL message is too small to shorten")
+    struct.pack_into("<H", raw, msg_off + 2, msg_size - 1)
+    _patch(path, bytes(raw))
+
+
+def _v1_pline_message(raw):
+    """Locate a version-1 filter-pipeline message inside a version-1 object header.
+
+    Version-1 object headers carry neither an OHDR signature nor a checksum, so
+    there is no anchor to walk from the way ``_v4_layout_message`` walks a v2
+    header -- and, usefully, nothing to repair after a patch.  Match on the
+    message instead: a v1 message header is type(2) size(2) flags(1)
+    reserved(3), and a v1 pipeline body opens with version 1, a nonzero filter
+    count, and six reserved zero bytes.  That is specific enough for the
+    single-dataset bases below.
+
+    Returns ``(mbody, msize)``: the payload offset and its declared size.
+    """
+    for p in range(len(raw) - 16):
+        if raw[p] != 0x0B or raw[p + 1] != 0x00:
+            continue
+        if raw[p + 5:p + 8] != b"\x00\x00\x00":
+            continue
+        msize = struct.unpack_from("<H", raw, p + 2)[0]
+        mbody = p + 8
+        if msize < 16 or mbody + msize > len(raw):
+            continue
+        if raw[mbody] != 1 or raw[mbody + 1] == 0:
+            continue
+        if raw[mbody + 2:mbody + 8] != b"\x00" * 6:
+            continue
+        return mbody, msize
+    raise RuntimeError("could not locate a version-1 filter-pipeline message")
+
+
+def _v1_gzip_pipeline(path, mutate):
+    """Write a chunked gzip dataset whose version-1 pipeline message ``mutate``
+    corrupts, as ``mutate(raw, mbody, msize)``.
+
+    Pinned to the earliest library bound because ``H5O_pline_ver_bounds`` picks
+    the version-1 pipeline encoding only there, and version 1 is the encoding
+    that pads the filter name and constrains its length.  gzip is used because
+    it is a registered filter, so libhdf5 writes a real "deflate\\0" name padded
+    to eight bytes -- exactly the field these fixtures corrupt.
+
+    The dataset is created but never written, so no chunk is ever allocated.
+    That keeps the defect in the pipeline *message*: a reader reaches the
+    corrupted descriptor while decoding the object header and never calls the
+    deflate filter itself, so the fixture cannot be confused with a
+    decompression failure over corrupted client data.
+    """
+    def build(h):
+        h.create_dataset("d", shape=(8,), dtype="i4", chunks=(4,),
+                         compression="gzip", track_times=False)
+    raw = _base_bytes(build, libver="earliest")
+    mbody, msize = _v1_pline_message(raw)
+    # Descriptor 0 follows the eight-byte v1 pipeline header, and its own header
+    # is id(2) name_length(2) flags(2) cd_nelmts(2).
+    if struct.unpack_from("<H", raw, mbody + 8)[0] != 1:
+        raise RuntimeError("expected the deflate filter in descriptor 0")
+    if struct.unpack_from("<H", raw, mbody + 10)[0] != 8:
+        raise RuntimeError('expected a name_length of 8 for "deflate\\0"')
+    mutate(raw, mbody, msize)
+    _patch(path, bytes(raw))
+
+
+def _make_filter_name_length_unaligned(path):
+    """A version-1 filter pipeline whose filter name length is not a multiple of
+    eight.
+
+    Version 1 pads the stored name out to an eight-byte boundary, and libhdf5
+    refuses any other length outright ("filter name length is not a multiple of
+    eight" in H5O__pline_decode).  Dropping the declared length from 8 to 7 --
+    the true length of "deflate" without its terminator -- is the smallest
+    change that violates it: the terminating NUL now sits one byte past the
+    declared name, still inside the message, so libhdf5's separate
+    NUL-termination scan is satisfied and this fixture isolates the alignment
+    rule on its own.
+    """
+    def mutate(raw, mbody, msize):
+        struct.pack_into("<H", raw, mbody + 10, 7)
+    _v1_gzip_pipeline(path, mutate)
+
+
+def _make_filter_name_not_terminated(path):
+    """A version-1 filter pipeline whose filter name has no terminating NUL.
+
+    libhdf5 locates the terminator with a strnlen bounded by the rest of the
+    *message*, not by the declared name length, and fails with "filter name not
+    null terminated" only when no NUL appears before the payload ends.  So the
+    fill has to run from the name all the way to the end of the message
+    payload -- overwriting just the eight name bytes would leave the NULs in the
+    client-data word behind it and libhdf5 would accept the file.  Everything
+    from the name to the message end therefore becomes 0xAA, which is also why
+    the base dataset holds no chunk: the mangled deflate client data is never
+    handed to the filter.
+    """
+    def mutate(raw, mbody, msize):
+        start = mbody + 16
+        end = mbody + msize
+        raw[start:end] = b"\xaa" * (end - start)
+    _v1_gzip_pipeline(path, mutate)
+
+
+def _make_filter_count_over_format_max(path):
+    """A filter pipeline declaring more filters than the format allows.
+
+    H5Z_MAX_NFILTERS (32) is a format-defined ceiling libhdf5 enforces
+    unconditionally in H5O__pline_decode, independent of any consumer budget --
+    which is what separates this from H5_RESOURCE_FILTER_COUNT, whose limit
+    comes from the selected profile and is satisfiable by loosening it.  The
+    declared count is raised to 33 while a single descriptor is actually
+    encoded, so a validator that only budgets filter counts accepts the file
+    under any profile permitting 33.
+    """
+    def mutate(raw, mbody, msize):
+        raw[mbody + 1] = 33
+    _v1_gzip_pipeline(path, mutate)
+
+
+def _v3_fill_message(raw):
+    """Locate the version-3 fill-value message in a v2 object header.
+
+    Returns ``(ohdr_off, mbody)`` so a caller can patch the message bytes and
+    then repair the header checksum with ``_fix_v2_ohdr_checksum``.
+    """
+    for o in range(len(raw) - 4):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        p = cur + size_w
+        end = cur + size_w + chunk0
+        while p < end - 3:
+            mtype = raw[p]
+            msize = struct.unpack_from("<H", raw, p + 1)[0]
+            mbody = p + 4 + (2 if flags & 0x04 else 0)
+            if mtype == 0x05 and raw[mbody] == 3:
+                return o, mbody
+            p = mbody + msize
+    raise RuntimeError("could not locate a version-3 fill-value message")
+
+
+def _make_fill_v3_flags(path, extra_bits):
+    """A dataset with an explicit fill value whose v3 flags gain ``extra_bits``.
+
+    The base message is what libhdf5 writes for ``fillvalue=7`` on an i4
+    dataset: version 3, HAVE_VALUE (0x20) set, UNDEFINED_VALUE (0x10) clear, the
+    two 2-bit time codes below them, and nothing above 0x3f.  Those three
+    properties are asserted rather than the literal flag byte, because the time
+    codes are a writer's choice and this fixture does not depend on them.
+
+    Only the flag byte changes, so the message stays exactly as long as it was
+    and the size and value bytes behind it remain well-formed -- the defect is
+    the flag combination alone.  The enclosing v2 object header is checksummed,
+    so it is repaired afterwards or libhdf5 rejects the file for the checksum
+    and the fixture proves nothing.
+    """
+    def build(h):
+        h.create_dataset("d", data=np.arange(8, dtype="i4"), fillvalue=7,
+                         track_times=False)
+    raw = _base_bytes(build)
+    ohdr, mbody = _v3_fill_message(raw)
+    flags = raw[mbody + 1]
+    if not flags & 0x20 or flags & 0x10 or flags & 0xC0:
+        raise RuntimeError(
+            f"unexpected base fill-value flags 0x{flags:02x}: expected "
+            "HAVE_VALUE set, UNDEFINED_VALUE clear, no undefined bits")
+    raw[mbody + 1] = flags | extra_bits
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_fill_v3_unknown_flags(path):
+    """A v3 fill-value message setting a flag bit the format does not define.
+
+    H5O_FILL_FLAGS_ALL is 0x3f -- two 2-bit time codes plus the undefined and
+    have-value bits -- and libhdf5 refuses anything above it ("unknown flag for
+    fill value message").  Bit 7 is set here; bit 6 would do equally well, and
+    they are the only two bits that can be wrong, since neither 2-bit time code
+    has a reserved encoding.
+    """
+    _make_fill_v3_flags(path, 0x80)
+
+
+def _make_fill_v3_flag_conflict(path):
+    """A v3 fill-value message claiming the value is both undefined and present.
+
+    UNDEFINED_VALUE (0x10) and HAVE_VALUE (0x20) are contradictory claims about
+    the same message and libhdf5 rejects the pair ("have value and undefined
+    value flags both set").  Setting 0x10 on a message that already has 0x20 is
+    the whole mutation: the size field and value bytes behind the flags are
+    untouched and still describe a perfectly good fill value, which is what
+    makes this a pure flag-semantics case rather than a truncation one.
+    """
+    _make_fill_v3_flags(path, 0x10)
 
 
 def _v4_layout_message(raw):
@@ -2301,6 +2731,149 @@ def _make_vds_selection_v2_rank_zero(path, base_path):
         struct.pack_into("<I", v2, 13, 0)
         return bytes(v2)
     _vds_rewrite_virtual_selection(path, base_path, rewrite)
+
+
+def _gcol_layout(raw):
+    """Locate the VDS global heap and walk its object list.
+
+    Returns (collection offset, declared collection size, [(offset, index,
+    length)]), walking the list the way H5HG__cache_heap_deserialize does: an
+    object at index 0 is the collection's free space and advances the cursor by
+    exactly its length, every other object by its header plus its 8-aligned
+    payload.
+    """
+    g = raw.find(b"GCOL")
+    if g < 0:
+        raise RuntimeError("no global heap collection in the base file")
+    if raw.find(b"GCOL", g + 1) >= 0:
+        raise RuntimeError("more than one global heap collection")
+    hdr = 16                                     # magic+version+reserved+size
+    coll = struct.unpack_from("<Q", raw, g + 8)[0]
+    objs, p, end = [], g + hdr, g + coll
+    while p < end and end - p >= hdr:
+        idx = struct.unpack_from("<H", raw, p)[0]
+        size = struct.unpack_from("<Q", raw, p + 8)[0]
+        objs.append((p, idx, size))
+        need = size if idx == 0 else hdr + ((size + 7) // 8) * 8
+        if need == 0:
+            break
+        p += need
+    return g, coll, objs
+
+
+def _gcol_free_object(raw):
+    """Offset of the explicit free-space object (heap index 0), which h5py
+    writes as the last object in the collection."""
+    _, _, objs = _gcol_layout(raw)
+    free = [o for o, idx, _ in objs if idx == 0]
+    if len(free) != 1:
+        raise RuntimeError(f"expected exactly one free-space object, got {len(free)}")
+    return free[0]
+
+
+def _vds_gcol_base(base_path):
+    raw = bytearray(open(base_path, "rb").read())
+    # create_virtual_dataset can't set track_times=False; pin the timestamps so
+    # these fixtures stay byte-reproducible.
+    _pin_ohdr_times(raw)
+    return raw
+
+
+def _make_vds_gheap_size_too_small(path, base_path):
+    """A VDS global heap declaring a collection smaller than H5HG_MINSIZE.
+
+    H5HG__hdr_deserialize refuses any collection below 4096 bytes before it
+    parses a single object -- the minimum is also the metadata cache's
+    speculative first read, so a smaller collection could not have been loaded
+    in one go anyway.  h5policy bounded the size only by the 16-byte header, so
+    every collection between 16 bytes and 4 KiB passed.
+
+    The declared size is dropped by 8 rather than to something tiny: it stays
+    8-aligned and still inside the file, so the minimum is the only rule broken.
+    """
+    raw = _vds_gcol_base(base_path)
+    g, coll, _ = _gcol_layout(raw)
+    struct.pack_into("<Q", raw, g + 8, coll - 8)
+    _patch(path, raw)
+
+
+def _make_vds_gheap_free_zero_length(path, base_path):
+    """A VDS global heap whose free-space object declares length zero.
+
+    For heap index 0 the parse advance IS the declared length, so libhdf5 never
+    moves its cursor and H5HG__cache_heap_deserialize spins forever.  This is
+    the shape the forensic sweep already reports on orphaned collections; what
+    this fixture pins down is that a VDS layout makes it reachable at H5Dopen,
+    where it is a hang rather than an anomaly -- and that h5policy accepted the
+    file, because it returned as soon as it had found the object the layout
+    named and never looked at the free-space object at all.
+    """
+    raw = _vds_gcol_base(base_path)
+    struct.pack_into("<Q", raw, _gcol_free_object(raw) + 8, 0)
+    _patch(path, raw)
+
+
+def _make_vds_gheap_free_short(path, base_path):
+    """A VDS global heap whose free-space object stops short of the collection.
+
+    Eight bytes of the collection are then left over -- too few to hold an
+    object header, so libhdf5 takes the remainder for the free-space object it
+    has already recorded and fails with "object 0 should not be set"
+    (H5HGcache.c:280).
+    """
+    raw = _vds_gcol_base(base_path)
+    free = _gcol_free_object(raw)
+    struct.pack_into("<Q", raw, free + 8,
+                     struct.unpack_from("<Q", raw, free + 8)[0] - 8)
+    _patch(path, raw)
+
+
+def _split_gcol_free_object(raw, first_len):
+    """Replace the single free-space object with two, the first ``first_len``
+    bytes long and the second covering the rest of the collection.
+
+    Two free-space objects are the only way to reach the post-parse alignment
+    rule: a single one that is misaligned also leaves a remainder, and the
+    "object 0 should not be set" check fires first.  With two, the first
+    object's (unaligned) length carries the cursor to an unaligned position and
+    the second closes the collection exactly, so the length libhdf5 finally
+    holds in obj[0] is the second one's.
+    """
+    g, coll, _ = _gcol_layout(raw)
+    free = _gcol_free_object(raw)
+    struct.pack_into("<H", raw, free, 0)
+    struct.pack_into("<Q", raw, free + 8, first_len)
+    second = free + first_len
+    struct.pack_into("<H", raw, second, 0)          # index 0
+    struct.pack_into("<H", raw, second + 2, 0)      # reference count
+    struct.pack_into("<I", raw, second + 4, 0)      # reserved
+    struct.pack_into("<Q", raw, second + 8, g + coll - second)
+
+
+def _make_vds_gheap_free_unaligned(path, base_path):
+    """A VDS global heap whose free-space object length is not 8-aligned.
+
+    H5HG_ISALIGNED(obj[0].size) is checked once, after the whole collection has
+    been parsed (H5HGcache.c:373).  Reaching it needs two free-space objects --
+    see _split_gcol_free_object -- with the first sized 15 so the second lands
+    on an odd length and still closes the collection exactly.
+    """
+    raw = _vds_gcol_base(base_path)
+    _split_gcol_free_object(raw, 15)
+    _patch(path, raw)
+
+
+def _make_vds_gheap_two_free_objects(path, base_path):
+    """The accept-side control for the two fixtures above.
+
+    Same two-free-space-object shape, but the first is sized 16 so both lengths
+    stay 8-aligned and the collection still closes exactly.  libhdf5 opens this
+    file, so h5policy must walk past the first free-space object -- which it
+    used to stop at -- without inventing a fault.
+    """
+    raw = _vds_gcol_base(base_path)
+    _split_gcol_free_object(raw, 16)
+    _patch(path, raw)
 
 
 def _make_vds_selection_rank_zero(path, base_path):
@@ -3684,6 +4257,248 @@ def _patch_dtype_size(raw, header_byte, expect_size, new_size, what):
     return hits[0]
 
 
+def _make_layout_chunk_ndims_one(path):
+    """A version-3 chunked layout declaring one dimension.
+
+    In layout versions 1 to 3 the trailing chunk dimension is the element size,
+    so a chunk needs at least one real dimension plus that one and libhdf5
+    refuses fewer ("bad dimensions for chunked storage").  h5policy rejected
+    only zero, so a one-dimensional chunked layout -- a chunk with no real
+    dimensions at all -- was accepted.
+
+    h5py writes a rank-1 chunked dataset as ndims 2 (one data dimension plus the
+    element size).  Dropping the field to 1 leaves the dimension list itself in
+    place, so the declared count is the only defect; the bytes behind it still
+    describe the chunk libhdf5 wrote.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", shape=(8,), dtype="i4", chunks=(4,),
+                                   track_times=False),
+        libver="earliest")
+    hits = []
+    for o in range(len(raw) - 8):
+        if raw[o] != 3 or raw[o + 1] != 2:      # layout version 3, class 2
+            continue
+        if raw[o + 2] != 2:                     # ndims as libhdf5 wrote it
+            continue
+        hits.append(o)
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one v3 chunked layout, found {len(hits)}")
+    raw[hits[0] + 2] = 1
+    _patch(path, bytes(raw))
+
+
+def _make_fsinfo_page_size_over_max(path):
+    """A file-space-info message whose page size exceeds the format maximum.
+
+    H5F_FILE_SPACE_PAGE_SIZE_MAX is 1 GiB and libhdf5 refuses anything above it
+    in the same test that rejects zero ("invalid page size in file space info").
+    h5policy checked only the zero half.
+
+    The fixture raises a real paged file's 4096-byte page size to 1 GiB + 1 --
+    one past the bound rather than absurdly large, so the case pins the boundary
+    rather than merely a big number.  The message lives in the superblock
+    extension's object header, whose checksum is repaired afterwards.
+    """
+    src = path + ".base"
+    _write_page_fsinfo(src, False, lambda h: h.create_dataset("d", data=[1, 2, 3]))
+    raw = bytearray(open(src, "rb").read())
+    os.unlink(src)
+    # v1 FSINFO payload: version(1) strategy(1) persist(1) threshold(8)
+    # page_size(8), so the page size sits 11 bytes into the payload.  Anchor on
+    # the value libhdf5 wrote and confirm the three bytes that open the payload:
+    # version 1, strategy 1 (page), persist 0.
+    want = struct.pack("<Q", 4096)
+    hits = [o for o in range(11, len(raw) - 8)
+            if raw[o:o + 8] == want
+            and raw[o - 11] == 1 and raw[o - 10] == 1 and raw[o - 9] == 0]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one v1 fsinfo page size, found {len(hits)}")
+    struct.pack_into("<Q", raw, hits[0], 1073741825)
+    ohdr = raw.rfind(b"OHDR", 0, hits[0])
+    if ohdr < 0:
+        raise RuntimeError("fsinfo message is not inside a v2 object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_dtype_float_normalization(path):
+    """An IEEE double whose mantissa normalization field holds the reserved
+    encoding.
+
+    Normalization is a 2-bit field in the class flags with three defined values
+    -- none (0), MSB-set (1) and implied (2).  libhdf5 refuses the fourth
+    ("unknown floating-point normalization").  h5policy read the class flags for
+    the sign bit only and never looked at this field.
+
+    libhdf5 writes 2 (implied) for an IEEE double, so class-flag byte 0x20
+    becomes 0x30.  Nothing else moves: the field is two bits inside a byte the
+    message already has, so every offset behind it is untouched.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.zeros(4, dtype="<f8"),
+                                   track_times=False),
+        libver="earliest")
+    hits = [i for i in range(len(raw) - 16)
+            if raw[i] == 0x11 and struct.unpack_from("<I", raw, i + 4)[0] == 8]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one 8-byte float datatype, found {len(hits)}")
+    dt = hits[0]
+    if (raw[dt + 1] >> 4) & 0x03 != 2:
+        raise RuntimeError("expected the implied-normalization encoding")
+    raw[dt + 1] = (raw[dt + 1] & 0xCF) | 0x30
+    _patch(path, bytes(raw))
+
+
+def _make_dtype_opaque_tag_unaligned(path):
+    """An opaque datatype whose declared tag length is not a multiple of eight.
+
+    The tag is stored NUL-padded to an 8-byte boundary, so its length field is
+    always a multiple of 8, and libhdf5 refuses any other value ("opaque flag
+    field must be aligned").  h5policy used the field to size the tag but never
+    checked it.
+
+    libhdf5 writes tag "tag" as length 8 -- three characters, a terminator and
+    four bytes of padding -- so dropping the declared length to 7 breaks the
+    rule while leaving the tag bytes themselves in place.
+    """
+    def build(h):
+        tid = h5py.h5t.create(h5py.h5t.OPAQUE, 4)
+        tid.set_tag(b"tag")
+        sid = h5py.h5s.create_simple((2,))
+        h5py.h5d.create(h.id, b"o", tid, sid)
+
+    raw = _base_bytes(build, libver="earliest")
+    hits = [i for i in range(len(raw) - 16)
+            if raw[i] == 0x15 and raw[i + 1] == 8
+            and struct.unpack_from("<I", raw, i + 4)[0] == 4
+            and raw[i + 8:i + 12] == b"tag\x00"]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one opaque datatype, found {len(hits)}")
+    raw[hits[0] + 1] = 7
+    _patch(path, bytes(raw))
+
+
+def _make_dtype_float_overlap(path):
+    """An IEEE double whose exponent range is shifted up by one bit so that it
+    covers the sign bit.
+
+    libhdf5 requires the sign, exponent and mantissa to describe disjoint bit
+    ranges and refuses any overlapping pair ("exponent and sign positions
+    overlap").  h5policy bounds-checked each range against the storage size but
+    never compared them, so an overlapping type was accepted.
+
+    Overlap is not a range error, which is what makes it worth its own check:
+    every field here is individually in bounds.  It makes the datatype
+    self-contradictory -- bit 63 would have to be read as both the sign and the
+    top exponent bit -- so no two consumers can agree on the value.
+
+    libhdf5 writes epos 52, esize 11, mpos 0, msize 52 and sign 63 for a
+    little-endian double.  Raising epos to 53 puts the exponent at bits 53..63,
+    which still fits the 64-bit storage (esize 11 == 64 - 53, the exact bound)
+    and still clears the mantissa at bits 0..51 -- so exactly one of the three
+    pairs overlaps and the fixture isolates it.  Written at the earliest bound:
+    a version-1 object header has no checksum to repair.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.zeros(4, dtype="<f8"),
+                                   track_times=False),
+        libver="earliest")
+    # v1 datatype message: class/version byte 0x11 (version 1, class 1) then
+    # three class-flag bytes and the 4-byte element size.
+    hits = [i for i in range(len(raw) - 16)
+            if raw[i] == 0x11 and struct.unpack_from("<I", raw, i + 4)[0] == 8]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one 8-byte float datatype, found {len(hits)}")
+    dt = hits[0]
+    if (raw[dt + 2], raw[dt + 12], raw[dt + 13], raw[dt + 14], raw[dt + 15]) \
+            != (63, 52, 11, 0, 52):
+        raise RuntimeError("unexpected IEEE double bit layout")
+    raw[dt + 12] = 53                       # exponent position 52 -> 53
+    _patch(path, bytes(raw))
+
+
+def _v1_attr_message(raw, name):
+    """Locate the version-1 attribute message named ``name`` in a version-1
+    object header, returning its payload offset.
+
+    Version-1 object headers carry no signature and no checksum, so this matches
+    on the message the way ``_v1_pline_message`` does: a v1 message header is
+    type(2) size(2) flags(1) reserved(3), and a v1 attribute body opens with
+    version 1, a reserved zero byte, and the name/type/space sizes.  Requiring
+    the stored name to equal ``name`` makes the match exact.
+    """
+    want = name.encode() + b"\x00"
+    for p in range(len(raw) - 16):
+        if raw[p] != 0x0C or raw[p + 1] != 0x00:
+            continue
+        if raw[p + 5:p + 8] != b"\x00\x00\x00":
+            continue
+        msize = struct.unpack_from("<H", raw, p + 2)[0]
+        mbody = p + 8
+        if msize < 16 or mbody + msize > len(raw):
+            continue
+        if raw[mbody] != 1 or raw[mbody + 1] != 0:
+            continue
+        if struct.unpack_from("<H", raw, mbody + 2)[0] != len(want):
+            continue
+        if raw[mbody + 8:mbody + 8 + len(want)] != want:
+            continue
+        return mbody
+    raise RuntimeError(f"could not locate a version-1 attribute message for {name!r}")
+
+
+def _make_attr_name_size_one(path):
+    """An attribute declaring a name length of 1: room for the terminator alone.
+
+    name_size counts the terminating NUL, so 1 describes the empty string and
+    libhdf5 refuses it with the same test that catches 0 ("decoded name length
+    is invalid").  h5policy only rejected 0, so an attribute with a present but
+    empty name was accepted.
+
+    Version 1 is what makes this a one-field edit: it pads the stored name to an
+    eight-byte boundary, and 1 and 2 both round to 8, so the datatype and
+    dataspace behind the name stay exactly where they were.  Under version 2 or
+    3 the same patch would shift them and the fixture would be testing
+    truncation instead.  A version-1 object header also has no checksum to
+    repair.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("a", np.int32(1))
+    raw = _base_bytes(build, libver="earliest")
+    mbody = _v1_attr_message(raw, "a")
+    struct.pack_into("<H", raw, mbody + 2, 1)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_name_embedded_nul(path):
+    """An attribute whose name ends before its declared length.
+
+    libhdf5 copies name_size - 1 bytes, measures the copy and refuses the
+    message when it comes up short ("attribute name has different length than
+    stored length"), which is a test for an embedded NUL.  Here "abcd\\0"
+    becomes "a\\0cd\\0": the declared length still says 5, so the datatype and
+    dataspace stay at their original offsets and the message is structurally
+    intact -- a C-string consumer simply sees the attribute as "a" while a
+    length-driven one sees "a\\0cd".  Two readers disagree about which attribute
+    this is, and neither sees anything malformed.
+
+    Note the mutation is deliberately *not* placed in the final byte: libhdf5
+    never examines it, so a name running up to the declared length without a
+    terminator is something it accepts, and the check must accept it too.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("abcd", np.int32(1))
+    raw = _base_bytes(build, libver="earliest")
+    mbody = _v1_attr_message(raw, "abcd")
+    raw[mbody + 9] = 0
+    _patch(path, bytes(raw))
+
+
 def _make_attr_reference_size_under(path):
     """An attribute whose reference datatype declares a smaller element than
     the file's addresses actually occupy.
@@ -4126,6 +4941,47 @@ def _make_gheap_infinite_loop(path, base_path):
     # Declared EOF must cover the appended collection for h5policy's ceiling.
     soff = raw[9]
     struct.pack_into("<Q", raw, 12 + 2 * soff, len(raw))
+    _fix_sb_checksum(raw)
+    _patch(path, bytes(raw))
+
+
+def _make_superblock_v0_status_flags(path, value, what):
+    """A version-0 superblock whose 32-bit consistency-flag field holds ``value``.
+
+    The field sits at offset 20: signature(8), version(1), the four
+    sub-version bytes, sizeof_offsets(1), sizeof_lengths(1), a reserved byte,
+    and the two 16-bit K values.  Version 0 and 1 superblocks carry no
+    checksum, so the patch stands alone.
+
+    ``what`` names which of libhdf5's two rules the value breaks -- see the two
+    callers below; they date differently, which is the reason they are separate
+    fixtures rather than one.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_group("g"), libver="earliest")
+    if raw[8] != 0:
+        raise RuntimeError("expected a version-0 superblock")
+    struct.pack_into("<I", raw, 20, value)
+    _patch(path, bytes(raw))
+
+
+def _make_superblock_v2_status_flags(path):
+    """A version-2 superblock whose status-flag byte sets a reserved bit.
+
+    libhdf5 applies one flag test to every version-2-and-later superblock
+    (H5Fsuper_cache.c, "bad flag value for superblock", present since 1.14.1),
+    but h5policy only checked version 3.  h5py writes version 0 or version 3
+    and never version 2, so the fixture downgrades a version-3 superblock: the
+    two versions have identical layout -- version 3 only adds meaning for the
+    SWMR flags -- so the byte edit is all that separates them.  The trailing
+    Jenkins checksum is recomputed, or the file would be rejected for the
+    checksum instead and the case would prove nothing.
+    """
+    raw = _base_bytes(lambda h: h.create_group("g"))
+    if raw[8] != 3:
+        raise RuntimeError("expected a version-3 superblock")
+    raw[8] = 2
+    raw[11] = 0x08                       # bit 3: outside H5F_SUPER_ALL_FLAGS
     _fix_sb_checksum(raw)
     _patch(path, bytes(raw))
 
@@ -4920,6 +5776,98 @@ def _make_bad_dataset_missing_layout(path):
     _patch(path, bytes(raw))
 
 
+def _zero_group_message(raw, m_type):
+    """Overwrite one message type byte with Null (0x00) in the non-root group's
+    v2 object header, and repair that header's checksum.
+
+    The base file for the group fixtures is a root group holding one subgroup
+    "g", so exactly two headers carry a link-info message and the root's address
+    is in the superblock; the other one is "g".  Each candidate header's stored
+    checksum is verified before it is edited, so incidental ``OHDR`` bytes are
+    never mistaken for a header."""
+    jenkins = _jenkins_lookup3()
+    root_addr = int.from_bytes(raw[12 + 3 * 8:12 + 4 * 8], "little")
+    pos = 0
+    while True:
+        ohdr = raw.find(b"OHDR", pos)
+        if ohdr < 0:
+            raise RuntimeError(f"could not locate a group holding message {m_type:#04x}")
+        pos = ohdr + 4
+        if ohdr == root_addr or raw[ohdr + 4] != 2:
+            continue
+        flags = raw[ohdr + 5]
+        cursor = ohdr + 6 + (16 if flags & (1 << 5) else 0) \
+            + (4 if flags & (1 << 4) else 0)
+        size_width = 1 << (flags & 3)
+        msg = cursor + size_width
+        end = msg + int.from_bytes(raw[cursor:cursor + size_width], "little")
+        if end + 4 > len(raw) or \
+                struct.unpack_from("<I", raw, end)[0] != jenkins(bytes(raw[ohdr:end])):
+            continue                              # incidental "OHDR" bytes
+        corder = 2 if (flags & (1 << 2)) else 0   # per-message creation order field
+        types = {}
+        while msg + 4 <= end:
+            types[raw[msg]] = msg
+            msg += 4 + corder + struct.unpack_from("<H", raw, msg + 1)[0]
+        if 0x02 not in types:                     # not a new-style group header
+            continue
+        if m_type not in types:
+            raise RuntimeError(f"group header carries no message {m_type:#04x}")
+        raw[types[m_type]] = 0x00
+        _fix_v2_ohdr_checksum(raw, ohdr)
+        return
+
+
+def _group_base_bytes():
+    """A new-style root group holding one subgroup "g" with one dataset.
+
+    Both group headers carry the link-info/group-info pair that the group
+    fixtures below remove one message from.  Nothing here tracks time, so the
+    bytes are reproducible without a timestamp fixup."""
+    raw = _base_bytes(
+        lambda h: h.create_group("g").create_dataset(
+            "d", data=np.arange(4, dtype="i4"), track_times=False))
+    assert raw[8] == 3 and raw[9] == 8, "expected a v3 superblock, 8-byte offsets"
+    return raw
+
+
+def _make_bad_group_missing_link_info(path):
+    """A new-style group whose Link Info message type byte is overwritten with
+    Null (0x02 -> 0x00), leaving the group-info and compact link messages with
+    nothing that says where the group's links live.
+
+    libhdf5 decides between the old and new group formats by asking whether the
+    link-info message exists (H5G__obj_get_linfo).  Without it every lookup,
+    iteration and info call takes the old-format branch and reads the
+    symbol-table message, which the header does not have either, so the
+    traversal aborts: h5dump reports an internal error, h5ls prints
+    ``**NOT FOUND**``, and h5py's visit raises "unable to determine object
+    type".  h5policy accepted the file until the finalize-time link-storage
+    check was added, which made this an invariant-A' false accept."""
+    raw = _group_base_bytes()
+    _zero_group_message(raw, 0x02)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_group_missing_group_info(path):
+    """A new-style group whose Group Info message type byte is overwritten with
+    Null (0x0a -> 0x00), so a group with a link-info message carries no
+    group-info message.
+
+    Unlike its link-info sibling, libhdf5 READS this file happily: H5G__obj_info,
+    H5G__obj_iterate and H5Gtraverse all guard the group-info read with
+    H5O_msg_exists and fall back to the default group creation properties, so
+    h5dump, h5ls and h5py traverse it without complaint.  The write direction is
+    where it breaks -- H5G__obj_insert reads the message unconditionally on the
+    new-format branch and fails with "can't get group info", so no link can ever
+    be added to the group.  The fixture therefore pins a WARNING: h5policy must
+    report the defect without claiming the bytes are corrupt, because refusing
+    what libhdf5 opens would be an invariant-A failure."""
+    raw = _group_base_bytes()
+    _zero_group_message(raw, 0x0a)
+    _patch(path, bytes(raw))
+
+
 def _make_bad_dataspace_trailing_bytes(path):
     """v1 dataspace message whose size is inflated so the following message
     prefix becomes nonzero trailing bytes.  Found by h5policy-fuzz; libhdf5
@@ -5060,6 +6008,129 @@ def _make_dataspace_nelem_overflow(path):
     _patch(path, bytes(raw))
 
 
+def _repurpose_root_nil_message(raw, m_type, m_flags):
+    """Turn the root v2 object header's trailing NIL message into a message of
+    type ``m_type`` carrying ``m_flags``, and re-seal the header checksum.
+
+    A NIL message is the one message with no payload semantics at all, so its
+    body can stand in for any message an unknown-ID reader will not decode.
+    Rewriting its two header bytes in place keeps every size and offset in the
+    header exactly as h5py wrote them, which is what isolates the message-type
+    and flag bytes as the only variables under test.
+    """
+    ohdr = raw.find(b"OHDR")
+    if ohdr < 0:
+        raise RuntimeError("root object header not found")
+
+    # Parse the v2 prefix to bound chunk 0: flags byte, optional times and
+    # phase-change values, then the chunk-0 size in 1 << (flags & 3) bytes.
+    flags = raw[ohdr + 5]
+    cursor = ohdr + 6
+    if flags & 0x20:
+        cursor += 16
+    if flags & 0x10:
+        cursor += 4
+    size_len = 1 << (flags & 0x03)
+    chunk0 = int.from_bytes(raw[cursor:cursor + size_len], "little")
+    cursor += size_len
+    end = cursor + chunk0
+
+    # Messages are (type, size, flags) then an optional 2-byte creation index.
+    while cursor < end:
+        mtype = raw[cursor]
+        msize = struct.unpack_from("<H", raw, cursor + 1)[0]
+        body = cursor + 4 + (2 if flags & 0x04 else 0)
+        if body + msize > end:
+            break
+        if mtype == 0x00:
+            raw[cursor] = m_type
+            raw[cursor + 3] = m_flags
+            _fix_v2_ohdr_checksum(raw, ohdr)
+            return cursor
+        cursor = body + msize
+    raise RuntimeError("no NIL message in the root object header")
+
+
+def _make_unknown_message_fail_always(path):
+    """Unknown object-header message ID carrying FAIL_IF_UNKNOWN_ALWAYS.
+
+    H5O__chunk_deserialize points any ID at or above H5O_UNKNOWN_ID (0x18) at
+    the "unknown" message class and carries on -- unknown IDs are the format's
+    forward-compatibility mechanism, not corruption.  Flag 0x80 is the one that
+    withdraws that permission unconditionally, so a reader that honours the
+    format still cannot load this header.  Flag 0x08 would withdraw it only for
+    a writer, which is why the two are not interchangeable.
+    """
+    raw = _base_bytes(lambda h: h.create_dataset("dset", data=np.arange(4)))
+    _repurpose_root_nil_message(raw, 0x30, 0x80)
+    _patch(path, bytes(raw))
+
+
+def _make_unknown_message_skippable(path):
+    """Unknown object-header message ID a read-only consumer may skip.
+
+    Same ID as the fail-always fixture with no flags set at all: libhdf5 opens
+    the file and reports the group's contents normally.  h5policy must not call
+    this corrupt -- rejecting it is a *policy* decision the unknown-message
+    feature toggle owns.  This is the accept-side control for the flag rule; the
+    pair is what keeps 0x80 from being read as "any flag" or "no flag".
+    """
+    raw = _base_bytes(lambda h: h.create_dataset("dset", data=np.arange(4)))
+    _repurpose_root_nil_message(raw, 0x30, 0x00)
+    _patch(path, bytes(raw))
+
+
+def _make_link_reserved_flags(path):
+    """Compact link message whose flags byte sets a bit above H5O_LINK_ALL_FLAGS.
+
+    Bits 0-4 are the whole defined set (name-length width, creation order, name
+    character set, link type); H5O__link_decode rejects anything else outright.
+    Bit 5 carries no layout meaning, so setting it shifts nothing that follows
+    and the flags byte is the only defect -- the enclosing v2 object-header
+    checksum is re-sealed so a checksum mismatch cannot stand in for it.
+    """
+    raw = _base_bytes(lambda h: h.create_dataset("dset", data=np.arange(4)))
+
+    # version 0x01, flags 0x00 (1-byte name length, hard link), name "dset".
+    off = raw.find(b"\x01\x00\x04dset")
+    if off < 0:
+        raise RuntimeError("could not locate the compact link payload")
+    raw[off + 1] |= 0x20
+
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate the containing object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_link_type_invalid(path):
+    """Link message naming a link type between the last hard-coded kind and the
+    user-defined range.
+
+    0 hard, 1 soft and 64 external are the only types libhdf5 knows; 64-255 is
+    the user-defined range a reader may decline rather than reject.  2-63 names
+    no link kind at all, so H5O__link_decode fails.  Demoting the external
+    link's type byte from 64 to 2 keeps every length intact, which is what makes
+    the pair sharp: the same bytes are a policy decision at 64 and a hard
+    corruption at 2.
+    """
+    raw = _base_bytes(
+        lambda h: h.__setitem__("ext", h5py.ExternalLink("other.h5", "/x")))
+
+    payload = b"\x01\x08\x40\x03ext\x0d\x00\x00other.h5\x00/x\x00"
+    off = raw.find(payload)
+    if off < 0:
+        raise RuntimeError("could not locate the external link payload")
+    raw[off + 2] = 0x02
+
+    ohdr = raw.rfind(b"OHDR", 0, off)
+    if ohdr < 0:
+        raise RuntimeError("could not locate the containing object header")
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
 def _make_bad_external_link_info(path):
     """External link whose user-data length is smaller than the minimum
     external-link encoding.  libhdf5 rejects this before link traversal policy
@@ -5157,6 +6228,21 @@ def _make_bad_efl_name_offset(path, base_path):
     _patch_efl(path, base_path,
                lambda raw, off: struct.pack_into("<Q", raw, off + 16,
                                                   0x1000))
+
+
+def _make_efl_name_empty(path, base_path):
+    """An EFL slot whose filename offset resolves to the empty string.
+
+    libhdf5 refuses a slot naming no file ("invalid external file name").
+    Offset 0 is used because a local heap conventionally holds the empty string
+    there, which makes this the shape a zeroed or never-initialised slot
+    actually takes -- but the rule libhdf5 enforces is about the *byte* at the
+    resolved offset, not the offset itself.  (Its explicit offset-0 test lives
+    three lines earlier inside #ifdef H5O_DEBUG and never runs in a release
+    build, so it is not what this exercises.)
+    """
+    _patch_efl(path, base_path,
+               lambda raw, off: struct.pack_into("<Q", raw, off + 16, 0))
 
 
 def _make_overflowing_efl_segment(path, base_path):

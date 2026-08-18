@@ -56,6 +56,22 @@ fun h5policy_validate_message_payload = (int ios,
                                                       shared_ref.msg_size,
                                                       object);
         }
+    /* Record the group-shape messages before dispatching.  Three of the four
+       validators below are void, so the flags cannot be set inside them, and
+       the symbol-table one returns a ctx of its own; setting them here keeps
+       the record in one place and makes it independent of whether a payload
+       validator bails out early.  h5policy_finalize_ohdr_dataset reads them
+       once the whole header -- continuation chunks included -- has been
+       walked.  */
+    if (m_type == 0x02UL)
+        ctx.has_link_info = 1UB;
+    else if (m_type == 0x06UL)
+        ctx.has_link_message = 1UB;
+    else if (m_type == 0x0aUL)
+        ctx.has_group_info = 1UB;
+    else if (m_type == 0x11UL)
+        ctx.has_symbol_table = 1UB;
+
     if (m_type == 0x01UL)
         {
             /* Dataspace is one of the four messages that form the dataset
@@ -298,12 +314,21 @@ fun h5policy_known_message_id = (uint<64> m_type) int:
     return 0;
 }
 
-/* Unknown message IDs are only forward-compatible when the prefix explicitly
-   says an older reader may skip them.  Otherwise an out-of-range ID is a
-   malformed object-header envelope, not a coverage gap or policy toggle.  */
+/* Unknown message IDs are forward-compatible by design: H5O__chunk_deserialize
+   points them at the "unknown" message class and carries on.  A reader is
+   obliged to refuse only when the prefix says so, and the two flags that say so
+   are not equivalent (H5Ocache.c):
+
+     H5O_MSG_FLAG_FAIL_IF_UNKNOWN_ALWAYS             0x80  reject unconditionally
+     H5O_MSG_FLAG_FAIL_IF_UNKNOWN_AND_OPEN_FOR_WRITE 0x08  reject only if RDWR
+
+   h5policy opens read-only, so 0x80 is exactly the set of headers libhdf5 will
+   not load for it: that bit alone decides corrupt-versus-skippable.  0x08 is a
+   real constraint on a *writer* and nothing a read-only consumer must refuse,
+   which is what the unknown-message policy toggle is for.  */
 fun h5policy_unknown_message_may_be_skipped = (uint<8> m_flags) int:
 {
-    return (m_flags & 0x08UB) != 0UB;
+    return (m_flags & 0x80UB) == 0UB;
 }
 
 /* Apply profile-level policy to a message class before payload validation.
@@ -342,7 +367,7 @@ fun h5policy_validate_message_policy_at = (uint<64> m_type,
                         h5policy_emit_error_ev(
                             "H5_CORRUPT_OBJECT_HEADER_MESSAGE_TYPE_RANGE",
                             "corrupt", loc, object,
-                            "object-header message type is out of range and is not marked skippable if unknown",
+                            "object-header message type is out of range and is marked fail-if-unknown-always",
                             H5Evidence {
                                 field = "object_header.message_type",
                                 actual = m_type, expected = 0x18UL,
@@ -354,7 +379,7 @@ fun h5policy_validate_message_policy_at = (uint<64> m_type,
                         h5policy_emit_error_ev(
                             "H5_CORRUPT_OBJECT_HEADER_MESSAGE_TYPE_RANGE",
                             "corrupt", loc, object,
-                            "object-header message type is out of range and is not marked skippable if unknown",
+                            "object-header message type is out of range and is marked fail-if-unknown-always",
                             H5Evidence {
                                 field = "object_header.message_type",
                                 actual = m_type, expected = 0x18UL,
@@ -532,6 +557,31 @@ fun h5policy_validate_msg_chunk = (int ios,
                     m_size = prefix.v2_msg_prefix.msg_size as uint<64>;
                     m_flags = prefix.v2_msg_prefix.msg_flags;
                 }
+
+            /* Version-1 object headers pad every message body out to an 8-byte
+               boundary, so the stored size is always a multiple of 8 and
+               libhdf5 refuses any other value outright (H5Ocache.c, "message
+               not aligned").  Version 2 dropped the padding and stores the
+               exact size, so no alignment rule applies there.
+
+               Checked ahead of the overrun test below because libhdf5 checks it
+               first: a size that is both misaligned and larger than the chunk
+               is reported as misaligned, and matching that order keeps the two
+               validators agreeing on which defect a doubly-corrupt message
+               has.  */
+            if (version == 1UB && (m_size % 8UL) != 0UL)
+                h5policy_emit_error_ev(
+                    "H5_CORRUPT_MESSAGE_SIZE_UNALIGNED",
+                    "corrupt", chunk_off + (i + 2UL)#B, object,
+                    "version 1 object-header message size is not a multiple of eight",
+                    H5Evidence {
+                        field = "envelope.message_size_alignment",
+                        actual = m_size,
+                        expected = 8UL,
+                        comparison = "multiple_of",
+                        has_loc1 = 1, loc1_role = "actual",
+                        loc1 = chunk_off + (i + 2UL)#B, loc1_len = 2UL,
+                    });
 
             var payload_off = chunk_off + i#B + (prefix_bytes as uint<64>)#B;
             var remaining = chunk_size - i - (prefix_bytes as uint<64>);

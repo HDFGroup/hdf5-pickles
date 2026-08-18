@@ -448,6 +448,27 @@ fun h5policy_validate_layout_payload = (int ios,
 
             var ndims = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 1UL);
             layout_class = h5policy_msg_u64_at(ios, profile, payload_off + 2#B, 1UL);
+
+            /* Chunked storage has a floor as well as a ceiling: in versions 1
+               to 3 the last chunk dimension is the element size, so a chunk
+               needs at least one real dimension plus that one.  libhdf5 refuses
+               fewer ("bad dimensions for chunked storage"); h5policy only
+               rejected zero, so a one-dimensional chunked layout -- a chunk
+               with no real dimensions at all -- was accepted.  The floor is
+               specific to chunked: contiguous and compact layouts in the same
+               versions are fine at ndims 1.  */
+            if (layout_class == 2UL && ndims == 1UL)
+                h5policy_emit_error_ev("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
+                                       "corrupt", payload_off + 1#B, object,
+                                       "chunked layout declares fewer than two dimensions",
+                                       H5Evidence {
+                                           field = "layout.chunk_dimensionality",
+                                           actual = ndims,
+                                           expected = 2UL,
+                                           comparison = "at_least",
+                                           has_loc1 = 1, loc1_role = "actual",
+                                           loc1 = payload_off + 1#B, loc1_len = 1UL,
+                                       });
             if (ndims == 0UL || ndims > H5O_LAYOUT_NDIMS)
                 h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
                                     "corrupt", payload_off + 1#B, object,
@@ -475,9 +496,11 @@ fun h5policy_validate_layout_payload = (int ios,
                                                     payload_off + 8#B, object,
                                                     "chunk B-tree address outside file");
                             else
+                                /* Entry node: no parent level to match. */
                                 ctx = h5policy_walk_chunk_btree(ios, profile, ctx,
                                                                 idx_addr, ndims,
-                                                                object, 0UL);
+                                                                object, 0UL,
+                                                                H5POLICY_BTREE_LEVEL_UNKNOWN);
                         }
                     var dims_rel = 8UL + (global_sizeof_offsets as uint<64>);
                     var dims_bytes = h5policy_checked_mul_u64(ndims, 4UL,
@@ -607,6 +630,24 @@ fun h5policy_validate_layout_payload = (int ios,
                         {
                             var ndims3 = h5policy_msg_u64_at(ios, profile,
                                                              payload_off + 2#B, 1UL);
+                            /* Same floor as v1/v2: the trailing dimension is
+                               the element size (H5Olayout.c, "bad dimensions
+                               for chunked storage").  Version 4 dropped that
+                               convention and stores the dataset rank directly,
+                               so it has no floor and none is applied there.  */
+                            if (ndims3 == 1UL)
+                                h5policy_emit_error_ev("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
+                                                       "corrupt", payload_off + 2#B, object,
+                                                       "chunked layout declares fewer than two dimensions",
+                                                       H5Evidence {
+                                                           field = "layout.chunk_dimensionality",
+                                                           actual = ndims3,
+                                                           expected = 2UL,
+                                                           comparison = "at_least",
+                                                           has_loc1 = 1, loc1_role = "actual",
+                                                           loc1 = payload_off + 2#B,
+                                                           loc1_len = 1UL,
+                                                       });
                             if (ndims3 == 0UL || ndims3 > H5O_LAYOUT_NDIMS)
                                 h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
                                                     "corrupt", payload_off + 2#B, object,
@@ -630,9 +671,11 @@ fun h5policy_validate_layout_payload = (int ios,
                                                             object,
                                                             "chunk B-tree address outside file");
                                     else
+                                        /* Entry node: no parent level to match. */
                                         ctx = h5policy_walk_chunk_btree(ios, profile, ctx,
                                                                         idx_addr3, ndims3,
-                                                                        object, 0UL);
+                                                                        object, 0UL,
+                                                                        H5POLICY_BTREE_LEVEL_UNKNOWN);
                                 }
                             var dims_rel3 = 3UL + (global_sizeof_offsets as uint<64>);
                             var dims_bytes3 = h5policy_checked_mul_u64(ndims3,
@@ -971,14 +1014,31 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
             return 0;
         }
 
+    /* Distinct from the profile budget above: H5Z_MAX_NFILTERS is a
+       format-defined ceiling libhdf5 enforces unconditionally
+       (H5Opline.c, "filter pipeline message has too many filters"), so a
+       profile permitting more filters must still refuse the file.  libhdf5
+       validates the version first, so this follows the dispatch above.  */
+    if (nfilters > 32UL)
+        h5policy_emit_error_ev("H5_CORRUPT_FILTER_PIPELINE_TOO_MANY_FILTERS",
+                               "corrupt", payload_off + 1#B, object,
+                               role + " filter pipeline declares more than the "
+                               + "32 filters the format permits",
+                               H5Evidence {
+                                   field = "filter_pipeline.nfilters",
+                                   actual = nfilters,
+                                   expected = 32UL,
+                                   comparison = "at_most",
+                                   has_loc1 = 1, loc1_role = "actual",
+                                   loc1 = payload_off + 1#B, loc1_len = 1UL,
+                               });
+
     var idx = 0UL;
     while (idx < nfilters)
         {
-            /* v1 descriptors include a padded filter name and align odd
-               client-data word counts; v2 removes the optional name.  */
-            var desc_header = version == 1UL ? 8UL : 6UL;
-
-            if (!h5policy_payload_range_ok(msg_size, cur, desc_header,
+            /* The filter ID decides the descriptor shape, so it is read under
+               its own bounds check before the rest of the header.  */
+            if (!h5policy_payload_range_ok(msg_size, cur, 2UL,
                                            "H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE",
                                            payload_off + cur#B, object,
                                            role + " filter descriptor overruns the pipeline message"))
@@ -986,13 +1046,28 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
 
             var filter_id = h5policy_msg_u64_at(ios, profile,
                                                 payload_off + cur#B, 2UL);
+
+            /* v1 always carries a name-length field and a padded name.  v2 only
+               omits them for filter IDs below H5Z_FILTER_RESERVED (256): every
+               dynamically registered filter -- blosc, zstd, lz4 and friends all
+               live above it -- still stores its name, so the header is 8 bytes
+               there too.  Assuming a flat 6 for v2 reads cd_nelmts out of the
+               flags field and shifts the whole descriptor.  */
+            var has_name = version == 1UL || filter_id >= 256UL;
+            var desc_header = has_name ? 8UL : 6UL;
+
+            if (!h5policy_payload_range_ok(msg_size, cur, desc_header,
+                                           "H5_CORRUPT_FILTER_PIPELINE_OVERRUNS_MESSAGE",
+                                           payload_off + cur#B, object,
+                                           role + " filter descriptor overruns the pipeline message"))
+                return 0;
+
             var name_len = 0UL;
             var cd_nelmts = 0UL;
 
             /* Descriptor headers give enough information to compute the full
-               descriptor extent before reading client data.  v1 includes an
-               optional filter name; v2 identifies filters only by ID.  */
-            if (version == 1UL)
+               descriptor extent before reading client data.  */
+            if (has_name)
                 {
                     name_len = h5policy_msg_u64_at(ios, profile,
                                                    payload_off + (cur + 2UL)#B,
@@ -1000,6 +1075,27 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                     cd_nelmts = h5policy_msg_u64_at(ios, profile,
                                                     payload_off + (cur + 6UL)#B,
                                                     2UL);
+
+                    /* v1 pads the stored name to an 8-byte boundary, and
+                       libhdf5 refuses any other length outright
+                       (H5Opline.c, "filter name length is not a multiple of
+                       eight").  v2 stores the exact length and has no such
+                       constraint.  */
+                    if (version == 1UL && (name_len % 8UL) != 0UL)
+                        h5policy_emit_error_ev(
+                            "H5_CORRUPT_FILTER_NAME_LENGTH_UNALIGNED",
+                            "corrupt", payload_off + (cur + 2UL)#B, object,
+                            role + " version 1 filter name length is not a "
+                            + "multiple of eight",
+                            H5Evidence {
+                                field = "filter.name_length",
+                                actual = name_len,
+                                expected = 8UL,
+                                comparison = "multiple_of",
+                                has_loc1 = 1, loc1_role = "actual",
+                                loc1 = payload_off + (cur + 2UL)#B,
+                                loc1_len = 2UL,
+                            });
                 }
             else
                 cd_nelmts = h5policy_msg_u64_at(ios, profile,
@@ -1074,6 +1170,42 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                                            payload_off + cur#B, object,
                                            role + " filter descriptor overruns the pipeline message"))
                 return 0;
+
+            /* libhdf5 finds the name's terminator with a strnlen bounded by the
+               rest of the *message*, not by name_len, and refuses the message
+               only when no NUL appears before the payload ends (H5Opline.c,
+               "filter name not null terminated").  Mirroring that bound exactly
+               keeps this a reject-parity check: a name left unterminated inside
+               its own name_len but terminated later in the message is something
+               libhdf5 accepts, so h5policy must accept it too.  Tightening to
+               name_len would be a stricter-than-libhdf5 rule and belongs in the
+               A+ track with its own evidence, not here.  */
+            if (name_len != 0UL)
+                {
+                    var scan_rel = cur + desc_header;
+                    /* Read the declared name first and only fall back to the
+                       rest of the payload if it holds no terminator.  The two
+                       spans together are exactly libhdf5's bound, but a
+                       well-formed name terminates inside the first one, so the
+                       common case reads name_len bytes instead of the whole
+                       message tail once per descriptor.  */
+                    var terminated =
+                        h5policy_span_has_nul(ios, profile,
+                                              payload_off + scan_rel#B,
+                                              name_len);
+                    if (!terminated)
+                        terminated =
+                            h5policy_span_has_nul(ios, profile,
+                                                  payload_off
+                                                  + (scan_rel + name_len)#B,
+                                                  msg_size - scan_rel - name_len);
+                    if (!terminated)
+                        h5policy_emit_error(
+                            "H5_CORRUPT_FILTER_NAME_NOT_TERMINATED",
+                            "corrupt", payload_off + scan_rel#B, object,
+                            role + " filter name is not NUL-terminated before "
+                            + "the end of the pipeline message");
+                }
 
             /* n-bit (5) and scale-offset (6) both store the chunk element count
                that libhdf5 auto-derives from the chunk dataspace in cd_values[2]
