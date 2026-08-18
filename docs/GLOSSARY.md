@@ -129,8 +129,8 @@ details.
 
 **Forensic profile**
 : The profile intended for bounded investigation: it continues reporting where
-  configured, never follows references, and does not materialize or activate
-  untrusted content.
+  configured, never follows external references, and does not materialize or
+  activate untrusted content.
 
 **Finding**
 : A stable, located report of a detected condition.  Findings distinguish
@@ -199,9 +199,10 @@ details.
   to evaluate a proposed fix or behavioral change.
 
 **Build identity**
-: The provenance that makes a probe result reproducible: the selected build's
-  version, linked library path, configuration, and `libhdf5.settings` hash, as
-  well as relevant toolchain information.
+: The portable provenance that identifies a probe build: its role (baseline or
+  candidate), version, linked-library soname, `settings_sha256`, build mode,
+  sanitizer list, and relevant toolchain information. Local install prefixes
+  select the build on a workstation but are not recorded in durable evidence.
 
 **Measured / source-derived / inferred / unmeasured**
 : Evidence labels required in CVE case work.  *Measured* comes from a recorded

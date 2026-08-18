@@ -356,7 +356,8 @@ the layout/index type, the counter is increased by:
 
 - an estimated chunk count for an implicit v4 index;
 - one for a defined single-chunk v4 layout;
-- one for an unsupported but defined chunk-index reference;
+- one for an unrecognized chunk-index reference before its structural
+  corruption decision takes precedence;
 - each leaf chunk reached in a v1 chunk B-tree;
 - a v2 chunk B-tree header's total record count;
 - a fixed-array header's element count; or
@@ -746,29 +747,31 @@ An object-header message ID outside the recognized range is always counted in
 `features.unknown_messages`.
 
 When the on-disk prefix flags are available, an out-of-range object-header
-message ID with the skip-if-unknown bit clear is treated as malformed envelope
-encoding, not as a policy or coverage choice. h5policy emits:
+message ID carrying `H5O_MSG_FLAG_FAIL_IF_UNKNOWN_ALWAYS` (`0x80`) is treated
+as malformed envelope encoding, not as a policy or coverage choice. h5policy
+emits:
 
 ```text
 H5_CORRUPT_OBJECT_HEADER_MESSAGE_TYPE_RANGE (corrupt)
 ```
 
-When the skip-if-unknown bit is set and this field is zero, h5policy emits:
+The distinct `H5O_MSG_FLAG_FAIL_IF_UNKNOWN_AND_OPEN_FOR_WRITE` flag (`0x08`)
+does not make the message malformed for h5policy's read-only analysis. If
+`0x80` is clear and this field is zero, h5policy emits:
 
 ```text
 H5_POLICY_UNKNOWN_MESSAGE (policy)
 ```
 
-When the skip-if-unknown bit is set and this field is nonzero, h5policy instead
-emits:
+If `0x80` is clear and this field is nonzero, h5policy instead emits:
 
 ```text
 H5_UNSUPPORTED_PICKLE_COVERAGE_GAP (unsupported)
 ```
 
 Thus, nonzero does not make an unknown message an unconditional accept; it only
-reclassifies a prefix-valid, skippable unknown message from denied-by-policy to
-not-covered-by-validator.
+reclassifies a prefix-valid unknown message that read-only `libhdf5` may skip
+from denied-by-policy to not-covered-by-validator.
 
 ### `allow_legacy_dangerous_messages`
 
@@ -825,7 +828,7 @@ CLI.
 | `max_accounted_metadata_bytes`, `max_object_count` | Equality, over-limit finding class, and saturating accumulation are covered directly through their accounting helpers. Reduced full-file cases saturate `metadata_bytes_seen` at the exact ceiling, including deep raw-data, SOHM type-7, and SOHM huge-object v2 B-tree cases that permit their roots but refuse and stop at a child-node charge. |
 | `max_attribute_count` | A valid synthetic attribute is parsed at and above a reduced cumulative limit. |
 | `max_object_header_chunks` | A synthetic continuation message covers equality, over-limit saturation, and the fact that its later structural finding is independent. A valid continuation-heavy object header crosses a reduced full-walk ceiling and saturates the reported counter without becoming corrupt. |
-| `max_chunk_count` | Defined chunk-index references cover equality, over-limit saturation, and the internal exact-versus-exceeded state. A valid four-chunk fixed-array dataset rejects as resource policy under a reduced ceiling. Separate legacy v1 cases cover exact equality and overflow within one leaf, plus a 130-chunk multi-level tree whose parent must continue at equality into a later child to prove overflow. In every rejecting case, `chunk_index_refs` saturates exactly at the selected limit. |
+| `max_chunk_count` | Synthetic opaque chunk-index references cover equality, over-limit saturation, and the internal exact-versus-exceeded state. A valid four-chunk fixed-array dataset rejects as resource policy under a reduced ceiling. Separate legacy v1 cases cover exact equality and overflow within one leaf, plus a 130-chunk multi-level tree whose parent must continue at equality into a later child to prove overflow. In every rejecting case, `chunk_index_refs` saturates exactly at the selected limit. |
 | `max_single_value_bytes` | Fill values cover equality, over-limit resource classification, and zero-as-disabled; separate valid datatype and attribute blobs cross the other two enforcement sites. A compact valid file isolates the attribute-value enforcement site during a full walk. |
 | `max_logical_dataset_bytes` | Synthetic dataset facts cover equality and saturation. `resource/huge_logical_dataset.h5` requires the resource finding, and the same file is accepted under legacy. |
 | Tiny logical chunks | Synthetic facts cover equality at both sub-thresholds, rejection when both strict comparisons pass, zero-byte disabling, and validation of the disabled pair. `resource/tiny_chunks.h5` supplies end-to-end coverage. |
@@ -837,7 +840,7 @@ CLI.
 | `max_filter_count` | A valid two-filter pipeline covers equality, resource classification, and continued descriptor parsing synthetically. The same shape is exercised end to end by a valid shuffle+gzip dataset: lowering only the filter ceiling retains both the decode advisory and all four chunk records. |
 | Metadata-ratio rules | Synthetic counters cover the strict absolute/percentage boundaries, warning behavior, reject behavior, and reject-over-warning precedence. Profile checks cover percentage bounds, disabled-rule floors, and warning/reject ordering. Full-walk cases separately require the warning and rejection decisions and verify rejection suppresses the advisory. |
 | `allow_external_links`, `allow_external_storage`, `allow_vds`, `allow_dynamic_filters` | Each zero/nonzero policy branch and feature counter is covered synthetically. External-link and EFL corpus cases also compare restrictive and permissive profiles; VDS has a permissive source-path corpus case. |
-| `allow_unknown_messages` | Synthetic message policy covers denied-as-policy and allowed-as-unsupported behavior. |
+| `allow_unknown_messages` | Synthetic checks cover denied-as-policy and allowed-as-unsupported behavior. Corpus fixtures separately pin a read-only-skippable unknown message and the corrupt `0x80` fail-if-unknown-always form. |
 | `allow_legacy_dangerous_messages` | Synthetic message policy covers both zero and nonzero behavior. |
 | Analysis controls | Unit checks cover independent mapping and continuation defaults plus CLI overrides. Integration cases isolate non-strict mapping from the other forensic controls and show that disabling the sweep suppresses an otherwise reachable orphaned-GCOL diagnostic. |
 | `max_walk_operations` | Unit checks cover the inclusive boundary, saturated metric, distinguished exception, zero rejection, and all four preset values. A dense-link full walk reaches the deterministic operation exception with the metric exactly saturated at the reduced ceiling and no time-budget finding. |

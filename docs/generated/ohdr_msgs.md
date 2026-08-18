@@ -25,8 +25,8 @@ preceded by a `msg_prefix`, whose layout differs between version 1 and
 version 2 headers. The message payload begins immediately after the
 prefix. Message type identifiers range from 0x0000 to 0x0018. The
 `message_factory` function dispatches a raw type ID and file offset to
-the appropriate typed struct. Unknown types are returned as raw byte
-arrays and are silently skipped.
+the appropriate typed struct. Unknown types are returned as bounded raw byte
+arrays; callers decide whether the message flags permit skipping them.
 
 Several messages exist in an "old" and a "new" versioned form:
 `oh_msg_old_fill` / `oh_msg_fill` and `oh_msg_old_mtime` /
@@ -100,9 +100,8 @@ Version 2 object header layout (identified by the 4-byte signature 'O' 'H' 'D' '
 | Flags | `flags` | Bit flags controlling optional fields and the encoding of `chunk0_size`. Bits 0–1: byte width of `chunk0_size`: 00 = 1 byte, 01 = 2 bytes, 10 = 4 bytes, 11 = 8 bytes. Bit 2: creation-order tracking is active — message prefixes include the optional `crt_order` field. Bit 3: a creation-order index (B-tree) is maintained for the attributes of this object. Bit 4: the `attr_phase` field is present. Bit 5: the `timestamps` field is present. |
 | Timestamps | `timestamps` | Optional creation and access timestamps (type `hdr_timestamps`). Present when `flags` bit 5 is set. _optional_ |
 | Attr Phase | `attr_phase` | Optional attribute phase-change thresholds (type `hdr_attr_phase`). Present when `flags` bit 4 is set. _optional_ |
-| Chunk0 Size | `chunk0_size` | Size in bytes of the message data in the first object header chunk. Encoded as 1, 2, 4, or 8 bytes according to `flags` bits 0–1. The message data immediately follows this field and is not itself part of the on-disk `oh_hdr` struct; it is accessed via the internal `_msg_chunk` wrapper. |
-| Gap | `gap` | Zero or more padding bytes between the last message and the checksum in the first chunk. Present only when the messages do not fill the chunk exactly (i.e. when `chunk0_size` is not divisible by the message prefix size). _optional_ |
-| Chksum | `chksum` | 4-byte Jenkins lookup3 checksum computed over all bytes of the object header from `signature` through the last byte of `gap` (or of the final message if there is no gap). |
+| Chunk0 Size | `chunk0_size` | Size in bytes of the message data in the first object header chunk. Encoded as 1, 2, 4, or 8 bytes according to `flags` bits 0–1. The message data immediately follows this field and is not itself part of the on-disk `oh_hdr` struct; it is accessed via the internal `_msg_chunk` wrapper. Any padding between the last message and the checksum is the trailing part of that same `chunk0_size`-byte region; `get_gap_size` derives its length instead of mapping a second on-disk field. |
+| Chksum | `chksum` | 4-byte Jenkins lookup3 checksum computed over all bytes of the object header from `signature` through the complete `chunk0_size`-byte message-and-padding region. |
 
 ### Version 1
 

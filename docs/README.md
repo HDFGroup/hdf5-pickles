@@ -58,7 +58,8 @@ against the implementation. The first-ten-minutes guide runs its inspection
 and policy commands and checks the canary inventory against its source
 mappings. The lazy-validation ratios are derived from the tracked measurement
 before its deterministic fields are reproduced. The Mermaid tool overview and
-Codespaces configuration retain their own structural checks:
+Codespaces configuration retain their own structural checks. Relative targets
+in tracked Markdown links are also checked, without fetching external URLs:
 
 ```sh
 cmake --build build --target docs-check
