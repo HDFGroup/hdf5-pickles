@@ -1179,6 +1179,10 @@ def _gen_malformed(root):
         f"{root}/malformed/contiguous_data_past_eof.h5")
     _make_bad_dataset_missing_layout(
         f"{root}/malformed/bad_dataset_missing_layout.h5")
+    _make_bad_group_missing_link_info(
+        f"{root}/malformed/bad_group_missing_link_info.h5")
+    _make_bad_group_missing_group_info(
+        f"{root}/malformed/bad_group_missing_group_info.h5")
     _make_bad_compact_layout_overrun(
         f"{root}/malformed/bad_compact_layout_overrun.h5")
     _make_bad_dataspace_trailing_bytes(
@@ -5769,6 +5773,98 @@ def _make_bad_dataset_missing_layout(path):
             break
     if not patched:
         raise RuntimeError("could not locate the data layout message")
+    _patch(path, bytes(raw))
+
+
+def _zero_group_message(raw, m_type):
+    """Overwrite one message type byte with Null (0x00) in the non-root group's
+    v2 object header, and repair that header's checksum.
+
+    The base file for the group fixtures is a root group holding one subgroup
+    "g", so exactly two headers carry a link-info message and the root's address
+    is in the superblock; the other one is "g".  Each candidate header's stored
+    checksum is verified before it is edited, so incidental ``OHDR`` bytes are
+    never mistaken for a header."""
+    jenkins = _jenkins_lookup3()
+    root_addr = int.from_bytes(raw[12 + 3 * 8:12 + 4 * 8], "little")
+    pos = 0
+    while True:
+        ohdr = raw.find(b"OHDR", pos)
+        if ohdr < 0:
+            raise RuntimeError(f"could not locate a group holding message {m_type:#04x}")
+        pos = ohdr + 4
+        if ohdr == root_addr or raw[ohdr + 4] != 2:
+            continue
+        flags = raw[ohdr + 5]
+        cursor = ohdr + 6 + (16 if flags & (1 << 5) else 0) \
+            + (4 if flags & (1 << 4) else 0)
+        size_width = 1 << (flags & 3)
+        msg = cursor + size_width
+        end = msg + int.from_bytes(raw[cursor:cursor + size_width], "little")
+        if end + 4 > len(raw) or \
+                struct.unpack_from("<I", raw, end)[0] != jenkins(bytes(raw[ohdr:end])):
+            continue                              # incidental "OHDR" bytes
+        corder = 2 if (flags & (1 << 2)) else 0   # per-message creation order field
+        types = {}
+        while msg + 4 <= end:
+            types[raw[msg]] = msg
+            msg += 4 + corder + struct.unpack_from("<H", raw, msg + 1)[0]
+        if 0x02 not in types:                     # not a new-style group header
+            continue
+        if m_type not in types:
+            raise RuntimeError(f"group header carries no message {m_type:#04x}")
+        raw[types[m_type]] = 0x00
+        _fix_v2_ohdr_checksum(raw, ohdr)
+        return
+
+
+def _group_base_bytes():
+    """A new-style root group holding one subgroup "g" with one dataset.
+
+    Both group headers carry the link-info/group-info pair that the group
+    fixtures below remove one message from.  Nothing here tracks time, so the
+    bytes are reproducible without a timestamp fixup."""
+    raw = _base_bytes(
+        lambda h: h.create_group("g").create_dataset(
+            "d", data=np.arange(4, dtype="i4"), track_times=False))
+    assert raw[8] == 3 and raw[9] == 8, "expected a v3 superblock, 8-byte offsets"
+    return raw
+
+
+def _make_bad_group_missing_link_info(path):
+    """A new-style group whose Link Info message type byte is overwritten with
+    Null (0x02 -> 0x00), leaving the group-info and compact link messages with
+    nothing that says where the group's links live.
+
+    libhdf5 decides between the old and new group formats by asking whether the
+    link-info message exists (H5G__obj_get_linfo).  Without it every lookup,
+    iteration and info call takes the old-format branch and reads the
+    symbol-table message, which the header does not have either, so the
+    traversal aborts: h5dump reports an internal error, h5ls prints
+    ``**NOT FOUND**``, and h5py's visit raises "unable to determine object
+    type".  h5policy accepted the file until the finalize-time link-storage
+    check was added, which made this an invariant-A' false accept."""
+    raw = _group_base_bytes()
+    _zero_group_message(raw, 0x02)
+    _patch(path, bytes(raw))
+
+
+def _make_bad_group_missing_group_info(path):
+    """A new-style group whose Group Info message type byte is overwritten with
+    Null (0x0a -> 0x00), so a group with a link-info message carries no
+    group-info message.
+
+    Unlike its link-info sibling, libhdf5 READS this file happily: H5G__obj_info,
+    H5G__obj_iterate and H5Gtraverse all guard the group-info read with
+    H5O_msg_exists and fall back to the default group creation properties, so
+    h5dump, h5ls and h5py traverse it without complaint.  The write direction is
+    where it breaks -- H5G__obj_insert reads the message unconditionally on the
+    new-format branch and fails with "can't get group info", so no link can ever
+    be added to the group.  The fixture therefore pins a WARNING: h5policy must
+    report the defect without claiming the bytes are corrupt, because refusing
+    what libhdf5 opens would be an invariant-A failure."""
+    raw = _group_base_bytes()
+    _zero_group_message(raw, 0x0a)
     _patch(path, bytes(raw))
 
 

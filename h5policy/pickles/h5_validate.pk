@@ -732,6 +732,63 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
         h5policy_emit_error("H5_CORRUPT_ROOT_OBJECT_NOT_GROUP",
                             "corrupt", loc, object,
                             "superblock root object does not decode as a group");
+
+    /* Group link storage.  A group declares where its links live with exactly
+       one message: a symbol-table message for the old format, or a link-info
+       message for the new one.  libhdf5 picks the branch by asking whether the
+       link-info message exists (H5G__obj_get_linfo); when it does not, every
+       lookup, iteration and info call falls into the old-format path and reads
+       the symbol-table message, which then is not there either -- H5G__obj_lookup
+       fails and the traversal aborts.  Measured on a header whose link-info
+       message type byte was zeroed: h5dump reports an internal error, h5ls
+       cannot resolve the name, and h5py's visit raises "unable to determine
+       object type".  Accepting such a header would be an A' violation, so it is
+       corrupt.
+
+       The trigger needs positive evidence that the header IS a group, because
+       h5policy has no group type bit.  Group-info and compact link messages
+       occur in no other object class, and the superblock names the root object
+       as a group outright.
+
+       Both group rules are gated on the header having decoded without an
+       error of its own.  They are message-ABSENCE rules, and absence only
+       means something once the message walk finished: a truncated chunk, an
+       overlapping continuation or an oversized message can swallow the very
+       message being looked for, and a derived second accusation against an
+       already-rejected object is noise, not evidence.  */
+    var header_walked_clean =
+        h5policy_error_finding_count == h5policy_object_finding_mark;
+
+    if (header_walked_clean
+        && (ctx.has_group_info != 0UB || ctx.has_link_message != 0UB
+            || object == "/")
+        && ctx.has_link_info == 0UB && ctx.has_symbol_table == 0UB)
+        h5policy_emit_error("H5_CORRUPT_GROUP_MISSING_LINK_STORAGE",
+                            "corrupt", loc, object,
+                            "group object header has neither a link-info nor a symbol-table message");
+
+    /* Group info in a new-style group.  libhdf5's writer emits the pair in one
+       place -- H5G__obj_create_real creates the link-info and group-info
+       messages together -- and H5G__obj_insert then reads the group-info
+       message back unconditionally on the new-format branch (H5Gobj.c, "can't
+       get group info") to decide between compact link messages and dense
+       storage.  A new-style group without one is therefore a group no consumer
+       can add a link to.
+
+       This is deliberately NOT a corruption finding.  The read paths that would
+       need the message -- H5G__obj_info, H5G__obj_iterate, H5Gtraverse -- all
+       guard the read with H5O_msg_exists and fall back to the default group
+       creation properties, so libhdf5 opens, traverses and dumps such a file
+       without complaint (measured with h5dump, h5ls and h5py).  Calling it
+       corrupt would refuse bytes the reference implementation accepts, which is
+       an invariant-A failure.  The defect is real but its consequence is
+       confined to the write direction, so it is reported as a warning and the
+       decision is left alone.  */
+    if (header_walked_clean
+        && ctx.has_link_info != 0UB && ctx.has_group_info == 0UB)
+        h5policy_emit_warning("H5_ADVISORY_GROUP_INFO_MISSING",
+                              loc, object,
+                              "new-style group has a link-info message but no group-info message");
 }
 
 /* Validate one object header at a known byte offset.  The per-object dataset
@@ -750,10 +807,15 @@ fun h5policy_validate_ohdr_raw = (int ios,
     h5policy_current_object_depth = depth;
     h5policy_current_object_msg_count = 0UL;
     h5policy_current_object_root_msg_count = 0UL;
+    h5policy_object_finding_mark = h5policy_error_finding_count;
     ctx.has_dataspace = 0UB;
     ctx.has_datatype = 0UB;
     ctx.has_dataset_layout = 0UB;
     ctx.has_fill_value = 0UB;
+    ctx.has_link_info = 0UB;
+    ctx.has_group_info = 0UB;
+    ctx.has_symbol_table = 0UB;
+    ctx.has_link_message = 0UB;
     ctx.has_compact_layout = 0UB;
     ctx.has_contiguous_layout = 0UB;
     ctx.has_legacy_chunked_layout = 0UB;
