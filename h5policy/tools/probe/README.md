@@ -8,8 +8,9 @@ cannot pin down:
 - **Which build?** `h5policy-diff` observes whatever libhdf5 h5py bundles;
   `h5policy-crashfuzz` drives whatever tools are on `PATH`. Here `--hdf5-bindir`
   names the build under test, the probe is compiled against it, and every result
-  carries that build's version, linked-library path, configuration, and
-  `libhdf5.settings` hash.
+  carries that build's version, linked-library soname, configuration,
+  `settings_sha256`, build mode, and sanitizer list. The local directory is
+  used to select and run the build but is not emitted into portable evidence.
 - **Did rejection precede activation?** For a hostile file the corpus forbids
   external/VDS/EFL opens, filter-plugin `dlopen`, writes, and network. The probe
   observes those from outside the library and asserts them absent.

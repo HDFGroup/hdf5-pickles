@@ -242,6 +242,63 @@ else:
     print(f"NOTE {VERIFICATION_PATH} absent; §12 status unknown "
           f"(run `h5cve verification`)")
 
+# registry/README.md presents a compact human-facing summary of the two
+# generated measurements above. Keep its exact counts derived as well: a stale
+# summary is worse than no summary because it looks like reviewed evidence.
+REGISTRY_README_PATH = "registry/README.md"
+if os.path.exists(EVIDENCE_PATH) and os.path.exists(VERIFICATION_PATH):
+    readme = open(REGISTRY_README_PATH).read()
+
+    def require_readme(fragment, label):
+        global errors
+        if fragment not in readme:
+            print(f"README_SUMMARY_DRIFT field={label} expected={fragment!r}")
+            errors += 1
+
+    evidence_doc = yaml.safe_load(open(EVIDENCE_PATH)) or {}
+    evidence_records = evidence_doc.get("records", {})
+    evidence_counts = {}
+    for entry in evidence_records.values():
+        verdict = entry.get("verdict", "unmeasured")
+        evidence_counts[verdict] = evidence_counts.get(verdict, 0) + 1
+    require_readme(
+        f"Current verdicts, against libhdf5 {evidence_doc.get('libhdf5_version')}:",
+        "libhdf5_version")
+    require_readme(f"| `enforced` | {evidence_counts.get('enforced', 0)} |",
+                   "enforced_families")
+    require_readme(
+        "| `partial` — some invariants enforced, some not | "
+        f"{evidence_counts.get('partial', 0)} |", "partial_families")
+
+    status_counts = {}
+    per_requirement = {req: {} for req in vdoc.get("requirements", [])}
+    for entry in vrecords.values():
+        for requirement, result in entry.items():
+            status = result.get("status")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            counts = per_requirement[requirement]
+            counts[status] = counts.get(status, 0) + 1
+    total_slots = sum(status_counts.values())
+    require_readme(
+        f"**{status_counts.get('met', 0)} of {total_slots} requirement-slots "
+        "are currently `met`.**", "met_requirement_slots")
+
+    stable = per_requirement["stable_finding_and_offset_assertions"]
+    require_readme(
+        f"{stable.get('met', 0)} families pin evidence locations as well as "
+        "finding codes; the remaining",
+        "stable_evidence_locations")
+    truncation = per_requirement["truncation_every_byte_boundary"]
+    require_readme(
+        f"Truncation is `met` for {truncation.get('met', 0)} families, "
+        f"`partial` for {truncation.get('partial', 0)} whose seed exceeds the",
+        "truncation_summary")
+    activation = per_requirement["no_activation_on_validation_failure"]
+    require_readme(
+        f"No-activation-on-failure is `met` for {activation.get('met', 0)} "
+        f"families and `partial` for {activation.get('partial', 0)}",
+        "activation_summary")
+
 for record in coverage["records"]:
     status = record.get("coverage_status")
     if status == "covered":

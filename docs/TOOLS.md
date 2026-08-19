@@ -25,7 +25,8 @@ tools/h5policy-seamcheck -> ../h5policy/tools/h5policy-seamcheck
 tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
-`tools/pkdoc.py`, `tools/check_tutorial.py`, `tools/check_tool_overview.py`,
+`tools/pkdoc.py`, `tools/check_tutorial.py`, `tools/check_markdown_links.py`,
+`tools/check_tool_overview.py`,
 `tools/finding_registry.py`, `tools/check_registry.py`,
 `tools/message_routing.py`, and `tools/h5cve` are repository-level helper
 scripts (not symlinks). They generate and test documentation, load and check

@@ -53,6 +53,8 @@ Important keys:
 - `RET`: open the selected message detail, follow a link path, or open chunk bytes.
 - `g`: jump to a raw offset view.
 - `v`: pretty-print the current object header or chunk-index metadata.
+- `w`: send a low-level GNU poke write expression after explicit opt-in and a
+  per-write confirmation.
 - `p`: switch to the backing GNU poke process buffer.
 
 ## User blocks
@@ -137,7 +139,12 @@ Fixture generation requires `h5py` and `numpy`; the process tests require GNU po
 
 ## Current Limits
 
-Writes are currently disabled.
+Writes are disabled by default. Setting `hdf5-poke-enable-writes` to non-`nil`
+enables the generic `w` command, which still asks for confirmation before
+sending a raw GNU poke write expression. This is not a coordinated HDF5 repair:
+it does not update dependent checksums or related metadata. Use `h5patch` for
+evidence-gated repair planning and make raw-write experiments only on a
+disposable copy.
 
 Dataset previews are intentionally narrow: filtered, chunked, floating-point,
 compound, variable-length, and large datasets are reported as unsupported rather

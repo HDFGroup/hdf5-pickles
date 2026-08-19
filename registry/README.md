@@ -95,13 +95,12 @@ derived and checked by `tools/check_quickstart.py`; see the
 [tool guide](../docs/TOOLS.md#exact-build-canary-matrix) for the current,
 machine-checked inventory and its malformed-fixture contract.
 
-Of the 52 uncontracted expectations, 51 are fixtures the oracle **accepts**. A
-family cannot be derived mechanically for those: the only findings present are
-incidental advisories (a deflate-filter notice, say) that describe a property of
-the file rather than what the fixture exercises, so assigning a family from one
-points the canary at the wrong structure. They need hand-assignment. The other
-is the focused forensic cache-image regression, which shares the existing
-cache-image fixture and canary rather than duplicating its exact-build row.
+Not every expectation needs its own canary contract. Alternate-profile checks,
+reduced-limit integrations, and multiple expectations over one fixture can
+reuse the family exercise already named by a contracted valid/malformed pair.
+An uncontracted expectation never inherits a passing matrix result: the
+family-level inventory is derived from the explicit contracts and fails if a
+record family lacks its required canaries.
 
 ## Claimed vs measured libhdf5 behaviour
 
@@ -123,15 +122,13 @@ Current verdicts, against libhdf5 2.2.0:
 
 | verdict | families |
 |---|---|
-| `enforced` | 10 |
-| `partial` — some invariants enforced, some not | 6 |
+| `enforced` | 7 |
+| `partial` — some invariants enforced, some not | 9 |
 
 Only `reject_corrupt` specimens count toward a verdict. Activation events
 (`external_open`) and crashes are recorded separately, since a build can enforce
-an invariant and still crash or activate on the way to it — `chunk_index` and
-`virtual_dataset` are both `enforced` and both have a fixture that crashes the
-build. The divergences behind the five `partial` verdicts are written up in
-[`cases/`](cases/).
+an invariant and still crash or activate on the way to it. The divergences
+behind the nine `partial` verdicts are written up in [`cases/`](cases/).
 
 ## §12 verification status
 
@@ -147,24 +144,27 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 | `absent` | mechanically demonstrated to be missing |
 | `not_assessed` | not determinable from artifacts; needs classification |
 
-**50 of 176 requirement-slots are currently `met`.** The distribution matters
+**56 of 176 requirement-slots are currently `met`.** The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
 - Lazy validation is `partial` everywhere: measured, and holding, but on the
   oracle as a whole rather than family by family.
-- Three are `not_assessed` for every family — boundary counts, integer overflow
-  versus allocation budget, and deep nesting versus non-progress. These are
-  deliberately **not** inferred from finding-code spelling; settling them needs
-  fixtures classified by the case they represent.
+- Reviewed fixture/recipe annotations now supply some boundary, arithmetic, and
+  progress evidence. Most families remain `not_assessed` in those columns:
+  13 for count/extent boundaries and 14 each for integer-overflow/allocation
+  budget and deep-nesting/non-progress. Missing categories are deliberately not
+  inferred from finding-code spelling.
 - Dedicated fuzz targets exist for 1 family of 16.
-- 12 families pin evidence locations as well as finding codes; the remaining
-  4 need cursor arithmetic at the emit site rather than test metadata.
-- Truncation is `met` for 11 families and `partial` for 3 whose seed exceeds
-  the sweep budget; see [`truncation-sweep.json`](truncation-sweep.json).
-- The strongest column is no-activation-on-failure, `met` for 12 families,
-  because the exact-build probe measures it directly.
+- 14 families pin evidence locations as well as finding codes; the remaining
+  2 need cursor arithmetic at the emit site rather than test metadata.
+- Truncation is `met` for 12 families, `partial` for 3 whose seed exceeds the
+  sweep budget, and `absent` for 1; see
+  [`truncation-sweep.json`](truncation-sweep.json).
+- No-activation-on-failure is `met` for 13 families and `partial` for 3 because
+  the exact-build probe observes an activation or crash in those families.
 
 `check_registry.py` enforces the report's structure — every manifest record
-present, every requirement scored — but not its content. Gating on content would
-be permanently red and therefore ignored; the file is a distance measure.
+present and every requirement scored — and derives the summary counts above.
+It does not require any particular grade. Gating on the grades would be
+permanently red and therefore ignored; the file is a distance measure.

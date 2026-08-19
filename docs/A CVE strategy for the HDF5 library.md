@@ -479,7 +479,7 @@ against the authenticated [HDF5 draft advisory form](https://github.com/HDFGroup
 inviting collaborators, identifier requests, and publication are separate
 authorization boundaries.
 
-The [`h5cve`](../TOOLS.md#h5cve-case-orchestrator) initializer creates
+The [`h5cve`](TOOLS.md#h5cve-case-orchestrator) initializer creates
 `cases/<id>/github-advisory.md` with these headings. The form instructions and
 version-range guidance are maintained by [GitHub's repository-advisory
 documentation](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/fix-reported-vulnerabilities/create-repository-advisory).
