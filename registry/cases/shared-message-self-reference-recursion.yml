@@ -1,0 +1,141 @@
+# Confirming fixture for Report 1 of a private HDF5 2.2.0 denial-of-service
+# disclosure: a shared object-header message whose target resolves back to the
+# object header being read drives H5O__shared_read into unbounded self-
+# recursion until the stack is exhausted.  h5policy already models and rejects
+# this cycle class (H5_CORRUPT_SHARED_MESSAGE_CYCLE, h5_shared.pk); this record
+# adds the tracked self-reference specimen and the measured libhdf5 divergence.
+schema_version: 1
+
+id: shared-message-self-reference-recursion
+title: >-
+  Shared object-header message pointing into its own object header recurses
+  unboundedly in H5O__shared_read (stack exhaustion); h5policy rejects the
+  self-reference as a shared-message cycle
+status: contained
+disclosure: >-
+  n/a — corroborates a third-party private DoS report against 2.2.0; local
+  fixture + libhdf5 divergence measured 2026-08-20, not reported upstream by us
+
+# ── Triage (§11.2) ────────────────────────────────────────────────────────────
+record: shared_messages_legacy
+versions: [1, 2, 3]        # shared-message reference versions the resolver accepts
+entry_points:
+  - h5policy (oracle) — h5_shared.pk shared-message resolver
+  - "libhdf5 H5Dopen/H5Ovisit -> H5O_msg_read (datatype) -> H5O__shared_decode
+     (H5Oshared.c:372) -> H5O__shared_read (H5Oshared.c:165) -> H5O_msg_read_oh
+     (H5Omessage.c:489) -> H5O__shared_decode -> ...  The open_oh branch at
+     H5Oshared.c:159-167 reads the shared message directly out of the already-
+     open header; when that message is itself shared and names the same header,
+     nothing bounds the depth or tracks visited (address, type) pairs."
+root_cause_classification: reference_graph
+violated_invariant: shared.no_cycle
+validation_closure: >-
+  the shared-message resolution chain -- the committed object headers a shared
+  message reaches through nested sharing -- must be validated as a visited set
+  before any target is followed, so a target that reappears is a cycle rather
+  than another level of recursion.
+activation_before_validation:
+  # h5policy performs no materialization.  The selected libhdf5 build was probed
+  # and does NOT reject: it recurses into H5O__shared_read until the stack guard
+  # page faults, materializing nothing but never returning an error.
+  - none
+
+# ── Oracle behaviour ──────────────────────────────────────────────────────────
+oracle:
+  profile: untrusted-strict
+  decision: reject_corrupt
+  primary_finding: H5_CORRUPT_SHARED_MESSAGE_CYCLE
+  object_path: "/dset"
+  offset: 231       # the datatype-message body carrying the self-referential wrapper
+
+# ── What was measured (develop tree, h5dump/h5debug 2.3.0) ────────────────────
+defect: >-
+  H5O__shared_read (H5Oshared.c:165) reads a shared message out of the object
+  header already open when the message's address matches that header
+  (open_oh && oloc.addr == H5O_OH_GET_ADDR(open_oh)).  That is correct for the
+  legitimate same-header sharing the comment describes, but the message read
+  back is decoded again with no recursion depth bound and no visited set, so a
+  shared message that names its own header re-enters H5O__shared_read forever.
+  Measured on this fixture against the develop tree (2.3.0):
+    - stock build: `h5dump -H` dies on SIGSEGV (exit 139), bounded by the stack
+      guard page (not an OOM -- the recursion is stack-bound, so a small
+      `ulimit -s` just makes it fault sooner).
+    - a local ASan build (2.3.0): "AddressSanitizer: stack-overflow"
+      with the repeating frame cycle H5O__shared_read (H5Oshared.c:165) ->
+      H5O__shared_decode (H5Oshared.c:372) -> H5O_msg_read_oh (H5Omessage.c:489)
+      -> H5O__shared_decode -- the exact frames the report names, still live
+      past the reported 2.2.0.
+  Not a memory-corruption primitive: the fault is a stack guard-page hit, not an
+  out-of-bounds write.  A fix is a recursion-depth counter threaded through
+  H5O__shared_read or a visited (address, message-type) set for one decode --
+  which is exactly what h5policy's resolver already does.
+prior_art: >-
+  Tracker #585 (closed, 2021) was a crash in H5O__shared_read reached via
+  h5dump on a much older version; it may or may not share this cause.  This
+  fixture demonstrates the self-reference route directly on 2.3.0.
+
+# ── Containment vs systemic (§11.5) ───────────────────────────────────────────
+containment:
+  status: landed
+  description: >-
+    h5policy_resolve_shared_message_inner (h5_shared.pk) carries a visited
+    obj_addr set (seen_addrs) and a recursion cap (H5POLICY_SHARED_NESTED_DEPTH);
+    a shared target that reappears in seen_addrs is emitted as
+    H5_CORRUPT_SHARED_MESSAGE_CYCLE and never followed, so the self-referential
+    wrapper is rejected before any re-entry.  This predates the fixture -- the
+    specimen is a regression guard for the existing check, not new code.
+systemic:
+  semantic_boundary: shared-message resolution closure in H5O__shared_read
+  status: linked-followup
+  owner: "n/a — libhdf5 depth-bound/visited-set fix pending; not reported upstream by us"
+backports: []
+
+# ── Reproducers (§11.4) ───────────────────────────────────────────────────────
+# Two specimens exercise the same H5O__shared_read recursion from the two paths
+# a shared message is reached: a dataset's own datatype, and (mirroring the
+# disclosure's PoC) an attribute typed by a committed datatype.
+reproducers:
+  integration_poc: >-
+    ( ulimit -s 4096; h5dump -H
+    h5policy/tests/malformed/shared_message_self_reference.h5 )  -> SIGSEGV on
+    the stock 2.3.0 build; the ASan build reports stack-overflow in the
+    H5O__shared_read recursion.  The attribute sibling reproduces identically
+    with `h5dump -A
+    h5policy/tests/malformed/shared_message_self_reference_attr.h5`.
+  direct_fixture: h5policy/tests/malformed/shared_message_self_reference.h5
+  direct_fixture_attr: h5policy/tests/malformed/shared_message_self_reference_attr.h5
+  generator: >-
+    h5policy-gencorpus :: _make_shared_message_self_reference -- builds a single
+    int32 dataset, rewrites its datatype message into a version-3 shared-message
+    wrapper (share_type 2) whose committed-object-header address is the dataset's
+    own header, sets the message's shared flag, and reseals the object-header
+    checksum.  Object-header times are pinned so the specimen is byte-stable.
+  generator_attr: >-
+    h5policy-gencorpus :: _make_shared_message_self_reference_attr -- reuses
+    _build_shared_attr (dataset /d with an attribute typed by committed datatype
+    /t), then rewrites /t's OWN datatype message -- which lives in an OCHK
+    continuation chunk -- into a shared wrapper pointing back at /t, clearing
+    the do-not-share bit and resealing the OCHK checksum.  Resolving the
+    attribute's shared datatype reaches /t, whose type is shared and names /t.
+    This is Report 1's exact H5Aopen route.
+  field_location: >-
+    Dataset variant: dataset v2 OHDR, datatype message (type 3) in chunk 0.
+    Attribute variant: committed datatype /t's v2 OHDR, datatype message in its
+    OCHK continuation chunk.  In both, the type-3 message body is overwritten
+    with [version=3][share_type=2][8-byte self address] and the message header's
+    shared-flag bit (0x02) is set (do-not-share bit 0x04 cleared).
+  assertions:
+    stable_finding: true          # H5_CORRUPT_SHARED_MESSAGE_CYCLE (/dset, /t)
+    fails_before_materialization: true
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_legacy_fallback: true
+
+# ── Provenance ────────────────────────────────────────────────────────────────
+provenance:
+  h5policy_commit: "branch updates/20260820"
+  poke_version: GNU poke 4.3
+  hdf5_build: >-
+    develop tree read + built locally; h5dump/h5debug 2.3.0 (stock) and an ASan
+    build (2.3.0).  Source frames cited from src/H5Oshared.c and src/H5Omessage.c.
