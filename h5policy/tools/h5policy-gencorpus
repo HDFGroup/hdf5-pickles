@@ -526,8 +526,34 @@ def _gen_resource(root):
     # An orphaned global heap collection whose free-space object has a zero
     # length -> libhdf5's H5HG deserialize loops forever.  The forensic GCOL
     # signature sweep flags it as a resource (DoS) hazard.
-    _make_gheap_infinite_loop(f"{root}/resource/gheap_infinite_loop.h5",
-                              f"{root}/valid/empty.h5")
+    _make_gheap_collection(f"{root}/resource/gheap_infinite_loop.h5",
+                           f"{root}/valid/empty.h5", index=0, length=0)
+    # The same non-termination through the OTHER branch of that loop: a normal
+    # object (index > 0) whose declared length makes the unchecked size_t sum
+    # `H5HG_SIZEOF_OBJHDR(f) + H5HG_ALIGN(size)` wrap to zero.  That length was
+    # measured to hang both a release and an AddressSanitizer build of libhdf5
+    # 2.3.0 -- on a REACHABLE carrier; this fixture is orphaned like its sentinel
+    # sibling, so it exercises the sweep rather than the read path.  The pair
+    # matters: the sentinel fixture alone leaves the impression that only the
+    # index-0 branch can fail to advance.
+    _make_gheap_collection(f"{root}/resource/gheap_need_wrap_zero.h5",
+                           f"{root}/valid/empty.h5",
+                           index=1, length=2 ** 64 - 16)
+    # The same wrap one width down: 2**32-16 gives need == 0 only where size_t
+    # is 32 bits.  A 64-bit reader rejects these bytes cleanly (measured), so
+    # this fixture is what distinguishes a width-parametric progress check from
+    # a 64-bit-only one.
+    _make_gheap_collection(f"{root}/resource/gheap_need_wrap_zero_ilp32.h5",
+                           f"{root}/valid/empty.h5",
+                           index=1, length=2 ** 32 - 16)
+    # The adjacent CONTROL, one below the eight-value wrap window at either
+    # width: need is huge instead of zero, so the collection overruns and
+    # libhdf5 errors cleanly rather than looping.  It must stay `accept` --
+    # this is the false-positive guard on the two fixtures above, and the
+    # reason the sweep returns silently on an overrun at all.
+    _make_gheap_collection(f"{root}/resource/gheap_need_wrap_below.h5",
+                           f"{root}/valid/empty.h5",
+                           index=1, length=2 ** 64 - 24)
 
     # Old-style (pre-1.8) groups: root and nested groups stored via a symbol
     # table -> v1 B-tree -> SNOD -> local heap.  Exercises that traversal, with
@@ -5266,30 +5292,48 @@ def _make_filtered_dense_link_pipeline_overrun(path, base_path):
                                         clear_checksum_flag=False))
 
 
-def _make_gheap_infinite_loop(path, base_path):
-    """Append an orphaned, malformed global heap collection to a valid file.
+def _make_gheap_collection(path, base_path, index, length):
+    """Append an orphaned global heap collection whose first object is ``index``
+    with declared payload ``length``.
 
-    The collection's free-space object (heap index 0) is encoded with a zero
-    length.  libhdf5's H5HG__cache_heap_deserialize advances the parse cursor by
-    obj[0].size for index 0, so a zero there never moves it and any consumer
-    that loads the collection loops forever (h5debug hangs on it).  Nothing
-    references the collection, so the reachability walk never sees it and
-    libhdf5's normal open ignores it; only the forensic profile's GCOL
+    libhdf5 advances the object parse in `H5HG__cache_heap_deserialize` by
+
+        need = obj[idx].size                                   idx == 0  (:358)
+        need = H5HG_SIZEOF_OBJHDR(f) + H5HG_ALIGN(obj[idx].size)  idx > 0 (:353)
+
+    and then checks only that `begin + need` stays inside the collection
+    (:363).  A `need` of zero passes that check trivially -- H5_IS_BUFFER_OVERFLOW
+    short-circuits on `(size) != 0` -- leaving the cursor where it was, so the
+    decode never terminates.  Both branches can reach zero, and this one
+    generator builds either:
+
+      * ``index=0, length=0``  -- the free-space sentinel used raw.
+      * ``index>0, length=2**W-16`` -- the unchecked size_t addition wrapping.
+        Eight lengths per width do it, the interval [2**W-23, 2**W-16]; the
+        callers pick the top of each so the intent reads off the value.
+
+    Nothing references the collection, so the reachability walk never sees it
+    and libhdf5's normal open ignores it; only the forensic profile's GCOL
     signature sweep catches it, reporting a resource (DoS) hazard.
     """
     raw = bytearray(open(base_path, "rb").read())
     assert raw[8] in (2, 3), "expected a v2/v3 superblock"
     len_size = raw[10]
     align8 = lambda n: (n + 7) & ~7
+    len_fmt = {2: "H", 4: "I", 8: "Q"}[len_size]
+    assert length < 1 << (8 * len_size), "declared length does not fit the length field"
 
     csize = 4096                                  # aligned collection size
     coll = bytearray(csize)                        # zero-filled body
     coll[0:4] = b"GCOL"
     coll[4] = 1                                    # version
-    struct.pack_into("<" + {2: "H", 4: "I", 8: "Q"}[len_size], coll, 8, csize)
-    # The first object sits at the aligned header and is left all-zero: heap
-    # index 0 with a zero length -- the non-advancing free-space object.
-    assert align8(4 + 1 + 3 + len_size) == 16 and coll[16:16 + 2 + len_size] == b"\x00" * (2 + len_size)
+    struct.pack_into("<" + len_fmt, coll, 8, csize)
+    # The first object sits at the aligned collection header.  nrefs and the
+    # reserved word stay zero; only the index and the declared length matter to
+    # the advance.
+    assert align8(4 + 1 + 3 + len_size) == 16
+    struct.pack_into("<HH", coll, 16, index, 0)
+    struct.pack_into("<" + len_fmt, coll, 24, length)
 
     raw += coll
     # Declared EOF must cover the appended collection for h5policy's ceiling.

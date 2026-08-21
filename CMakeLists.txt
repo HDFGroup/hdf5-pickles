@@ -291,6 +291,20 @@ if(POKE_EXECUTABLE)
         TIMEOUT 30
         ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
     )
+    # The global-heap walk cases assert TERMINATION, so the timeout is part of
+    # the assertion rather than a safety net: before the progress guard in
+    # gheap.pk these inputs spun forever and this test would hang here instead
+    # of reporting a failed expectation.
+    add_test(
+        NAME pickle_gheap_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_gheap.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(pickle_gheap_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
     message(STATUS "shared pickle regression tests enabled (poke: ${POKE_EXECUTABLE})")
 else()
     message(STATUS "shared pickle regression tests skipped (needs poke)")

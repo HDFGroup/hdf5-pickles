@@ -1,13 +1,22 @@
-# The global-heap object loop advances by a value that is guaranteed positive
-# for every object EXCEPT the index-0 free-space sentinel, whose declared size
-# is used raw. A zero there leaves the cursor where it was, and the loop
-# condition unchanged.
+# The global-heap object loop can be made not to advance at all, so its decode
+# never terminates. There are TWO entrances: the index-0 free-space sentinel,
+# whose declared size is used raw, and any normal object, whose advance is an
+# unchecked size_t sum that eight declared lengths per width wrap to zero.
+#
+# CORRECTED 2026-08-21. This record previously asserted that the advance was
+# "guaranteed positive for every object EXCEPT the index-0 sentinel". It is not:
+# see `defect` and the `need_wrap` trigger. The classification, invariant,
+# validation closure and semantic boundary were all right; only the claim that
+# one branch was safe was wrong, and it made the recorded scope too narrow by
+# half.
 #
 # Promoted from two working bundles (gitignored h5cve scratch) that reach the
 # same defect from different distances.  Each is named by its specimen's
 # input_sha256, given in full under `triggers`:
 #   specimen ccee352f...   orphaned collection -- inert until swept
 #   specimen 417c2f1d...   VDS mapping references it -- reachable
+# A third trigger, `need_wrap`, was added by the correction and has no specimen
+# of its own: it is generated (see `triggers.need_wrap`).
 # They are recorded together because the PAIR is the finding: the same
 # zero-progress object is harmless when nothing points at it and a
 # non-terminating open when something does. Either bundle alone would misstate
@@ -15,9 +24,9 @@
 schema_version: 1
 
 id: global-heap-zero-progress-sentinel
-title: the global-heap index-0 free-space sentinel advances the parse cursor by
-  its raw declared size, so a zero-size sentinel makes the decode loop
-  non-terminating
+title: the global-heap object loop can be made not to advance -- by a zero-size
+  index-0 free-space sentinel, or by an unchecked size_t sum that wraps to zero
+  for a normal object -- and its decode then never terminates
 status: oracle-hardened          # h5policy reports it; libhdf5 unfixed
 disclosure: >-
   n/a -- local analysis only.  No advisory database was consulted, no advisory
@@ -59,14 +68,25 @@ defect: >-
       if (H5_IS_BUFFER_OVERFLOW(begin, need, p_end))                        /* :363 */
           HGOTO_ERROR(... "ran off end of input buffer while decoding");
       p = begin + need;                                                     /* :365 */
-  For any normal object the step includes H5HG_SIZEOF_OBJHDR(f), so `need` is
-  structurally positive and progress is guaranteed however small the payload.
+  NEITHER branch guarantees progress, and this record used to claim the first
+  one did.
   For the index-0 sentinel the declared size is used RAW, with no header addend
   and no floor.  A file declaring zero yields need == 0, p == begin, and a loop
-  condition that has not changed.  The decode does not terminate.
-  The bounds check at :363 is no help: `need` of zero passes it trivially.  This
-  is a LIVENESS failure, not a memory-safety one -- nothing is read out of
-  bounds; the parse simply never ends.
+  condition that has not changed.
+  For any other index the step does include H5HG_SIZEOF_OBJHDR(f) -- but the sum
+  is UNCHECKED size_t arithmetic, and so is the H5HG_ALIGN inside it
+  (8*((X+7)/8), src/H5HGpkg.h:69).  `heap->obj[idx].size` is a `size_t` and
+  H5F_DECODE_LENGTH stores the 8-byte on-disk length into it through
+  UINT64DECODE, whose own comment reads "WE DON'T CHECK FOR OVERFLOW!"
+  (src/H5encode.h:221).  For any declared length in the closed interval
+  [SIZE_MAX-22, SIZE_MAX-15] -- eight values -- the sum wraps to exactly zero.
+  So "structurally positive" described the ALGEBRA, not the arithmetic: the
+  header addend is present, it simply cannot survive the wrap.
+  The bounds check at :363 is no help against either branch, and cannot be made
+  to be: H5_IS_BUFFER_OVERFLOW short-circuits on `(size) != 0`
+  (src/H5private.h:347), so a `need` of zero is exactly the value it is defined
+  to ignore.  This is a LIVENESS failure, not a memory-safety one -- nothing is
+  read out of bounds; the parse simply never ends.
   THE INTENDED INVARIANT IS WRITTEN DOWN AND NOT ENFORCED.  The comment
   immediately above the branch (:348-351) says the free-space object's "size is
   never padded and already includes the object header".  That is exactly the
@@ -78,14 +98,21 @@ defect: >-
   treatment of the sentinel a dozen lines above the incorrect one.
 
 shape_note: >-
-  This is the second record in this directory whose defect is BRANCH ASYMMETRY
-  -- one arm of a decision lacking a property the other arms get for free.  The
-  first is registry/cases/layout-v4-ndims-lower-bound-missing.yml, where the
-  v4+ layout decoder omits a lower bound that both older decoders apply.
-  In both cases the unguarded arm is the SPECIAL CASE: the newest version there,
-  the sentinel index here.  Worth noting as a review heuristic -- when a decoder
-  special-cases one value or version, check whether the special case inherits
-  the general path's guarantees or merely its structure.
+  This record was filed as the second case in this directory whose defect is
+  BRANCH ASYMMETRY -- one arm of a decision lacking a property the other arms
+  get for free (the first being
+  registry/cases/layout-v4-ndims-lower-bound-missing.yml, where the v4+ layout
+  decoder omits a lower bound both older decoders apply).  The 2026-08-21
+  correction dissolves that framing HERE: measuring the other arm showed it was
+  never safe either, so the loop has no safe arm to be asymmetric with.
+  The heuristic that produced the original note still holds and is worth keeping
+  -- when a decoder special-cases one value or version, check whether the special
+  case inherits the general path's guarantees or merely its structure.  But this
+  record is now also a caution about that heuristic's failure mode: it directs
+  attention to the special case and thereby CERTIFIES the general one.  The
+  general path here was certified by an algebraic argument -- "the step includes
+  the header size" -- that unchecked arithmetic invalidates.  Prefer a bound
+  that is evaluated to one that is argued.
 
 # -- The two reaches, and why both are needed ---------------------------------
 triggers:
@@ -127,6 +154,49 @@ triggers:
       untrusted-strict: reject_policy at H5_POLICY_VDS @ 896 -- it stops at the
       VDS policy boundary before loading the referenced heap.
 
+  need_wrap:
+    specimen: >-
+      none -- generated.  h5policy/tests/resource/gheap_need_wrap_zero.h5 is
+      valid/empty.h5 with an orphaned collection appended whose index-1 object
+      declares 2**64-16; the ILP32 sibling declares 2**32-16 and
+      gheap_need_wrap_below.h5 declares 2**64-24, one below the wrap window, as
+      the control.  Discovered from the specimen bundle for the global-heap
+      overrun seed sha256:3ca01580..., whose own first corrupted object wraps
+      `need` to 8 -- a desync rather than a hang, which is what made the wrap
+      visible.
+    how: >-
+      A NORMAL object, index > 0, declaring a length in [SIZE_MAX-22,
+      SIZE_MAX-15].  This is the branch this record used to certify as safe.  The
+      collection is otherwise well formed: 4096 bytes, aligned, version 1, no
+      checksum anywhere in a GCOL, so one 8-byte field is the entire mutation.
+    reach: >-
+      Reached by any consumer that reads variable-length or reference DATA, since
+      that is what carries a global-heap ID.  Measured through H5Aread on a vlen
+      H5T_REFERENCE attribute; H5Fopen, H5Ovisit3 and fixed-length H5Dread are
+      all unaffected.  The committed fixtures are ORPHANED, so like the sentinel
+      fixture they are found by the forensic sweep rather than by a read.
+    impact: >-
+      Non-termination inside H5HG__cache_heap_deserialize, measured on libhdf5
+      2.3.0 in BOTH a release build (asserts off) and an AddressSanitizer build
+      (asserts live): a read-only public-API witness never returns, under a 30 s
+      timeout, with ZERO sanitizer reports.  Interrupted under gdb the process
+      sits in that function with `need = 0` in scope, reached via
+      H5T__conv_vlen -> H5T__vlen_disk_read -> H5VL_blob_get ->
+      H5HG_get_obj_size -> H5HG__protect -> H5AC_protect -> H5C_protect ->
+      H5C__load_entry.  The cache entry is never published and no vlen buffer is
+      materialised.
+    boundary: >-
+      The wrap window was ENUMERATED, not derived: the four operations
+      (UINT64DECODE into size_t, H5HG_ALIGN, the + H5HG_SIZEOF_OBJHDR, and the
+      :363 guard) were transcribed and compiled at both -m64 and -m32 with
+      __SIZE_TYPE__, giving exactly eight lengths per width.  The library agrees
+      at both ends: 2**64-23 hangs, 2**64-24 is rejected cleanly.
+    oracle_finding: >-
+      forensic: reject_resource, H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP at the
+      object header, for both the LP64 and the ILP32 fixture.  untrusted-strict
+      ACCEPTS all three -- see profile_note; the sweep is forensic-only.  The
+      control accepts under both profiles.
+
 profile_note: >-
   The two specimens produce different strict-profile verdicts and NEITHER is a
   clean library verdict on the heap defect.  Both bundles say so themselves and
@@ -160,9 +230,23 @@ measured:
     nothing is read out of bounds -- which is exactly why a sanitizer-first
     methodology would miss this family entirely.
   width: >-
-    NOT measured at 32 bits, and not expected to matter: a zero step is zero at
-    any width.  What could differ is how quickly a consumer is noticed to be
-    hung, which is not a property of the file.
+    SUPERSEDED 2026-08-21.  The original entry read: "NOT measured at 32 bits,
+    and not expected to matter: a zero step is zero at any width."  True of the
+    SENTINEL entrance -- a declared zero is zero everywhere -- and false of the
+    defect, because the wrap entrance is width-parametric: it is the DECLARED
+    LENGTH that must be tuned to the width, and the eight values that work at
+    one width work at no other.
+    Now measured.  The advance arithmetic was executed at both widths (gcc -m64
+    and -m32 on the same source, __SIZE_TYPE__ so the width follows the target):
+    need == 0 for the closed interval [2**W-23, 2**W-16], eight values, at each
+    of W = 64 and W = 32.  On the LIBRARY, LP64 is measured (two builds hang on
+    the 2**64-16 fixture; the 2**32-16 fixture is rejected cleanly, which is the
+    control) and the ILP32 library consequence is source-derived, because no
+    32-bit libhdf5 was available.
+    This is also where the ORACLE had a real gap: h5policy's arithmetic is
+    uint<64> and so reproduced an LP64 reader only, accepting the 2**32-16 shape
+    under every profile.  h5policy_gcol_advance now models both widths, gated on
+    a collection a 32-bit reader could hold (csize <= 2**32-1).
 
 # -- Divergence from the selected build ---------------------------------------
 divergence:
@@ -184,10 +268,14 @@ containment:
   status: not_implemented        # libhdf5 side; not proposed upstream by this repo
   description: >-
     Minimal: reject a zero advance before reassigning the cursor.  At
-    src/H5HGcache.c:358-365, require `need > 0` -- or better, give the index-0
-    branch the same floor the general branch gets for free, since the comment at
-    :348-351 already asserts that the sentinel's size includes the object
-    header.  Enforcing the documented assumption is the whole fix.
+    src/H5HGcache.c:358-365, require `need > 0`.
+    The 2026-08-21 correction rules out the variant of this fix that this record
+    used to prefer -- "give the index-0 branch the same floor the general branch
+    gets for free" -- because the general branch has no such floor to share.  The
+    fix must therefore be an explicit floor on the computed advance, evaluated
+    BEFORE :363 since that guard cannot see a zero: `need >=
+    H5HG_SIZEOF_OBJHDR(f)` for idx > 0 and `need > 0` for idx == 0, with the sum
+    itself computed in checked arithmetic.  One floor covers both entrances.
     Systemic, and the bundles are right that the minimal fix is not the boundary:
     the object-list loop needs checked remaining-length arithmetic and a
     monotonic-cursor assertion covering BOTH normal objects and the sentinel.  A
@@ -214,25 +302,93 @@ systemic:
     - h5policy/pickles (heap.global_progress; H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP)
     - h5policy/tests/resource/gheap_infinite_loop.h5 + expectation
     - registry/findings/catalog (H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP)
+    # 2026-08-21, the correction:
+    - h5policy/pickles/h5_validate.pk -- h5policy_gcol_advance models the object
+      advance at 64 AND 32 bits, so the width-dependent shape is reported too
+    - h5policy/tests/resource/gheap_need_wrap_zero.h5 + expectation (the wrap
+      entrance, LP64)
+    - h5policy/tests/resource/gheap_need_wrap_zero_ilp32.h5 + expectation (the
+      same wrap one width down; the fixture that distinguishes a width-parametric
+      progress check from a 64-bit-only one)
+    - h5policy/tests/resource/gheap_need_wrap_below.h5 + expectation (the
+      adjacent control, one below the wrap window, which must stay accept)
+    - h5policy/tools/h5policy-gencorpus (_make_gheap_infinite_loop generalised to
+      _make_gheap_collection(index, length); the existing fixture's appended
+      collection is byte-identical after the refactor)
+    - pickles/gheap.pk -- THIS REPOSITORY had the same defect.  gheap_obj_step
+      states the untrusted advance once and both walkers now require the cursor to
+      advance strictly.  The dumper additionally vets the declared extent BEFORE
+      printing, because printing maps the object's data and that map threw on a
+      wild length before any later check could report it.
+    - pickles/tests/unit_gheap.pk + CMakeLists.txt -- 15 cases over the step
+      helper, both walkers and the adjacent controls, registered as ctest
+      pickle_gheap_regression with a 30 s timeout.  The timeout IS the assertion
+      for the hang; the test was confirmed to hang against the pre-fix model.
+
+# -- Post-CVE learning (strategy doc section 11.8) ----------------------------
+learning:
+  our_own_model_had_it_too: >-
+    Worth recording because it was not looked for, and could not have been found
+    by testing h5policy: pickles/gheap.pk -- this repository's SHARED FORMAT
+    MODEL, the one h5explain and h5patch decode collections with -- reproduced
+    the reference library's defect exactly.  Both of its walkers
+    (gheap_gcol_find_obj, print_global_heap) advanced by the same two unguarded
+    expressions, and poke uint<64> wraps precisely as an LP64 size_t does, so the
+    same eight declared lengths that hang libhdf5 hung them.
+    Measured before the fix, on the same bytes, and the failure mode is not
+    uniform: the FINDER spun forever on both shapes; the DUMPER spun forever on
+    the zero-span sentinel but died with an unhandled EOF exception on the
+    wrapping length, because it mapped byte[data_size] to print the object before
+    anything checked the length.  That ordering is why the fix vets the extent
+    before printing -- a guard placed after the map is unreachable.
+    h5policy itself was never affected: it loads none of pickles/gheap.pk and
+    carries its own validator.  The exposure was h5explain and h5patch, through
+    vds.pk and ref_enc.pk.
+  the_transferable_lesson: >-
+    A decoder written FROM a reference implementation inherits that
+    implementation's unchecked arithmetic along with its layout, and a modular
+    64-bit language reproduces a 64-bit size_t wrap silently and faithfully.  When
+    a case records unchecked arithmetic in libhdf5, audit this repository's model
+    of the same structure in the same change.  Do not assume the oracle's
+    correctness extends to the shared pickles: they have different callers and no
+    profile budget to fall back on.
+  audit_status: >-
+    Done for the global heap only.  Sibling walkers driven by a declared,
+    unvalidated span -- local-heap free lists, fractal-heap block walks,
+    object-header message loops -- were NOT audited for this shape and remain an
+    open follow-up.
 
 # -- Reproducers --------------------------------------------------------------
 reproducers:
   integration_pocs:
-    - h5policy/tests/resource/gheap_infinite_loop.h5     # orphaned
+    - h5policy/tests/resource/gheap_infinite_loop.h5     # orphaned, sentinel arm
+    - h5policy/tests/resource/gheap_need_wrap_zero.h5    # orphaned, wrap arm
   integration_poc_limitations: >-
     The VDS-referenced route has no committed fixture; it remains a coverage
-    gap rather than a tracked reproducer.
+    gap rather than a tracked reproducer.  The wrap arm's committed fixtures are
+    likewise orphaned, so they exercise the sweep rather than the read path that
+    was measured to hang -- the reachable route was measured on a case-bundle
+    specimen, which is not promotable.
   direct_fixtures:
     - h5policy/tests/resource/gheap_infinite_loop.h5
+    - h5policy/tests/resource/gheap_need_wrap_zero.h5
+    - h5policy/tests/resource/gheap_need_wrap_zero_ilp32.h5
+    - h5policy/tests/resource/gheap_need_wrap_below.h5   # control: must accept
   expectations:
     - h5policy/tests/expected/resource-gheap_infinite_loop.yml
+    - h5policy/tests/expected/resource-gheap_need_wrap_zero.yml
+    - h5policy/tests/expected/resource-gheap_need_wrap_zero_ilp32.yml
+    - h5policy/tests/expected/resource-gheap_need_wrap_below.yml
   direct_witness: >-
     The 16-byte GCOL header plus the first 16-byte object header at [88,120) of
     the orphaned specimen.  No public raw-global-heap decoder API exists
     locally, so h5debug is the available direct consumer -- and it times out,
     which IS the measurement.
   generator: >-
-    NEITHER specimen has a deterministic generator.  h5cve minimize is deferred
+    The wrap arm DOES have one: h5policy-gencorpus `_make_gheap_collection`,
+    parameterised by object index and declared length, builds all four tracked
+    fixtures (including the sentinel one, whose bytes it reproduces exactly).
+    NEITHER SPECIMEN has a deterministic generator.  h5cve minimize is deferred
     and the available mutator produced zero recipes, since neither seed has
     continuations.  A crafted.py exists beside the crafted bundle and is the
     nearest thing to a recipe; it was not verified at promotion.

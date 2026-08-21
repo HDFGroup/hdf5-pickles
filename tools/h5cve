@@ -1466,6 +1466,44 @@ def _comparison_verdict(baseline, candidate):
     return "inconclusive"
 
 
+# Canary entry points whose failure says nothing the oracle claims.  Everything
+# NOT listed here -- H5Fopen, H5Ovisit3, H5Oopen, H5Dopen2, H5Aopen_by_idx, the
+# dataspace and datatype queries -- is in scope: those decode metadata, so one of
+# them refusing a file the oracle accepted is a real disagreement.  The list is
+# deliberately the exceptions rather than the rule, so an entry point added to
+# the canary later counts as in scope until someone argues otherwise.
+#
+# Two unrelated reasons to be on it, kept apart because they generalise
+# differently:
+#   * raw-data reads -- h5policy never reads dataset or attribute payloads
+#     (h5_walk.pk: "it never ... reads raw dataset payloads"), so a payload that
+#     will not decode is outside its scope BY CONSTRUCTION, and always will be;
+#   * type-class-dependent queries -- H5Tget_nmembers on a non-compound type
+#     fails BY DESIGN, and the canary calls it on every type it meets, so its
+#     failures are a property of the harness and would be fixed there.
+_OUT_OF_ORACLE_SCOPE_ENTRY_POINTS = frozenset({
+    "H5Dread", "H5Aread", "H5Sselect_elements", "H5Tget_nmembers",
+})
+
+
+def _traversal_failure_is_in_scope(rep):
+    """True when a post-open failure is one the oracle's verdict spoke about.
+
+    Conservative in both directions: an unrecognised failing entry point counts
+    as IN scope, so a new canary call cannot silently turn a real divergence into
+    a shrug, and the answer is only ever consulted for a build that opened the
+    file and then errored.
+    """
+    probe = rep.get("probe") or {}
+    entry_points = probe.get("entry_points") or []
+    if not entry_points:
+        return True                       # no detail: keep the strict reading
+    failed = [e["name"] for e in entry_points if e.get("failures")]
+    if not failed:
+        return True
+    return any(name not in _OUT_OF_ORACLE_SCOPE_ENTRY_POINTS for name in failed)
+
+
 def _oracle_alignment(rep, oracle_decision):
     """Compare the oracle's decision with what the build under test did.
 
@@ -1474,11 +1512,27 @@ def _oracle_alignment(rep, oracle_decision):
     the selected PROFILE -- a traversal budget or a denied feature -- and
     libhdf5 has no equivalent, so it accepting such a file is expected by design
     and must not be reported as a divergence.
+
+    The same asymmetry applies to an `accept` oracle.  h5policy is metadata-only,
+    so its accept is a claim about the metadata graph and about nothing else.  A
+    build that opened the file, traversed it, opened every object -- and then
+    failed only in a raw-data read is not contradicting that claim; it is
+    answering a question the oracle did not ask.  Scoring it `divergent` makes
+    `_comparison_verdict` report `regression` on a case whose accept is correct,
+    which is how the global-heap vlen seed read for two revisions.  Metadata-scope
+    failures still count as divergence, and an outright `rejected_at_open` always
+    does.
     """
     if not oracle_decision:
         return "unknown"
     if oracle_decision == "accept":
-        return "aligned" if rep.get("outcome") == "accepted" else "divergent"
+        outcome = rep.get("outcome")
+        if outcome == "accepted":
+            return "aligned"
+        if outcome == "rejected_in_traversal" and \
+                not _traversal_failure_is_in_scope(rep):
+            return "not_comparable"
+        return "divergent"
     if oracle_decision == "reject_corrupt":
         return "aligned" if rep.get("outcome") != "accepted" else "divergent"
     if oracle_decision.startswith("reject_"):
