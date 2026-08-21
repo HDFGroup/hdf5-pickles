@@ -1,0 +1,245 @@
+# Fractal-heap doubling-table parameters are decoded without validation.
+#
+# libhdf5 writes the rules for these fields down itself, completely, in its own
+# writer -- and then compiles them out of every release build and never applies
+# them on read.  One two-byte field set to zero is enough to make a decoder loop
+# with no reachable exit while indexing three heap arrays; two neighbouring
+# values of the same field pair reach an unbounded allocation and an
+# out-of-bounds write instead.
+schema_version: 1
+
+id: fractal-heap-doubling-table
+title: fractal-heap doubling-table geometry unvalidated on read; width 0 loops without exit
+status: oracle-hardened          # h5policy rejects; no libhdf5 containment exists
+disclosure: "not disclosed; local analysis only.  No advisory text was fetched
+  and no outbound action was taken, so whether an advisory already covers this
+  code path is UNKNOWN rather than answered."
+
+record: heap_structures
+root_cause_classification: local_decode
+violated_invariant: heap.fractal_doubling_table
+entry_points:
+  - h5policy (oracle) -- untrusted-strict, now rejects on all three heap clients
+  - "libhdf5 H5HF_open -> H5HF__hdr_protect -> H5AC_protect -> H5C__load_entry
+     -> H5HF__cache_hdr_deserialize -> H5HF__hdr_finish_init
+     -> H5HF__hdr_finish_init_phase2 -> H5HF__hdr_compute_free_space"
+  - "dense group links: H5Lexists / H5Literate2 / H5Lvisit2 -> H5G__dense_iterate.
+     A single existence check is enough; nothing has to be enumerated or read."
+  - "dense attributes: H5Aexists / H5Aiterate2 -> H5A__dense_* -> H5HF_open"
+  - "shared object-header messages: H5O_msg_read -> H5O__dtype_shared_decode
+     -> H5O__shared_decode -> H5HF_open"
+  - "shipped tools: h5dump, h5ls, h5stat -- any traversal.  NOT reached by
+     H5Fopen, H5Gopen2 or H5Gget_info, all of which complete normally."
+
+# ── The defect, read out of the source tree (HDF5 develop @f8f0379c7c5, 2.3.0) ─
+defect: >-
+  H5HF__dtable_decode (H5HFcache.c:236) is the only reader of a fractal-heap
+  header's doubling-table block and performs no range, representation or
+  relational check on any of its fields.  H5HF__dtable_init then derives
+  first_row_bits = H5VM_log2_of2(start_block_size) + H5VM_log2_of2(table_width)
+  and max_root_rows = (max_index - first_row_bits) + 1 in unsigned arithmetic,
+  and max_root_rows sizes four H5MM_malloc arrays -- H5MM_malloc being a bare
+  malloc (H5MMprivate.h:38).  H5VM_log2_of2's only guard is
+  assert(POWER_OF_TWO(n)) (H5VMprivate.h:402), compiled out under NDEBUG, where
+  it answers 0 for 0 and a meaningless De Bruijn slot for any other
+  non-power-of-two.
+  Three failure modes follow from that one field pair.
+  (1) table_width == 0 makes H5HF__hdr_compute_free_space (H5HFhdr.c:133)
+  accumulate `row_block_size[curr_row] * width`, identically zero, so its
+  `while (acc_heap_size < iblock_size)` loop has no reachable exit and curr_row
+  is never compared against max_root_rows: three arrays are read without bound.
+  The two stores after the loop are index-bounded and never reached, so the
+  access is read-only.
+  (2) first_row_bits > max_index wraps max_root_rows to ~4.29e9 and asks malloc
+  for 32 GiB, four times.
+  (3) first_row_bits == max_index + 1 makes max_root_rows exactly 0, so all four
+  arrays are malloc(0) while H5HF__dtable_init stores row_block_size[0] and
+  row_block_off[0] unconditionally, ahead of the `u < max_root_rows` loop -- an
+  eight-byte out-of-bounds write per array.
+  The header's stored checksum IS verified first (H5HF__cache_hdr_verify_chksum
+  registered at H5HFcache.c:125; H5C__load_entry runs verify_chksum at
+  H5Centry.c:1215 before deserialize at :1241), so accidental corruption is
+  caught and this requires a file whose checksum was recomputed after the
+  mutation.
+
+writer_note: >-
+  The rules exist in H5HF__hdr_create (H5HFhdr.c:314-350): width non-zero,
+  <= H5HF_WIDTH_LIMIT (65536) and a power of two; starting block size non-zero
+  and a power of two; maximum direct block size non-zero, a power of two and at
+  least max_man_size; maximum heap size non-zero and no wider than the file's
+  length size.  Every one of them is inside `#ifndef NDEBUG`, and all of them are
+  on the WRITE path only.  All three clients hard-code width 4
+  (H5G_FHEAP_MAN_WIDTH at H5Gdense.c:43, H5O_FHEAP_MAN_WIDTH at H5Adense.c:182
+  and H5SM.c:492), so no file any release can write comes near these bounds and
+  enforcing them on read cannot reject a legitimate file.
+
+activation_note: >-
+  The fault occurs inside the metadata cache's deserialize callback, so the
+  native H5HF_hdr_t -- including four heap allocations sized from unvalidated
+  fields -- is already constructed.  It is before H5C__load_entry publishes the
+  cache entry and before any group, attribute or datatype object is
+  materialised.  The exact-build probe measured zero external opens, zero plugin
+  loads, zero writes and no network on both builds; the only violation is the
+  crash itself.
+
+# ── Measured behaviour ────────────────────────────────────────────────────────
+measured:
+  oracle_before: >-
+    unsupported_coverage_gap for the dense-link and dense-attribute heaps
+    (H5_UNSUPPORTED_PICKLE_COVERAGE_GAP, "dense link storage uses an unsupported
+    fractal-heap/B-tree layout") -- a refusal, so a consumer honouring it was
+    protected, but the wrong verdict for a provably malformed file.  For the
+    SHARED-MESSAGE heap it was a PROVEN FALSE ACCEPT: exit 0, zero findings, on a
+    file that SIGSEGVs libhdf5, because the only doubling-table test lived in the
+    dense walkers as a silent `table_width == 0UL` early return and the
+    shared-message envelope never looked at the geometry.  Width 3 (the
+    unbounded-allocation shape) was also accepted, against invariant A-prime.
+  oracle_after: >-
+    reject_corrupt with H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE on all three
+    clients, from one shared validator whose caller-supplied role prefix routes
+    each occurrence to the owning family.  The valid controls still accept,
+    including a legal non-default width (valid/sohm_frhp_width8.h5).
+  libhdf5_stock: >-
+    width 0: SIGSEGV in H5HF__hdr_compute_free_space (H5HFhdr.c:160), faulting
+    instruction `mov 0x0(%rbp,%rdx,8),%rdx`, si_addr equal to the end of the
+    process heap mapping -- the loop read forward from a 192-byte allocation
+    (max_root_rows 24) to the end of the heap segment, roughly half a megabyte.
+    Deterministic on every build measured, and identical from all three clients.
+    Width 3, and the two first-row-relation shapes: a clean error return under a
+    bounded address space, after a measured 32 GiB (34359738336-byte) malloc
+    request.  Width 7 and width 65535: ACCEPTED, exit 0 -- see not_tracked.
+  libhdf5_asserts_on: >-
+    SIGABRT on assert(POWER_OF_TWO(n)) in H5VM_log2_of2 (H5VMprivate.h:402).
+    An assertion abort, NOT an AddressSanitizer report; no memory-safety claim is
+    drawn from it.  It also SHADOWS the defect: the ASan build carries the same
+    live assert, so it stops before reaching the out-of-bounds access and cannot
+    characterise it.
+  oob_characterisation: >-
+    obtained from a standalone AddressSanitizer witness that transcribes
+    H5HF__dtable_init, H5HF__hdr_compute_free_space and the
+    H5HF__hdr_finish_init_phase2 loop with the NDEBUG body of H5VM_log2_of2:
+    "heap-buffer-overflow READ of size 8, 0 bytes after 192-byte region" for
+    width 0, and "WRITE of size 8, 0 bytes after 1-byte region" for the
+    max_root_rows == 0 shape.  A measurement of the extracted arithmetic, not of
+    the shipped library, whose behaviour on the same inputs is above.
+  ilp32: >-
+    checked and does NOT escalate.  max_root_rows * sizeof(hsize_t) is a size_t
+    multiplication, so on ILP32 the 32 GiB request could in principle wrap to a
+    small allocation and turn exhaustion into heap corruption.  Measured with a
+    -m32 build over every reachable wrapped value (max_root_rows can only
+    underflow by first_row_bits - max_index - 1, at most a few dozen): every
+    request lands within 350 bytes of 4 GiB and fails.  The one wrapped value
+    that does allocate is max_root_rows == 0, which is failure mode (3) and is
+    reachable on both ABIs.
+  version_range: >-
+    every release with fractal heaps: 1.8.0 through development 2.3.0, no fixed
+    version.  hdf5-1_8_0 carries the same unchecked
+    UINT16DECODE(*pp, dtable->cparam.width) (H5HFcache.c:167) and the same
+    while(acc_heap_size < iblock_size) loop (H5HFhdr.c:178); git log -S dates the
+    decode to ee3fdc2dbcd and the loop to c83c1eb42d2, both 2006.  Measured on
+    1.14.5 (SIGSEGV, 3 runs of 3) and on two 2.3.0 builds.
+
+# ── Containment vs systemic remediation (strategy doc §11.5) ──────────────────
+containment:
+  status: planned
+  description: >-
+    Validate the doubling-table parameters in H5HF__dtable_decode, before any
+    derived arithmetic: it is the single reader, it is reached from every client,
+    and the rule set is already written in H5HF__hdr_create and only needs to
+    leave `#ifndef NDEBUG`.  Add the one relation that writer does not state --
+    log2(start_block_size) + log2(table_width) <= max_heap_size_bits -- which is
+    what stops max_root_rows from wrapping or reaching zero.  Backportable to
+    every branch; cannot reject a file any release can write.  Bounding curr_row
+    against max_root_rows in H5HF__hdr_compute_free_space is worthwhile defence
+    in depth but closes only failure mode (1).
+systemic:
+  semantic_boundary: >-
+    the complete fractal-heap header record.  max_root_rows combines the table
+    width, the starting block size and the maximum heap size, and its use is
+    gated on the maximum direct block size, so validating the width alone
+    reopens two of the three failure modes.
+  status: planned
+  owner: n/a -- upstream libhdf5; not reported from this bundle
+
+# ── Reproducers ───────────────────────────────────────────────────────────────
+reproducers:
+  direct_fixtures:
+    - h5policy/tests/malformed/dense_link_frhp_width_zero.h5
+    - h5policy/tests/malformed/dense_attr_frhp_width_zero.h5
+    - h5policy/tests/malformed/sohm_frhp_width_zero.h5
+    - h5policy/tests/malformed/dense_link_frhp_width_not_power_of_two.h5
+    - h5policy/tests/malformed/dense_link_frhp_no_root_rows.h5
+    - h5policy/tests/malformed/dense_link_frhp_first_row_overflow.h5
+  control_fixture: h5policy/tests/valid/sohm_frhp_width8.h5
+  generator: >-
+    h5policy-gencorpus _make_frhp_width_zero / _make_frhp_width_not_power_of_two
+    / _make_frhp_no_root_rows / _make_frhp_first_row_overflow / _make_frhp_width8,
+    all through _patch_frhp_dtable, which rewrites one doubling-table field of a
+    nominated heap header and repairs that header's Jenkins checksum.  Nothing
+    outside the header moves, so no address or superblock fixup is needed.
+    _sohm_frhp identifies the shared-message heap from the master table (whose
+    size it recovers from that table's own trailing checksum) rather than by
+    creation parameters, because sohm_list.h5 carries two heaps.
+  expectations:
+    - h5policy/tests/expected/malformed-dense_link_frhp_width_zero.yml
+    - h5policy/tests/expected/malformed-dense_attr_frhp_width_zero.yml
+    - h5policy/tests/expected/malformed-sohm_frhp_width_zero.yml
+    - h5policy/tests/expected/malformed-dense_link_frhp_width_not_power_of_two.yml
+    - h5policy/tests/expected/malformed-dense_link_frhp_no_root_rows.yml
+    - h5policy/tests/expected/malformed-dense_link_frhp_first_row_overflow.yml
+    - h5policy/tests/expected/valid-sohm_frhp_width8.yml
+  integration_poc: >-
+    a 2285-byte specimen that differs from a valid file in exactly one 2-byte
+    field plus the repaired header checksum; input_sha256
+    eb628331b099438cc8b5b7ef71d8aebb8e06c304af8ccafdc6b7b327c8c62669.  The
+    tracked dense-link fixture above is the same mutation applied to
+    valid/dense_links.h5, so the specimen itself needs no tracked reference.
+
+# ── What is deliberately NOT tracked ──────────────────────────────────────────
+not_tracked: >-
+  The widths that are neither zero nor a first-row violation -- 7, 65535 -- are
+  ACCEPTED by libhdf5: h5dump exits 0 and prints the group.  Width 7 is
+  nevertheless failure mode (3), an eight-byte out-of-bounds write per array that
+  glibc's malloc(0) slack absorbs, so no fault is reproducible on this host and
+  the severity is latent and allocator-dependent.  h5policy rejects both, which
+  is stricter than the reference library, so a corpus fixture for either would
+  hard-fail invariant A and would need an h5policy-diff A~ predicate to excuse
+  it.  Rather than add a predicate for a shape whose libhdf5 consequence cannot
+  be demonstrated through the harness, the power-of-two rule is exercised by
+  dense_link_frhp_width_not_power_of_two.h5 (width 3), where libhdf5 does reject,
+  and the max_root_rows == 0 shape by dense_link_frhp_no_root_rows.h5, which
+  reaches it through the maximum-heap-size field instead.  Revisit if an
+  allocator or platform is found where the write is observable.
+
+sibling_audit: >-
+  All three fractal-heap clients are affected, each measured faulting at the
+  identical frame with its own fixture, and all three now share one validator.
+  Two adjacent rules the writer states are NOT enforced by the oracle, both
+  deliberately: max_direct_size >= max_man_size (it only feeds the heap-ID length
+  width, which H5_CORRUPT_FRACTAL_HEAP_ID_WIDTH already bounds, so it is not a
+  memory-safety lever), and max_direct_size >= start_block_size (unstated by the
+  writer; it underflows max_direct_rows to a huge unsigned, which makes
+  H5HF__hdr_finish_init_phase2 take the direct-row branch for every row and can
+  underflow row_tot_dblock_free -- a distinct shape, unmeasured, and not part of
+  this invariant).  Neither is reachable through the doubling-table check, so
+  both remain open coverage.
+
+coverage_manifest_change: >-
+  validation-coverage.yml gains dense.fractal_doubling_table (dense_index),
+  heap.fractal_doubling_table (heap_structures) and sohm.fractal_doubling_table
+  (shared_messages_legacy); findings/catalog/heap_structures.yml gains
+  H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE (scope record_local, ambiguous, so it
+  carries a route shard splitting the three roles the same way
+  H5_CORRUPT_FILTERED_HEAP_NO_DBLOCK_CHECKSUM does).  One finding rather than
+  three because one validator checks one record; three invariants because
+  `record` selects the exact-build canary and the canary differs per client.
+
+provenance:
+  found_by: "supplied specimen, worked end to end 2026-08-21"
+  promoted_bundles:
+    # cases/ is gitignored, so this record is the only tracked artifact.
+    - the fractal-heap table-width bundle (input_sha256 eb628331b099438c...)
+  hdf5_build: "HDF5 develop @f8f0379c7c5 (2.3.0); baseline RelWithDebInfo with
+    -DNDEBUG and no sanitizer, candidate RelWithDebInfo -fsanitize=address with
+    asserts live; third build measured 1.14.5.  Workstation-local installs; paths
+    not recorded."

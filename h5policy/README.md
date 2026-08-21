@@ -259,8 +259,10 @@ final decision:
   that permits it still returns a coverage gap because the bounded raw body has
   no validator.
 - **Filtered fractal-heap bodies.** h5policy validates the heap and filter
-  envelopes for SOHM, dense links, and dense attributes, including checksums
-  and the required direct-block checksum flag. It does not reverse the filter
+  envelopes for SOHM, dense links, and dense attributes, including checksums,
+  the required direct-block checksum flag, and the doubling-table geometry
+  (`H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE`, checked once for all three clients
+  on the heap header rather than per traversal). It does not reverse the filter
   pipeline, so message/link/attribute bodies inside compressed blocks remain
   uninspected. A defect visible only after decompression therefore remains an
   explicit refusal.

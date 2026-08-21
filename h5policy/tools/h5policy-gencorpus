@@ -1462,6 +1462,30 @@ def _gen_malformed(root):
         f"{root}/malformed/mdci_parent_addr_unresolved.h5")
     _make_mdci_parent_addr_self(
         f"{root}/malformed/mdci_parent_addr_self.h5")
+    # Fractal-heap doubling-table geometry, one rewritten field each.  The
+    # dense-link, dense-attribute and shared-message heaps are all covered
+    # because they are three separate walkers over one shared header record.
+    _make_frhp_width_zero(
+        f"{root}/malformed/dense_link_frhp_width_zero.h5",
+        f"{root}/valid/dense_links.h5")
+    _make_frhp_width_zero(
+        f"{root}/malformed/dense_attr_frhp_width_zero.h5",
+        f"{root}/valid/dense_attribute.h5")
+    _make_frhp_width_zero(
+        f"{root}/malformed/sohm_frhp_width_zero.h5",
+        f"{root}/valid/sohm_list.h5", _sohm_frhp)
+    _make_frhp_width_not_power_of_two(
+        f"{root}/malformed/dense_link_frhp_width_not_power_of_two.h5",
+        f"{root}/valid/dense_links.h5")
+    _make_frhp_no_root_rows(
+        f"{root}/malformed/dense_link_frhp_no_root_rows.h5",
+        f"{root}/valid/dense_links.h5")
+    _make_frhp_first_row_overflow(
+        f"{root}/malformed/dense_link_frhp_first_row_overflow.h5",
+        f"{root}/valid/dense_links.h5")
+    _make_frhp_width8(
+        f"{root}/valid/sohm_frhp_width8.h5",
+        f"{root}/valid/sohm_list.h5", _sohm_frhp)
     _make_filtered_dense_link_no_dblock_checksum(
         f"{root}/malformed/filtered_dense_link_no_dblock_checksum.h5",
         f"{root}/valid/dense_links.h5")
@@ -5021,6 +5045,184 @@ def _filtered_frhp_rewrite(base_path, pipeline, clear_checksum_flag):
     struct.pack_into("<Q", new, 12 + 2 * soff, len(new))
     _fix_sb_checksum(new)
     return bytes(new)
+
+
+def _frhp_dtable_offsets(raw, frhp):
+    """Byte offsets of one fractal-heap header's doubling-table fields.
+
+    `_dense_frhp_info` decodes the FIRST heap in a file and returns its values;
+    this returns the OFFSETS of a nominated heap's fields, which is what a
+    single-field rewrite needs, and it works on a file with more than one heap
+    (sohm_list.h5 has two: the shared-message heap and the root group's).
+    """
+    off_size, len_size = raw[9], raw[10]
+    dtable = frhp + 14 + (10 * len_size) + (2 * off_size)
+    body = 14 + (2 * off_size) + (10 * len_size) + (8 + 2 * len_size + off_size)
+    filter_len = struct.unpack_from("<H", raw, frhp + 7)[0]
+    if filter_len:
+        body += len_size + 4 + filter_len
+    return dict(off_size=off_size, len_size=len_size, frhp=frhp,
+                width=dtable, start=dtable + 2,
+                max_direct=dtable + 2 + len_size,
+                max_heap_bits=dtable + 2 + 2 * len_size,
+                checksum=frhp + body)
+
+
+def _frhp_offsets_in(raw):
+    out, i = [], 0
+    while True:
+        i = raw.find(b"FRHP", i)
+        if i < 0:
+            return out
+        out.append(i)
+        i += 1
+
+
+def _sole_frhp(raw):
+    """The file's only fractal-heap header.  More than one is a base-fixture
+    change, not something to disambiguate silently."""
+    heaps = _frhp_offsets_in(raw)
+    if len(heaps) != 1:
+        raise RuntimeError(
+            f"expected exactly one fractal heap header, found {len(heaps)}")
+    return heaps[0]
+
+
+def _sohm_frhp(raw):
+    """The fractal-heap header the shared-message table names.
+
+    sohm_list.h5 carries two heaps and picking by creation parameters would be
+    a guess, so the master table is asked instead.  Its total size is not
+    derivable without knowing the index count, so it is recovered from its own
+    trailing checksum -- which also proves the block was located correctly --
+    and the one heap address encoded inside that verified block is the answer.
+    """
+    smtb = raw.find(b"SMTB")
+    if smtb < 0:
+        raise RuntimeError("could not locate the shared message table")
+    off_size = raw[9]
+    jenkins = _jenkins_lookup3()
+    entry = 13 + 2 * off_size
+    total = None
+    for size in range(9, 4 + 1 + 16 * entry + 4 + 2):
+        end = smtb + size - 4
+        if end + 4 > len(raw):
+            break
+        if struct.unpack_from("<I", raw, end)[0] == jenkins(bytes(raw[smtb:end])):
+            total = size
+            break
+    if total is None:
+        raise RuntimeError("shared message table checksum did not verify")
+    window = bytes(raw[smtb:smtb + total])
+    hits = [h for h in _frhp_offsets_in(raw)
+            if h.to_bytes(off_size, "little") in window]
+    if len(hits) != 1:
+        raise RuntimeError(
+            f"shared message table names {len(hits)} fractal heaps, expected 1")
+    return hits[0]
+
+
+def _patch_frhp_dtable(path, base_path, find_frhp, **fields):
+    """Rewrite doubling-table fields of one fractal-heap header and repair that
+    header's Jenkins checksum, so the rewritten field is the only defect.
+
+    Nothing outside the header moves, so the declared EOF and the superblock
+    checksum stay valid and no address needs fixing up.  `width` and
+    `max_heap_bits` are two-byte fields; `start` and `max_direct` are
+    length-sized.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    frhp = find_frhp(raw)
+    info = _frhp_dtable_offsets(raw, frhp)
+    if not fields:
+        raise RuntimeError("no doubling-table field to rewrite")
+    for name, value in fields.items():
+        if name in ("width", "max_heap_bits"):
+            struct.pack_into("<H", raw, info[name], value)
+        elif name in ("start", "max_direct"):
+            raw[info[name]:info[name] + info["len_size"]] = \
+                value.to_bytes(info["len_size"], "little")
+        else:
+            raise RuntimeError(f"unknown doubling-table field {name}")
+    struct.pack_into("<I", raw, info["checksum"],
+                     _jenkins_lookup3()(bytes(raw[frhp:info["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_frhp_width_zero(path, base_path, find_frhp=_sole_frhp):
+    """A fractal-heap header whose doubling-table width is zero.
+
+    libhdf5 never writes anything but 4 (H5G_FHEAP_MAN_WIDTH,
+    H5O_FHEAP_MAN_WIDTH), and width 0 is the one value that stops
+    H5HF__hdr_compute_free_space from terminating: its accumulator advances by
+    `row_block_size[row] * width`, so with width 0 the loop has no reachable
+    exit and walks three heap arrays out of bounds.  Measured on a release
+    build: SIGSEGV in H5HFhdr.c, having read from a 192-byte allocation to the
+    end of the process heap mapping.  The only existing guard is
+    `assert(POWER_OF_TWO(n))` inside H5VM_log2_of2, compiled out under NDEBUG.
+    """
+    _patch_frhp_dtable(path, base_path, find_frhp, width=0)
+
+
+def _make_frhp_width_not_power_of_two(path, base_path):
+    """A doubling-table width of 3.
+
+    H5VM_log2_of2 is a De Bruijn lookup that is only meaningful for powers of
+    two; under NDEBUG it answers 28 for 3.  first_row_bits then exceeds the
+    maximum heap size, `max_root_rows` underflows to ~4.29e9, and each of the
+    four doubling-table arrays asks malloc for 32 GiB (measured: 34359738336
+    bytes).  A bounded address space turns that into a clean libhdf5 error; an
+    unbounded one turns it into a memory-amplification denial of service.
+    """
+    _patch_frhp_dtable(path, base_path, _sole_frhp, width=3)
+
+
+def _make_frhp_no_root_rows(path, base_path):
+    """A doubling table whose first row is exactly one bit too wide.
+
+    `max_root_rows = (max_heap_size_bits - first_row_bits) + 1`, so declaring
+    10 heap-size bits against this heap's 11-bit first row makes it exactly
+    zero.  H5HF__dtable_init then allocates all four row arrays with
+    H5MM_malloc(0) -- a bare malloc -- and stores row_block_size[0] and
+    row_block_off[0] unconditionally, before the `u < max_root_rows` loop:
+    an eight-byte out-of-bounds write per array.  glibc's malloc(0) leaves
+    usable slack, so the write is absorbed and libhdf5 fails later, on the
+    heap geometry rather than on the memory error.
+    """
+    _patch_frhp_dtable(path, base_path, _sole_frhp, max_heap_bits=10)
+
+
+def _make_frhp_first_row_overflow(path, base_path):
+    """The same relation violated by two bits instead of one.
+
+    Nine declared heap-size bits against an 11-bit first row makes the
+    `max_root_rows` subtraction wrap rather than reach zero, so this is the
+    32 GiB allocation shape reached without a non-power-of-two width -- the
+    same libhdf5 consequence as the width-3 fixture, a different oracle rule.
+    """
+    _patch_frhp_dtable(path, base_path, _sole_frhp, max_heap_bits=9)
+
+
+def _make_frhp_width8(path, base_path, find_frhp=_sole_frhp):
+    """A VALID control: doubling-table width 8 instead of libhdf5's 4.
+
+    Eight is a power of two within H5HF_WIDTH_LIMIT, so it satisfies every rule
+    libhdf5's own writer states, even though no libhdf5 writer emits anything
+    but 4.  The fixture exists so the doubling-table invariant is pinned to the
+    format's rule rather than to the one width the library happens to write -- a
+    check that rejected this would be over-tight -- and so the fuzzer's seed
+    pool holds a heap geometry other than the default.
+
+    The base heap must have a DIRECT root block (current root rows 0).  An
+    indirect root block's on-disk size is `nrows * table_width` entries, so
+    rewriting the width there resizes the block and invalidates its checksum:
+    measured on valid/dense_links.h5, whose root has one indirect row, both
+    libhdf5 and h5policy then reject the file for the FHIB checksum rather than
+    accepting it.  sohm_list.h5's shared-message heap stores its objects in a
+    root direct block, which the doubling table is not consulted to find.
+    Measured there: `h5dump` and `h5dump -H` both exit 0.
+    """
+    _patch_frhp_dtable(path, base_path, find_frhp, width=8)
 
 
 def _make_filtered_dense_link_no_dblock_checksum(path, base_path):
