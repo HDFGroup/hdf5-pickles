@@ -73,7 +73,8 @@ advisory.
   present an unavailable platform result as measured.
 - Consider 32-bit and 64-bit behavior and other relevant platform differences.
   Run representative platforms when locally available; otherwise document the
-  gap and the arithmetic, ABI, or layout risks that remain.
+  gap and the arithmetic, ABI, or layout risks that remain. See
+  [32-bit builds](#32-bit-builds) for what is measurable here and how.
 - Measure the oracle verdict, but do not make existing rejection the primary
   conclusion. Identify the violated invariant, affected entry points, exact-build
   behavior, activation boundary, sibling variants, and remaining coverage gaps.
@@ -123,6 +124,153 @@ measurements against current HEAD and replace TODOs or unsupported assertions.
 - Before handing off a bundle, run `python3 tools/check_hygiene.py --paths
   cases/<id>` and correct every reported portable-provenance or identifier
   violation.
+
+## 32-bit builds
+
+On an x86-64 Linux host with a multilib GCC, 32-bit behavior is something to
+*measure*, not to argue about. The devcontainer image states the same contract —
+`gcc-multilib`, `lib32-gcc-libs`, and an HDF5 `-m32` variant installed at
+`$HDF5_32_PREFIX` — and [`.devcontainer/README.md`](.devcontainer/README.md)
+documents it. Check each step below in the environment you are in rather than
+assuming it; when one is unavailable, name it and give the arithmetic argument in
+its place, per [Evidence requirements](#evidence-requirements).
+
+### Width witnesses
+
+`-m32` is a hosted build here: `malloc`, `printf` and the sanitizers all work, so
+a width witness is an ordinary program compiled twice from one source.
+
+```sh
+cc -m32 -O1 -o witness32 witness.c && ./witness32   # sizeof(size_t) == 4
+cc      -O1 -o witness64 witness.c && ./witness64   # sizeof(size_t) == 8
+cc -m32 -g -O1 -fsanitize=address    -o witness32a witness.c
+cc -m32    -O1 -fsanitize=undefined  -o witness32u witness.c
+```
+
+Write the arithmetic against `size_t` (or `__SIZE_TYPE__`), never `unsigned
+long`, so the width follows the target and one source really is both arms of the
+comparison. AddressSanitizer and UndefinedBehaviorSanitizer both report from an
+i386 binary, which is usually the shortest route from a width-dependent wrap to a
+memory-safety witness: it needs no libhdf5 build at all.
+
+Only the C toolchain is multilib on a workstation — there is no 32-bit
+`libstdc++`, so this repository's C++ target cannot be built at `-m32`, and
+installing one is a new build dependency (see [Ask first](#ask-first)). If `-m32`
+linking is unavailable altogether, the fallback is a freestanding witness
+(`-nostdlib -static`, a hand-written `_start`, raw syscalls); note that libgcc's
+`__udivdi3` and `__umoddi3` are not linkable at `-m32`, so 64-bit decimal
+formatting has to be hand-rolled there.
+
+### Running libhdf5 at 32 bits
+
+Set `HDF5_32_PREFIX` to the 32-bit install (already set in the devcontainer).
+A build is identified by `-m32` in the `CFLAGS` its `libhdf5.settings` records,
+which is how to find one without recording where this machine keeps it:
+
+```sh
+prefix=$(dirname "$(dirname "$(command -v h5cc)")")
+for settings in "$prefix"/*/lib/libhdf5.settings; do
+    grep -q -e ' -m32' "$settings" &&
+        HDF5_32_PREFIX=$(cd "$(dirname "$settings")/.." && pwd)
+done
+file "$HDF5_32_PREFIX"/lib/libhdf5.so.*.*      # ELF 32-bit ... Intel i386
+```
+
+The installed tools run natively (`h5dump`, `h5debug`, `h5ls`, `h5stat`), and
+`setarch i686` is available for anything that branches on `uname -m`. Keep the
+usual cap on a dumping run of a suspect file — `ulimit -v` in the subshell — and
+read a 32-bit resource verdict carefully: an amplification that a 64-bit run
+reaches may hit the ILP32 address-space ceiling first, so a 32-bit failure is not
+evidence that the 64-bit path is bounded.
+
+That install's `h5cc` does **not** imply `-m32`; it drives the host `cc` with the
+install's include and library paths, so a reproducer has to pass the flag:
+
+```sh
+"$HDF5_32_PREFIX/bin/h5cc" -m32 -O1 -o poc32 poc.c
+```
+
+Without it the link fails with `skipping incompatible .../libhdf5.so` and
+`cannot find -lhdf5` — an ABI mismatch, not a missing library.
+
+### The exact-build probe at 32 bits
+
+`h5policy-probe` builds two artifacts: the probe executable, with the selected
+`h5cc`, and the `LD_PRELOAD` activation interposer, with plain `cc`. Both must be
+32-bit, so shim both:
+
+```sh
+mkdir -p shim32
+printf '#!/bin/sh\nexec "%s/bin/h5cc" -m32 "$@"\n' "$HDF5_32_PREFIX" >shim32/h5cc
+printf '#!/bin/sh\nexec /usr/bin/cc -m32 "$@"\n' >shim32/cc
+chmod +x shim32/h5cc shim32/cc
+PATH="$PWD/shim32:$PATH" h5policy/tools/h5policy-probe suspect.h5 \
+    --hdf5-bindir "$PWD/shim32" --json
+```
+
+The `cc` shim needs the absolute compiler path: the shim directory is on `PATH`
+for the whole run, so a bare `cc` inside it re-executes the shim until the build
+times out.
+
+Shimming `h5cc` alone is the other trap. A 64-bit interposer cannot be preloaded into a
+32-bit process; the loader's complaint is not part of the report, so every
+activation counter reads zero and the run looks clean. Measured on
+`h5policy/tests/policy/external_link.h5`, whose `external_open` count falls from
+3 to 0 that way. The probe's build cache is keyed on `h5cc` and the library
+settings but not on `cc`, so remove the stale `h5policy/tools/probe/.build/<key>/`
+directory when changing the width of either artifact instead of trusting a cached
+pair. `tools/h5cve` hands its `--baseline`/`--candidate` bindir straight to the
+probe, so the same shim directory serves there.
+
+`h5policy/tests/run.sh` resolves `h5cc` from `PATH`, so the probe and `h5cve`
+phases follow the shim, while the differential phase does not: it drives h5py in
+the 64-bit interpreter. Report such a run as those phases, not as the suite.
+
+### Limits of the 32-bit variant
+
+- External filters are deliberately off (there are no 32-bit zlib or SZIP
+  libraries to link), so metadata paths are fully exercisable but filtered data
+  is not: `h5dump -d` on a shuffle+deflate dataset prints `unable to print data`
+  where the 64-bit build prints values. A conclusion about filtered chunk data
+  cannot be measured with this variant.
+- Assert state belongs to the variant, not to the width. Read the build's
+  `libhdf5.settings` (`-DNDEBUG` present or absent) before attributing an abort
+  to an assert or reporting an assert-free baseline.
+- No 32-bit AddressSanitizer libhdf5 exists here. One is buildable — the 32-bit
+  ASan runtime is present — but nothing in this repository has built or measured
+  it, so treat it as unmeasured, and prefer a standalone `-m32` ASan witness that
+  transcribes the suspect arithmetic.
+
+### Building the variant
+
+`.devcontainer/build-hdf5.sh 32` is the canonical recipe, and takes
+`HDF5_SOURCE_DIR` and `HDF5_32_PREFIX` from the environment; outside the
+container the prefix must exist and be writable, and the script builds in
+`$HDF5_SOURCE_DIR/build-32`, reusing any directory already there. The equivalent
+standalone invocation, which configures, builds and installs out of tree in under
+two minutes with the test suite off, is:
+
+```sh
+cmake -S <hdf5-checkout> -B <build-dir> -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_C_FLAGS=-m32 -DCMAKE_EXE_LINKER_FLAGS=-m32 \
+    -DCMAKE_SHARED_LINKER_FLAGS=-m32 -DCMAKE_MODULE_LINKER_FLAGS=-m32 \
+    -DCMAKE_INSTALL_PREFIX=<prefix> -DHDF5_ENABLE_ZLIB_SUPPORT=OFF \
+    -DHDF5_ENABLE_SZIP_SUPPORT=OFF -DHDF5_ALLOW_EXTERNAL_SUPPORT=NO \
+    -DHDF5_BUILD_TOOLS=ON -DBUILD_TESTING=OFF
+cmake --build <build-dir> --parallel 4 && cmake --install <build-dir>
+file <prefix>/bin/h5dump    # must say ELF 32-bit ... Intel i386
+```
+
+For a candidate-role 32-bit build add `-DHDF5_ENABLE_ASSERTS=YES`, which appends
+`-UNDEBUG`. The option is a tri-state string — `YES`, `NO`, `OFF` — in which
+`OFF` means "do not override the build type", so a `RelWithDebInfo` configure
+that passes `OFF` (or nothing) still inherits CMake's `-DNDEBUG` and has no live
+asserts.
+
+Record the result the way [Portable provenance](#portable-provenance) requires:
+name the build by role, pin it with `build_mode`, `sanitizers` and
+`settings_sha256`, add the ABI (`i386` against `x86-64`) because that is the
+distinction the record exists to carry, and leave the prefix out.
 
 ## Documentation
 
