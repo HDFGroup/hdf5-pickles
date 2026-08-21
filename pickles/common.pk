@@ -19,7 +19,11 @@
 load "h5_format_constants.pk";
 load "lookup3.pk";
 
-fun set_little_endian = void: 
+/* Sets poke's own mapping endianness for the rest of the session/script --
+ * not an HDF5 field, a poke interpreter setting. Call once, before mapping
+ * anything; every multi-byte field in this format layer assumes it's in
+ * effect. */
+fun set_little_endian = void:
 {
     set_endian(ENDIAN_LITTLE);
 };
@@ -38,14 +42,20 @@ fun hdf5_field_width_valid = (uint<8> sz) int:
     return (sz == 2UB || sz == 4UB || sz == 8UB || sz == 16UB || sz == 32UB);
 };
 
-fun set_global_sizeof_offsets = (uint<8> sz) int: 
+/* Returns 1/0 rather than raising so these can run as superblock field
+ * constraints: a bad width rejects the field (and, transitively, the
+ * whole superblock) instead of throwing out of the mapping. Every other
+ * pickle in this codebase sizes its address/length fields off the
+ * global_sizeof_offsets/global_sizeof_lengths these set, so call them
+ * (via mapping the superblock) before mapping anything else. */
+fun set_global_sizeof_offsets = (uint<8> sz) int:
 {
     if (!hdf5_field_width_valid(sz)) return 0;
     global_sizeof_offsets = sz;
     return 1;
 };
 
-fun set_global_sizeof_lengths = (uint<8> sz) int: 
+fun set_global_sizeof_lengths = (uint<8> sz) int:
 {
     if (!hdf5_field_width_valid(sz)) return 0;
     global_sizeof_lengths = sz;
@@ -82,6 +92,9 @@ fun hdf5_u32_le_bytes = (uint<32> value) byte[]:
             ((value .>> 24) & 0xffU) as uint<8>];
 };
 
+/* Rounds x up to the next multiple of 8 -- HDF5's on-disk alignment unit
+ * for metadata (header prefixes, message bodies, etc). Returns x unchanged
+ * if it's already 8-aligned. */
 fun align8 = (uint<64> x) uint<64>:
 {
     return ((x + 7UL) / 8UL) * 8UL;
@@ -130,6 +143,16 @@ fun bytes_to_u64_le_at = (byte[] raw, uint<64> off, uint<64> n) uint<64>:
     return acc;
 }
 
+/* Decodes the entire array as one little-endian value (shorthand for
+ * bytes_to_u64_le_at(raw, 0, raw'length)) -- so it inherits that function's
+ * 8-byte cap silently: a 16-/32-byte extended field decodes only its first
+ * 8 bytes. Use hdf5_bytes_fit_u64() first if the high bytes might be
+ * nonzero and matter.
+ *
+ * This returns the raw, base-relative value as stored on disk -- it does
+ * NOT translate an address. Reach for hdf5_addr_to_file_u64() or
+ * bytes_to_off() instead when the result is going to be used as an actual
+ * file offset (printed as one, or mapped with @). */
 fun bytes_to_u64_le = (byte[] raw) uint<64>:
 {
     return bytes_to_u64_le_at(raw, 0UL, raw'length as uint<64>);
@@ -142,6 +165,10 @@ var global_hdf5_base_addr = 0UL;
 var global_hdf5_declared_eof = 0UL;
 var global_hdf5_declared_eof_known = 0UB;
 
+/* Call before mapping a different file's superblock in the same poke
+ * session -- otherwise a nonzero base address left over from a
+ * previously-mapped file would silently leak into this one. Mapping a
+ * superblock does not call this for you. */
 fun reset_global_hdf5_base_addr = void:
 {
     global_hdf5_base_addr = 0UL;
@@ -159,12 +186,60 @@ fun reset_global_hdf5_declared_eof = int:
     return 1;
 };
 
+/* Called from the superblock's base_addr_raw field constraint. Unlike
+ * every other address field in the format, base_addr itself is stored
+ * (and used) untranslated -- it IS the translation origin the rest of this
+ * function's family adds to everything else, not a value that needs
+ * translating in turn. */
 fun set_global_hdf5_base_addr = (byte[] raw) int:
 {
     global_hdf5_base_addr = bytes_to_u64_le(raw);
     return 1;
 }
 
+/* The core address-translation primitive for this whole shared format
+ * layer: every other pickle that loads common.pk relies on it.
+ *
+ * Every HDF5 file address is stored on disk relative to the superblock's
+ * base address (nonzero only when a user block precedes the HDF5 data).
+ * `addr` here is that raw, base-relative uint64 -- already decoded (see
+ * bytes_to_u64_le()/bytes_to_u64_le_at()), not raw bytes. The return value
+ * is the physical byte offset in the actual file: safe to print as a
+ * real address, or to convert to an offset (#B) and map with @.
+ *
+ * Translate exactly once, at the point the address is actually consumed
+ * (about to be printed, or about to be mapped) -- never store a
+ * pre-translated value, and never skip translation on the assumption it
+ * happens elsewhere. Two places that's easy to get wrong in practice:
+ *   - A `var` global that outlives one call (caches a decoded address for
+ *     reuse) should stay raw and be translated at each read, not once at
+ *     write time -- see e.g. fsm.pk's global_fshd_sect_addr or fheap.pk's
+ *     global_frhp_root_addr.
+ *   - A raw address crossing from one pickle file's caller into a
+ *     function defined in a different pickle file should be translated by
+ *     the caller before the call, not inside the callee -- see
+ *     ohdr_msgs.pk's calls into sohm.pk's set_sohm_master_table().
+ * One deliberate exception to "never store a pre-translated value":
+ * global_hdf5_declared_eof (set by set_global_hdf5_declared_eof() below)
+ * stores the translated form, because unlike the globals above it has
+ * exactly one consumption shape everywhere it's read -- compared against
+ * an already-translated address -- never printed raw, never used in
+ * further raw-address arithmetic, never passed across a pickle boundary.
+ * See that function's comment for why this doesn't need to be, and isn't
+ * meant to be, a precedent for other address globals.
+ *
+ * Saturates to the all-ones sentinel (UINT64_MAX) on overflow rather than
+ * wrapping, which also happens to be exactly right for HADDR_UNDEF/
+ * UNDEF_LEN: since those are already all-ones, translating one is a no-op
+ * through this same overflow path, so callers don't need a separate
+ * is_undef_bytes() check before translating (though callers that need to
+ * treat undef specially, e.g. to skip navigating into it, should still
+ * check the raw bytes explicitly rather than rely on this).
+ *
+ * See also bytes_to_off(), which does bytes_to_u64_le() + this function +
+ * `#B` in one call -- prefer it whenever you're starting from a raw byte
+ * array and want something ready to map, rather than composing these
+ * three steps by hand. */
 fun hdf5_addr_to_file_u64 = (uint<64> addr) uint<64>:
 {
     if (addr > 0xffffffffffffffffUL - global_hdf5_base_addr)
@@ -185,6 +260,29 @@ fun hdf5_bytes_fit_u64 = (byte[] raw) int:
     return 1;
 };
 
+/* Called from the superblock's end-of-file-address field constraint.
+ * Rejects (returns 0, leaving global_hdf5_declared_eof_known clear) an
+ * extended-width value that doesn't fit u64, an undefined-address
+ * sentinel, or a decoded EOF at or before the base address -- all three
+ * are degenerate and would make every range check below either always
+ * pass or always fail.
+ *
+ * On success, stores the already-*translated* (physical) EOF -- a
+ * deliberate, narrow exception to the "globals stay raw" convention
+ * stated above hdf5_addr_to_file_u64(), not a precedent for other address
+ * globals. It's safe here specifically because global_hdf5_declared_eof
+ * has exactly one consumption shape everywhere it's read
+ * (hdf5_addr_in_declared_eof(), hdf5_range_in_declared_eof()): compared
+ * against an already-translated candidate address. It's never printed raw,
+ * never used in further raw-address arithmetic, and never crosses a
+ * pickle-file boundary -- the varied consumption shapes that make
+ * raw-storage-with-translate-at-read worth it for e.g.
+ * global_frhp_root_addr don't apply to this global. Translating once here
+ * also avoids repeating the same call at both read sites. (The degenerate
+ * check above could equivalently compare the raw decoded value against
+ * 0UL instead of the translated value against global_hdf5_base_addr --
+ * storing translated isn't required by that check, it's just consistent
+ * with what's stored.) */
 fun set_global_hdf5_declared_eof = (byte[] raw) int:
 {
     if (!hdf5_bytes_fit_u64(raw) || is_undef_bytes(raw)) return 0;
@@ -221,16 +319,33 @@ fun hdf5_range_in_declared_eof = (byte[] addr_raw, byte[] size_raw,
     return size <= global_hdf5_declared_eof - addr;
 };
 
+/* Decodes raw bytes AND translates in one step, returning a ready-to-map
+ * offset<uint<64>,B> -- the preferred way to go straight from a struct's
+ * raw address field to an @ mapping, e.g.
+ * `var db = fheap_dblock @ bytes_to_off(hdr.root_addr_raw);`. Equivalent
+ * to hdf5_addr_to_file_u64(bytes_to_u64_le(raw))#B; use that longer form
+ * instead only when you need the plain uint64 (to print it, or to do more
+ * arithmetic before it becomes an offset). */
 fun bytes_to_off = (byte[] raw) offset<uint<64>,B>:
 {
     return hdf5_addr_to_file_u64(bytes_to_u64_le(raw)) #B;
 }
 
+/* Reads 2 bytes directly from the mapped IOS at absolute offset `off` and
+ * decodes them little-endian -- unlike bytes_to_u64_le_at(), which decodes
+ * bytes you already have in hand as a byte[], this one does the @ read
+ * itself. Returns uint64 (not uint16) for uniformity with the rest of
+ * this decode family; the value never exceeds 0xffff. */
 fun bytes_u16_at = (off64 off) uint<64>:
 {
     return bytes_to_u64_le(byte[2] @ off);
 }
 
+/* Prints a char[] as text with a trailing newline, for when printing is
+ * the whole point and you don't also need the text as a value. Despite
+ * the `string` return type, it always returns "" -- use
+ * char_array_to_string() instead when you need the decoded text itself
+ * (e.g. to compare it, or to embed it in another printf). */
 fun print_char_array = (char[] data) string:
 {
     for (c in data) {
@@ -240,6 +355,11 @@ fun print_char_array = (char[] data) string:
     printf("\n");
 }
 
+/* Decodes a char[] into a poke string via repeated concatenation --
+ * O(n^2), fine for the short strings this codebase decodes (names,
+ * comments) but not intended for large text blobs. Does not stop at a
+ * NUL byte; if the array is a fixed-width NUL-padded field, trim trailing
+ * NULs at the call site first if they matter. */
 fun char_array_to_string = (char[] data) string:
 {
   var result = ""; /* Start with an empty string */
@@ -252,6 +372,10 @@ fun char_array_to_string = (char[] data) string:
   return result;
 }
 
+/* Prints `depth` levels of two-space indentation with no trailing
+ * newline -- meant to prefix another printf on the same line (see e.g.
+ * v1_btree.pk's recursive print_v1_btree()), not to be a complete
+ * statement by itself. */
 fun indent = (int depth) void:
 {
   var i = 0;
