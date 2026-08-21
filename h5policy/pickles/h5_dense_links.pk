@@ -616,6 +616,115 @@ fun h5policy_frhp_filter_pipeline_off = (uint<64> fheap_addr) offset<uint<64>,B>
     return (fheap_addr + unfiltered_body + el + 4UL)#B;
 }
 
+fun h5policy_frhp_is_power_of_two = (uint<64> value) int:
+{
+    return (value != 0UL && (value & (value - 1UL)) == 0UL) ? 1 : 0;
+}
+
+/* Validate a fractal-heap header's doubling-table parameters before anything is
+   derived from them.  Shared by every fractal-heap client -- dense links, dense
+   attributes and shared object-header messages -- because the record being
+   checked is the heap header, not the client that owns it.
+
+   libhdf5 states these rules itself, in H5HF__hdr_create, but inside
+   `#ifndef NDEBUG` and only on the WRITE path; H5HF__dtable_decode validates
+   nothing on read.  Every writer in the library hard-codes width 4
+   (H5G_FHEAP_MAN_WIDTH, H5O_FHEAP_MAN_WIDTH), so a value outside these rules is
+   malformed rather than merely unsupported, and reporting a bare coverage gap
+   for it understates what is wrong.
+
+   The final rule is the one with teeth.  libhdf5 derives
+       first_row_bits = log2(start_block_size) + log2(table_width)
+       max_root_rows  = (max_heap_size_bits - first_row_bits) + 1
+   in unsigned arithmetic, and max_root_rows sizes four heap arrays.  Width 0
+   collapses first_row_bits and then makes
+   H5HF__hdr_compute_free_space accumulate `row_block_size[row] * width` -- zero
+   every time -- so its loop has no reachable exit and walks all three arrays out
+   of bounds (measured: SIGSEGV in H5HFhdr.c, reading to the end of the heap
+   mapping).  first_row_bits above max_heap_size_bits wraps max_root_rows to
+   ~4.29e9 and asks malloc for 32 GiB; equal to max_heap_size_bits + 1 makes it
+   exactly zero, so the two unconditional stores in H5HF__dtable_init write past
+   a malloc(0).  Requiring first_row_bits <= max_heap_size_bits closes all
+   three, and no file any libhdf5 release can write comes close to the bound.
+
+   Returns 1 when the doubling table is usable, 0 after emitting a finding.  */
+fun h5policy_validate_frhp_doubling_table = (
+        uint<64> heap_addr, uint<64> table_width, uint<64> start_size,
+        uint<64> max_direct_size, uint<64> max_heap_bits,
+        string object, string what) int:
+{
+    if (table_width == 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE",
+                                "corrupt", heap_addr#B, object,
+                                what + " doubling-table width is zero");
+            return 0;
+        }
+    /* libhdf5's own H5HF_WIDTH_LIMIT (65536, H5HFhdr.c) needs no check here: the
+       encoded table width is a two-byte field, so 65535 is the largest value
+       that can reach us and the limit is unreachable by construction.  A branch
+       for it would be dead code advertising a message that can never be
+       emitted.  */
+    if (!h5policy_frhp_is_power_of_two(table_width))
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE",
+                                "corrupt", heap_addr#B, object,
+                                what + " doubling-table width is not a power of two");
+            return 0;
+        }
+    if (start_size == 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE",
+                                "corrupt", heap_addr#B, object,
+                                what + " doubling-table starting block size is zero");
+            return 0;
+        }
+    if (!h5policy_frhp_is_power_of_two(start_size))
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE",
+                                "corrupt", heap_addr#B, object,
+                                what + " doubling-table starting block size is not a power of two");
+            return 0;
+        }
+    if (max_direct_size == 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE",
+                                "corrupt", heap_addr#B, object,
+                                what + " doubling-table maximum direct block size is zero");
+            return 0;
+        }
+    if (!h5policy_frhp_is_power_of_two(max_direct_size))
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE",
+                                "corrupt", heap_addr#B, object,
+                                what + " doubling-table maximum direct block size is not a power of two");
+            return 0;
+        }
+    if (max_heap_bits == 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE",
+                                "corrupt", heap_addr#B, object,
+                                what + " doubling-table maximum heap size is zero");
+            return 0;
+        }
+    if (max_heap_bits > 8UL * (global_sizeof_lengths as uint<64>))
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE",
+                                "corrupt", heap_addr#B, object,
+                                what + " doubling-table maximum heap size exceeds the file length width");
+            return 0;
+        }
+    if (h5policy_floor_log2(start_size) + h5policy_floor_log2(table_width)
+        > max_heap_bits)
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE",
+                                "corrupt", heap_addr#B, object,
+                                what + " doubling-table first row exceeds the maximum heap size");
+            return 0;
+        }
+    return 1;
+}
+
 /* Size a fractal heap indirect block from its doubling-table geometry.  Direct
    entries appear until max_direct_size is reached; remaining rows hold child
    indirect-block pointers.  */
@@ -1999,7 +2108,12 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
     var len_size = h5policy_bytes_for_limit(max_man_size);
     if (len_size > off_size)
         len_size = off_size;
-    if (h5policy_msg_addr_is_undef(root_raw) || start_size == 0UL || table_width == 0UL)
+    if (!h5policy_validate_frhp_doubling_table(fheap_addr, table_width,
+                                               start_size, max_direct_size,
+                                               max_heap_bits, object,
+                                               "dense link heap"))
+        return 1;
+    if (h5policy_msg_addr_is_undef(root_raw))
         return 0;
     if (1UL + off_size + len_size > 7UL)
         {

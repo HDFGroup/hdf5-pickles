@@ -85,6 +85,23 @@ COMPOSING_HELPERS = {
     "h5policy_ea_mark_block": (2, {
         "H5_CORRUPT_CHUNK_INDEX_CYCLE": [" repeats a metadata-block address"],
     }),
+    # h5_dense_links.pk: the shared fractal-heap doubling-table validator.  One
+    # implementation for the dense-link, dense-attribute and shared-message
+    # clients, each of which supplies its own role as `what` (parameter 6), so
+    # the role prefix is what the route shard matches on.
+    "h5policy_validate_frhp_doubling_table": (6, {
+        "H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE": [
+            " doubling-table width is zero",
+            " doubling-table width is not a power of two",
+            " doubling-table starting block size is zero",
+            " doubling-table starting block size is not a power of two",
+            " doubling-table maximum direct block size is zero",
+            " doubling-table maximum direct block size is not a power of two",
+            " doubling-table maximum heap size is zero",
+            " doubling-table maximum heap size exceeds the file length width",
+            " doubling-table first row exceeds the maximum heap size",
+        ],
+    }),
     # h5_dense_links.pk: shared bad-charset emitter; callers pass the whole text.
     "h5policy_emit_bad_link_charset": (2, {
         "H5_CORRUPT_LINK_NAME_CHARSET": [""],

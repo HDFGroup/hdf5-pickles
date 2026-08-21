@@ -840,6 +840,154 @@ def _make_nul_compact_link_name(path):
     _patch(path, bytes(raw))
 
 
+def _make_shared_message_self_reference(path):
+    """A dataset whose datatype message is a shared-message wrapper pointing at
+    its OWN object header, so resolving it re-enters the same header forever.
+
+    Confirms Report 1 of a private DoS disclosure against HDF5 2.2.0: a shared
+    object-header message whose target resolves back to the object header being
+    read drives H5O__shared_read into unbounded self-recursion until the stack
+    is exhausted.  Reproduced here on the develop tree (h5dump 2.3.0): the stock
+    build SIGSEGVs opening /dset, and the ASan build reports `stack-overflow`
+    in the H5O__shared_read (H5Oshared.c:165) -> H5O__shared_decode
+    (H5Oshared.c:372) -> H5O_msg_read_oh (H5Omessage.c:489) cycle -- the exact
+    frames the report names, still live past 2.2.0.
+
+    h5policy resolves shared messages with a visited-address set and a recursion
+    cap (h5_shared.pk), so it rejects the self-reference as
+    H5_CORRUPT_SHARED_MESSAGE_CYCLE -- precisely the cycle detection the report
+    recommends libhdf5 add.  Not writer-producible: the library's own
+    H5O__shared_read would recurse trying to write it, so the wrapper is patched
+    in directly.  See registry/cases/shared-message-self-reference-recursion.yml.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("dset", data=np.arange(4, dtype="i4")))
+    _pin_ohdr_times(raw)     # the root group header embeds the build time
+
+    # The dataset's own v2 object header is the one carrying both a datatype
+    # (type 3) and a layout (type 8) message; the root group's header has
+    # neither.  Rewrite that datatype message as a version-3 shared wrapper
+    # (share_type 2) whose committed-object-header address is the header itself.
+    target = None
+    for o in range(len(raw) - 4):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        body, end = cur + size_w, cur + size_w + chunk0
+        hdr = 4 + (2 if flags & 0x04 else 0)      # type(1) size(2) flags(1) [+crt-order]
+        msgs, p = {}, body
+        while p < end - 3:
+            mtype = raw[p]
+            msize = struct.unpack_from("<H", raw, p + 1)[0]
+            msgs[mtype] = (p, msize, p + hdr)     # (prefix, size, body)
+            p = p + hdr + msize
+        if 3 in msgs and 8 in msgs:
+            target = (o, msgs[3])
+            break
+    if target is None:
+        raise RuntimeError("could not locate the dataset object header")
+    ohdr, (msg_prefix, msg_size, msg_body) = target
+    if msg_size < 10:
+        raise RuntimeError("datatype message too small for a 10-byte shared wrapper")
+
+    # A shared-message flag on the message header (bit 1) plus a v3 wrapper
+    # [version=3][type=2][8-byte self address].  Clear the do-not-share bit
+    # (0x04) so shared|do-not-share is not itself a flag-combination defect.
+    # The wrapper is 10 bytes; the datatype message's trailing bytes are left as
+    # ignored padding, so no size or chunk field shifts and only the
+    # object-header checksum needs resealing.
+    raw[msg_prefix + 3] = (raw[msg_prefix + 3] & ~0x04) | 0x02
+    raw[msg_body:msg_body + 10] = bytes([3, 2]) + struct.pack("<Q", ohdr)
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_shared_message_self_reference_attr(path):
+    """Report 1's exact route: an ATTRIBUTE whose committed (shared) datatype
+    resolves back into the committed datatype's own object header.
+
+    The sibling _make_shared_message_self_reference builds the cycle on a
+    dataset's own datatype; this one mirrors the disclosure's reproducer, which
+    reaches the recursion through H5Aopen on an attribute typed by a shared
+    datatype.  The base file (from _build_shared_attr) gives dataset `d` an
+    attribute whose datatype field is a shared-message wrapper pointing at the
+    committed datatype `t`'s object header.  Here `t`'s OWN datatype message --
+    which lives in an OCHK continuation chunk -- is rewritten into a shared
+    wrapper pointing back at `t`, so resolving the attribute's type reaches `t`,
+    whose type is shared and points at `t` again, without bound.
+
+    Stock h5dump 2.3.0 SIGSEGVs dumping the attribute; the ASan build reports
+    stack-overflow in the same H5O__shared_read/H5O__shared_decode/
+    H5O_msg_read_oh cycle.  h5policy rejects it as H5_CORRUPT_SHARED_MESSAGE_CYCLE
+    on /t.  See registry/cases/shared-message-self-reference-recursion.yml.
+    """
+    raw = _base_bytes(_build_shared_attr)
+    _pin_ohdr_times(raw)
+
+    # Collect the messages of every v2 object header, following its OCHK
+    # continuation chunks, so the committed datatype's datatype message is found
+    # wherever it lives.  The committed named datatype is the header carrying a
+    # datatype (type 3) but neither a layout (type 8) nor an attribute (type
+    # 0x0c) message -- that is, not the dataset and not the root group.
+    def _messages(ohdr):
+        flags = raw[ohdr + 5]
+        hdr = 4 + (2 if flags & 0x04 else 0)
+        cur = ohdr + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        body = cur + size_w
+        pending = [(body, body + chunk0, False)]     # (start, end, is_ochk)
+        seen, out = set(), []
+        while pending:
+            start, end, is_ochk = pending.pop(0)
+            p = start
+            while p < end - 3:
+                mtype = raw[p]
+                msize = struct.unpack_from("<H", raw, p + 1)[0]
+                mbody = p + hdr
+                out.append((mtype, start, end, is_ochk, p, mbody))
+                if mtype == 0x10:                    # continuation -> OCHK
+                    addr = struct.unpack_from("<Q", raw, mbody)[0]
+                    span = struct.unpack_from("<Q", raw, mbody + 8)[0]
+                    if raw[addr:addr + 4] == b"OCHK" and addr not in seen:
+                        seen.add(addr)
+                        pending.append((addr + 4, addr + span - 4, True))
+                p = mbody + msize
+        return out
+
+    target = None
+    o = 0
+    while True:
+        o = raw.find(b"OHDR", o)
+        if o < 0:
+            break
+        if raw[o + 4] == 2:
+            msgs = _messages(o)
+            types = {m[0] for m in msgs}
+            if 3 in types and 8 not in types and 0x0c not in types:
+                target = (o, next(m for m in msgs if m[0] == 3))
+                break
+        o += 4
+    if target is None:
+        raise RuntimeError("could not locate the committed datatype object header")
+    ohdr, (_t, cstart, cend, is_ochk, msg_prefix, msg_body) = target
+    if cend - msg_body < 10:
+        raise RuntimeError("committed datatype message too small for a shared wrapper")
+
+    raw[msg_prefix + 3] = (raw[msg_prefix + 3] & ~0x04) | 0x02
+    raw[msg_body:msg_body + 10] = bytes([3, 2]) + struct.pack("<Q", ohdr)
+    if is_ochk:
+        ochk = cstart - 4                            # back to the 'OCHK' signature
+        struct.pack_into("<I", raw, cend,
+                         _jenkins_lookup3()(bytes(raw[ochk:cend])))
+    else:
+        _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
 def _make_unsupported_superblock_offset_width(path):
     """A v2/v3 superblock advertising a nonsensical 100-byte offset width.
 
@@ -1021,6 +1169,10 @@ def _gen_malformed(root):
         f"{root}/malformed/bad_dtype_duplicate_member_name.h5")
     _make_nul_compact_link_name(
         f"{root}/malformed/nul_compact_link_name.h5")
+    _make_shared_message_self_reference(
+        f"{root}/malformed/shared_message_self_reference.h5")
+    _make_shared_message_self_reference_attr(
+        f"{root}/malformed/shared_message_self_reference_attr.h5")
     _make_unknown_message_fail_always(
         f"{root}/malformed/bad_unknown_message_fail_always.h5")
     _make_link_reserved_flags(
@@ -1310,6 +1462,30 @@ def _gen_malformed(root):
         f"{root}/malformed/mdci_parent_addr_unresolved.h5")
     _make_mdci_parent_addr_self(
         f"{root}/malformed/mdci_parent_addr_self.h5")
+    # Fractal-heap doubling-table geometry, one rewritten field each.  The
+    # dense-link, dense-attribute and shared-message heaps are all covered
+    # because they are three separate walkers over one shared header record.
+    _make_frhp_width_zero(
+        f"{root}/malformed/dense_link_frhp_width_zero.h5",
+        f"{root}/valid/dense_links.h5")
+    _make_frhp_width_zero(
+        f"{root}/malformed/dense_attr_frhp_width_zero.h5",
+        f"{root}/valid/dense_attribute.h5")
+    _make_frhp_width_zero(
+        f"{root}/malformed/sohm_frhp_width_zero.h5",
+        f"{root}/valid/sohm_list.h5", _sohm_frhp)
+    _make_frhp_width_not_power_of_two(
+        f"{root}/malformed/dense_link_frhp_width_not_power_of_two.h5",
+        f"{root}/valid/dense_links.h5")
+    _make_frhp_no_root_rows(
+        f"{root}/malformed/dense_link_frhp_no_root_rows.h5",
+        f"{root}/valid/dense_links.h5")
+    _make_frhp_first_row_overflow(
+        f"{root}/malformed/dense_link_frhp_first_row_overflow.h5",
+        f"{root}/valid/dense_links.h5")
+    _make_frhp_width8(
+        f"{root}/valid/sohm_frhp_width8.h5",
+        f"{root}/valid/sohm_list.h5", _sohm_frhp)
     _make_filtered_dense_link_no_dblock_checksum(
         f"{root}/malformed/filtered_dense_link_no_dblock_checksum.h5",
         f"{root}/valid/dense_links.h5")
@@ -4869,6 +5045,184 @@ def _filtered_frhp_rewrite(base_path, pipeline, clear_checksum_flag):
     struct.pack_into("<Q", new, 12 + 2 * soff, len(new))
     _fix_sb_checksum(new)
     return bytes(new)
+
+
+def _frhp_dtable_offsets(raw, frhp):
+    """Byte offsets of one fractal-heap header's doubling-table fields.
+
+    `_dense_frhp_info` decodes the FIRST heap in a file and returns its values;
+    this returns the OFFSETS of a nominated heap's fields, which is what a
+    single-field rewrite needs, and it works on a file with more than one heap
+    (sohm_list.h5 has two: the shared-message heap and the root group's).
+    """
+    off_size, len_size = raw[9], raw[10]
+    dtable = frhp + 14 + (10 * len_size) + (2 * off_size)
+    body = 14 + (2 * off_size) + (10 * len_size) + (8 + 2 * len_size + off_size)
+    filter_len = struct.unpack_from("<H", raw, frhp + 7)[0]
+    if filter_len:
+        body += len_size + 4 + filter_len
+    return dict(off_size=off_size, len_size=len_size, frhp=frhp,
+                width=dtable, start=dtable + 2,
+                max_direct=dtable + 2 + len_size,
+                max_heap_bits=dtable + 2 + 2 * len_size,
+                checksum=frhp + body)
+
+
+def _frhp_offsets_in(raw):
+    out, i = [], 0
+    while True:
+        i = raw.find(b"FRHP", i)
+        if i < 0:
+            return out
+        out.append(i)
+        i += 1
+
+
+def _sole_frhp(raw):
+    """The file's only fractal-heap header.  More than one is a base-fixture
+    change, not something to disambiguate silently."""
+    heaps = _frhp_offsets_in(raw)
+    if len(heaps) != 1:
+        raise RuntimeError(
+            f"expected exactly one fractal heap header, found {len(heaps)}")
+    return heaps[0]
+
+
+def _sohm_frhp(raw):
+    """The fractal-heap header the shared-message table names.
+
+    sohm_list.h5 carries two heaps and picking by creation parameters would be
+    a guess, so the master table is asked instead.  Its total size is not
+    derivable without knowing the index count, so it is recovered from its own
+    trailing checksum -- which also proves the block was located correctly --
+    and the one heap address encoded inside that verified block is the answer.
+    """
+    smtb = raw.find(b"SMTB")
+    if smtb < 0:
+        raise RuntimeError("could not locate the shared message table")
+    off_size = raw[9]
+    jenkins = _jenkins_lookup3()
+    entry = 13 + 2 * off_size
+    total = None
+    for size in range(9, 4 + 1 + 16 * entry + 4 + 2):
+        end = smtb + size - 4
+        if end + 4 > len(raw):
+            break
+        if struct.unpack_from("<I", raw, end)[0] == jenkins(bytes(raw[smtb:end])):
+            total = size
+            break
+    if total is None:
+        raise RuntimeError("shared message table checksum did not verify")
+    window = bytes(raw[smtb:smtb + total])
+    hits = [h for h in _frhp_offsets_in(raw)
+            if h.to_bytes(off_size, "little") in window]
+    if len(hits) != 1:
+        raise RuntimeError(
+            f"shared message table names {len(hits)} fractal heaps, expected 1")
+    return hits[0]
+
+
+def _patch_frhp_dtable(path, base_path, find_frhp, **fields):
+    """Rewrite doubling-table fields of one fractal-heap header and repair that
+    header's Jenkins checksum, so the rewritten field is the only defect.
+
+    Nothing outside the header moves, so the declared EOF and the superblock
+    checksum stay valid and no address needs fixing up.  `width` and
+    `max_heap_bits` are two-byte fields; `start` and `max_direct` are
+    length-sized.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    frhp = find_frhp(raw)
+    info = _frhp_dtable_offsets(raw, frhp)
+    if not fields:
+        raise RuntimeError("no doubling-table field to rewrite")
+    for name, value in fields.items():
+        if name in ("width", "max_heap_bits"):
+            struct.pack_into("<H", raw, info[name], value)
+        elif name in ("start", "max_direct"):
+            raw[info[name]:info[name] + info["len_size"]] = \
+                value.to_bytes(info["len_size"], "little")
+        else:
+            raise RuntimeError(f"unknown doubling-table field {name}")
+    struct.pack_into("<I", raw, info["checksum"],
+                     _jenkins_lookup3()(bytes(raw[frhp:info["checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_frhp_width_zero(path, base_path, find_frhp=_sole_frhp):
+    """A fractal-heap header whose doubling-table width is zero.
+
+    libhdf5 never writes anything but 4 (H5G_FHEAP_MAN_WIDTH,
+    H5O_FHEAP_MAN_WIDTH), and width 0 is the one value that stops
+    H5HF__hdr_compute_free_space from terminating: its accumulator advances by
+    `row_block_size[row] * width`, so with width 0 the loop has no reachable
+    exit and walks three heap arrays out of bounds.  Measured on a release
+    build: SIGSEGV in H5HFhdr.c, having read from a 192-byte allocation to the
+    end of the process heap mapping.  The only existing guard is
+    `assert(POWER_OF_TWO(n))` inside H5VM_log2_of2, compiled out under NDEBUG.
+    """
+    _patch_frhp_dtable(path, base_path, find_frhp, width=0)
+
+
+def _make_frhp_width_not_power_of_two(path, base_path):
+    """A doubling-table width of 3.
+
+    H5VM_log2_of2 is a De Bruijn lookup that is only meaningful for powers of
+    two; under NDEBUG it answers 28 for 3.  first_row_bits then exceeds the
+    maximum heap size, `max_root_rows` underflows to ~4.29e9, and each of the
+    four doubling-table arrays asks malloc for 32 GiB (measured: 34359738336
+    bytes).  A bounded address space turns that into a clean libhdf5 error; an
+    unbounded one turns it into a memory-amplification denial of service.
+    """
+    _patch_frhp_dtable(path, base_path, _sole_frhp, width=3)
+
+
+def _make_frhp_no_root_rows(path, base_path):
+    """A doubling table whose first row is exactly one bit too wide.
+
+    `max_root_rows = (max_heap_size_bits - first_row_bits) + 1`, so declaring
+    10 heap-size bits against this heap's 11-bit first row makes it exactly
+    zero.  H5HF__dtable_init then allocates all four row arrays with
+    H5MM_malloc(0) -- a bare malloc -- and stores row_block_size[0] and
+    row_block_off[0] unconditionally, before the `u < max_root_rows` loop:
+    an eight-byte out-of-bounds write per array.  glibc's malloc(0) leaves
+    usable slack, so the write is absorbed and libhdf5 fails later, on the
+    heap geometry rather than on the memory error.
+    """
+    _patch_frhp_dtable(path, base_path, _sole_frhp, max_heap_bits=10)
+
+
+def _make_frhp_first_row_overflow(path, base_path):
+    """The same relation violated by two bits instead of one.
+
+    Nine declared heap-size bits against an 11-bit first row makes the
+    `max_root_rows` subtraction wrap rather than reach zero, so this is the
+    32 GiB allocation shape reached without a non-power-of-two width -- the
+    same libhdf5 consequence as the width-3 fixture, a different oracle rule.
+    """
+    _patch_frhp_dtable(path, base_path, _sole_frhp, max_heap_bits=9)
+
+
+def _make_frhp_width8(path, base_path, find_frhp=_sole_frhp):
+    """A VALID control: doubling-table width 8 instead of libhdf5's 4.
+
+    Eight is a power of two within H5HF_WIDTH_LIMIT, so it satisfies every rule
+    libhdf5's own writer states, even though no libhdf5 writer emits anything
+    but 4.  The fixture exists so the doubling-table invariant is pinned to the
+    format's rule rather than to the one width the library happens to write -- a
+    check that rejected this would be over-tight -- and so the fuzzer's seed
+    pool holds a heap geometry other than the default.
+
+    The base heap must have a DIRECT root block (current root rows 0).  An
+    indirect root block's on-disk size is `nrows * table_width` entries, so
+    rewriting the width there resizes the block and invalidates its checksum:
+    measured on valid/dense_links.h5, whose root has one indirect row, both
+    libhdf5 and h5policy then reject the file for the FHIB checksum rather than
+    accepting it.  sohm_list.h5's shared-message heap stores its objects in a
+    root direct block, which the doubling table is not consulted to find.
+    Measured there: `h5dump` and `h5dump -H` both exit 0.
+    """
+    _patch_frhp_dtable(path, base_path, find_frhp, width=8)
 
 
 def _make_filtered_dense_link_no_dblock_checksum(path, base_path):
