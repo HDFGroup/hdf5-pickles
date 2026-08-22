@@ -38,7 +38,15 @@ order, ID registration) require a patched libhdf5 and are out of scope here.
 
 Outcome is one of: accepted (opened, no traversal error), rejected_at_open,
 rejected_in_traversal (opened but a later call refused, no crash), crashed
-(killed by a signal), timeout, or build_unavailable.
+(killed by a fault signal -- SIGSEGV, SIGFPE, SIGABRT), timeout (did not
+terminate: the wall-clock deadline, or SIGXCPU from the RLIMIT_CPU guard), or
+build_unavailable.
+
+crashed and timeout are kept apart deliberately, because they support opposite
+conclusions about the selected build: a fault is a memory-safety or arithmetic
+defect, a non-termination is a denial-of-service one.  `--forbid crash` covers
+BOTH, so the violation it raises does not distinguish them -- read `outcome`,
+not the violation name, when the difference matters.
 
 Usage:
   h5policy-probe FILE [--hdf5-bindir DIR] [--json]
@@ -52,6 +60,7 @@ import json
 import os
 import re
 import resource
+import signal
 import shutil
 import subprocess
 import sys
@@ -401,7 +410,22 @@ def probe_file(path, probe, trace, ident, timeout, cpu, mem_mb, fsize_mb,
             pass
 
         if proc.returncode < 0:
-            result["outcome"] = "crashed"
+            # SIGXCPU is the RLIMIT_CPU guard firing, which means the child did
+            # not TERMINATE -- semantically the wall-clock `timeout` branch
+            # above, not a fault.  Distinguishing them matters because these two
+            # outcomes support opposite conclusions about libhdf5: a SIGSEGV or
+            # SIGFPE is a memory-safety or arithmetic defect, a CPU-limit kill is
+            # a non-termination (DoS) defect.  Reporting both as `crashed` made
+            # them indistinguishable to every consumer of this JSON -- including
+            # the expected-fixture matrix, where the reasoned override for a hang
+            # then had to be written as if libhdf5 had crashed.
+            # `--forbid crash` still covers this (it accepts crashed OR timeout),
+            # so the violation and every allowed_statuses contract are unchanged;
+            # only the diagnosis gets sharper.
+            if -proc.returncode == signal.SIGXCPU:
+                result.update(outcome="timeout", timed_out=True)
+            else:
+                result["outcome"] = "crashed"
             result["signal"] = -proc.returncode
         elif probe_json is None:
             result["outcome"] = "crashed"                  # died without valid JSON
