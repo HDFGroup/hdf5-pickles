@@ -26,6 +26,43 @@
    dimensionality from the layout message (dataset rank + 1); a type-1 key is
    chunk_size(4) + filter_mask(4) + ndims 8-byte offsets.  This validates the
    index structure under budget; it does not read chunk contents.  */
+/* One rule, every chunk index: a record that names a chunk address must give
+   that chunk a nonzero stored size.
+
+   WHY IT IS NOT MERELY A TIDINESS CHECK.  The stored size is what libhdf5 hands
+   the filter pipeline as `nbytes`, and the pipeline's fixed-overhead filters
+   SUBTRACT from it without a floor.  H5Zfletcher32.c:73 is the measured case:
+     size_t src_nbytes = nbytes;
+     src_nbytes -= FLETCHER_LEN;      -- 4, unguarded, on size_t
+     tmp_src = src + src_nbytes;      -- wild pointer when nbytes < 4
+     UINT32DECODE(tmp_src, stored_fletcher);
+     fletcher = H5_checksum_fletcher32(src, src_nbytes);
+   With a stored size of 0 that wraps to SIZE_MAX-3, and the checksum walks off
+   the end of the buffer -- a hard SIGSEGV on an ordinary H5Dread, measured on
+   the specimen behind registry/cases/filtered-chunk-zero-stored-size.yml.
+   A zero-size record is also meaningless on its own terms: no chunk, filtered
+   or not, occupies zero bytes on disk, and libhdf5's own writer never emits one
+   (H5D__chunk_allocate always allocates at least the filtered size).  So this
+   is corrupt-on-read, not a policy choice.
+
+   The bound that already existed here -- checked_addr_range(addr, size) -- is
+   satisfied trivially by size 0, which is exactly why the hole survived: the
+   range check passes and the record proceeds.
+
+   Returns 1 when the caller should go on to range-check the extent, 0 when the
+   record has been rejected.  All four chunk-index walkers route through this so
+   the rule cannot land in three of them and be forgotten in the fourth, which
+   is the state this replaced: only the extensible-array walker had it.  */
+fun h5policy_chunk_record_size_ok = (uint<64> stored_size, off64 loc,
+                                     string object, string kind) int:
+{
+    if (stored_size != 0UL)
+        return 1;
+    h5policy_emit_error("H5_CORRUPT_CHUNK_STORED_SIZE", "corrupt", loc, object,
+                        kind + " chunk record has a zero stored size");
+    return 0;
+}
+
 fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                  uint<64> btree_addr, uint<64> ndims,
                                  string object, uint<64> btree_depth,
@@ -183,9 +220,18 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext
                                                          key_off#B, 4UL);
                     if (!h5policy_msg_addr_is_undef(child_raw))
                         {
-                            var ok = h5policy_checked_addr_range(
-                                child_addr, chunk_size, file_size,
-                                "chunk data outside file", key_off#B, object);
+                            /* The v1 key carries a size field for filtered and
+                               unfiltered chunks alike, so the rule needs no
+                               client-id split here -- unlike the array indexes,
+                               where an unfiltered record has no size field and
+                               the layout's fixed chunk size stands in.  */
+                            if (h5policy_chunk_record_size_ok(
+                                    chunk_size, key_off#B, object, "v1 B-tree"))
+                                {
+                                    var ok = h5policy_checked_addr_range(
+                                        child_addr, chunk_size, file_size,
+                                        "chunk data outside file", key_off#B, object);
+                                }
                         }
                     i = i + 1UL;
                 }
@@ -286,7 +332,9 @@ fun h5policy_validate_v2_chunk_records = (int ios, H5PolicyProfile profile,
                     if (record_type == 11UL)
                         stored_size = h5policy_msg_u64_at(
                             ios, profile, rec_addr#B + o#B, filtered_size_len);
-                    if (stored_size != 0xffffffffffffffffUL)
+                    if (h5policy_chunk_record_size_ok(
+                            stored_size, rec_addr#B, object, "v2 B-tree")
+                        && stored_size != 0xffffffffffffffffUL)
                         {
                             var ok = h5policy_checked_addr_range(
                                 chunk_addr, stored_size, file_size,
@@ -534,6 +582,13 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                             "fixed array header checksum mismatch");
 
     var raw_elmt_size = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 6#B, 1UL);
+    /* Client 1 (filtered) elements carry a post-filter byte count between the
+       address and the four-byte filter mask, exactly as the extensible array
+       does.  Client 0 stores only an address, so the layout's fixed chunk size
+       is the stored size and a zero there is a dataspace/layout fault caught
+       elsewhere -- hence size_width 0 and the chunk_byte_size fallback below. */
+    var fa_size_width = client_id == 1UL && raw_elmt_size > o + 4UL
+                        ? raw_elmt_size - o - 4UL : 0UL;
     var page_bits = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 7#B, 1UL);
     var nelmts = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 8#B, el);
     var dblk_raw = h5policy_msg_bytes(ios, profile, hdr_addr#B + (8UL + el)#B, o);
@@ -611,9 +666,24 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                     var elem_off = dblk_addr + db_prefix + (i * raw_elmt_size);
                     var caddr_raw = h5policy_msg_bytes(ios, profile, elem_off#B, o);
                     var caddr = hdf5_addr_to_file_u64(bytes_to_u64_le(caddr_raw));
-                    if (!h5policy_msg_addr_is_undef(caddr_raw) && caddr >= file_size)
-                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt", elem_off#B, object,
-                                            "chunk data address outside file");
+                    if (!h5policy_msg_addr_is_undef(caddr_raw))
+                        {
+                            if (caddr >= file_size)
+                                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt", elem_off#B, object,
+                                                    "chunk data address outside file");
+                            /* Filtered elements only.  A client-0 element
+                               carries no size field at all -- its extent is the
+                               layout's fixed chunk size, which is not a
+                               per-record value and is checked where the layout
+                               is -- so there is no per-record zero to find.  */
+                            if (fa_size_width != 0UL)
+                                {
+                                    var fa_ok = h5policy_chunk_record_size_ok(
+                                        h5policy_msg_u64_at(ios, profile,
+                                                            elem_off#B + o#B, fa_size_width),
+                                        elem_off#B, object, "fixed-array");
+                                }
+                        }
                     i = i + 1UL;
                 }
 
@@ -698,10 +768,20 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                             var elem_off = page_start + (j * raw_elmt_size);
                             var caddr_raw = h5policy_msg_bytes(ios, profile, elem_off#B, o);
                             var caddr = hdf5_addr_to_file_u64(bytes_to_u64_le(caddr_raw));
-                            if (!h5policy_msg_addr_is_undef(caddr_raw) && caddr >= file_size)
-                                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
-                                                    elem_off#B, object,
-                                                    "chunk data address outside file");
+                            if (!h5policy_msg_addr_is_undef(caddr_raw))
+                                {
+                                    if (caddr >= file_size)
+                                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                                            elem_off#B, object,
+                                                            "chunk data address outside file");
+                                    if (fa_size_width != 0UL)
+                                        {
+                                            var fa_ok = h5policy_chunk_record_size_ok(
+                                                h5policy_msg_u64_at(ios, profile,
+                                                                    elem_off#B + o#B, fa_size_width),
+                                                elem_off#B, object, "fixed-array");
+                                        }
+                                }
                             j = j + 1UL;
                         }
                 }
@@ -782,11 +862,9 @@ fun h5policy_validate_ea_elements = (int ios, H5PolicyProfile profile,
                     if (cfg.client_id == 1UL)
                         stored_size = h5policy_msg_u64_at(
                             ios, profile, current#B + o#B, size_width);
-                    if (stored_size == 0UL)
-                        h5policy_emit_error("H5_CORRUPT_CHUNK_STORED_SIZE",
-                                            "corrupt", current#B, object,
-                                            "extensible-array chunk record has a zero stored size");
-                    else if (stored_size != 0xffffffffffffffffUL)
+                    if (h5policy_chunk_record_size_ok(
+                            stored_size, current#B, object, "extensible-array")
+                        && stored_size != 0xffffffffffffffffUL)
                         {
                             var ok = h5policy_checked_addr_range(
                                 addr, stored_size, file_size,

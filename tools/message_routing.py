@@ -85,6 +85,15 @@ COMPOSING_HELPERS = {
     "h5policy_ea_mark_block": (2, {
         "H5_CORRUPT_CHUNK_INDEX_CYCLE": [" repeats a metadata-block address"],
     }),
+    # h5_chunkindex.pk: the one zero-stored-size rule shared by all four
+    # chunk-index walkers.  `kind` (parameter 3) names which index the record
+    # came from -- "v1 B-tree", "v2 B-tree", "fixed-array", "extensible-array".
+    # Unlike the dense/SOHM helpers above this needs no route shard: every
+    # caller is the chunk_index family, so the prefix is diagnostic only and
+    # does not select a different record.
+    "h5policy_chunk_record_size_ok": (3, {
+        "H5_CORRUPT_CHUNK_STORED_SIZE": [" chunk record has a zero stored size"],
+    }),
     # h5_dense_links.pk: the shared fractal-heap doubling-table validator.  One
     # implementation for the dense-link, dense-attribute and shared-message
     # clients, each of which supplies its own role as `what` (parameter 6), so

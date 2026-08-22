@@ -588,6 +588,17 @@ def _gen_resource(root):
                         "d", data=np.arange(100, dtype="i4").reshape(10, 10),
                         chunks=(5, 5)))
 
+    # Control for chunk.stored_size on the LEGACY index, and the base file the
+    # zero-size fixture is patched from.  fletcher32 is deliberate: it is the
+    # filter whose fixed-overhead subtraction turns a zero stored size into a
+    # wrap (H5Zfletcher32.c:73), so the pair carries the crash consequence and
+    # not just the rule.  chunked_v1_btree.h5 above covers the unfiltered v1
+    # path; this one adds the filtered element layout.
+    _write_earliest(f"{root}/valid/chunk_v1_btree_fletcher.h5",
+                    lambda h: h.create_dataset(
+                        "d", data=np.arange(100, dtype="i4").reshape(10, 10),
+                        chunks=(5, 5), fletcher32=True))
+
     # A multi-level legacy chunk index.  A v1 B-tree node holds at most 2*K
     # entries (64 with the generated superblock's indexed-storage K), so 130
     # allocated one-element chunks force internal-node recursion.  Reduced
@@ -1269,6 +1280,9 @@ def _gen_malformed(root):
     _make_lheap_data_segment_alias(
         f"{root}/malformed/lheap_data_segment_alias.h5",
         f"{root}/valid/two_symbol_table_groups.h5")
+    _make_chunk_zero_stored_size(
+        f"{root}/malformed/chunk_zero_stored_size.h5",
+        f"{root}/valid/chunk_v1_btree_fletcher.h5")
     _make_bad_message_flag_combination(
         f"{root}/malformed/bad_message_flag_combination.h5")
     _make_bad_link_info_max_corder(
@@ -5702,6 +5716,67 @@ def _make_lheap_data_segment_alias(path, base_path):
         if prfx + 32 == shared:
             raise RuntimeError("appended segment is adjacent to a prefix")
         struct.pack_into("<Q", raw, prfx + 24, shared)
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_zero_stored_size(path, base_path):
+    """A v1 B-tree chunk record whose stored size is zero while its address is
+    defined -- the shape that wraps the fletcher32 filter's fixed-overhead
+    subtraction.
+
+    libhdf5 hands the record's stored size to the filter pipeline as `nbytes`.
+    H5Zfletcher32.c:73 then does an unguarded `src_nbytes -= FLETCHER_LEN` on a
+    size_t, so a stored size of 0 becomes SIZE_MAX-3: the code reads a checksum
+    at `src + (2**64-4)` and then checksums 2**64-4 bytes.  Measured on the
+    selected build: a hard SIGSEGV in H5_checksum_fletcher32 from an ordinary
+    H5Dread, while the file OPENS cleanly -- h5dump -H, h5ls and h5stat all
+    succeed, which is why the header-only differential probe cannot see it and
+    the data-forcing probe is what supplies the A+ evidence.
+
+    fletcher32 is the filter that makes this reachable, and the reason is that
+    its overhead is FIXED: it always subtracts 4 before looking at the data.  A
+    variable-overhead filter (deflate) fails its own decode first and returns an
+    error instead of wrapping, so a specimen built over deflate proves nothing.
+
+    THE KEY LAYOUT, because it is easy to patch the wrong four bytes.  A v1
+    B-tree node is a 24-byte header (signature, type, level, entries-used, left
+    and right sibling addresses) followed by an alternating sequence
+    key[0], addr[0], key[1], addr[1], ... key[n] -- note n+1 KEYS for n
+    children.  Each chunked-storage key is
+        chunk size (4) | filter mask (4) | offsets (ndims * 8)
+    where `ndims` is the LAYOUT message's dimensionality, which is the dataset
+    rank PLUS ONE (it carries a trailing element-size dimension).  So for the
+    rank-2 base file each key is 4 + 4 + 3*8 = 32 bytes.
+    The trailing key[n] is a boundary sentinel whose size is legitimately zero,
+    so patching it would produce a file that changes nothing -- the record to
+    patch is key[0], which has a real address after it.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    at = raw.find(b"TREE")
+    while at >= 0:
+        # type 1 is chunked storage; type 0 is a group node.
+        if raw[at + 4] == 1:
+            break
+        at = raw.find(b"TREE", at + 4)
+    if at < 0:
+        raise RuntimeError("could not locate a type-1 (chunk) v1 B-tree node")
+    entries = struct.unpack_from("<H", raw, at + 6)[0]
+    if entries < 1:
+        raise RuntimeError(f"chunk B-tree node holds {entries} entries")
+    ndims = 3                                    # rank 2 + the element dimension
+    key0 = at + 24
+    addr0 = key0 + 8 + 8 * ndims
+    size0 = struct.unpack_from("<I", raw, key0)[0]
+    addr = struct.unpack_from("<Q", raw, addr0)[0]
+    # Assert the parse before trusting it: a real first record has a nonzero
+    # size and an address inside the file.  Getting ndims wrong lands on an
+    # offset word instead and both of these fail.
+    if size0 == 0 or not (0 < addr < len(raw)):
+        raise RuntimeError(
+            f"key[0] parse looks wrong: size={size0} addr={addr} (file {len(raw)} bytes)")
+    struct.pack_into("<I", raw, key0, 0)         # stored size -> 0, address kept
     _patch(path, bytes(raw))
 
 
