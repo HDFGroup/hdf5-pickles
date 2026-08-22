@@ -109,6 +109,86 @@ fun h5policy_validate_local_heap_free_list = (int ios,
         }
 }
 
+/* One local heap owns its data segment.  Two prefixes naming one segment is
+   corrupt-on-read, and libhdf5 does not survive it.
+
+   WHY THIS CANNOT BE A PER-HEAP CHECK, and why libhdf5 cannot catch it itself:
+   the data segment carries no header, no signature and no back-pointer, so
+   there is nothing in the segment to compare against the prefix that claims it.
+   The fractal heap has the opposite shape -- its blocks store an owner address
+   on disk, which is what heap.fractal_block_owner reads -- so ownership there
+   is a local check.  Here the only witness is the SET of prefixes, which makes
+   this a file-scoped uniqueness invariant and puts it in the same family as the
+   superblock-extension alias check in h5_walk.pk.
+
+   WHAT libhdf5 DOES WITH THE ALIAS: H5HL_protect reaches the data block through
+   H5AC_protect(H5AC_LHEAP_DBLK, heap->dblk_addr, heap, ...), which is keyed by
+   ADDRESS -- the heap it passes is udata, used only to deserialize on a MISS.
+   A second heap naming the same address therefore gets a cache HIT, the
+   deserialize callback never runs, and H5HL__dblk_new -- the only code that
+   sets heap->dblk and heap->dblk_image -- never runs for it either.  The second
+   heap is then live with both fields NULL: H5HL_unprotect calls
+   H5AC_unpin_entry(NULL), and H5HL_offset_into returns (NULL + name_off), which
+   is non-NULL and so defeats its caller's NULL guard before strndup reads it.
+   Release builds segfault; assert-enabled builds stop one line earlier on
+   assert(heap->dblk), which is why measuring only a debug build makes this look
+   assert-only.  It is not.  Full mechanism, crash sites and a generator recipe:
+   registry/cases/local-heap-dblk-address-aliased-across-heaps.yml
+
+   No writer emits this: H5HL_create allocates a data block per heap, so the
+   rejection cannot cost a conforming file.  Hence corrupt, not a warning. */
+fun h5policy_check_lheap_segment_owner = (uint<64> prfx_addr,
+                                          uint<64> seg_addr,
+                                          uint<64> o,
+                                          uint<64> seg_field_off,
+                                          off64 loc, string object) void:
+{
+    var n = h5policy_lheap_seg_addrs'length as uint<64>;
+    /* Charge the linear scan, exactly as h5policy_seen_u64 does: on a file with
+       many heaps this cost is real and the walk budget must see it. */
+    h5policy_walk_tick(n + 1UL);
+
+    var i = 0UL;
+    while (i < n)
+        {
+            if (h5policy_lheap_seg_addrs[i] == seg_addr)
+                {
+                    /* Same prefix: this is a re-decode of one heap, not an
+                       alias.  Nothing to report and nothing to record. */
+                    if (h5policy_lheap_prfx_addrs[i] == prfx_addr)
+                        return;
+
+                    /* The finding points at THIS prefix's segment-address
+                       field, with the earlier claimant's matching field as the
+                       second location, so a reader sees both bytes that
+                       disagree rather than just the value they agree on. */
+                    var other_field_off = h5policy_lheap_prfx_addrs[i]
+                                          + 8UL + (2UL * (global_sizeof_lengths as uint<64>));
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_LOCAL_HEAP_DATA_SEGMENT_ALIAS", "corrupt",
+                        seg_field_off#B, object,
+                        "local heap data segment is already claimed by another local heap",
+                        H5Evidence {
+                            field = "heap.local_data_segment_unique",
+                            actual = prfx_addr,
+                            expected = h5policy_lheap_prfx_addrs[i],
+                            comparison = "not_equal",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = seg_field_off#B, loc1_len = o,
+                            has_loc2 = 1, loc2_role = "expected",
+                            loc2 = other_field_off#B, loc2_len = o
+                        });
+                    return;
+                }
+            i = i + 1UL;
+        }
+
+    if (n >= H5POLICY_MAX_LHEAP_OWNERS)
+        return;
+    h5policy_lheap_prfx_addrs += [prfx_addr];
+    h5policy_lheap_seg_addrs += [seg_addr];
+}
+
 /* Validate a local heap header and return its data-segment address (or the
    undef sentinel on error, after emitting).  */
 fun h5policy_local_heap_data_addr = (int ios, H5PolicyProfile profile,
@@ -167,16 +247,10 @@ fun h5policy_local_heap_data_addr = (int ios, H5PolicyProfile profile,
     if (!seg_ok)
         return 0xffffffffffffffffUL;
 
-    /* KNOWN GAP, not an oversight: data_seg_addr is bounded against the file
-       but is NOT checked for UNIQUENESS across the heaps in one file.  Two
-       local-heap prefixes may name the same data segment, and libhdf5 then
-       hands the second heap the first heap's cached data block, leaving the
-       second heap's dblk and dblk_image NULL -- a segfault in every shipped
-       reader that h5policy currently accepts.  The fix belongs right here (the
-       address is in hand): a file-scoped h5policy_seen_u64 accumulator plus a
-       corrupt finding, modelled on H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS in
-       h5_walk.pk.  Measured mechanism, crash sites and generator recipe:
-       registry/cases/local-heap-dblk-address-aliased-across-heaps.yml  */
+    /* Bounds are not enough: the segment address must also be UNIQUE among the
+       local heaps in this file.  See h5policy_check_lheap_segment_owner. */
+    h5policy_check_lheap_segment_owner(heap_addr, data_seg_addr, o,
+                                       seg_field_off, loc, object);
 
     /* The group walk uses the data segment for names, but validating the free
        list here catches corrupted heap bookkeeping while the heap header is in

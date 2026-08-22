@@ -564,6 +564,20 @@ def _gen_resource(root):
         g.create_dataset("beta", data=np.arange(6, dtype="i4"))
         h.create_dataset("top", data=np.arange(3, dtype="i4"))
     _write_earliest(f"{root}/valid/old_style_group.h5", _old_style)
+
+    # Control for heap.local_data_segment_unique: two SIBLING symbol-table
+    # groups, so the file carries three local heaps (root plus one each) that
+    # correctly own three distinct data segments.  old_style_group.h5 above has
+    # two heaps and would nearly do, but the malformed fixture is derived from
+    # this file so the pair differs by exactly the aliased field -- and a
+    # sibling pair is the shape the alias needs, since the mutation points both
+    # group prefixes at one segment.
+    def _two_stab_groups(h):
+        g1 = h.create_group("g1")
+        g1.create_dataset("a", data=np.arange(3, dtype="i4"))
+        g2 = h.create_group("g2")
+        g2.create_dataset("b", data=np.arange(3, dtype="i4"))
+    _write_earliest(f"{root}/valid/two_symbol_table_groups.h5", _two_stab_groups)
     # Structurally sound, deliberately not `accept`: see _make_drvinfo_block.
     _make_drvinfo_block(f"{root}/valid/drvinfo_block.h5")
 
@@ -1252,6 +1266,9 @@ def _gen_malformed(root):
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_heap_free_list_size_wrap(
         f"{root}/malformed/heap_free_list_size_wrap.h5")
+    _make_lheap_data_segment_alias(
+        f"{root}/malformed/lheap_data_segment_alias.h5",
+        f"{root}/valid/two_symbol_table_groups.h5")
     _make_bad_message_flag_combination(
         f"{root}/malformed/bad_message_flag_combination.h5")
     _make_bad_link_info_max_corder(
@@ -5605,6 +5622,86 @@ def _make_heap_free_list_size_wrap(path):
     struct.pack_into("<Q", raw, heap + 16, off)                  # head -> our node
     struct.pack_into("<Q", raw, dblk_addr + off, 1)              # next == H5HL_FREE_NULL
     struct.pack_into("<Q", raw, dblk_addr + off + 8, 0xFFFFFFFFFFFFFFFF)  # size
+    _patch(path, bytes(raw))
+
+
+def _make_lheap_data_segment_alias(path, base_path):
+    """Two local-heap prefixes declaring the SAME data-segment address.
+
+    Each prefix is individually well-formed -- version, reserved bytes, segment
+    size, free-list head and segment address all pass their own bounds gates,
+    and the shared segment deserialises cleanly -- so the violation exists only
+    across the SET of prefixes.  That is why h5policy checks it at the dedupe
+    point (h5policy_check_lheap_segment_owner) rather than per heap, and why
+    libhdf5 cannot catch it at all: a local-heap data segment carries no header,
+    signature or back-pointer to compare against the prefix claiming it.
+
+    libhdf5's metadata cache is keyed by ADDRESS, so the second heap to protect
+    the shared segment gets a cache HIT.  Its deserialize callback never runs,
+    so H5HL__dblk_new -- the only code that sets heap->dblk and
+    heap->dblk_image -- never runs either, and the heap goes live with both
+    fields NULL.  h5dump -H, h5ls -vr and h5stat all SIGSEGV on this file.
+
+    THREE TRAPS, each of which produces a file that proves nothing:
+      * The shared segment must be adjacent to NEITHER prefix.  H5HLcache.c:438
+        sets single_cache_obj from `prfx_addr + prfx_size == dblk_addr`, and a
+        heap on that path never creates a separate data-block cache entry -- so
+        there is no shared entry to collide on.  Appending a copy of a valid
+        segment at EOF is what guarantees non-adjacency for both prefixes; just
+        pointing one prefix at the other's (adjacent) segment does not.
+      * BOTH group prefixes must be patched, not just one.  Aliasing a victim
+        onto a donor that is itself on the single-cache-object path is the same
+        dead end.
+      * The two prefixes must AGREE on segment size and free-list head.  They do
+        so for free here because both groups are built identically, but a
+        hand-tuned variant that disagrees dies earlier and elsewhere, in
+        H5HL__fl_deserialize (H5HLcache.c:241, "bad heap free list"), without
+        ever reaching the aliasing hole.
+
+    The local-heap prefix carries no checksum and the address edit is
+    size-neutral, so no repair step is needed -- only the superblock's
+    end-of-address field has to grow to cover the appended segment.
+
+    See registry/cases/local-heap-dblk-address-aliased-across-heaps.yml.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    # sizeof_lengths is superblock byte 14 in a VERSION 0 superblock, and the
+    # end-of-address field sits at byte 40 (base 24, free-space 32, EOA 40 with
+    # 8-byte offsets).  Assert the shape so a future libver change fails loudly
+    # rather than silently patching the wrong bytes.
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    if raw[13] != 8 or raw[14] != 8:
+        raise RuntimeError(
+            f"expected 8-byte offsets and lengths, got {raw[13]}/{raw[14]}")
+
+    prefixes = []
+    at = raw.find(b"HEAP")
+    while at >= 0:
+        prefixes.append(at)
+        at = raw.find(b"HEAP", at + 4)
+    # Root group plus the two sibling groups.
+    if len(prefixes) != 3:
+        raise RuntimeError(f"expected 3 local heaps, found {len(prefixes)}")
+
+    def seg_addr(prfx):
+        return struct.unpack_from("<Q", raw, prfx + 24)[0]
+
+    donor = prefixes[1]                        # /g1's heap
+    size = struct.unpack_from("<Q", raw, donor + 8)[0]
+    start = seg_addr(donor)
+    if start + size > len(raw):
+        raise RuntimeError("donor data segment runs past end of file")
+    image = bytes(raw[start:start + size])
+
+    shared = len(raw)                          # adjacent to no prefix
+    raw += image
+    struct.pack_into("<Q", raw, 40, len(raw))  # EOA must cover the copy
+
+    for prfx in prefixes[1:]:                  # both GROUP heaps, not the root
+        if prfx + 32 == shared:
+            raise RuntimeError("appended segment is adjacent to a prefix")
+        struct.pack_into("<Q", raw, prfx + 24, shared)
     _patch(path, bytes(raw))
 
 

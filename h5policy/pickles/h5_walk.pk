@@ -88,6 +88,39 @@ type H5WalkContext = struct
 var h5policy_visited_ohdrs = uint<64>[]();
 var h5policy_visited_btrees = uint<64>[]();
 
+/* Local-heap segment ownership: parallel arrays of (prefix address, declared
+   data-segment address), one pair per local heap the walk has decoded.
+
+   A PAIR, not a set of segment addresses, and that is the whole design.  The
+   invariant is "no two DISTINCT prefixes claim one segment", so a repeat is a
+   violation only when the segment matches and the prefix does not.  Keying on
+   the segment alone would fire on every legitimate re-decode of the same heap
+   -- and re-decode happens: a shared (SOHM) external-file-list message is
+   decoded once per referencing object, and duplicate messages run their
+   validator twice.  Those all arrive with the SAME prefix address and must stay
+   silent.  Model shared here on datatype.member_name_unique, which is the same
+   "two positions, one value" shape.
+
+   Reset with the rest of the traversal state, which means the second reset (the
+   one at the top of h5policy_walk_reachable_metadata) discards anything decoded
+   before the reachable walk began.  That is deliberate and safe in one
+   direction only: dropping earlier pairs can cost a DETECTION, never invent
+   one, because a forgotten prefix simply re-registers.  The pre-walk window
+   holds only the root object header, which is a group and carries no
+   external-file-list heap, so nothing is lost today -- but a future caller that
+   decodes an EFL before the walk would silently lose its heap from this set. */
+var h5policy_lheap_prfx_addrs = uint<64>[]();
+var h5policy_lheap_seg_addrs = uint<64>[]();
+
+/* Ceiling on the ownership record, in the spirit of H5POLICY_MAX_REACHED: the
+   scan below is linear, so an unbounded set would add an O(N^2) term to the
+   walk budget and could push a large-but-valid file past max_walk_operations --
+   turning a detection into a verdict change on files this check is not about.
+   Past the cap, recording stops and aliases among later heaps go unreported.
+   A file with more than this many local heaps is already far outside anything
+   a conforming writer produces. */
+var H5POLICY_MAX_LHEAP_OWNERS = 4096UL;
+
 /* Continuation chunks are tracked as the [lo, hi) byte intervals they occupy,
    not as bare start addresses.  A start-address set can only reject a target
    that lands on a byte some earlier continuation started on; it cannot see a
@@ -265,6 +298,12 @@ fun h5policy_reset_traversal_state = void:
     /* Load-bearing: left set from a previous analysis this would make an
        unrelated address in the next file look like an extension alias. */
     h5policy_ext_ohdr_addr = 0xffffffffffffffffUL;
+    /* Same hazard, same reason: a segment address surviving from an earlier
+       file would make the next file's first local heap look like an alias of
+       it.  That is a false REJECT across the seam, which is worse than the
+       missed detection the other direction costs. */
+    h5policy_lheap_prfx_addrs = uint<64>[]();
+    h5policy_lheap_seg_addrs = uint<64>[]();
     h5policy_current_object_depth = 0UL;
     h5policy_current_object_msg_count = 0UL;
     h5policy_current_object_root_msg_count = 0UL;
