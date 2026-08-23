@@ -263,7 +263,7 @@ selected record families**. Those families are security-oriented groupings,
 not a claim that every legal HDF5 representation, payload behavior, or
 application activation has been modeled.
 
-**8 families are marked `covered`, 8 `partial`, and 0 `coverage_gap`.** A
+**12 families are marked `covered`, 4 `partial`, and 0 `coverage_gap`.** A
 covered vertical slice requires the validator, fixtures, entry-point driver,
 and CI gate together. The family-level `validators.h5policy` claim is `enforced`
 for 15 families and `partial` for 1, the cache-image dependency-graph family.
@@ -271,8 +271,9 @@ The difference is intentional: a check can exist in the oracle while its
 complete evidence and migration slice remains partial.
 
 The covered set is `object_header_continuation`, `external_file_list`,
-`external_link`, `virtual_dataset`, `btree_heap_index`,
-`address_space_bounds`, `message_envelope`, and `validation_controls`.
+`external_link`, `virtual_dataset`, `datatypes`, `btree_heap_index`,
+`dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
+`chunk_index`, `message_envelope`, and `validation_controls`.
 
 The stronger §12 verification score is lower. Of **176 assurance slots**, **57
 are `met`, 40 `partial`, 52 `not_assessed`, and 27 `absent`**. These are eleven
