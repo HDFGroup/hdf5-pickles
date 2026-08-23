@@ -1473,6 +1473,12 @@ def _gen_malformed(root):
     _make_bad_fsm_section_extent(
         f"{root}/malformed/bad_fsm_section_extent.h5",
         f"{root}/valid/fsm_persist.h5")
+    _make_dense_name_hash_order(
+        f"{root}/malformed/dense_link_name_hash_order.h5",
+        f"{root}/valid/dense_links.h5", 5, 0)
+    _make_dense_name_hash_order(
+        f"{root}/malformed/dense_attr_name_hash_order.h5",
+        f"{root}/valid/dense_attribute.h5", 8, 13)
     _make_bad_fsm_class_count(
         f"{root}/malformed/bad_fsm_class_count.h5",
         f"{root}/valid/fsm_persist.h5")
@@ -3986,6 +3992,62 @@ def _make_bad_fsm_class_count(path, base_path):
     chksum = i + hdr_size - 4
     struct.pack_into("<I", raw, chksum,
                      _jenkins_lookup3()(bytes(raw[i:chksum])))
+    _patch(path, bytes(raw))
+
+
+def _bt2_name_index(raw, record_type):
+    """Locate a name-indexed v2 B-tree and a node holding at least two records.
+
+    Returns (node_off, nrec, record_size).  The dense-LINK name index (type 5)
+    is a depth-0 root, so the root itself carries the records; the dense-ATTR
+    one (type 8) has an internal root whose records live in its children, so the
+    first child is followed.  Child-pointer width comes from leaf capacity, the
+    same derivation libhdf5 uses.
+    """
+    bt = _bthd_info_for_type(raw, record_type)
+    root, rs, node = bt["root"], bt["record_size"], bt["node_size"]
+    if bt["depth"] == 0:
+        return root, bt["nroot"], rs
+    nrec_bytes = _bt2_nrec_bytes(node, rs, bt["off_size"])
+    ptr = root + 6 + bt["nroot"] * rs
+    child = int.from_bytes(raw[ptr:ptr + bt["off_size"]], "little")
+    cnrec = int.from_bytes(raw[ptr + bt["off_size"]:
+                               ptr + bt["off_size"] + nrec_bytes], "little")
+    if raw[child:child + 4] != b"BTLF":
+        raise RuntimeError("expected a leaf child of the name index root")
+    return child, cnrec, rs
+
+
+def _make_dense_name_hash_order(path, base_path, record_type, hash_off):
+    """Swap two adjacent name-hash values in a name-indexed v2 B-tree node, so
+    the node is no longer ordered by hash, and repair the node checksum.
+
+    The name index is ordered by hash and libhdf5 BINARY-SEARCHES it on a
+    by-name lookup.  On equal hashes
+    H5{G,A}__dense_btree2_name_compare falls through to comparing the real names
+    out of the heap (src/H5Gbtree2.c, src/H5Abtree2.c), so collisions are legal
+    and only a decrease is corrupt -- which is why this swaps two real values
+    rather than planting a sentinel.
+
+    A MEASURED invariant-A' gap: a single flipped hash byte made a leaf
+    non-monotonic, h5policy accepted the file with zero findings under every
+    profile, and libhdf5 2.3.0 refused the lookup path.  The pre-existing order
+    check covered only the CREATION-ORDER indexes (types 6 and 9).
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    node, nrec, rs = _bt2_name_index(raw, record_type)
+    if nrec < 2:
+        raise RuntimeError("need two records in one node to invert an order")
+    a = node + 6 + hash_off
+    b = node + 6 + rs + hash_off
+    ha = bytes(raw[a:a + 4])
+    hb = bytes(raw[b:b + 4])
+    if int.from_bytes(ha, "little") >= int.from_bytes(hb, "little"):
+        raise RuntimeError("base name index is not already ascending")
+    raw[a:a + 4], raw[b:b + 4] = hb, ha
+    chksum = node + 6 + nrec * rs
+    struct.pack_into("<I", raw, chksum,
+                     _jenkins_lookup3()(bytes(raw[node:chksum])))
     _patch(path, bytes(raw))
 
 

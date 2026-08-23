@@ -249,7 +249,7 @@ source-derived, its classification mapping is curated, and the corpus and
 exact-build outcomes are measured corroboration.
 
 Registry checks currently account for **321 finding codes** and **0 semantic-
-backlog entries**. Static enumeration resolves **981 in-pickle message
+backlog entries**. Static enumeration resolves **983 in-pickle message
 variants**, with **0 unrouted** and **0 unanalyzable** variants. That is complete
 classification coverage for the current emission surface, not complete
 invariant coverage for the HDF5 format.
