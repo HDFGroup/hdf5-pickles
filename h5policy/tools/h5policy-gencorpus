@@ -1324,6 +1324,8 @@ def _gen_malformed(root):
         f"{root}/malformed/contiguous_data_over_metadata.h5")
     _make_fixed_array_paged_element_over_metadata(
         f"{root}/malformed/fixed_array_paged_element_over_metadata.h5")
+    _make_chunk_data_over_other_dataset(
+        f"{root}/malformed/chunk_data_over_other_dataset.h5")
     _make_scaleoffset_param_count(
         f"{root}/malformed/scaleoffset_param_count.h5")
     _make_nbit_param_count(
@@ -6159,6 +6161,56 @@ def _make_fixed_array_paged_element_over_metadata(path):
     body_end = page0 + page_nelmts * elmt_size
     raw[body_end:body_end + 4] = _jenkins_lookup3()(
         bytes(raw[page0:body_end])).to_bytes(4, "little")
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_data_over_other_dataset(path):
+    """One dataset's chunk pointed at ANOTHER dataset's chunk.
+
+    Two datasets sharing raw bytes is not a feature HDF5 has -- the allocator
+    gives every chunk its own space -- so an overlap means one dataset serves the
+    other's values.  MEASURED: /a is written as all 111s and /b as all 222s;
+    after crossing /a's first chunk onto /b's, h5dump prints
+    "222, 222, 222, 222, 222" for the first five elements of /a and exits 0.
+    A cross-DATASET read, silently, and h5policy accepted it before this check.
+
+    Both datasets are UNFILTERED so nothing can notice the substitution, and
+    they are given distinct constant fill patterns rather than aranges so the
+    wrong answer is unmistakable in the dump rather than a plausible-looking
+    sequence.
+
+    Located by scanning for the two type-1 (chunked storage) v1 B-tree nodes and
+    copying the second node's first chunk address over the first node's.  The
+    key stride is 4 + 4 + ndims*8 with ndims the LAYOUT dimensionality -- rank
+    plus one -- so a rank-1 dataset has 24-byte keys; the generator asserts the
+    two addresses differ before crossing them.
+    """
+    def _build(h):
+        h.create_dataset("a", data=np.full(25, 111, dtype="i4"), chunks=(5,))
+        h.create_dataset("b", data=np.full(25, 222, dtype="i4"), chunks=(5,))
+    raw = _base_bytes(_build, libver="earliest")
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+
+    nodes = []
+    at = raw.find(b"TREE")
+    while at >= 0:
+        if raw[at + 4] == 1:
+            nodes.append(at)
+        at = raw.find(b"TREE", at + 4)
+    if len(nodes) != 2:
+        raise RuntimeError(f"expected two chunk B-trees, found {len(nodes)}")
+
+    ndims = 2                                    # rank 1 + the element dimension
+    def key0_addr_off(node):
+        return node + 24 + 8 + 8 * ndims
+    dst, src = key0_addr_off(nodes[0]), key0_addr_off(nodes[1])
+    a_addr = struct.unpack_from("<Q", raw, dst)[0]
+    b_addr = struct.unpack_from("<Q", raw, src)[0]
+    if not (0 < a_addr < len(raw)) or not (0 < b_addr < len(raw)) or a_addr == b_addr:
+        raise RuntimeError(
+            f"chunk address parse looks wrong: {a_addr} and {b_addr}")
+    struct.pack_into("<Q", raw, dst, b_addr)     # a's chunk[0] -> b's chunk[0]
     _patch(path, bytes(raw))
 
 

@@ -93,6 +93,10 @@ COMPOSING_HELPERS = {
         "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA":
             [" data extent overlaps file metadata"],
     }),
+    "h5policy_report_data_over_data": (0, {
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_DATA":
+            [" data extent overlaps another raw-data extent"],
+    }),
     "h5policy_report_data_overlapped": (0, {
         "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA":
             [" data extent is overlapped by file metadata read later"],

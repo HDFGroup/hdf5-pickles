@@ -398,6 +398,14 @@ var h5policy_chunk_extent_hi = uint<64>[]();
    found from the metadata side could not say whether it hit a chunk or a
    contiguous extent, and the route shard would have nothing to split on.  */
 var h5policy_chunk_extent_what = string[]();
+/* The file offset of the RECORD that declared each extent.  It distinguishes
+   two genuinely different records that happen to name identical bytes -- a real
+   alias -- from the same record being decoded twice, which would otherwise
+   report itself as overlapping itself.  Node-level dedup (visited_btrees,
+   h5policy_ea_mark_block) and the once-per-analysis reset make a re-decode
+   unlikely, but "unlikely" is not a basis for a check that can reject a VALID
+   file, so the ambiguity is removed rather than argued away.  */
+var h5policy_chunk_extent_loc = uint<64>[]();
 /* h5policy_extents_truncated is declared in h5_findings.pk, not here: the JSON
    report is printed from that file and it LOADS FIRST, so a flag declared here
    would be invisible to the printer.  It lives with the other report-level
@@ -427,6 +435,7 @@ fun h5policy_reset_extents = void:
     h5policy_chunk_extent_lo = uint<64>[]();
     h5policy_chunk_extent_hi = uint<64>[]();
     h5policy_chunk_extent_what = string[]();
+    h5policy_chunk_extent_loc = uint<64>[]();
     h5policy_extents_truncated = 0;
     h5policy_chunk_extent_checks = 0UL;
 }
@@ -437,6 +446,25 @@ fun h5policy_intervals_overlap = (uint<64> a_lo, uint<64> a_hi,
                                   uint<64> b_lo, uint<64> b_hi) int:
 {
     return (a_lo < b_hi && b_lo < a_hi) ? 1 : 0;
+}
+
+/* Two raw-data extents overlapping each other.  Separate emitter for the same
+   reason as the reverse-direction one: `what + suffix` with WHAT as parameter 0
+   is the shape tools/message_routing.py can enumerate.  */
+fun h5policy_report_data_over_data = (string what, off64 loc, string object,
+                                      uint<64> this_lo, uint<64> other_lo) void:
+{
+    h5policy_emit_error_ev(
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_DATA", "corrupt", loc, object,
+        what + " data extent overlaps another raw-data extent",
+        H5Evidence {
+            field = what + ".data_disjoint_from_data",
+            actual = this_lo,
+            expected = other_lo,
+            comparison = "not_equal",
+            has_loc1 = 1, loc1_role = "actual",
+            loc1 = loc, loc1_len = 8UL,
+        });
 }
 
 /* Raw-data side: does this data extent hit metadata already recorded?  Emits
@@ -490,11 +518,40 @@ fun h5policy_data_extent_disjoint = (uint<64> addr, uint<64> size,
             i = i + 1UL;
         }
 
+    /* Raw data must also be disjoint from OTHER raw data.  Two datasets sharing
+       bytes is not a feature HDF5 has: the allocator gives every chunk and every
+       contiguous extent its own space, so an overlap means one dataset serves
+       another's bytes.  MEASURED on two 25-element datasets whose chunks were
+       crossed -- /a's first chunk returned /b's values (222s where 111s belong)
+       and h5dump exited 0.  Same silent-wrong-answer character as the metadata
+       case, and a cross-DATASET read wherever a consumer exposes one dataset of
+       a file without exposing another.
+       Scanned against the extents recorded so far, which is the same list the
+       metadata side already keeps, so this costs one more capped linear pass and
+       nothing new is stored. */
+    var dn = h5policy_chunk_extent_lo'length as uint<64>;
+    h5policy_walk_tick(dn + 1UL);
+    var d = 0UL;
+    while (d < dn)
+        {
+            if (h5policy_intervals_overlap(lo, hi,
+                                           h5policy_chunk_extent_lo[d],
+                                           h5policy_chunk_extent_hi[d])
+                && h5policy_chunk_extent_loc[d] != (loc/#B) as uint<64>)
+                {
+                    h5policy_report_data_over_data(
+                        what, loc, object, lo, h5policy_chunk_extent_lo[d]);
+                    return 0;
+                }
+            d = d + 1UL;
+        }
+
     if (h5policy_chunk_extent_lo'length as uint<64> < H5POLICY_MAX_CHUNK_EXTENT_CHECKS)
         {
             h5policy_chunk_extent_lo += [lo];
             h5policy_chunk_extent_hi += [hi];
             h5policy_chunk_extent_what += [what];
+            h5policy_chunk_extent_loc += [(loc/#B) as uint<64>];
         }
     else
         h5policy_extents_truncated = 1;
