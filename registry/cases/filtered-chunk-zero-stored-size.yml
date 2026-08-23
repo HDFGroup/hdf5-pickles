@@ -79,8 +79,11 @@ measured:
     chunk-index field, so this was inside the oracle's boundary, not beyond it
     the way a vlen/global-heap DATA corruption would be.
   oracle_now: >-
-    REJECT_CORRUPT, H5_CORRUPT_CHUNK_STORED_SIZE.  Two findings on the specimen
-    (its index carries two zero-size records), one on the tracked fixture.
+    REJECT_CORRUPT, H5_CORRUPT_CHUNK_STORED_SIZE, for a stored size of 0 OR any
+    value below the pipeline's fixed framing.  Two findings on the specimen (its
+    index carries two zero-size records), one on each tracked fixture.  The
+    first version of the check tested only `size == 0` and left 1, 2 and 3
+    reachable -- see the answered open question below.
   libhdf5: >-
     OPENS CLEANLY, FAULTS ON READ.  On the specimen and the tracked fixture
     alike: h5dump -H, h5ls -vr, h5stat and h5debug all exit 0; h5dump WITH data
@@ -156,7 +159,14 @@ systemic:
   landed_changes:
     - h5policy/pickles/h5_chunkindex.pk (h5policy_chunk_record_size_ok, plus its
       call sites in the v1 B-tree, v2 B-tree and fixed-array walkers; the
-      extensible-array walker's existing inline check now routes through it)
+      extensible-array walker's existing inline check now routes through it).
+      It also records the smallest stored size seen, for the framing comparison.
+    - h5policy/pickles/h5_layout.pk (records the pipeline's fixed framing for
+      fletcher32 and szip, behind the same dataset-only gate the element-count
+      recording uses)
+    - h5policy/pickles/h5_walk.pk + h5_validate.pk (the per-object framing and
+      minimum-stored-size state, its reset, and the cross-message comparison in
+      h5policy_finalize_ohdr_dataset)
     - registry/findings/catalog/chunk_index.yml (versions [2] -> [2,3,4])
     - tools/message_routing.py (COMPOSING_HELPERS entry for the shared helper)
     - h5policy-gencorpus _make_chunk_zero_stored_size and the valid control
@@ -165,10 +175,20 @@ systemic:
 # -- Reproducers --------------------------------------------------------------
 reproducers:
   integration_poc: h5policy/tests/malformed/chunk_zero_stored_size.h5
+  below_framing_poc: h5policy/tests/malformed/chunk_stored_size_below_framing.h5
   control_fixture: h5policy/tests/valid/chunk_v1_btree_fletcher.h5
   expectations:
     - h5policy/tests/expected/malformed-chunk_zero_stored_size.yml
+    - h5policy/tests/expected/malformed-chunk_stored_size_below_framing.yml
     - h5policy/tests/expected/valid-chunk_v1_btree_fletcher.yml
+  two_fixtures_why: >-
+    THREE files, two rules, one libhdf5 defect.  The zero fixture is caught
+    inline at the record; the below-framing fixture (stored size 3) is caught at
+    object finalization against the pipeline's framing.  They are different
+    h5policy code paths, so neither covers the other -- the inline check cannot
+    see the 3, and the finalize check would not catch a zero on an UNFILTERED
+    dataset, where the framing is 0 and the comparison is vacuous.  libhdf5
+    behaves identically on both (opens, then SIGSEGV on read).
   generator: >-
     h5policy-gencorpus _make_chunk_zero_stored_size, from the valid control.
     Write a rank-2 chunked dataset with fletcher32=True at libver="earliest" so
@@ -281,13 +301,27 @@ coverage_gaps:
     records through libhdf5's own API, not by hand.
 open_questions:
   - >-
-    Can a nonzero-but-too-small stored size (1, 2 or 3 bytes) be reached?  The
-    oracle now rejects only zero, so a 3-byte record still wraps
-    `src_nbytes -= 4` to SIZE_MAX.  Whether a chunk index can carry such a
-    record while the rest of the file stays plausible is unmeasured -- if it
-    can, the oracle rule should be "at least the pipeline's fixed overhead"
-    rather than "nonzero", which requires knowing the pipeline from the layout
-    message.  This is the most likely real gap left in this record.
+    ANSWERED 2026-08-22, and the answer widened the rule -- this was a real gap,
+    not a hypothetical.  YES: sizes 1, 2 and 3 are all reachable and all SIGSEGV
+    the shipped build exactly as 0 does, because fletcher32 subtracts 4
+    regardless.  Measured by patching the tracked control to each value: every
+    one was `accept` under the first version of the check.  So "nonzero" closed
+    ONE OF FOUR reachable values, and the rule is now "at least the pipeline's
+    fixed framing".
+    Implementing it made this a CROSS-MESSAGE check, which is the interesting
+    part: the framing comes from the pipeline message and the sizes from the
+    chunk index, and object-header messages arrive in any order, so an inline
+    gate in the layout dispatch would have been evadable by reordering.  The
+    shape is O(1) per-object state -- the pipeline records its framing, the
+    chunk walk records the SMALLEST stored size it saw and where, and
+    h5policy_finalize_ohdr_dataset compares -- so no index is walked twice.
+    The zero case stays inline, because it is invalid against any pipeline and
+    needs no cross-message context.
+    THE BOUNDARY IS A FLOOR, measured in both directions: a stored size of
+    exactly 4 is ACCEPTED, because the subtraction yields 0 (a legal empty
+    payload) and libhdf5 then rejects cleanly on the checksum rather than
+    faulting.  Sizes 4 and 5 accept and give libhdf5 rc=1.  Refusing them would
+    be h5policy checking that data is correct, which is not its job.
   - >-
     Would a floor in H5Z_pipeline be better than one per filter?  It would need
     a declared minimum-input property per filter, which the filter class struct
