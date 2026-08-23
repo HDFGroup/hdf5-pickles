@@ -8,6 +8,10 @@ For the repository entry points and the dependencies between them, see the
 Start with [H5Lens in 10 Minutes](FIRST_10_MINUTES.md) to install the toolchain,
 inspect a file, and interpret a policy finding. Continue with the [H5Lens
 tutorial](TUTORIAL.md) for guided exploration through `h5explain`. The
+[HDF5 file assessment workflow](H5POLICY_WORKFLOW.md) explains how to select an
+`h5policy` profile, run the bounded preflight, interpret completeness and
+findings, trace the evidence behind a classification, judge invariant-coverage
+completeness, and act on the decision. The
 [low-level GNU poke tutorial](POKE_TUTORIAL.md) exposes the underlying mappings,
 and [Writing HDF5 with GNU poke](POKE_CONSTRUCTION.md) keeps write-through and
 construction exercises in an explicitly advanced path. For repository-specific
@@ -54,12 +58,15 @@ construction sessions in [`POKE_CONSTRUCTION.md`](POKE_CONSTRUCTION.md). It
 also checks the documented h5policy cache-image boundary against live reports
 from every profile, the root h5patch entry points against the authoritative
 repair catalog, and the documented h5explain navigation-history semantics
-against the implementation. The first-ten-minutes guide runs its inspection
-and policy commands and checks the canary inventory against its source
-mappings. The lazy-validation ratios are derived from the tracked measurement
-before its deterministic fields are reproduced. The Mermaid tool overview and
-Codespaces configuration retain their own structural checks. Relative targets
-in tracked Markdown links are also checked, without fetching external URLs:
+against the implementation. The h5policy assessment workflow's profiles,
+decision table, finding inventory, invariant coverage, and assurance counts are
+checked against the command-line and registry contracts. The first-ten-minutes
+guide runs its inspection and policy commands and checks the canary inventory
+against its source mappings. The lazy-validation ratios are derived from the
+tracked measurement before its deterministic fields are reproduced. The
+Mermaid tool overview and Codespaces configuration retain their own structural
+checks. Relative targets in tracked Markdown links are also checked, without
+fetching external URLs:
 
 ```sh
 cmake --build build --target docs-check

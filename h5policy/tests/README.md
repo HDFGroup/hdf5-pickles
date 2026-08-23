@@ -59,6 +59,9 @@ controlled outcome; a change that alters any decision is surfaced for review.
 - `check_cache_image_docs.py` — a focused documentation contract that checks
   the cache-image boundary text and compares it with live reports from all four
   profiles plus an explicit continuation override.
+- `check_workflow_docs.py` — ties the operator assessment workflow's profiles
+  and decisions to the CLI, and derives its finding, message-routing,
+  invariant-family, verification, and exact-build counts from the registries.
 - `check_lazy_docs.py` — derives the documented lazy-validation growth ratios
   from the tracked artifact and reproduces its deterministic ladder fields.
 - `valid/ malformed/ policy/ resource/ coverage/ integration/ cve/` — generated
@@ -102,6 +105,11 @@ The smaller `cache_image_docs_regression` CTest test runs the cache-image
 documentation contract directly. It is also part of the top-level
 `docs-check` target, so a profile, decision, analysis-state, or documentation
 change at that hard boundary is reviewed as documentation drift.
+
+`h5policy_workflow_docs_regression` checks the operator workflow without
+running an HDF5 analysis. It fails when the CLI profiles or decisions, finding
+or message inventory, invariant-family status, verification score, or pinned
+exact-build evidence changes without a matching documentation update.
 
 `lazy_validation_docs_regression` similarly checks the narrative against
 `registry/lazy-validation.json`, reruns the measurement when its optional

@@ -41,6 +41,10 @@ Run from the repository root:
 Output is JSON (the machine-readable result); it is the only format, so no flag
 is required.  `--json` is still accepted as a no-op for backward compatibility.
 
+For the end-to-end operator procedure, including profile selection, report
+completeness, and actions for each decision, see
+[Assessing an HDF5 File with `h5policy`](../docs/H5POLICY_WORKFLOW.md).
+
 Useful mode flags:
 
 - `--strict` / `--non-strict` force GNU poke strict or non-strict mapping.
