@@ -4,8 +4,8 @@
 
 - The CVE workflow below applies only when a task involves a vulnerability
   specimen, advisory, OSS-Fuzz finding, or explicit CVE-case analysis.
-- The documentation, generated-file, portable-provenance, boundary, and
-  verification rules apply to every task.
+- The version-targeting, documentation, generated-file, portable-provenance,
+  boundary, and verification rules apply to every task.
 
 ## Companion repository: hdf5-ssp-sig
 
@@ -35,6 +35,43 @@ the general documentation rule and the CVE workflow would otherwise overlap.
 | Ordinary implementation or documentation | Files required by the requested change, subject to generated-file and boundary rules | Run the checks in [Verification](#verification) for the changed surface. |
 | CVE case development | `cases/<id>/` and temporary build directories only | Complete the case bundle and its local hygiene check; do not promote tracked changes. |
 | CVE promotion | None until the user approves the explicit promotion list | After approval, make only the listed tracked changes and run their verification. |
+
+## Target libhdf5 versions
+
+Every claim this repository makes about libhdf5 is a claim about the newest
+version reachable here — the current release line and the `develop` branch.
+Older library versions are historical context, not a work item.
+
+- **Measure against the newest available build.** Prefer `develop`, then the
+  newest release. A defect that reproduces only on an older build is not a live
+  finding, and a backlog item scoped to an older build does not outrank a
+  newly measured gap on the newest one. When a case record, registry row, or
+  earlier measurement cites a version older than the newest build available,
+  re-measure before building on it and report the stale pin rather than
+  inheriting its verdict.
+- **Distinguish a legacy library version from a legacy FORMAT version.** Only
+  the first is deprioritized. The newest library still reads v1 object headers,
+  old-style symbol tables, and every superseded message version, so those
+  remain fully in scope for the oracle and for verification — the file format is
+  the attack surface, the library release is the measurement target.
+- **Read the version off the artifact, never from a neighbouring record.**
+  `h5dump --version` for an install, `H5_VERS_MAJOR`/`H5_VERS_MINOR`/
+  `H5_VERS_RELEASE` in `src/H5public.h` for a checkout, `libhdf5.settings` for
+  build mode and assert state. h5py is the trap: its wheel bundles its own
+  libhdf5, older than the installed tools, so a differential run through h5py
+  measures that bundled library and not the build under test. Date any
+  conclusion that depends on which of the two saw the file.
+- **Reproducing on an older release earns its cost only twice:** to establish a
+  fix boundary for an affected-product block (see [Private
+  repository-advisory draft](#private-repository-advisory-draft)), and to show
+  that a fix landed. Neither requires making the older version a coverage
+  target. If every local install is already fixed, build the affected tag from
+  a worktree for that measurement alone and record it as such.
+- Keep the pinned `libhdf5_version` in `registry/libhdf5-evidence.yml` and
+  `registry/ssp-control-evidence.yml` equal to the build actually measured, and
+  treat a pin older than the newest available build as stale work rather than as
+  a current statement about libhdf5. Refreshing it cascades — see [Generated
+  files](#generated-files).
 
 ## CVE case workflow
 
@@ -69,6 +106,10 @@ advisory.
 - Record the current Git commit and dirty-worktree state, specimen hashes, tool
   and library versions, exact commands, exit codes, and baseline/candidate build
   identities.
+- Establish the conclusion on the newest available libhdf5 first, per [Target
+  libhdf5 versions](#target-libhdf5-versions). A case whose only measurement is
+  against an older build is incomplete, and one that `develop` has already fixed
+  is a fix-confirmation record, not a live finding.
 - Label conclusions as measured, source-derived, inferred, or unmeasured. Never
   present an unavailable platform result as measured.
 - Consider 32-bit and 64-bit behavior and other relevant platform differences.
@@ -304,7 +345,8 @@ distinction the record exists to carry, and leave the prefix out.
   measured verdict. So a measurement refresh cascades: reconcile the affected
   `validators.hdf5` claims (and any `registry/ssp-control-evidence.yml` rows that
   cite that family's verdict) in the same change, and keep the contract's pinned
-  `libhdf5_version` matching the build you measured.
+  `libhdf5_version` matching the build you measured — which per [Target libhdf5
+  versions](#target-libhdf5-versions) should be the newest one available.
 
 ## Portable provenance
 
