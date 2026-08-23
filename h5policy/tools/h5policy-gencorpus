@@ -1317,6 +1317,16 @@ def _gen_malformed(root):
         f"{root}/malformed/stab_heap_addr_undefined.h5")
     _make_stab_btree_addr_undefined(
         f"{root}/malformed/stab_btree_addr_undefined.h5")
+    _make_layout_virtual_version_v3(
+        f"{root}/malformed/layout_virtual_version_v3.h5")
+    _make_layout_virtual_version_v1(
+        f"{root}/malformed/layout_virtual_version_v1.h5")
+    _make_contiguous_computed_extent_past_eof(
+        f"{root}/malformed/contiguous_computed_extent_past_eof.h5")
+    _make_contiguous_v1_computed_extent_past_eof(
+        f"{root}/malformed/contiguous_v1_computed_extent_past_eof.h5")
+    _make_contiguous_stored_size_past_eof(
+        f"{root}/valid/contiguous_stored_size_past_eof.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_heap_free_list_size_wrap(
@@ -5720,6 +5730,233 @@ def _make_softlink_name_offset_oob(path):
         raise RuntimeError("chosen offset leaves the file, so the fixture would "
                            "test the wrong bound")
     struct.pack_into("<Q", raw, ent, off)
+    _patch(path, bytes(raw))
+
+
+def _v1_ohdr_message(raw, mtype=0x08):
+    """Locate the one data-layout message in a version-1 object header.
+
+    Returns ``(body, msize)``.  A version-1 object header carries no checksum,
+    so a caller may patch the message and write the file unchanged -- unlike the
+    version-2 path, which needs ``_fix_v2_ohdr_checksum``.
+
+    The dataset's header is reached through the root group's symbol table rather
+    than by scanning, and exactly one layout message is required, so a layout
+    change from a different h5py raises instead of patching the wrong bytes.
+    """
+    snod = raw.find(b"SNOD")
+    if snod < 0:
+        raise RuntimeError("could not locate the symbol table node")
+    nsyms = struct.unpack_from("<H", raw, snod + 6)[0]
+    hits = []
+
+    def walk(off, count, limit):
+        p, seen = off, 0
+        while seen < count and p + 8 <= limit:
+            mt, msize = struct.unpack_from("<HH", raw, p)
+            body = p + 8
+            if mt == mtype:
+                hits.append((body, msize))
+            elif mtype == 0x10:
+                cont_addr, cont_size = struct.unpack_from("<QQ", raw, body)
+                if cont_addr < len(raw):
+                    walk(cont_addr, 99, min(cont_addr + cont_size, len(raw)))
+            p = body + msize
+            seen += 1
+
+    for i in range(nsyms):
+        ent = snod + 8 + i * 40
+        oh = struct.unpack_from("<Q", raw, ent + 8)[0]
+        if oh >= len(raw) or raw[oh] != 1:
+            continue
+        walk(oh + 16, struct.unpack_from("<H", raw, oh + 2)[0], len(raw))
+    if len(hits) != 1:
+        raise RuntimeError(f"expected exactly one layout message, found {len(hits)}")
+    return hits[0]
+
+
+def _make_layout_virtual_version_v3(path):
+    """A layout message at VERSION 3 declaring the VIRTUAL class (3).
+
+    libhdf5 allows class 3 only from version 4 on.  Version 3 shares the class
+    switch with v4/v5, and `case H5D_VIRTUAL` opens with an explicit version
+    test that fails here (H5Olayout.c:529-530, "invalid layout version with
+    virtual layout").  h5policy only looked at the virtual class inside its
+    v4/v5 branch -- where VDS is a policy feature, not corruption -- so at v3 a
+    class of 3 fell through the contiguous/chunked/compact dispatch in silence,
+    and the unknown-class check could not see it either because 3 IS a valid
+    class value, just not at this version.
+
+    THE BODY IS LEFT AS THE CONTIGUOUS ONE and that is deliberate: the version
+    test is the FIRST statement in `case H5D_VIRTUAL`, before the heap
+    information is read at H5Olayout.c:532, so libhdf5 never reaches the
+    malformed body and the fixture isolates the version rule alone.
+
+    h5py writes layout version 3 even for libver="earliest", and a version-1
+    object header carries no checksum, so this is a single byte with nothing to
+    repair.  MEASURED: a corpus specimen has exactly this shape.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(10, dtype="i4")),
+        libver="earliest")
+    body, _ = _v1_ohdr_message(raw)
+    if raw[body] != 3:
+        raise RuntimeError(f"expected a version-3 layout message, got {raw[body]}")
+    if raw[body + 1] != 1:
+        raise RuntimeError(f"expected the contiguous class, got {raw[body + 1]}")
+    raw[body + 1] = 3                                  # H5D_VIRTUAL
+    _patch(path, bytes(raw))
+
+
+def _make_layout_virtual_version_v1(path):
+    """The OTHER door to the same rule: a VERSION 1 layout message declaring the
+    virtual class.
+
+    Versions 1 and 2 take their own decode block in libhdf5 and permit only
+    contiguous, chunked and compact -- anything else is "bad layout type for
+    layout message" (H5Olayout.c:122-123).  So the upstream MESSAGE differs from
+    the version-3 case above while the verdict is the same, and one h5policy
+    predicate (virtual class requires version >= 4) covers both.
+
+    REGIME THE CORPUS CANNOT OTHERWISE EXPRESS: h5py writes version 3 even at
+    libver="earliest", so no h5py call produces a v1 or v2 layout message at all
+    and this branch of the predicate would otherwise be untested.  The message is
+    therefore re-emitted by hand in the v1 shape -- version, dimensionality,
+    class, five reserved bytes, the data address, then one 4-byte dimension --
+    which is 20 bytes and so fits inside the 24 the v3 contiguous message
+    already occupies, leaving the object header's geometry untouched.
+
+    ndims is 1 and the class is 3, so neither the chunked two-dimension floor
+    (which requires class 2) nor the dimensionality range check fires: the
+    fixture yields the one finding under test.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(10, dtype="i4")),
+        libver="earliest")
+    body, msize = _v1_ohdr_message(raw)
+    if raw[body] != 3 or raw[body + 1] != 1:
+        raise RuntimeError("base layout message is not v3 contiguous")
+    if msize < 20:
+        raise RuntimeError(f"layout message is {msize} bytes, too small for the "
+                           "version-1 shape")
+    data_addr = struct.unpack_from("<Q", raw, body + 2)[0]
+    rewritten = bytes([1, 1, 3]) + bytes(5) + struct.pack("<Q", data_addr) \
+        + struct.pack("<I", 4)
+    raw[body:body + len(rewritten)] = rewritten
+    raw[body + len(rewritten):body + msize] = bytes(msize - len(rewritten))
+    _patch(path, bytes(raw))
+
+
+def _set_dataspace_nelmts(raw, nelmts):
+    """Rewrite the one simple-dataspace message to declare ``nelmts`` elements.
+
+    A version-1 or 2 simple dataspace is version, rank, flags, one reserved byte
+    and four more reserved bytes, then rank 8-byte current dimensions, then --
+    when bit 0 of flags is set -- rank 8-byte maximum dimensions.
+
+    BOTH VECTORS ARE REWRITTEN.  Raising only the current dimension leaves it
+    above the stored maximum, which is a *different* defect
+    (H5_CORRUPT_DATASPACE_DIMENSION_EXCEEDS_MAX) and may be what libhdf5 rejects
+    first -- so the fixture would no longer isolate the extent bound under test.
+    """
+    body, msize = _v1_ohdr_message(raw, 0x01)
+    if raw[body] not in (1, 2):
+        raise RuntimeError(f"unexpected dataspace version {raw[body]}")
+    rank = raw[body + 1]
+    if rank != 1:
+        raise RuntimeError(f"expected a rank-1 dataspace, got {rank}")
+    has_max = bool(raw[body + 2] & 1)
+    need = 8 + 8 * rank + (8 * rank if has_max else 0)
+    if msize < need:
+        raise RuntimeError("dataspace message is too small for its dimensions")
+    struct.pack_into("<Q", raw, body + 8, nelmts)
+    if has_max:
+        struct.pack_into("<Q", raw, body + 8 + 8 * rank, nelmts)
+
+
+def _make_contiguous_computed_extent_past_eof(path):
+    """Contiguous dataset whose STORED size is perfectly in-file while the
+    extent libhdf5 actually computes runs off the end.
+
+    H5D__contig_check recomputes data_size = nelmts * dt_size from the dataspace
+    and the datatype and bounds only THAT against the raw-data EOA
+    (H5Dcontig.c:391-411); it never looks at the size field the layout message
+    carries.  So inflating the dataspace alone yields a file whose every stored
+    field is in range and which libhdf5 still refuses to open.  h5policy bounded
+    only the stored size and accepted it.
+
+    The element count is kept modest (100k elements of 4 bytes = 400 KB) so the
+    logical-dataset-byte resource budget is not tripped first: the point is the
+    address-space bound, not a resource refusal.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(10, dtype="i4")),
+        libver="earliest")
+    _set_dataspace_nelmts(raw, 100_000)
+    _patch(path, bytes(raw))
+
+
+def _make_contiguous_v1_computed_extent_past_eof(path):
+    """The same rule reached through a VERSION 1 contiguous layout.
+
+    REGIME THE CORPUS COULD NOT EXPRESS, and the shape of the corpus specimen
+    that exposed this gap.  h5py writes layout version 3 even at
+    libver="earliest", and h5policy's v1/v2 branch previously handled only
+    chunked and compact -- so a v1 contiguous layout's data address was never
+    even decoded, and neither the extent bound nor the metadata-overlap check
+    could see such a dataset at all.
+
+    Version 1 also matters because it is the case where the stored size is
+    provably irrelevant: libhdf5 DISCARDS it and recomputes from the dataspace
+    (H5Dcontig.c:536-551), so the computed extent is the only one that exists.
+
+    The message is re-emitted in the v1 shape -- version, dimensionality, class,
+    five reserved bytes, the data address, then one 4-byte dimension = 20 bytes
+    -- which fits inside the 24 the v3 contiguous message occupied, so the
+    object header's geometry is untouched.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(10, dtype="i4")),
+        libver="earliest")
+    layout, msize = _v1_ohdr_message(raw)
+    if raw[layout] != 3 or raw[layout + 1] != 1:
+        raise RuntimeError("base layout message is not v3 contiguous")
+    if msize < 20:
+        raise RuntimeError("layout message too small for the version-1 shape")
+    data_addr = struct.unpack_from("<Q", raw, layout + 2)[0]
+    rewritten = bytes([1, 2, 1]) + bytes(5) + struct.pack("<Q", data_addr) \
+        + struct.pack("<I", 4)
+    raw[layout:layout + len(rewritten)] = rewritten
+    raw[layout + len(rewritten):layout + msize] = bytes(msize - len(rewritten))
+    _set_dataspace_nelmts(raw, 100_000)
+    _patch(path, bytes(raw))
+
+
+def _make_contiguous_stored_size_past_eof(path):
+    """Contiguous dataset whose STORED size alone reaches past the end of file,
+    with a valid address and a valid dataspace.
+
+    THIS FILE MUST NOT BE REJECTED.  libhdf5 opens it and returns every correct
+    value, because it never bounds the stored size -- so calling it corrupt is an
+    invariant-A violation.  MEASURED: with the field set to 10,000,000 in a
+    ~2.4 KB file, h5dump -H and h5dump -d both exit 0 and all 100 values read
+    back.  h5policy therefore reports a WARNING, which this fixture pins.
+
+    Reported rather than ignored because the field is live for layout version 3
+    and later: libhdf5 keeps it and uses it as store.contig.dset_size on the I/O
+    path (H5Dcontig.c:227, :637), as the length handed to H5MF_xfree when the
+    dataset is deleted (:352), as the sieve-buffer bound (:559), and as the
+    answer H5Dget_storage_size gives the application (H5Dint.c:2572).
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(100, dtype="i4")),
+        libver="earliest")
+    layout, _ = _v1_ohdr_message(raw)
+    if raw[layout] != 3 or raw[layout + 1] != 1:
+        raise RuntimeError("base layout message is not v3 contiguous")
+    if struct.unpack_from("<Q", raw, layout + 10)[0] != 400:
+        raise RuntimeError("unexpected stored contiguous size")
+    struct.pack_into("<Q", raw, layout + 10, 10_000_000)
     _patch(path, bytes(raw))
 
 

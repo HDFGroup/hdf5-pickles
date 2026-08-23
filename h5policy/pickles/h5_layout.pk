@@ -91,12 +91,45 @@ fun h5policy_check_contiguous_extent = (int ios, H5PolicyProfile profile,
                can cite the bytes carrying it rather than only the rejected
                range -- which, being outside the file, is not decodable. */
             var data_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(data_addr_raw));
-            var ok = h5policy_checked_addr_range_at(data_addr,
-                                                    data_size, file_size,
-                                                    "contiguous data range outside file",
-                                                    payload_off, object,
-                                                    (payload_off + 2#B)/#B,
-                                                    global_sizeof_offsets as uint<64>);
+            /* Kept for the finalize-time bound on the COMPUTED extent, which is
+               the one libhdf5 actually enforces -- see the long note in
+               h5policy_update_logical_dataset_size.  */
+            ctx.contiguous_layout_addr = data_addr;
+            ctx.contiguous_layout_addr_offset = (payload_off + 2#B)/#B;
+
+            /* THE STORED SIZE IS A WARNING, NOT CORRUPTION, and this is measured
+               rather than assumed.  libhdf5 never bounds the size field the
+               layout message carries: H5D__contig_check recomputes the extent
+               from the dataspace and datatype and checks only that
+               (H5Dcontig.c:391-411).  Inflating this field to 10,000,000 in a
+               2448-byte file leaves libhdf5 opening the dataset AND returning
+               all 100 correct values, while h5policy called it corrupt -- a live
+               invariant-A false positive, since "libhdf5 opens" must imply "not
+               reject_corrupt".
+
+               IT IS STILL WORTH REPORTING, because the field is not dead.  For
+               layout version 3 and later libhdf5 KEEPS the stored value (it
+               recomputes only for v1/v2, H5Dcontig.c:536-551) and then uses it:
+               as store.contig.dset_size on the I/O path (:227, :637), as the
+               length passed to H5MF_xfree when the dataset is deleted (:352),
+               as the sieve-buffer bound (:559), and as the answer
+               H5Dget_storage_size hands the application (H5Dint.c:2572).  A
+               value past the end of the file is wrong in every one of those
+               uses; it simply is not what stops the open.  So: warning here,
+               corrupt on the computed extent.
+
+               `ok` still gates the metadata-overlap check below, because an
+               extent reaching outside the file has no meaningful intersection
+               with anything inside it and would only produce noise.  */
+            var ok = 1;
+            if (data_size > 0xffffffffffffffffUL - data_addr
+                || data_addr + data_size > file_size)
+                {
+                    ok = 0;
+                    h5policy_emit_warning("H5_ADVISORY_CONTIGUOUS_STORED_SIZE_PAST_EOF",
+                                          payload_off, object,
+                                          "contiguous layout stored size reaches past the end of the file");
+                }
             /* In-file is not enough: the extent must also miss file METADATA.
                A contiguous dataset is the plainest instance of the primitive --
                no filter, no checksum, nothing to notice the substitution -- so
@@ -488,6 +521,41 @@ fun h5policy_validate_layout_payload = (int ios,
                 h5policy_emit_error("H5_CORRUPT_LAYOUT_DIMENSIONALITY",
                                     "corrupt", payload_off + 1#B, object,
                                     "layout dimensionality is out of range");
+            /* V1/V2 CONTIGUOUS WAS NOT DECODED AT ALL before this: the branch
+               handled only chunked and compact, so the data address was never
+               even read, and neither the extent bound nor the metadata-overlap
+               check could see such a dataset.  The corpus specimen is exactly
+               this shape -- a version-1 contiguous layout.
+
+               The v1/v2 prefix is version, dimensionality, class and five
+               reserved bytes, so the address sits at payload_off + 8.  Only the
+               address is recorded: libhdf5 DISCARDS the stored size for these
+               versions, recomputing it from the dataspace and datatype
+               (H5Dcontig.c:536-551), so the trailing 4-byte dimensions carry no
+               size the file can be held to and has_contiguous_layout stays
+               unset -- setting it would make the stored-size comparison above
+               fire on a quantity libhdf5 overwrites.  */
+            if (layout_class == CONTIG as uint<64>
+                && h5policy_payload_range_ok(msg_size, 0UL,
+                                             8UL + (global_sizeof_offsets as uint<64>),
+                                             "H5_CORRUPT_LAYOUT_MESSAGE_TOO_SMALL",
+                                             payload_off, object,
+                                             "contiguous v1/v2 layout message is too small"))
+                {
+                    var v12_addr_raw = h5policy_msg_bytes(ios, profile,
+                                                          payload_off + 8#B,
+                                                          global_sizeof_offsets as uint<64>);
+                    /* An undefined address means unallocated storage, which
+                       libhdf5 skips (H5Dcontig.c:399). */
+                    if (!h5policy_msg_addr_is_undef(v12_addr_raw))
+                        {
+                            ctx.contiguous_layout_addr =
+                                hdf5_addr_to_file_u64(bytes_to_u64_le(v12_addr_raw));
+                            ctx.contiguous_layout_addr_offset =
+                                (payload_off + 8#B)/#B;
+                        }
+                }
+
             if (layout_class == CHUNKED as uint<64>)
                 {
                     /* Legacy chunked layout stores dataset-rank-plus-one dims:
@@ -829,6 +897,46 @@ fun h5policy_validate_layout_payload = (int ios,
                             "corrupt", payload_off, object,
                             "unsupported layout message version");
 
+    /* THE VIRTUAL CLASS IS VERSION-GATED.  Class 3 is only legal from layout
+       version 4 on, and libhdf5 refuses it below that through two separate
+       doors:
+
+         - versions 1 and 2 take their own decode block and allow only
+           contiguous, chunked and compact -- anything else is "bad layout type
+           for layout message" (H5Olayout.c:122-123);
+         - version 3 shares the class switch with v4/v5, which opens
+           `case H5D_VIRTUAL` with an explicit version test and fails with
+           "invalid layout version with virtual layout" (H5Olayout.c:529-530).
+
+       One predicate covers both because the h5policy-side rule is the same in
+       each: the virtual class requires version >= 4.  The two upstream messages
+       differ but the verdict does not.
+
+       WHY IT WAS MISSED: h5policy only ever looks at the virtual class inside
+       the v4/v5 branch, where it is a POLICY feature (VDS indirection) rather
+       than corruption.  The v1/v2 and v3 branches dispatch on contiguous /
+       chunked / compact and a class of 3 falls through all of them in silence,
+       while the unknown-class check below cannot see it either, since 3 is a
+       perfectly valid class value -- just not at these versions.  So the check
+       belongs here, after the version dispatch, where the class is known for
+       every version.
+
+       MEASURED on a corpus specimen whose layout message is exactly
+       `03 03 ffffffffffffffff ...` -- version 3, class 3, with an undefined VDS
+       heap address.  libhdf5 refuses the open; h5policy accepted the file.  */
+    if (layout_class == VIRTUAL as uint<64> && version < 4UL)
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_LAYOUT_VIRTUAL_VERSION", "corrupt", payload_off, object,
+            "virtual layout class requires layout version 4 or later",
+            H5Evidence {
+                field = "layout.virtual_version",
+                actual = version,
+                expected = 4UL,
+                comparison = "at_least",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = payload_off, loc1_len = 1UL,
+            });
+
     /* Layout class values are shared across versions.  Unknown classes are
        structural corruption even when the version itself was recognized.  */
     if (layout_class > VIRTUAL as uint<64>)
@@ -836,7 +944,7 @@ fun h5policy_validate_layout_payload = (int ios,
                             "corrupt", payload_off, object,
                             "unknown data layout class");
 
-    return h5policy_update_logical_dataset_size(ctx, profile,
+    return h5policy_update_logical_dataset_size(ios, ctx, profile,
                                                 payload_off, object);
 }
 
