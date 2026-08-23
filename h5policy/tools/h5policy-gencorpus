@@ -219,6 +219,14 @@ def _gen_valid(root):
                          maxshape=(None,), chunks=(8,))
     _write_userblock(f"{root}/valid/userblock_latest.h5", "latest",
                      _userblock_content)
+    # Chunked + user block: the control for chunk.data_disjoint_from_metadata at
+    # a nonzero base address, and the base file its malformed sibling is patched
+    # from.  userblock_earliest.h5 below has a chunked dataset too, but this one
+    # exists so the pair differs by exactly one address field.
+    _write_userblock(f"{root}/valid/userblock_chunked.h5", "earliest",
+                     lambda h: h.create_dataset(
+                         "d", data=np.arange(100, dtype="i4").reshape(10, 10),
+                         chunks=(5, 5)))
     _write_userblock(f"{root}/valid/userblock_earliest.h5", "earliest",
                      _userblock_content)
     # A user block and a cache image together.  The image records the address of
@@ -1286,6 +1294,22 @@ def _gen_malformed(root):
     _make_chunk_stored_size_below_framing(
         f"{root}/malformed/chunk_stored_size_below_framing.h5",
         f"{root}/valid/chunk_v1_btree_fletcher.h5")
+    _make_chunk_data_over_metadata(
+        f"{root}/malformed/chunk_data_over_metadata.h5",
+        f"{root}/valid/chunked_v1_btree.h5")
+    # The SAME defect behind a 512-byte user block, because this check compares
+    # two address spaces and getting one of them wrong is a user-block-ONLY bug
+    # -- invisible at base 0, which is where every other fixture sits.
+    _make_chunk_data_over_metadata(
+        f"{root}/malformed/chunk_data_over_metadata_userblock.h5",
+        f"{root}/valid/userblock_chunked.h5")
+    _make_chunk_duplicate_key_offset(
+        f"{root}/malformed/chunk_duplicate_key_offset.h5",
+        f"{root}/valid/chunked_v1_btree.h5")
+    _make_scaleoffset_param_count(
+        f"{root}/malformed/scaleoffset_param_count.h5")
+    _make_nbit_param_count(
+        f"{root}/malformed/nbit_param_count.h5")
     _make_bad_message_flag_combination(
         f"{root}/malformed/bad_message_flag_combination.h5")
     _make_bad_link_info_max_corder(
@@ -5821,6 +5845,190 @@ def _make_chunk_stored_size_below_framing(path, base_path):
         raise RuntimeError(
             f"key[0] parse looks wrong: size={size0} addr={addr} (file {len(raw)} bytes)")
     struct.pack_into("<I", raw, key0, 3)         # one below fletcher32's framing
+    _patch(path, bytes(raw))
+
+
+def _build_nbit(h):
+    """A chunked n-bit dataset.  h5py has no high-level spelling for n-bit (it
+    exposes set_scaleoffset but not set_nbit), so the filter is set by ID through
+    the property-list API -- the same route _build_dynamic_filter takes.  n-bit
+    is a CORE filter, so libhdf5's own set_local callback computes the parameter
+    tree and writes the real cd_values; only the descriptor's declared count is
+    patched afterwards."""
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_chunk((5, 5))
+    dcpl.set_filter(5, 0, ())                    # 5 == H5Z_FILTER_NBIT
+    sid = h5py.h5s.create_simple((10, 10))
+    d = h5py.h5d.create(h.id, b"d", h5py.h5t.NATIVE_INT32, sid, dcpl=dcpl)
+    d.write(h5py.h5s.ALL, h5py.h5s.ALL,
+            np.arange(100, dtype="i4").reshape(10, 10))
+
+
+def _pipeline_cd_nelmts_offset(raw, filter_id):
+    """File offset of the 2-byte cd_nelmts field of FILTER_ID's descriptor.
+
+    A version-1 filter-pipeline message descriptor is
+        filter id (2) | name length (2) | flags (2) | cd_nelmts (2) | name | cd
+    and libver="earliest" writes version 1, which always carries the name-length
+    field -- so cd_nelmts sits at descriptor + 6.  The message payload begins
+    after the pipeline header (version, nfilters, 6 reserved bytes), and the
+    descriptor is located by scanning for the filter id rather than by walking
+    the message, because the preceding descriptors' name padding makes the
+    offset layout-dependent.  Asserting the located count against what the
+    filter requires is what keeps a wrong hit from producing a silent no-op.
+    """
+    want = struct.pack("<H", filter_id)
+    at = 0
+    while True:
+        at = raw.find(want, at)
+        if at < 0:
+            raise RuntimeError(f"filter id {filter_id} not found in the file")
+        # A plausible descriptor: name length and cd_nelmts both small.
+        name_len = struct.unpack_from("<H", raw, at + 2)[0]
+        nelmts = struct.unpack_from("<H", raw, at + 6)[0]
+        if name_len % 8 == 0 and name_len <= 64 and 0 < nelmts <= 64:
+            return at + 6
+        at += 2
+
+
+def _make_chunk_data_over_metadata(path, base_path):
+    """A chunk record whose data address points at the superblock.
+
+    libhdf5 serves it: the chunk's bytes come back as dataset VALUES with no
+    error and rc=0.  Measured on this fixture's shape -- the first two int32
+    values read 1178880137 and 169478669, which are 0x46444889 and 0x0A1A0A0D,
+    the file's own "\x89HDF\r\n\x1a\n" signature.  Pointing the same record
+    at a v1 B-tree node yields 0x45455254, "TREE".  So the primitive is an
+    arbitrary in-file read, silently returned as data.
+
+    THE BASE MUST BE UNFILTERED, and that is the point of using
+    chunked_v1_btree.h5 rather than the fletcher32 control: with a checksum
+    filter in the pipeline libhdf5 notices the substituted bytes and fails the
+    read, which hides the defect behind a clean error.  Without one there is
+    nothing to check the bytes against and they are simply returned.
+
+    Address 0 is chosen because it is the one offset guaranteed to be metadata in
+    every file, but the invariant is not "addr != 0" -- it is that chunk data and
+    metadata occupy disjoint bytes.  h5policy enforces it from both directions
+    against a registry of accounted metadata extents.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    at = raw.find(b"TREE")
+    while at >= 0 and raw[at + 4] != 1:
+        at = raw.find(b"TREE", at + 4)
+    if at < 0:
+        raise RuntimeError("could not locate a type-1 (chunk) v1 B-tree node")
+    ndims = 3                                    # rank 2 + the element dimension
+    key0 = at + 24
+    addr0 = key0 + 8 + 8 * ndims
+    size0 = struct.unpack_from("<I", raw, key0)[0]
+    addr = struct.unpack_from("<Q", raw, addr0)[0]
+    if size0 == 0 or not (0 < addr < len(raw)):
+        raise RuntimeError(
+            f"key[0] parse looks wrong: size={size0} addr={addr} (file {len(raw)} bytes)")
+    # RELATIVE address, not physical: every stored HDF5 address is relative to
+    # the superblock's base, so 0 means "the superblock" at base 0 and at base
+    # 512 alike.  Writing a physical offset here would silently miss the
+    # superblock on a user-block file -- the exact base-relative-vs-physical
+    # confusion this fixture pair exists to catch.
+    struct.pack_into("<Q", raw, addr0, 0)        # chunk data -> the superblock
+    _patch(path, bytes(raw))
+
+
+def _make_scaleoffset_param_count(path):
+    """A scale-offset filter descriptor declaring the wrong parameter count.
+
+    H5Z__filter_scaleoffset's first act is `if (cd_nelmts !=
+    H5Z_SCALEOFFSET_TOTAL_NPARMS)` -- exactly 20 (H5Zscaleoffset.c:104, checked
+    at :1122) -- so libhdf5 refuses the read outright.  h5policy accepted it,
+    which is the gap: a file no reader can use was passing the preflight.
+
+    The count is dropped by one rather than to something wild, so the descriptor
+    still parses and stays inside the message; only the required-total rule is
+    broken.  The client-data words are left in place, so the descriptor extent is
+    unchanged and no checksum needs repairing (v1 pipeline messages carry none).
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(100, dtype="i4").reshape(10, 10),
+                                   chunks=(5, 5), scaleoffset=3),
+        libver="earliest")
+    off = _pipeline_cd_nelmts_offset(raw, 6)
+    have = struct.unpack_from("<H", raw, off)[0]
+    if have != 20:
+        raise RuntimeError(f"expected 20 scale-offset parameters, found {have}")
+    struct.pack_into("<H", raw, off, 19)
+    _patch(path, bytes(raw))
+
+
+def _make_nbit_param_count(path):
+    """An n-bit filter descriptor whose cd_nelmts disagrees with its own
+    cd_values[0].
+
+    n-bit is self-describing: H5Znbit.c:897 writes the actual parameter count
+    into cd_values[0], and :935 refuses the read when `cd_nelmts !=
+    cd_values[0]`.  Patching the DESCRIPTOR count leaves cd_values[0] saying
+    something else, which is the disagreement libhdf5 rejects and h5policy
+    accepted.
+
+    Patched down by one for the same reason as the scale-offset sibling: the
+    descriptor still parses and stays in range, so the only broken rule is the
+    self-consistency one.  Note this is a DIFFERENT defect from
+    H5_CORRUPT_NBIT_PARAMS_OVERRUN, which is about a parameter TREE that walks
+    past cd_nelmts; here the tree is fine and the count is the lie.
+    """
+    raw = _base_bytes(_build_nbit, libver="earliest")
+    off = _pipeline_cd_nelmts_offset(raw, 5)
+    have = struct.unpack_from("<H", raw, off)[0]
+    if have < 2:
+        raise RuntimeError(f"expected an n-bit parameter tree, found {have} values")
+    struct.pack_into("<H", raw, off, have - 1)
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_duplicate_key_offset(path, base_path):
+    """Two v1 B-tree chunk keys declaring the same chunk offset.
+
+    The key order is not decoration: libhdf5 locates a chunk by searching the
+    tree on it, so a duplicate makes one chunk UNREACHABLE and serves the other
+    in its place.  Measured on this fixture's shape -- h5dump exits 0 and returns
+    chunk (0,5)'s bytes at logical position (0,0), while the region whose record
+    was displaced comes back as the dataset's FILL VALUE.  Silent wrong data, no
+    error, same character as chunk_data_over_metadata.h5.
+
+    key[1]'s offset words are copied from key[0] rather than being zeroed or
+    randomised, so the node stays otherwise well-formed: both records keep valid
+    addresses and sizes, and the only broken rule is the strict ordering.  A
+    v1 B-tree node carries no checksum and the edit is size-neutral.
+
+    The offsets are copied from the PREVIOUS key, which makes the pair an
+    equality rather than an inversion -- the duplicate arm of the rule.  An
+    inversion (a later key with a smaller offset) is the other arm and is not
+    separately fixtured; both emit the same code from the same comparison.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    at = raw.find(b"TREE")
+    while at >= 0 and raw[at + 4] != 1:
+        at = raw.find(b"TREE", at + 4)
+    if at < 0:
+        raise RuntimeError("could not locate a type-1 (chunk) v1 B-tree node")
+    entries = struct.unpack_from("<H", raw, at + 6)[0]
+    if entries < 2:
+        raise RuntimeError(f"need at least two entries to duplicate, found {entries}")
+    ndims = 3                                    # rank 2 + the element dimension
+    stride = 8 + 8 * ndims + 8                   # key + child address
+    k0 = at + 24
+    k1 = k0 + stride
+    first = struct.unpack_from("<" + "Q" * ndims, raw, k0 + 8)
+    second = struct.unpack_from("<" + "Q" * ndims, raw, k1 + 8)
+    if not first < second:
+        raise RuntimeError(
+            f"key parse looks wrong: offsets {first} then {second} are not increasing")
+    for w in range(ndims):                       # key[1] offset := key[0] offset
+        struct.pack_into("<Q", raw, k1 + 8 + 8 * w, first[w])
     _patch(path, bytes(raw))
 
 

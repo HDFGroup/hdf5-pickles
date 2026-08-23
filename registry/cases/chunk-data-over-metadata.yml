@@ -1,0 +1,294 @@
+# A chunk-index record's data address can point anywhere in the file, including
+# at metadata, and libhdf5 serves it: the bytes come back as dataset VALUES with
+# no error.  An arbitrary in-file read, silently presented as data.
+#
+# Found 2026-08-22 while re-examining the specimen behind
+# registry/cases/filtered-chunk-zero-stored-size.yml, whose corrupt chunk index
+# carries this defect too.
+schema_version: 1
+
+id: chunk-data-over-metadata
+title: nothing re-checks on read that raw chunk data and file metadata occupy
+  disjoint bytes, so a chunk address pointing into metadata returns those bytes
+  as dataset values
+status: oracle-hardened          # h5policy rejects as of 2026-08-22; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: chunk_index
+versions: [2, 3, 4]
+root_cause_classification: cross_object_alias
+violated_invariant:
+  - chunk.data_disjoint_from_metadata
+validation_closure: >-
+  the whole file's byte layout, not any one record: a chunk extent is only
+  wrong RELATIVE to where metadata lives.  That makes this the third member of
+  the address-aliasing family (see sibling_audit) and, like the others, a
+  property no per-record check can see.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-08-22 (was: accept, no findings)"
+  - "libhdf5 H5Dread -> H5D__chunk_read -> H5D__chunk_lock -> H5F_block_read at the record's address"
+  - "shipped consumers: h5dump returns the metadata bytes as data and exits 0"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  There is no check to point at, and that is the finding.  libhdf5's allocator
+  guarantees raw data and metadata are disjoint when it WRITES a file, and the
+  read path never re-establishes it: H5D__chunk_lock takes the address from the
+  chunk record and reads the chunk from there.  Any in-file address is accepted,
+  because the only property anyone verifies is that the read stays inside the
+  file.
+  h5policy had the same hole for the same reason: its bound was
+  `addr + size <= file_size`, which every in-file address satisfies.
+  A FIX INSIDE libhdf5 IS NOT AS CHEAP AS THE OTHER CASES IN THIS REGISTRY, and
+  that should be said plainly rather than hand-waved.  The library has no
+  file-wide map of live metadata extents at read time -- the metadata cache
+  knows what it has loaded, not what exists -- so there is no single comparison
+  to add.  The honest options are a debug-only assertion when a chunk read
+  overlaps a cached metadata entry's extent, or treating it as a
+  format-validation concern for a preflight tool, which is what h5policy is.
+  This record therefore does NOT propose a one-line upstream fix; it records a
+  read-path property that a consumer cannot rely on.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  MEASURED: 2026-08-22, libhdf5 2.3.0 (source tree at develop f8f0379c7c5).
+  oracle_as_found: ACCEPT, zero findings, under untrusted-strict and forensic.
+  oracle_now: >-
+    REJECT_CORRUPT, H5_CORRUPT_CHUNK_DATA_OVERLAPS_METADATA.
+  libhdf5: >-
+    RETURNS THE BYTES AS DATA, rc=0, no error.  Measured on an UNFILTERED
+    chunked dataset -- the choice matters, see below -- by pointing one chunk
+    record at three different targets:
+      offset 0 (superblock):  first two int32 values 1178880137, 169478669
+                              == 0x46444889, 0x0A1A0A0D == "\x89HDF\r\n\x1a\n"
+      a v1 B-tree node:       first value 1162170964 == 0x45455254 == "TREE"
+      an arbitrary offset:    those bytes, verbatim
+    h5dump exits 0 in all three cases and prints them as dataset content.
+  why_unfiltered: >-
+    With a checksum filter in the pipeline libhdf5 notices the substituted bytes
+    and fails the read, which hides the defect behind a clean error.  The
+    unfiltered case is the one that demonstrates the primitive, and it is also
+    the common case for uncompressed data.
+  severity_honest: >-
+    NOT memory-unsafety and NOT a crash.  Two real consequences:
+    (1) integrity, always -- a reader is silently handed wrong data;
+    (2) confidentiality, conditionally -- an arbitrary in-file read is a
+    boundary crossing wherever a consumer exposes some datasets of a file
+    without exposing all of its bytes: a userblock carrying application data, or
+    a service serving selected datasets from a shared file.  Same-file only; a
+    reader who already has the whole file learns nothing new.
+    It is worth resisting the temptation to inflate this into a memory-safety
+    finding.  It is a silent-wrong-answer defect, which is a different and
+    narrower thing.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt          # was: accept, until 2026-08-22
+  libhdf5: opens AND reads successfully, returning metadata as data
+  libhdf5_version: 2.3.0 (measured)
+  classification: A-prime -- an oracle FALSE ACCEPT, closed on the oracle side.
+  note: >-
+    CARRIED BY A CODE-SCOPED A~ PREDICATE (chunk_over_metadata_only in
+    h5policy-diff), and this is the one A~ case in that file where the reference
+    library is ACTIVELY WRONG rather than merely lazy.  Every other predicate
+    there excuses libhdf5 for validating late or on a path the harness does not
+    run; here BOTH "libhdf5 opens" and "libhdf5 reads" succeed, and that success
+    IS the defect.  A silent wrong answer leaves no trace a return code can
+    carry, so the A+ evidence path finds nothing and the divergence has to be
+    named explicitly.
+    Code-scoped rather than per-fixture because the missing check is a property
+    of libhdf5's read path, not of one specimen -- so every file emitting this
+    code deserves the same exemption, which is the test that form requires.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: oracle_only
+  description: >-
+    h5policy: landed.  A registry of accounted metadata extents, checked against
+    every chunk extent FROM BOTH SIDES -- chunk-then-metadata and
+    metadata-then-chunk -- because the object graph is walked breadth-first and
+    either can be reached first.  Recording hooks into
+    h5policy_account_metadata, which already received both the byte count and
+    the location at all 22 of its call sites, so no walker had to be touched to
+    supply extents.
+    BOTH REGISTRIES ARE HARD-CAPPED (512 metadata extents, 1024 chunk checks)
+    and that is a deliberate trade, not an oversight: the scans are linear and
+    charged to the walk budget, so an uncapped cross-product would scale with
+    file size and could push a large VALID file past max_walk_operations --
+    converting a detection into a verdict change on files this rule is not
+    about.  With the caps the added cost is bounded at ~512K comparisons
+    regardless of file size, about 5% of the tightest profile's 10M budget.
+    Past a cap, checking stops and a truncation flag records it.
+    libhdf5: no cheap fix proposed -- see defect.
+systemic:
+  semantic_boundary: >-
+    byte-range ownership across the whole file.  Metadata structures, raw data
+    extents and free space partition the file, and nothing enforces the
+    partition on read.  Chunk data is the instance measured here; contiguous and
+    compact layouts name extents the same way and were NOT tested.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder) -- landed; libhdf5 read path unaddressed
+  landed_changes:
+    - h5policy/pickles/h5_walk.pk (the two extent registries, their caps, the
+      saturating extent helper, both directions of the check, and the recording
+      hook in h5policy_account_metadata)
+    - h5policy/pickles/h5_policy.pk (h5policy_reset_extents, once per analysis)
+    - h5policy/pickles/h5_chunkindex.pk (call sites in all four walkers)
+    - registry/findings/catalog/chunk_index.yml + registry/validation-coverage.yml
+    - tools/h5policy-diff (chunk_over_metadata_only, the A~ predicate)
+    - h5policy-gencorpus _make_chunk_data_over_metadata and its expectation
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/chunk_data_over_metadata.h5
+  control_fixture: h5policy/tests/valid/chunked_v1_btree.h5
+  expectations:
+    - h5policy/tests/expected/malformed-chunk_data_over_metadata.yml
+  generator: >-
+    h5policy-gencorpus _make_chunk_data_over_metadata.  From the UNFILTERED v1
+    B-tree control, set key[0]'s eight-byte data address to 0 and keep its size.
+    Size-neutral, and a v1 B-tree node carries no checksum.
+    THE BASE MUST BE UNFILTERED -- see measured.why_unfiltered.  Building it over
+    the fletcher32 control produces a file libhdf5 rejects on the checksum, which
+    tests fletcher32 rather than this.
+    The v1 B-tree key stride trap applies here as it does to the stored-size
+    fixtures: n+1 keys for n children, stride 4 + 4 + ndims*8 with ndims the
+    LAYOUT dimensionality (rank plus one).  The generator asserts key[0] parses
+    to a nonzero size and an in-file address before patching.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: false
+
+backports: []
+
+fuzz_seed: >-
+  Chunk-record ADDRESS fields are a productive mutation axis and the interesting
+  values are legal ones -- offsets that are in-file and happen to belong to
+  another structure.  A mutator that only widens or zeroes lengths will not find
+  this; substituting addresses BETWEEN structures in the same file finds it at
+  once.  The same cross-substitution strategy found the local-heap segment alias.
+
+compatibility_backport_risks: >-
+  None for the oracle check: no writer emits a chunk overlapping metadata,
+  because the allocator cannot produce one.  Any file it newly rejects is a file
+  whose data reads were already wrong.
+
+sibling_findings: >-
+  chunk.key_order, closed 2026-08-22, is the SAME CHARACTER through a different
+  field and shares this record's A~ predicate.  Two v1 B-tree keys declaring one
+  chunk offset make one chunk unreachable and serve the other in its place:
+  measured, h5dump exits 0 returning chunk (0,5)'s bytes at logical position
+  (0,0) with the displaced region reported as the dataset's fill value.
+  IT IS DELIBERATELY NOT A SEPARATE CASE RECORD, and the reason is a judgement
+  worth stating: searching a corrupt B-tree and getting a wrong answer is closer
+  to garbage-in-garbage-out than to a library defect -- libhdf5 is entitled to
+  assume the tree it is handed is ordered.  Contrast THIS record, where libhdf5
+  reads bytes it never wrote as data.  So chunk.key_order is recorded as an
+  ORACLE completeness gap (invariant + fixture + expectation) rather than as a
+  libhdf5 defect, and the fixture is
+  h5policy/tests/malformed/chunk_duplicate_key_offset.h5.
+  Its own limit: LEAF keys only.  Internal-node separator keys are ordered too
+  and are not checked, so a duplicate separator in a multi-level index is still
+  accepted.
+
+sibling_audit: >-
+  THE THIRD MEMBER OF THE ADDRESS-ALIASING FAMILY, and the first where the
+  aliased bytes are handed to a caller as data:
+    - registry/cases/local-heap-dblk-address-aliased-across-heaps.yml -- two
+      heap prefixes, one data segment (oracle gap, crash).
+    - the superblock-extension alias check
+      (H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS) -- contained.
+    - registry/cases/mdci-reconstruct-cleanup-unsafe.yml -- duplicate
+      cache-image entry addresses (oracle gap, double free).
+  Four instances now, three of them oracle gaps found in the same week.  That is
+  a pattern about the ORACLE as much as about libhdf5: address fields were
+  bounded individually and never checked against each other.
+  NOT AUDITED, and each is the same shape as this one:
+    - CONTIGUOUS and COMPACT layout data extents.  Both name a byte range the
+      same way a chunk record does, and neither is checked against metadata.
+      Contiguous is the more likely instance because compact data lives inside
+      the object header itself.  No specimen built; this is the most obvious
+      next step from this record.
+    - global-heap collections, local-heap data segments and external-file-list
+      targets as chunk-data targets, i.e. raw data over raw data belonging to a
+      DIFFERENT object.  h5policy records no raw-data extents, so overlapping
+      two datasets is invisible to it and would return one dataset's bytes for
+      another.  Not measured.
+    - free-space regions.  A chunk pointing into free space is not aliasing
+      anything live, so it is probably benign, but it is unmeasured.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range, and the phrasing matters here: this is the ABSENCE of
+    a check rather than a defective one, so it is present in every version that
+    reads chunk data by address -- which is all of them.  Measured at 2.3.0.
+  label: structural; measured at one point
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    CONTIGUOUS AND COMPACT LAYOUTS ARE UNCHECKED.  The extent registry exists
+    and both layouts declare an extent, so wiring them in is small; it was left
+    out because neither has a measurement or a fixture yet and the caps deserve
+    a budget check first.  This is the clear next step.
+  - >-
+    CHUNK KEY ORDER IS CHECKED ON LEAVES ONLY (chunk.key_order, added the same
+    day).  Internal-node separator keys are unchecked; a duplicate separator in a
+    multi-level v1 index would still be accepted.  valid/chunked_v1_btree_deep.h5
+    proves no false positive on internal nodes but does not close the gap.
+  - >-
+    RAW-DATA-OVER-RAW-DATA IS INVISIBLE.  Only metadata extents are recorded, so
+    a chunk pointed at ANOTHER DATASET'S data is accepted and returns that
+    dataset's bytes.  Same primitive, different target, no coverage.
+  - >-
+    THE CAPS ARE A REAL LIMIT, not a formality.  Past 512 metadata extents or
+    1024 chunk checks the comparison stops and the truncation flag is set, so a
+    large file gets partial coverage by design.  The flag is internal and is NOT
+    surfaced in the report, so a reader cannot currently tell partial coverage
+    from clean -- that is a reporting gap worth closing.
+  - >-
+    NO ILP32 MEASUREMENT.  Nothing here is width-dependent (no arithmetic), so
+    identical behaviour is expected and unmeasured.
+open_questions:
+  - >-
+    Should the extent registry record RAW-DATA extents too, making the check
+    "every declared extent is disjoint from every other"?  That is the real
+    invariant and it subsumes both this record and the raw-over-raw gap, but the
+    cost grows with the number of chunks rather than the number of metadata
+    blocks, which the current caps were sized against.  Needs a budget
+    measurement before it is attempted.
+  - >-
+    Is there a cheap libhdf5-side containment after all -- for instance, having
+    H5D__chunk_lock reject a read whose extent overlaps a metadata entry the
+    cache currently holds?  That is weaker than the full invariant (it only sees
+    cached entries) but it would catch the superblock case, which is the one an
+    attacker reaches for first.  Unexplored.
+
+provenance:
+  found_by: >-
+    re-examining the specimen behind the filtered-chunk-zero-stored-size record.
+    Its corrupt index carried three distinct defects; the zero stored size was
+    promoted first, this is the second, and the third -- records sharing one
+    chunk offset -- was closed the same day as chunk.key_order (see
+    sibling_findings).
+  input_sha256: f925c76b461e17638296e204b76fbe760a0f4367d5f55bec3161318370a0e504
+  input_note: >-
+    The same specimen as filtered-chunk-zero-stored-size.  Its
+    /Fletcher_float_data_be index has two records at address 0, which is what
+    this check catches there; the crash from the zero stored size masked them
+    until that was fixed.
+  hdf5_build: >-
+    HDF5 2.3.0, source tree at develop f8f0379c7c5ef3cd4939cb9e115d2fd3502e1748;
+    stock Release install.  Workstation-local; paths not recorded.
+  poke_version: GNU poke 4.3

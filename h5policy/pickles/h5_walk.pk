@@ -361,12 +361,175 @@ fun h5policy_mark_visited_ohdr = (uint<64> addr) int:
     return 1;
 }
 
+/* Raw chunk data and file metadata must occupy disjoint bytes.  libhdf5's
+   allocator guarantees it on write -- raw data gets its own space -- but nothing
+   RE-checks it on read, so a chunk record whose address points into metadata is
+   served happily: the bytes come back as dataset values with no error at all.
+   MEASURED on an unfiltered chunked dataset (no checksum filter to notice):
+   pointing one chunk at offset 0 returns 0x46444889 and 0x0A1A0A0D as the first
+   two int32 values -- the file's own "\x89HDF\r\n\x1a\n" signature -- and
+   pointing it at a v1 B-tree node returns 0x45455254, "TREE".  h5dump exits 0.
+   So this is an arbitrary in-file read: any offset, returned as data, silently.
+   Not memory-unsafety and not a crash; wrong data always, and a read primitive
+   across a boundary wherever a consumer exposes some datasets of a file but not
+   all of its bytes.
+   The existing bound is only `addr + size <= file_size`, which every in-file
+   address satisfies -- which is why an address of 0 passed.
+
+   TWO REGISTRIES, because either can be seen first: the object graph is walked
+   breadth-first, so a chunk index may be read before or after the metadata its
+   records point at.  Each side scans the other's recorded extents, so the pair
+   is order-independent without a second pass over the file.
+
+   BOTH ARE HARD-CAPPED, and that is a deliberate trade.  The scans are linear
+   and charged to the walk budget, so an uncapped cross-product would scale with
+   file size and could push a large VALID file past max_walk_operations --
+   turning a detection into a verdict change on files this rule is not about.
+   With these caps the added cost is bounded by 512 * 1024 comparisons no matter
+   how big the file is: about 5% of the tightest profile's 10M budget.  Past a
+   cap, checking stops and the flag says so, exactly as H5POLICY_MAX_REACHED
+   does -- a reader must be able to tell "disjoint" from "we stopped looking".  */
+var h5policy_meta_lo = uint<64>[]();
+var h5policy_meta_hi = uint<64>[]();
+var h5policy_chunk_extent_lo = uint<64>[]();
+var h5policy_chunk_extent_hi = uint<64>[]();
+var h5policy_extents_truncated = 0;
+var h5policy_chunk_extent_checks = 0UL;
+var H5POLICY_MAX_METADATA_EXTENTS = 512UL;
+var H5POLICY_MAX_CHUNK_EXTENT_CHECKS = 1024UL;
+
+/* Saturating end-of-extent: a decoded length can be adversarial, and an extent
+   that would wrap past the address space is clamped rather than wrapped so the
+   overlap test still sees a plausible interval instead of an inverted one.  */
+fun h5policy_extent_hi = (uint<64> lo, uint<64> bytes) uint<64>:
+{
+    if (bytes > 0xffffffffffffffffUL - lo)
+        return 0xffffffffffffffffUL;
+    return lo + bytes;
+}
+
+/* File-scoped, so reset ONCE per analysis from h5policy_analyze -- NOT from
+   h5policy_reset_traversal_state, which runs again when the reachable walk
+   starts and would discard the superblock's own extent, recorded before it.
+   That extent is the one the measured specimen needs.  */
+fun h5policy_reset_extents = void:
+{
+    h5policy_meta_lo = uint<64>[]();
+    h5policy_meta_hi = uint<64>[]();
+    h5policy_chunk_extent_lo = uint<64>[]();
+    h5policy_chunk_extent_hi = uint<64>[]();
+    h5policy_extents_truncated = 0;
+    h5policy_chunk_extent_checks = 0UL;
+}
+
 /* Half-open interval overlap: [a_lo, a_hi) and [b_lo, b_hi) share a byte iff
    each starts strictly before the other ends.  Callers guarantee hi > lo. */
 fun h5policy_intervals_overlap = (uint<64> a_lo, uint<64> a_hi,
                                   uint<64> b_lo, uint<64> b_hi) int:
 {
     return (a_lo < b_hi && b_lo < a_hi) ? 1 : 0;
+}
+
+/* Chunk side: does this chunk's byte extent hit metadata already recorded?
+   Emits and returns 0 on overlap.  Also records the extent so metadata read
+   LATER can catch the same collision from its own side.  */
+fun h5policy_chunk_extent_disjoint = (uint<64> addr, uint<64> size,
+                                      off64 loc, string object) int:
+{
+    if (size == 0UL)
+        return 1;
+    if (h5policy_chunk_extent_checks >= H5POLICY_MAX_CHUNK_EXTENT_CHECKS)
+        {
+            h5policy_extents_truncated = 1;
+            return 1;
+        }
+    h5policy_chunk_extent_checks = h5policy_chunk_extent_checks + 1UL;
+
+    var lo = addr;
+    var hi = h5policy_extent_hi(addr, size);
+    var n = h5policy_meta_lo'length as uint<64>;
+    h5policy_walk_tick(n + 1UL);
+    var i = 0UL;
+    while (i < n)
+        {
+            if (h5policy_intervals_overlap(lo, hi,
+                                           h5policy_meta_lo[i],
+                                           h5policy_meta_hi[i]))
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_CHUNK_DATA_OVERLAPS_METADATA", "corrupt",
+                        loc, object,
+                        "chunk data extent overlaps file metadata",
+                        H5Evidence {
+                            field = "chunk.data_disjoint_from_metadata",
+                            actual = lo,
+                            expected = h5policy_meta_hi[i],
+                            comparison = "at_least",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = loc, loc1_len = 8UL,
+                        });
+                    return 0;
+                }
+            i = i + 1UL;
+        }
+
+    if (h5policy_chunk_extent_lo'length as uint<64> < H5POLICY_MAX_CHUNK_EXTENT_CHECKS)
+        {
+            h5policy_chunk_extent_lo += [lo];
+            h5policy_chunk_extent_hi += [hi];
+        }
+    else
+        h5policy_extents_truncated = 1;
+    return 1;
+}
+
+/* Metadata side: record this structure's extent, and catch a chunk recorded
+   EARLIER that lands inside it.  Called from h5policy_account_metadata, so
+   every structure already charged against the metadata budget is covered --
+   the superblock and both object-header versions among them.  */
+fun h5policy_record_metadata_extent = (uint<64> lo, uint<64> bytes,
+                                       off64 loc, string object) void:
+{
+    if (bytes == 0UL)
+        return;
+    var hi = h5policy_extent_hi(lo, bytes);
+
+    var n = h5policy_chunk_extent_lo'length as uint<64>;
+    h5policy_walk_tick(n + 1UL);
+    var i = 0UL;
+    while (i < n)
+        {
+            if (h5policy_intervals_overlap(lo, hi,
+                                           h5policy_chunk_extent_lo[i],
+                                           h5policy_chunk_extent_hi[i]))
+                {
+                    /* Reported at the METADATA, because that is what this call
+                       site can name; the chunk that collides with it was read
+                       earlier and its own record is already past.  */
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_CHUNK_DATA_OVERLAPS_METADATA", "corrupt",
+                        loc, object,
+                        "file metadata overlaps a chunk data extent",
+                        H5Evidence {
+                            field = "chunk.data_disjoint_from_metadata",
+                            actual = h5policy_chunk_extent_lo[i],
+                            expected = hi,
+                            comparison = "at_least",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = loc, loc1_len = 8UL,
+                        });
+                    return;
+                }
+            i = i + 1UL;
+        }
+
+    if (h5policy_meta_lo'length as uint<64> >= H5POLICY_MAX_METADATA_EXTENTS)
+        {
+            h5policy_extents_truncated = 1;
+            return;
+        }
+    h5policy_meta_lo += [lo];
+    h5policy_meta_hi += [hi];
 }
 
 /* Classify a continuation target interval [tgt_lo, tgt_hi) against the source
@@ -552,6 +715,10 @@ fun h5policy_account_metadata = (H5WalkContext ctx,
     ctx.metadata_seen = next;
     if (exceeds)
         ctx.metadata_count_exceeded = 1UB;
+    /* Every accounted structure is also a metadata EXTENT.  Recording it here
+       rather than at 22 call sites is the whole reason this check was cheap:
+       each caller already passes both the byte count and the location.  */
+    h5policy_record_metadata_extent(loc/#B, bytes, loc, object);
     return ctx;
 }
 

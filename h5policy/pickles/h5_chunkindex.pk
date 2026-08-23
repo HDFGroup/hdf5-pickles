@@ -81,6 +81,70 @@ fun h5policy_chunk_record_size_ok = (uint<64> stored_size, off64 loc,
     return 0;
 }
 
+/* Chunk B-tree keys are ordered by chunk offset, and the order is load-bearing:
+   libhdf5 finds a chunk by searching the tree on that ordering, so two keys
+   claiming one offset are not a redundancy -- they make one chunk unreachable
+   and serve the other in its place.
+
+   MEASURED on a v1 B-tree whose key[1] offsets were copied from key[0]: h5dump
+   exits 0 and returns chunk (0,5)'s bytes at logical position (0,0), while the
+   region whose record was displaced comes back as the FILL VALUE.  Silent wrong
+   data, no error -- the same shape as chunk.data_disjoint_from_metadata, and
+   h5policy accepted it.
+
+   Compared lexicographically across the offset words, strictly: a conforming
+   node's keys increase at the first word where they differ, and equality in
+   every word is the duplicate case.  Verified against the corpus controls, whose
+   keys increase strictly INCLUDING the trailing boundary key -- the sentinel has
+   a greater offset than the last real record even though its size is zero.  */
+fun h5policy_chunk_keys_ordered = (int ios, H5PolicyProfile profile,
+                                   uint<64> a_key, uint<64> b_key,
+                                   uint<64> ndims, string object) int:
+{
+    var j = 0UL;
+    while (j < ndims)
+        {
+            var a = h5policy_msg_u64_at(ios, profile,
+                                        (a_key + 8UL + (j * 8UL))#B, 8UL);
+            var b = h5policy_msg_u64_at(ios, profile,
+                                        (b_key + 8UL + (j * 8UL))#B, 8UL);
+            if (a < b)
+                return 1;                       /* strictly increasing: done */
+            if (a > b)
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_CHUNK_KEY_ORDER", "corrupt",
+                        b_key#B, object,
+                        "chunk B-tree keys are not in increasing chunk-offset order",
+                        H5Evidence {
+                            field = "chunk.key_order",
+                            actual = b, expected = a,
+                            comparison = "at_least",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = (b_key + 8UL + (j * 8UL))#B, loc1_len = 8UL,
+                            has_loc2 = 1, loc2_role = "expected",
+                            loc2 = (a_key + 8UL + (j * 8UL))#B, loc2_len = 8UL,
+                        });
+                    return 0;
+                }
+            j = j + 1UL;
+        }
+    h5policy_emit_error_ev(
+        "H5_CORRUPT_CHUNK_KEY_ORDER", "corrupt",
+        b_key#B, object,
+        "two chunk B-tree keys declare the same chunk offset",
+        H5Evidence {
+            field = "chunk.key_order",
+            actual = b_key, expected = a_key,
+            comparison = "not_equal",
+            has_loc1 = 1, loc1_role = "actual",
+            loc1 = b_key#B, loc1_len = 8UL,
+            has_loc2 = 1, loc2_role = "expected",
+            loc2 = a_key#B, loc2_len = 8UL,
+        });
+    return 0;
+}
+
 fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                  uint<64> btree_addr, uint<64> ndims,
                                  string object, uint<64> btree_depth,
@@ -231,6 +295,12 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext
             while (i < inspect_entries)
                 {
                     var key_off = btree_addr + hdr + (i * pair);
+                    /* Key i against key i+1.  A node holds entries_used + 1
+                       keys, so the successor always exists and the node's whole
+                       extent -- hdr + capacity*pair + key_size -- was
+                       range-checked above.  */
+                    var ordered = h5policy_chunk_keys_ordered(
+                        ios, profile, key_off, key_off + pair, ndims, object);
                     var child_raw = h5policy_msg_bytes(ios, profile,
                                                        (key_off + key_size)#B, o);
                     var child_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(child_raw));
@@ -249,6 +319,10 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext
                                     var ok = h5policy_checked_addr_range(
                                         child_addr, chunk_size, file_size,
                                         "chunk data outside file", key_off#B, object);
+                                    if (ok)
+                                        ok = h5policy_chunk_extent_disjoint(
+                                            child_addr, chunk_size,
+                                            key_off#B, object);
                                 }
                         }
                     i = i + 1UL;
@@ -357,6 +431,9 @@ fun h5policy_validate_v2_chunk_records = (int ios, H5PolicyProfile profile,
                             var ok = h5policy_checked_addr_range(
                                 chunk_addr, stored_size, file_size,
                                 "chunk data outside file", rec_addr#B, object);
+                            if (ok)
+                                ok = h5policy_chunk_extent_disjoint(
+                                    chunk_addr, stored_size, rec_addr#B, object);
                         }
                 }
             i = i + 1UL;
@@ -696,10 +773,25 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                                is -- so there is no per-record zero to find.  */
                             if (fa_size_width != 0UL)
                                 {
-                                    var fa_ok = h5policy_chunk_record_size_ok(
-                                        h5policy_msg_u64_at(ios, profile,
-                                                            elem_off#B + o#B, fa_size_width),
-                                        elem_off#B, object, "fixed-array");
+                                    var fa_stored = h5policy_msg_u64_at(
+                                        ios, profile, elem_off#B + o#B, fa_size_width);
+                                    if (h5policy_chunk_record_size_ok(
+                                            fa_stored, elem_off#B, object, "fixed-array"))
+                                        {
+                                            var fa_ok = h5policy_chunk_extent_disjoint(
+                                                caddr, fa_stored, elem_off#B, object);
+                                        }
+                                }
+                            else
+                                {
+                                    /* Client 0 carries no size field, so the
+                                       extent is unknown here; check the single
+                                       starting byte.  That catches an address
+                                       landing INSIDE metadata -- the measured
+                                       shape -- and misses only a chunk that
+                                       starts in free space and runs into it.  */
+                                    var fa_ok = h5policy_chunk_extent_disjoint(
+                                        caddr, 1UL, elem_off#B, object);
                                 }
                         }
                     i = i + 1UL;
@@ -794,10 +886,19 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                                                             "chunk data address outside file");
                                     if (fa_size_width != 0UL)
                                         {
-                                            var fa_ok = h5policy_chunk_record_size_ok(
-                                                h5policy_msg_u64_at(ios, profile,
-                                                                    elem_off#B + o#B, fa_size_width),
-                                                elem_off#B, object, "fixed-array");
+                                            var fa_stored = h5policy_msg_u64_at(
+                                                ios, profile, elem_off#B + o#B, fa_size_width);
+                                            if (h5policy_chunk_record_size_ok(
+                                                    fa_stored, elem_off#B, object, "fixed-array"))
+                                                {
+                                                    var fa_ok = h5policy_chunk_extent_disjoint(
+                                                        caddr, fa_stored, elem_off#B, object);
+                                                }
+                                        }
+                                    else
+                                        {
+                                            var fa_ok = h5policy_chunk_extent_disjoint(
+                                                caddr, 1UL, elem_off#B, object);
                                         }
                                 }
                             j = j + 1UL;
@@ -888,6 +989,9 @@ fun h5policy_validate_ea_elements = (int ios, H5PolicyProfile profile,
                                 addr, stored_size, file_size,
                                 "extensible-array chunk data outside file",
                                 current#B, object);
+                            if (ok)
+                                ok = h5policy_chunk_extent_disjoint(
+                                    addr, stored_size, current#B, object);
                         }
                 }
             i = i + 1UL;
