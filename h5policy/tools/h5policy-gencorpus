@@ -586,6 +586,19 @@ def _gen_resource(root):
         g2 = h.create_group("g2")
         g2.create_dataset("b", data=np.arange(3, dtype="i4"))
     _write_earliest(f"{root}/valid/two_symbol_table_groups.h5", _two_stab_groups)
+
+    # Control for envelope.symbol_table_addresses_defined: an old-style file
+    # holding ONLY the root group.  It carries a symbol-table message with both
+    # addresses DEFINED, a local heap and a v1 B-tree -- but no SNOD at all,
+    # because no link has been inserted yet.  Verified: b"SNOD" is absent while
+    # b"HEAP" and b"TREE" are present.
+    #
+    # THE REGIME NO OTHER VALID FIXTURE EXPRESSES.  Every other old-style
+    # control has at least one member and therefore a SNOD, so none of them can
+    # tell "this group has no symbol-table NODE yet" apart from "this group's
+    # symbol-table ADDRESSES are undefined".  A future tightening that demanded a
+    # reachable SNOD would pass the whole corpus and reject this file.
+    _write_earliest(f"{root}/valid/old_style_root_only.h5", lambda h: None)
     # Structurally sound, deliberately not `accept`: see _make_drvinfo_block.
     _make_drvinfo_block(f"{root}/valid/drvinfo_block.h5")
 
@@ -1300,6 +1313,10 @@ def _gen_malformed(root):
         f"{root}/malformed/softlink_name_offset_oob.h5")
     _make_softlink_value_offset_oob(
         f"{root}/malformed/softlink_value_offset_oob.h5")
+    _make_stab_heap_addr_undefined(
+        f"{root}/malformed/stab_heap_addr_undefined.h5")
+    _make_stab_btree_addr_undefined(
+        f"{root}/malformed/stab_btree_addr_undefined.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_heap_free_list_size_wrap(
@@ -5703,6 +5720,95 @@ def _make_softlink_name_offset_oob(path):
         raise RuntimeError("chosen offset leaves the file, so the fixture would "
                            "test the wrong bound")
     struct.pack_into("<Q", raw, ent, off)
+    _patch(path, bytes(raw))
+
+
+def _stab_message_body(raw):
+    """Byte offset of the one symbol-table message payload in a fixture base.
+
+    The payload is B-tree address then name-heap address, each offset-sized.
+
+    The root object header address is read from the superblock rather than found
+    by scanning for a plausible header, so a layout change fails loudly instead
+    of patching whatever byte happened to look right.  A version-0 superblock is
+    signature(8), seven version/size bytes plus two reserved, leaf/internal K
+    (2+2), consistency flags (4), then base / free-space / EOF / driver-info
+    addresses, then the root group's symbol-table entry -- whose object header
+    address is its second field, so at 56 + 8 for 8-byte offsets.
+
+    A version-1 object header is version(1) reserved(1) nmesgs(2) nlink(4)
+    hdrsize(4) pad(4), then messages of type(2) size(2) flags(1) reserved(3)
+    plus body.  Requires exactly one symbol-table message.
+    """
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    if raw[13] != 8:
+        raise RuntimeError(f"expected 8-byte offsets, got {raw[13]}")
+    root_oh = struct.unpack_from("<Q", raw, 64)[0]
+    if root_oh >= len(raw) or raw[root_oh] != 1:
+        raise RuntimeError(f"root object header at {root_oh} is not version 1")
+    hits = []
+
+    def walk(off, count, limit):
+        p, seen = off, 0
+        while seen < count and p + 8 <= limit:
+            mtype, msize = struct.unpack_from("<HH", raw, p)
+            body = p + 8
+            if mtype == 17:                      # symbol table
+                if msize < 16:
+                    raise RuntimeError("symbol-table message is too small to patch")
+                hits.append(body)
+            elif mtype == 16:                    # continuation
+                cont_addr, cont_size = struct.unpack_from("<QQ", raw, body)
+                if cont_addr < len(raw):
+                    walk(cont_addr, 99, min(cont_addr + cont_size, len(raw)))
+            p = body + msize
+            seen += 1
+
+    walk(root_oh + 16, struct.unpack_from("<H", raw, root_oh + 2)[0], len(raw))
+    if len(hits) != 1:
+        raise RuntimeError(f"expected exactly one symbol-table message, found {len(hits)}")
+    return hits[0]
+
+
+def _make_stab_heap_addr_undefined(path):
+    """Old-style group whose symbol-table message names an UNDEFINED name-heap
+    address, while a perfectly good local heap sits elsewhere in the file.
+
+    libhdf5 does not read undefined as absent: H5G__stab_iterate protects the
+    heap unconditionally (H5Gstab.c:488), so at HADDR_UNDEF the open fails in the
+    sec2 driver with "addr undefined".  h5policy used to return early here,
+    treating an undefined address as "no traversable symbol table" -- accepting
+    the file.  H5G__stab_create always allocates both the B-tree and the heap
+    (H5Gstab.c:132, :136), so requiring them cannot cost a conforming file.
+
+    MEASURED: a corpus specimen with exactly this shape.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    body = _stab_message_body(raw)
+    if struct.unpack_from("<Q", raw, body + 8)[0] == 0xFFFFFFFFFFFFFFFF:
+        raise RuntimeError("the base file's name-heap address is already "
+                           "undefined; the fixture would prove nothing")
+    struct.pack_into("<Q", raw, body + 8, 0xFFFFFFFFFFFFFFFF)
+    _patch(path, bytes(raw))
+
+
+def _make_stab_btree_addr_undefined(path):
+    """Same shape as the name-heap case, but the symbol-table message's B-tree
+    address is undefined.  Separate fixture because the two are reported by
+    distinct emit sites with distinct messages; libhdf5 reaches the heap first
+    (H5Gstab.c:488) and the B-tree immediately after.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    body = _stab_message_body(raw)
+    if struct.unpack_from("<Q", raw, body)[0] == 0xFFFFFFFFFFFFFFFF:
+        raise RuntimeError("the base file's B-tree address is already undefined; "
+                           "the fixture would prove nothing")
+    struct.pack_into("<Q", raw, body, 0xFFFFFFFFFFFFFFFF)
     _patch(path, bytes(raw))
 
 

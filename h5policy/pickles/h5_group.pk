@@ -627,10 +627,46 @@ fun h5policy_validate_stab_payload = (int ios,
     var btree_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(btree_raw));
     var heap_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(heap_raw));
 
-    /* Both addresses are required for an old-style group.  Undefined means the
-       group has no traversable symbol table here, so the validator leaves the
-       current context unchanged.  */
-    if (h5policy_msg_addr_is_undef(btree_raw) || h5policy_msg_addr_is_undef(heap_raw))
+    /* BOTH ADDRESSES ARE MANDATORY.  This used to return early on an undefined
+       address, reading it as "the group has no traversable symbol table here"
+       -- the same conflation of "we will not traverse it" with "it is well
+       formed" that hid the soft-link name checks in the SNOD entry loop above.
+
+       libhdf5 does not treat undefined as absent.  H5G__stab_iterate reads the
+       message and then calls H5HL_protect(oloc->file, stab.heap_addr, ...)
+       UNCONDITIONALLY (src/H5Gstab.c:488); at HADDR_UNDEF that becomes a read
+       at 0xffffffffffffffff and the open fails in the sec2 driver
+       ("addr undefined").  H5G__stab_delete asserts both are defined
+       (src/H5Gstab.c:427-428).
+
+       WHY THIS COSTS NO CONFORMING FILE: H5G__stab_create always allocates both
+       -- H5B_create for the B-tree and H5HL_create for the heap
+       (src/H5Gstab.c:132, :136) -- and a symbol-table message is written only
+       for an old-style group, which by definition has both.  Contrast the
+       link-info message (h5_dense_links.pk), where an undefined fractal-heap
+       address is LEGAL and means compact rather than dense storage; that is a
+       PAIRING invariant (both or neither), while this one is an existence
+       requirement.  Two near-identical shapes with different legal states, which
+       is how this hid.
+
+       MEASURED on a corpus specimen whose stab message names heap address
+       HADDR_UNDEF while a perfectly good HEAP sits at offset 96: libhdf5 fails
+       the open, h5policy accepted the file.
+
+       Reported per address with literal messages rather than one composed
+       string, so tools/message_routing.py can analyze both sites and so a file
+       with both undefined reports both.  */
+    var btree_undef = h5policy_msg_addr_is_undef(btree_raw);
+    var heap_undef = h5policy_msg_addr_is_undef(heap_raw);
+    if (heap_undef)
+        h5policy_emit_error("H5_CORRUPT_SYMBOL_TABLE_ADDRESS_UNDEFINED",
+                            "corrupt", payload_off, object,
+                            "symbol-table message name-heap address is undefined");
+    if (btree_undef)
+        h5policy_emit_error("H5_CORRUPT_SYMBOL_TABLE_ADDRESS_UNDEFINED",
+                            "corrupt", payload_off, object,
+                            "symbol-table message B-tree address is undefined");
+    if (heap_undef || btree_undef)
         return ctx;
 
     var file_size = h5policy_ceiling(ios);
