@@ -1326,6 +1326,8 @@ def _gen_malformed(root):
         f"{root}/malformed/fixed_array_paged_element_over_metadata.h5")
     _make_chunk_data_over_other_dataset(
         f"{root}/malformed/chunk_data_over_other_dataset.h5")
+    _make_fsm_section_relative_addr(
+        f"{root}/malformed/fsm_section_relative_addr.h5")
     _make_scaleoffset_param_count(
         f"{root}/malformed/scaleoffset_param_count.h5")
     _make_nbit_param_count(
@@ -6211,6 +6213,110 @@ def _make_chunk_data_over_other_dataset(path):
         raise RuntimeError(
             f"chunk address parse looks wrong: {a_addr} and {b_addr}")
     struct.pack_into("<Q", raw, dst, b_addr)     # a's chunk[0] -> b's chunk[0]
+    _patch(path, bytes(raw))
+
+
+def _make_fsm_section_relative_addr(path):
+    """A free-space section whose extent runs past EOF only once its BASE is
+    added -- the specimen that proves free-space section addresses are
+    base-relative and must be translated before the range check.
+
+    REGRESSION GUARD for a one-directional soundness gap.  h5policy read the
+    section address raw and compared it against the PHYSICAL ceiling.  A relative
+    address is smaller than its physical location, so the bound passed too easily
+    and a section running past EOF was accepted -- by up to the user block's
+    size.  It is invisible at base 0, which is where every other fixture sits,
+    and the userblock audit's grep cannot find it either: that grep looks for an
+    unwrapped `bytes_to_u64_le`, while this site reads via
+    `h5policy_msg_u64_at`.
+
+    THE PROOF THAT THESE ADDRESSES ARE RELATIVE is inside the same structure and
+    needs no external authority: the FSHD's own sect_addr field reads N while the
+    FSSE it points at sits at physical N + base.  The generator asserts exactly
+    that below, so a future h5py layout change cannot quietly invalidate the
+    premise.
+
+    CONTRAST h5_frhp_fspace.pk, whose section records are logical HEAP offsets
+    and correctly are NOT translated.  Two walkers that look alike, in different
+    address spaces.
+
+    The patched address is chosen so the check passes UNTRANSLATED and fails
+    TRANSLATED -- that window is
+        (eof - base - sect_size, eof - sect_size]
+    -- which is what makes the fixture prove the translation rather than merely
+    prove an out-of-file section.
+    """
+    values = np.full(50, 111, dtype="i4")
+    fd, base_path = tempfile.mkstemp(suffix=".h5")
+    os.close(fd)
+    try:
+        with h5py.File(base_path, "w", libver="latest", userblock_size=512,
+                       fs_strategy="fsm", fs_persist=True, fs_threshold=1) as h:
+            h.create_dataset("keep", data=values, chunks=(10,))
+            h.create_dataset("gone", data=np.full(200, 222, dtype="i4"),
+                             chunks=(8,))
+        with h5py.File(base_path, "a") as h:
+            del h["gone"]                     # persists a free-space section
+        raw = bytearray(open(base_path, "rb").read())
+    finally:
+        os.unlink(base_path)
+
+    sb = raw.find(b"\x89HDF\r\n\x1a\n")
+    if sb < 0 or raw[sb + 8] != 3:
+        raise RuntimeError("expected a version-3 superblock behind a user block")
+    o = raw[sb + 9]
+    base = int.from_bytes(raw[sb + 12:sb + 12 + o], "little")
+    eof = int.from_bytes(raw[sb + 12 + 2 * o:sb + 12 + 3 * o], "little")
+    if base != 512 or eof != len(raw):
+        raise RuntimeError(f"unexpected geometry: base={base} eof={eof} size={len(raw)}")
+
+    fshd = raw.find(b"FSHD")
+    if fshd < 0:
+        raise RuntimeError("no persisted free-space manager")
+    p = fshd + 6                              # signature, version, client
+    tot = int.from_bytes(raw[p:p + 8], "little"); p += 8
+    p += 8                                    # total section count
+    serial = int.from_bytes(raw[p:p + 8], "little"); p += 8
+    p += 8                                    # ghost count
+    p += 2 + 2 + 2                            # nclasses, shrink, expand
+    addr_bits = int.from_bytes(raw[p:p + 2], "little"); p += 2
+    max_sect = int.from_bytes(raw[p:p + 8], "little"); p += 8
+    sect_rel = int.from_bytes(raw[p:p + o], "little"); p += o
+    used = int.from_bytes(raw[p:p + 8], "little")
+
+    fsse = sect_rel + base
+    if raw[fsse:fsse + 4] != b"FSSE":
+        raise RuntimeError(
+            f"FSHD sect_addr {sect_rel} + base {base} is not an FSSE -- the "
+            f"base-relative premise no longer holds")
+
+    def bytes_for_limit(limit):
+        n, mx = 1, 0xFF
+        while n < 8 and limit > mx:
+            n += 1
+            mx = (mx << 8) | 0xFF
+        return n
+    cnt_w = bytes_for_limit(serial)
+    len_w = bytes_for_limit(max_sect)
+    off_w = (addr_bits + 7) // 8
+
+    cur = fsse + 5 + o                        # signature, version, back-pointer
+    count = int.from_bytes(raw[cur:cur + cnt_w], "little")
+    sect_size = int.from_bytes(raw[cur + cnt_w:cur + cnt_w + len_w], "little")
+    addr_off = cur + cnt_w + len_w
+    if count < 1 or sect_size != tot:
+        raise RuntimeError(f"section node parse looks wrong: count={count} size={sect_size} tot={tot}")
+
+    lo = eof - base - sect_size               # exclusive
+    hi = eof - sect_size                      # inclusive
+    if hi <= lo:
+        raise RuntimeError("no address satisfies passes-untranslated/fails-translated")
+    new_addr = lo + (hi - lo + 1) // 2
+    struct.pack_into("<Q", raw, addr_off, new_addr)
+
+    end = fsse + used - 4                     # the FSSE checksum trails used_size
+    raw[end:end + 4] = _jenkins_lookup3()(
+        bytes(raw[fsse:end])).to_bytes(4, "little")
     _patch(path, bytes(raw))
 
 
