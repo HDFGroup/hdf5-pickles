@@ -85,6 +85,18 @@ COMPOSING_HELPERS = {
     "h5policy_ea_mark_block": (2, {
         "H5_CORRUPT_CHUNK_INDEX_CYCLE": [" repeats a metadata-block address"],
     }),
+    # h5_walk.pk: the shared raw-data-vs-metadata disjointness check, in both
+    # directions.  `what` is the layout role ("chunk", "contiguous") and is what
+    # the finding's route shard splits the record family on -- the two callers
+    # live in chunk_index and dataset_layout_filter_fill respectively.
+    "h5policy_data_extent_disjoint": (4, {
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA":
+            [" data extent overlaps file metadata"],
+    }),
+    "h5policy_report_data_overlapped": (0, {
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA":
+            [" data extent is overlapped by file metadata read later"],
+    }),
     # h5_chunkindex.pk: the one zero-stored-size rule shared by all four
     # chunk-index walkers.  `kind` (parameter 3) names which index the record
     # came from -- "v1 B-tree", "v2 B-tree", "fixed-array", "extensible-array".

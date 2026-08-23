@@ -53,6 +53,28 @@
    record has been rejected.  All four chunk-index walkers route through this so
    the rule cannot land in three of them and be forgotten in the fourth, which
    is the state this replaced: only the extensible-array walker had it.  */
+/* Is page P flagged initialized in a page-init bitmap byte?
+
+   libhdf5 stores these bitmaps MSB-FIRST WITHIN EACH BYTE.  H5VM_bit_get tests
+   `buf[off / 8] & H5VM_bit_set_g[off % 8]` with
+   H5VM_bit_set_g = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01}
+   (H5VMprivate.h:453), and its own note spells the convention out: "bit offset 0
+   in the first byte's high-bit position, proceeding down to bit offset 7 in the
+   first byte's low-bit position".
+
+   Both readers here had it LSB-first, which inverts the meaning for every page
+   in a byte.  The consequence was silent and one-directional: page 0 of a
+   conforming file looks UNINITIALIZED, its elements are skipped, and every
+   per-element check -- chunk address in file, chunk stored size, raw-data /
+   metadata disjointness -- does nothing at all.  No finding is produced, so
+   nothing said the coverage had gone.  MEASURED before the fix: a 1200-element
+   paged fixed array whose two pages are both live carries bitmap byte
+   0b11000000, and h5policy walked zero of its 1200 elements.  */
+fun h5policy_page_initialized = (uint<64> bitmap_byte, uint<64> page) int:
+{
+    return ((bitmap_byte & (0x80UL .>> (page % 8UL))) != 0UL) ? 1 : 0;
+}
+
 fun h5policy_chunk_record_size_ok = (uint<64> stored_size, off64 loc,
                                      string object, string kind) int:
 {
@@ -320,9 +342,9 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext
                                         child_addr, chunk_size, file_size,
                                         "chunk data outside file", key_off#B, object);
                                     if (ok)
-                                        ok = h5policy_chunk_extent_disjoint(
+                                        ok = h5policy_data_extent_disjoint(
                                             child_addr, chunk_size,
-                                            key_off#B, object);
+                                            key_off#B, object, "chunk");
                                 }
                         }
                     i = i + 1UL;
@@ -432,8 +454,8 @@ fun h5policy_validate_v2_chunk_records = (int ios, H5PolicyProfile profile,
                                 chunk_addr, stored_size, file_size,
                                 "chunk data outside file", rec_addr#B, object);
                             if (ok)
-                                ok = h5policy_chunk_extent_disjoint(
-                                    chunk_addr, stored_size, rec_addr#B, object);
+                                ok = h5policy_data_extent_disjoint(
+                                    chunk_addr, stored_size, rec_addr#B, object, "chunk");
                         }
                 }
             i = i + 1UL;
@@ -778,8 +800,8 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                                     if (h5policy_chunk_record_size_ok(
                                             fa_stored, elem_off#B, object, "fixed-array"))
                                         {
-                                            var fa_ok = h5policy_chunk_extent_disjoint(
-                                                caddr, fa_stored, elem_off#B, object);
+                                            var fa_ok = h5policy_data_extent_disjoint(
+                                                caddr, fa_stored, elem_off#B, object, "chunk");
                                         }
                                 }
                             else
@@ -790,8 +812,8 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                                        landing INSIDE metadata -- the measured
                                        shape -- and misses only a chunk that
                                        starts in free space and runs into it.  */
-                                    var fa_ok = h5policy_chunk_extent_disjoint(
-                                        caddr, 1UL, elem_off#B, object);
+                                    var fa_ok = h5policy_data_extent_disjoint(
+                                        caddr, 1UL, elem_off#B, object, "chunk");
                                 }
                         }
                     i = i + 1UL;
@@ -817,10 +839,37 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                                  4UL, 0xffffffffffffffffUL,
                                  "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
                                  dblk_addr#B, object, "fixed array page size overflow");
-    var all_pages = h5policy_checked_mul_u64(npages, full_page_bytes, 0xffffffffffffffffUL,
-                                             "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
-                                             dblk_addr#B, object,
-                                             "fixed array data block size overflow");
+    /* The LAST page is short, and charging it as a full one over-estimates the
+       block by (page_nelmts - last_page_nelmts) * raw_elmt_size.  That is not
+       cosmetic: when the over-estimate runs past EOF the bound below rejects a
+       VALID file.  Measured before the fix, with 4-byte elements and a
+       1024-element page: nelmts 1025..1200 and 2049 were reject_corrupt
+       ("fixed array paged data block outside file") while libhdf5 read them
+       fine, and exact multiples (1024, 2048) plus 3000 passed -- 3000 only
+       because its file is big enough to absorb a 576-byte over-count.  The loop
+       below already sized the last page correctly via last_page_nelmts; only
+       this total ignored it.
+       Messages are reused verbatim from the sites above so the finding's route
+       shard needs no new entries.  */
+    var last_page_bytes =
+        h5policy_checked_add_u64(h5policy_checked_mul_u64(last_page_nelmts, raw_elmt_size,
+                                                          0xffffffffffffffffUL,
+                                                          "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                                          dblk_addr#B, object,
+                                                          "fixed array page size overflow"),
+                                 4UL, 0xffffffffffffffffUL,
+                                 "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                 dblk_addr#B, object, "fixed array page size overflow");
+    var all_pages =
+        h5policy_checked_add_u64(h5policy_checked_mul_u64(npages - 1UL, full_page_bytes,
+                                                          0xffffffffffffffffUL,
+                                                          "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                                          dblk_addr#B, object,
+                                                          "fixed array data block size overflow"),
+                                 last_page_bytes, 0xffffffffffffffffUL,
+                                 "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                 dblk_addr#B, object,
+                                 "fixed array data block size overflow");
     if (!h5policy_checked_addr_range(dblk_addr, db_prefix + all_pages, file_size,
                                      "fixed array paged data block outside file",
                                      dblk_addr#B, object))
@@ -853,7 +902,7 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
             var pn = (p == npages - 1UL) ? last_page_nelmts : page_nelmts;
             var bmap = h5policy_msg_u64_at(ios, profile,
                                            dblk_addr#B + (6UL + o + (p / 8UL))#B, 1UL);
-            if (((bmap .>> (p % 8UL)) & 1UL) != 0UL)   /* page initialized */
+            if (h5policy_page_initialized(bmap, p))
                 {
                     var page_body =
                         h5policy_checked_mul_u64(pn, raw_elmt_size,
@@ -891,14 +940,14 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                                             if (h5policy_chunk_record_size_ok(
                                                     fa_stored, elem_off#B, object, "fixed-array"))
                                                 {
-                                                    var fa_ok = h5policy_chunk_extent_disjoint(
-                                                        caddr, fa_stored, elem_off#B, object);
+                                                    var fa_ok = h5policy_data_extent_disjoint(
+                                                        caddr, fa_stored, elem_off#B, object, "chunk");
                                                 }
                                         }
                                     else
                                         {
-                                            var fa_ok = h5policy_chunk_extent_disjoint(
-                                                caddr, 1UL, elem_off#B, object);
+                                            var fa_ok = h5policy_data_extent_disjoint(
+                                                caddr, 1UL, elem_off#B, object, "chunk");
                                         }
                                 }
                             j = j + 1UL;
@@ -990,8 +1039,8 @@ fun h5policy_validate_ea_elements = (int ios, H5PolicyProfile profile,
                                 "extensible-array chunk data outside file",
                                 current#B, object);
                             if (ok)
-                                ok = h5policy_chunk_extent_disjoint(
-                                    addr, stored_size, current#B, object);
+                                ok = h5policy_data_extent_disjoint(
+                                    addr, stored_size, current#B, object, "chunk");
                         }
                 }
             i = i + 1UL;
@@ -1136,7 +1185,7 @@ fun h5policy_walk_ea_dblock = (int ios, H5PolicyProfile profile,
         {
             var bitmap = h5policy_msg_u64_at(
                 ios, profile, (page_init_addr + (p / 8UL))#B, 1UL);
-            if (((bitmap .>> (p % 8UL)) & 1UL) != 0UL)
+            if (h5policy_page_initialized(bitmap, p))
                 {
                     var page_addr = dblock_addr + prefix_size + (p * page_size);
                     h5policy_mark_reached(page_addr, "EAPG");

@@ -730,6 +730,20 @@ def _gen_resource(root):
         d[:] = np.arange(2000)
     _write(f"{root}/valid/chunk_fixed_array_paged.h5", _paged)
 
+    # REGRESSION GUARD for a bug that rejected VALID files.  A paged fixed-array
+    # data block whose last page is SHORT: 1200 elements over 1024-element pages
+    # leaves 176 in the second page.  h5policy used to charge every page as full,
+    # over-estimating the block by (1024-176)*8 bytes, and when that ran past EOF
+    # it reported H5_CORRUPT_LENGTH_OVERFLOW ("fixed array paged data block
+    # outside file") on a file libhdf5 reads without complaint.
+    # chunk_fixed_array_paged.h5 above has 2000 elements and did NOT catch it --
+    # its over-count happened to fit inside its larger file, which is exactly how
+    # the bug survived.  The element count here is chosen so it does not.
+    def _partial_last_page(h):
+        d = h.create_dataset("d", shape=(1200,), chunks=(1,), dtype="i4")
+        d[:] = np.arange(1200)
+    _write(f"{root}/valid/chunk_fixed_array_partial_page.h5", _partial_last_page)
+
     # Implicit chunk index (v4 index type 2): fixed dims + early allocation, so
     # chunks are contiguous from a base address with no index structure.
     def _implicit(h):
@@ -1306,6 +1320,10 @@ def _gen_malformed(root):
     _make_chunk_duplicate_key_offset(
         f"{root}/malformed/chunk_duplicate_key_offset.h5",
         f"{root}/valid/chunked_v1_btree.h5")
+    _make_contiguous_data_over_metadata(
+        f"{root}/malformed/contiguous_data_over_metadata.h5")
+    _make_fixed_array_paged_element_over_metadata(
+        f"{root}/malformed/fixed_array_paged_element_over_metadata.h5")
     _make_scaleoffset_param_count(
         f"{root}/malformed/scaleoffset_param_count.h5")
     _make_nbit_param_count(
@@ -6029,6 +6047,118 @@ def _make_chunk_duplicate_key_offset(path, base_path):
             f"key parse looks wrong: offsets {first} then {second} are not increasing")
     for w in range(ndims):                       # key[1] offset := key[0] offset
         struct.pack_into("<Q", raw, k1 + 8 + 8 * w, first[w])
+    _patch(path, bytes(raw))
+
+
+def _make_contiguous_data_over_metadata(path):
+    """A contiguous layout whose data address points at the superblock.
+
+    The same invariant as malformed/chunk_data_over_metadata.h5 through a
+    different layout, and the plainest instance of the primitive: a contiguous
+    dataset has no filter and no checksum, so there is nothing to notice the
+    substitution.  libhdf5 seeks to whatever address the layout message gives and
+    returns those bytes as dataset values.  MEASURED: with the address set to 0,
+    h5dump exits 0 and the first two int32 values are 1178880137 and 169478669,
+    i.e. 0x46444889 and 0x0A1A0A0D -- the file's own "\x89HDF\r\n\x1a\n".
+
+    COMPACT layout has no sibling fixture and needs none: its data is embedded in
+    the layout message payload and bounded against msg_size, so it declares no
+    independent extent and cannot collide with anything.
+
+    LOCATING THE ADDRESS FIELD.  The v3/v4/v5 contiguous layout message stores
+    the data address then the data size, right after the 1-byte version and
+    1-byte class.  Rather than walk the object header to find the message, the
+    generator finds the raw data payload, then scans for the 8-byte word equal to
+    that offset whose SUCCESSOR equals the payload length -- the address/size
+    pair can only be the layout message.  Requiring both halves to match is what
+    keeps it from patching one of the other words that happen to hold the same
+    offset (there were two such decoys in the base file).
+    """
+    # Self-contained rather than derived from another fixture: this generator
+    # locates the layout message by matching the data payload, so it must know
+    # that payload exactly, and coupling to a shared control's shape would break
+    # silently the day that control changes.
+    values = np.arange(25, dtype="i4")
+    raw = _base_bytes(lambda h: h.create_dataset("d", data=values),
+                      libver="earliest")
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    payload = values.tobytes()
+    doff = raw.find(payload)
+    if doff < 0:
+        raise RuntimeError("could not locate the contiguous data payload")
+    addr_off = -1
+    for i in range(len(raw) - 16):
+        if (struct.unpack_from("<Q", raw, i)[0] == doff
+                and struct.unpack_from("<Q", raw, i + 8)[0] == len(payload)):
+            addr_off = i
+            break
+    if addr_off < 0:
+        raise RuntimeError(
+            f"no address/size pair for data at {doff} length {len(payload)}")
+    struct.pack_into("<Q", raw, addr_off, 0)     # relative 0 -> the superblock
+    _patch(path, bytes(raw))
+
+
+def _make_fixed_array_paged_element_over_metadata(path):
+    """A PAGED fixed-array chunk element pointing at the superblock, with the
+    page checksum repaired so the file's only defect is the address.
+
+    REGRESSION GUARD for a silent coverage hole.  h5policy read the page-init
+    bitmap LSB-first; libhdf5 writes it MSB-first (H5VM_bit_set_g = {0x80, 0x40,
+    ...}, H5VMprivate.h:453, whose own note says "bit offset 0 in the first
+    byte's high-bit position").  So page 0 of every conforming file looked
+    UNINITIALIZED, its elements were skipped, and every per-element check --
+    chunk address in file, chunk stored size, raw-data/metadata disjointness --
+    did nothing at all while emitting no finding to say so.  Before the fix this
+    file was `accept`.
+
+    It has to be PAGED to exercise that path, which needs more than one page:
+    h5py writes 1024-element pages, so 1200 elements gives two.  A small fixed
+    array is unpaged and takes the other branch entirely, which is why every
+    pre-existing control missed this.
+
+    The page checksum is recomputed after the edit so the fixture reports the
+    overlap ALONE.  Without that repair it also raises
+    H5_CORRUPT_BAD_CHECKSUM, and a fixture that trips two rules cannot show
+    which one it was built for.
+    """
+    values = np.arange(1200, dtype="i4")
+    def _build(h):
+        d = h.create_dataset("d", shape=(1200,), chunks=(1,), dtype="i4")
+        d[:] = values
+    raw = _base_bytes(_build, libver="latest")
+
+    fahd = raw.find(b"FAHD")
+    if fahd < 0:
+        raise RuntimeError("no fixed-array header")
+    o = 8
+    page_bits = raw[fahd + 7]
+    if page_bits == 0:
+        raise RuntimeError("fixed array is not paged; the bitmap path is untested")
+    nelmts = struct.unpack_from("<Q", raw, fahd + 8)[0]
+    dblk = struct.unpack_from("<Q", raw, fahd + 16)[0]
+    if raw[dblk:dblk + 4] != b"FADB":
+        raise RuntimeError(f"no FADB at {dblk}")
+
+    page_nelmts = 1 << page_bits
+    npages = (nelmts + page_nelmts - 1) // page_nelmts
+    if npages < 2:
+        raise RuntimeError(f"need a multi-page block, got {npages}")
+    elmt_size = raw[fahd + 6]
+    db_prefix = 6 + o + (npages + 7) // 8 + 4
+    full_page = page_nelmts * elmt_size + 4
+
+    page0 = dblk + db_prefix
+    before = struct.unpack_from("<Q", raw, page0)[0]
+    if not (0 < before < len(raw)):
+        raise RuntimeError(f"page 0 element[0] parse looks wrong: {before}")
+    struct.pack_into("<Q", raw, page0, 0)        # relative 0 -> the superblock
+
+    # Repair this page's trailing checksum over its element bytes.
+    body_end = page0 + page_nelmts * elmt_size
+    raw[body_end:body_end + 4] = _jenkins_lookup3()(
+        bytes(raw[page0:body_end])).to_bytes(4, "little")
     _patch(path, bytes(raw))
 
 

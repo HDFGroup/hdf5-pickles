@@ -393,7 +393,15 @@ var h5policy_meta_lo = uint<64>[]();
 var h5policy_meta_hi = uint<64>[]();
 var h5policy_chunk_extent_lo = uint<64>[]();
 var h5policy_chunk_extent_hi = uint<64>[]();
-var h5policy_extents_truncated = 0;
+/* The layout role each recorded data extent came from, so the reverse-direction
+   report can name it.  Parallel to the two arrays above; without it a collision
+   found from the metadata side could not say whether it hit a chunk or a
+   contiguous extent, and the route shard would have nothing to split on.  */
+var h5policy_chunk_extent_what = string[]();
+/* h5policy_extents_truncated is declared in h5_findings.pk, not here: the JSON
+   report is printed from that file and it LOADS FIRST, so a flag declared here
+   would be invisible to the printer.  It lives with the other report-level
+   truncation flags for that reason. */
 var h5policy_chunk_extent_checks = 0UL;
 var H5POLICY_MAX_METADATA_EXTENTS = 512UL;
 var H5POLICY_MAX_CHUNK_EXTENT_CHECKS = 1024UL;
@@ -418,6 +426,7 @@ fun h5policy_reset_extents = void:
     h5policy_meta_hi = uint<64>[]();
     h5policy_chunk_extent_lo = uint<64>[]();
     h5policy_chunk_extent_hi = uint<64>[]();
+    h5policy_chunk_extent_what = string[]();
     h5policy_extents_truncated = 0;
     h5policy_chunk_extent_checks = 0UL;
 }
@@ -430,11 +439,19 @@ fun h5policy_intervals_overlap = (uint<64> a_lo, uint<64> a_hi,
     return (a_lo < b_hi && b_lo < a_hi) ? 1 : 0;
 }
 
-/* Chunk side: does this chunk's byte extent hit metadata already recorded?
-   Emits and returns 0 on overlap.  Also records the extent so metadata read
-   LATER can catch the same collision from its own side.  */
-fun h5policy_chunk_extent_disjoint = (uint<64> addr, uint<64> size,
-                                      off64 loc, string object) int:
+/* Raw-data side: does this data extent hit metadata already recorded?  Emits
+   and returns 0 on overlap.  Also records the extent so metadata read LATER can
+   catch the same collision from its own side.
+
+   WHAT names the layout that declared the extent -- "chunk" or "contiguous" --
+   and selects the record family through the finding's route shard, because the
+   two live in different families (chunk_index and dataset_layout_filter_fill)
+   while the invariant is one and the same.  COMPACT layout is deliberately
+   absent: its data is embedded in the layout message payload and bounded
+   against msg_size, so it has no independent extent to collide with anything.  */
+fun h5policy_data_extent_disjoint = (uint<64> addr, uint<64> size,
+                                     off64 loc, string object,
+                                     string what) int:
 {
     if (size == 0UL)
         return 1;
@@ -457,11 +474,11 @@ fun h5policy_chunk_extent_disjoint = (uint<64> addr, uint<64> size,
                                            h5policy_meta_hi[i]))
                 {
                     h5policy_emit_error_ev(
-                        "H5_CORRUPT_CHUNK_DATA_OVERLAPS_METADATA", "corrupt",
+                        "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA", "corrupt",
                         loc, object,
-                        "chunk data extent overlaps file metadata",
+                        what + " data extent overlaps file metadata",
                         H5Evidence {
-                            field = "chunk.data_disjoint_from_metadata",
+                            field = what + ".data_disjoint_from_metadata",
                             actual = lo,
                             expected = h5policy_meta_hi[i],
                             comparison = "at_least",
@@ -477,10 +494,32 @@ fun h5policy_chunk_extent_disjoint = (uint<64> addr, uint<64> size,
         {
             h5policy_chunk_extent_lo += [lo];
             h5policy_chunk_extent_hi += [hi];
+            h5policy_chunk_extent_what += [what];
         }
     else
         h5policy_extents_truncated = 1;
     return 1;
+}
+
+/* The reverse-direction report, extracted so its message is `what + suffix`
+   with WHAT as parameter 0 -- the shape tools/message_routing.py can analyse.
+   Composed inline it was UNANALYZABLE, and an unroutable message is invisible to
+   check_registry rather than merely ugly.  The role leads both phrasings for the
+   same reason.  */
+fun h5policy_report_data_overlapped = (string what, off64 loc, string object,
+                                       uint<64> data_lo, uint<64> meta_hi) void:
+{
+    h5policy_emit_error_ev(
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA", "corrupt", loc, object,
+        what + " data extent is overlapped by file metadata read later",
+        H5Evidence {
+            field = what + ".data_disjoint_from_metadata",
+            actual = data_lo,
+            expected = meta_hi,
+            comparison = "at_least",
+            has_loc1 = 1, loc1_role = "actual",
+            loc1 = loc, loc1_len = 8UL,
+        });
 }
 
 /* Metadata side: record this structure's extent, and catch a chunk recorded
@@ -506,18 +545,21 @@ fun h5policy_record_metadata_extent = (uint<64> lo, uint<64> bytes,
                     /* Reported at the METADATA, because that is what this call
                        site can name; the chunk that collides with it was read
                        earlier and its own record is already past.  */
-                    h5policy_emit_error_ev(
-                        "H5_CORRUPT_CHUNK_DATA_OVERLAPS_METADATA", "corrupt",
-                        loc, object,
-                        "file metadata overlaps a chunk data extent",
-                        H5Evidence {
-                            field = "chunk.data_disjoint_from_metadata",
-                            actual = h5policy_chunk_extent_lo[i],
-                            expected = hi,
-                            comparison = "at_least",
-                            has_loc1 = 1, loc1_role = "actual",
-                            loc1 = loc, loc1_len = 8UL,
-                        });
+                    /* The role is passed as a LITERAL from each branch rather
+                       than as the array element, so tools/message_routing.py can
+                       enumerate both messages: it resolves a composing helper's
+                       `what` from the call site, and an array subscript is not
+                       something it can evaluate.  Two branches for two roles is
+                       the honest cost of keeping the message routable -- an
+                       unroutable message names no record family at all.  */
+                    if (h5policy_chunk_extent_what[i] == "contiguous")
+                        h5policy_report_data_overlapped(
+                            "contiguous", loc, object,
+                            h5policy_chunk_extent_lo[i], hi);
+                    else
+                        h5policy_report_data_overlapped(
+                            "chunk", loc, object,
+                            h5policy_chunk_extent_lo[i], hi);
                     return;
                 }
             i = i + 1UL;
