@@ -263,15 +263,19 @@ selected record families**. Those families are security-oriented groupings,
 not a claim that every legal HDF5 representation, payload behavior, or
 application activation has been modeled.
 
-**4 families are marked `covered`, 12 `partial`, and 0 `coverage_gap`.** A
+**8 families are marked `covered`, 8 `partial`, and 0 `coverage_gap`.** A
 covered vertical slice requires the validator, fixtures, entry-point driver,
 and CI gate together. The family-level `validators.h5policy` claim is `enforced`
 for 15 families and `partial` for 1, the cache-image dependency-graph family.
 The difference is intentional: a check can exist in the oracle while its
 complete evidence and migration slice remains partial.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **56
-are `met`, 39 `partial`, 52 `not_assessed`, and 29 `absent`**. These are eleven
+The covered set is `object_header_continuation`, `external_file_list`,
+`external_link`, `virtual_dataset`, `btree_heap_index`,
+`address_space_bounds`, `message_envelope`, and `validation_controls`.
+
+The stronger §12 verification score is lower. Of **176 assurance slots**, **57
+are `met`, 40 `partial`, 52 `not_assessed`, and 27 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 
@@ -279,8 +283,8 @@ the HDF5 specification. Major visible gaps include:
   OSS-Fuzz integration;
 - family-by-family boundary, overflow/allocation, nesting, and progress cases
   that are still partial or not assessed;
-- truncation coverage that is met for 12 families, sampled/partial for 3, and
-  absent for 1;
+- truncation coverage that is met for 12 families, sampled/partial for 4, and
+  absent for 0;
 - lazy-validation behavior measured for the oracle as a whole, but not yet
   discharged independently for every family;
 - no-activation-on-failure evidence met for 13 families and partial for 3 where

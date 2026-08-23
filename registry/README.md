@@ -144,7 +144,7 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 | `absent` | mechanically demonstrated to be missing |
 | `not_assessed` | not determinable from artifacts; needs classification |
 
-**56 of 176 requirement-slots are currently `met`.** The distribution matters
+**57 of 176 requirement-slots are currently `met`.** The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -158,8 +158,8 @@ more than the total:
 - Dedicated fuzz targets exist for 1 family of 16.
 - 14 families pin evidence locations as well as finding codes; the remaining
   2 need cursor arithmetic at the emit site rather than test metadata.
-- Truncation is `met` for 12 families, `partial` for 3 whose seed exceeds the
-  sweep budget, and `absent` for 1; see
+- Truncation is `met` for 12 families, `partial` for 4 whose seed exceeds the
+  sweep budget, and `absent` for 0; see
   [`truncation-sweep.json`](truncation-sweep.json).
 - No-activation-on-failure is `met` for 13 families and `partial` for 3 because
   the exact-build probe observes an activation or crash in those families.

@@ -110,7 +110,7 @@ def run_tool(command: list[str], label: str) -> str:
     return result.stdout
 
 
-def evidence_contract() -> dict[str, int | str]:
+def evidence_contract() -> dict[str, int | str | list[str]]:
     coverage = yaml.safe_load(VALIDATION_COVERAGE.read_text())
     records = coverage["records"]
     coverage_statuses = Counter(record["coverage_status"] for record in records)
@@ -157,6 +157,11 @@ def evidence_contract() -> dict[str, int | str]:
         "records": len(records),
         "invariants": sum(len(record["invariants"]) for record in records),
         "covered": coverage_statuses["covered"],
+        "covered_records": [
+            record["record"]
+            for record in records
+            if record["coverage_status"] == "covered"
+        ],
         "partial": coverage_statuses["partial"],
         "coverage_gap": coverage_statuses["coverage_gap"],
         "oracle_enforced": oracle_statuses["enforced"],
@@ -219,6 +224,14 @@ def main() -> int:
         )
 
     evidence = evidence_contract()
+    covered_labels = [f"`{record}`" for record in evidence["covered_records"]]
+    covered_set = (
+        "The covered set is "
+        + ", ".join(covered_labels[:-1])
+        + ", and "
+        + covered_labels[-1]
+        + "."
+    )
     evidence_fragments = (
         f"**{evidence['findings']} finding codes**",
         f"**{evidence['backlog']} semantic-\nbacklog entries**",
@@ -230,6 +243,7 @@ def main() -> int:
         f"**{evidence['covered']} families are marked `covered`, "
         f"{evidence['partial']} `partial`, and "
         f"{evidence['coverage_gap']} `coverage_gap`.**",
+        covered_set,
         f"`enforced` for {evidence['oracle_enforced']} families and\n"
         f"`partial` for {evidence['oracle_partial']}",
         f"Of **{evidence['verification_total']} assurance slots**, "
