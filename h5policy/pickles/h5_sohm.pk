@@ -53,7 +53,7 @@ fun h5policy_validate_sohm_v2_records = (
     int ios, H5PolicyProfile profile, uint<64> records_addr, uint<64> nrec,
     uint<64> record_type, uint<64> record_size, uint<64> types,
     uint<64> nfilters, uint<64> storage_heap_addr, uint<64> huge_key_size,
-    uint<64> file_size, string object) void:
+    uint<64> max_man_size, uint<64> file_size, string object) void:
 {
     var o = global_sizeof_offsets as uint<64>;
     var el = global_sizeof_lengths as uint<64>;
@@ -146,6 +146,14 @@ fun h5policy_validate_sohm_v2_records = (
                                     h5policy_sohm_huge_sizes += [disk_size];
                                 }
                         }
+                    /* The DECODED size: for an unfiltered record the stored
+                       length is the object's size, for a filtered one it is the
+                       separate mem_size field.  Which one this is matters for
+                       the threshold check below -- testing a filtered record's
+                       STORED length would reject every huge object the filter
+                       actually compressed.  */
+                    var decoded = disk_size;
+                    var decoded_off = r#B + o#B;
                     if (record_type == 2UL || record_type == 4UL)
                         {
                             var mask = h5policy_msg_u64_at(
@@ -161,7 +169,40 @@ fun h5policy_validate_sohm_v2_records = (
                                                     "corrupt", r#B + (o + el)#B,
                                                     object,
                                                     "SOHM huge-object filter mask names absent filters");
+                            decoded = mem_size;
+                            decoded_off = r#B + (o + el + 4UL)#B;
                         }
+                    /* A huge object exists BECAUSE it did not fit the doubling
+                       table: H5HF_insert routes to H5HF__huge_insert only when
+                       the object's size exceeds the heap's maximum managed size
+                       (src/H5HF.c:335), and H5HF__huge_insert then asserts it
+                       (src/H5HFhuge.c:291).  That assert is the ONLY enforcement
+                       anywhere.  The read path carries the record's decoded size
+                       out through H5HF__huge_get_obj_len (src/H5HFhuge.c:520)
+                       without comparing it again, so on an NDEBUG build nothing
+                       checks it at all.
+                       For a FILTERED record the consequence is memory safety, not
+                       tidiness: that unchecked value sizes the caller's buffer
+                       while the copy length comes from the filter's own output
+                       (src/H5HFhuge.c:753-761), and the two are never related.
+                       A zero size is already reported above, so it is excluded
+                       here rather than counted twice.  */
+                    if (max_man_size != 0UL && decoded != 0UL
+                        && decoded <= max_man_size)
+                        h5policy_emit_error_ev(
+                            "H5_CORRUPT_SOHM_HUGE_OBJECT_BELOW_MANAGED_MAX",
+                            "corrupt", decoded_off, object,
+                            "SOHM huge object declares a decoded size the heap would have managed",
+                            H5Evidence {
+                                field = "huge.decoded_size",
+                                actual = decoded,
+                                expected = max_man_size + 1UL,
+                                comparison = "at_least",
+                                has_loc1 = 1, loc1_role = "actual",
+                                loc1 = decoded_off, loc1_len = el,
+                                has_loc2 = 1, loc2_role = "expected",
+                                loc2 = storage_heap_addr#B + 10#B, loc2_len = 4UL,
+                            });
                 }
             i = i + 1UL;
         }
@@ -174,7 +215,7 @@ fun h5policy_walk_sohm_v2_btree = (
     int ios, H5PolicyProfile profile, H5WalkContext ctx,
     uint<64> btree_addr, uint<64> expected_type, uint<64> types,
     uint<64> nfilters, uint<64> storage_heap_addr, uint<64> huge_key_size,
-    uint<64> expected_total, uint<8> enforce_total,
+    uint<64> max_man_size, uint<64> expected_total, uint<8> enforce_total,
     off64 loc, string object) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
@@ -323,7 +364,7 @@ fun h5policy_walk_sohm_v2_btree = (
                 h5policy_validate_sohm_v2_records(
                     vios, vprofile, vrecords_addr, vnrec, record_type,
                     record_size, types, nfilters, storage_heap_addr,
-                    huge_key_size, vfile_size, vobject);
+                    huge_key_size, max_man_size, vfile_size, vobject);
             },
     };
     return h5policy_walk_v2_btree_node(
@@ -336,12 +377,12 @@ fun h5policy_walk_sohm_v2_btree = (
 fun h5policy_validate_sohm_huge_objects = (
     int ios, H5PolicyProfile profile, H5WalkContext ctx,
     uint<64> btree_addr, uint<64> expected_type, uint<64> nfilters,
-    uint<64> storage_heap_addr, uint<64> huge_key_size,
+    uint<64> storage_heap_addr, uint<64> huge_key_size, uint<64> max_man_size,
     off64 loc, string object) H5WalkContext:
 {
     return h5policy_walk_sohm_v2_btree(
         ios, profile, ctx, btree_addr, expected_type, 0UL, nfilters,
-        storage_heap_addr, huge_key_size,
+        storage_heap_addr, huge_key_size, max_man_size,
         0UL, 0UB, loc, object);
 }
 
@@ -442,11 +483,15 @@ fun h5policy_validate_sohm_heap_envelope = (
                                 : (direct ? 3UL : 1UL);
             var huge_key_size = id_len > 0UL && id_len - 1UL < 8UL
                                 ? id_len - 1UL : 8UL;
+            /* The heap's maximum managed-object size, FRHP+10 (4 bytes) --
+               the floor every huge object's decoded size must clear.  */
+            var max_man_size = h5policy_msg_u64_at(ios, profile,
+                                                   heap_addr#B + 10#B, 4UL);
             ctx = h5policy_validate_sohm_huge_objects(
                 ios, profile, ctx,
                 hdf5_addr_to_file_u64(bytes_to_u64_le(huge_raw)),
                 expected_type, nfilters, heap_addr, huge_key_size,
-                heap_addr#B, object);
+                max_man_size, heap_addr#B, object);
         }
     return ctx;
 }
@@ -507,7 +552,7 @@ fun h5policy_validate_sohm_list = (
         return ctx;
     h5policy_validate_sohm_v2_records(
         ios, profile, addr + 4UL, nmessages, 7UL, entry_size,
-        types, 0UL, 0UL, 0UL, file_size, object);
+        types, 0UL, 0UL, 0UL, 0UL, file_size, object);
     return ctx;
 }
 
@@ -640,7 +685,7 @@ fun h5policy_validate_sohm_payload = (
             else if (it == 1UL && !h5policy_msg_addr_is_undef(index_raw))
                 ctx = h5policy_walk_sohm_v2_btree(
                     ios, profile, ctx, index_addr, 7UL, types, 0UL,
-                    0UL, 0UL, nmessages, 1UB, p#B, object);
+                    0UL, 0UL, 0UL, nmessages, 1UB, p#B, object);
             if (ctx.metadata_count_exceeded != 0UB)
                 return ctx;
             i = i + 1UL;

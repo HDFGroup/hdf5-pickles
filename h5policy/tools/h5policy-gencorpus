@@ -1450,6 +1450,17 @@ def _gen_malformed(root):
     _make_bad_sohm_huge_object_extent(
         f"{root}/malformed/bad_sohm_huge_object_extent.h5",
         f"{root}/coverage/sohm_huge_btree.h5")
+    # The control lives under coverage/, not valid/: a FILTERED SOHM heap can
+    # never reach `accept`, because resolving a shared message out of it would
+    # mean running the filter, which the oracle refuses by design.  Its job is
+    # to prove the decoded-size check is pinned to the format rule rather than
+    # to the fixture -- the finding must be ABSENT here.
+    _make_sohm_filtered_huge(
+        f"{root}/coverage/sohm_filtered_huge.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
+    _make_sohm_filtered_huge_below_managed_max(
+        f"{root}/malformed/sohm_filtered_huge_below_managed_max.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
     _make_bad_fsm_section_list_checksum(
         f"{root}/malformed/bad_fsm_section_list_checksum.h5",
         f"{root}/valid/fsm_persist.h5")
@@ -3704,6 +3715,195 @@ def _make_bad_sohm_huge_object_extent(path, base_path):
     struct.pack_into("<I", raw, checksum,
                      _jenkins_lookup3()(bytes(raw[child:checksum])))
     _patch(path, bytes(raw))
+
+
+def _sohm_repoint_frhp(raw, old_addr, new_addr, off_size, jenkins):
+    """Rewrite the shared-message table's fractal-heap address and repair its
+    checksum, so a relocated heap header is the one the table names."""
+    smtb = raw.find(b"SMTB")
+    if smtb < 0:
+        raise RuntimeError("could not locate the shared message table")
+    entry = 13 + 2 * off_size
+    total = None
+    for size in range(9, 4 + 1 + 16 * entry + 4 + 2):
+        end = smtb + size - 4
+        if end + 4 > len(raw):
+            break
+        if struct.unpack_from("<I", raw, end)[0] == jenkins(bytes(raw[smtb:end])):
+            total = size
+            break
+    if total is None:
+        raise RuntimeError("shared message table checksum did not verify")
+    end = smtb + total - 4
+    window = bytes(raw[smtb:end])
+    needle = old_addr.to_bytes(off_size, "little")
+    idx = window.find(needle)
+    if idx < 0 or window.find(needle, idx + 1) >= 0:
+        raise RuntimeError("expected exactly one heap address in the SMTB")
+    raw[smtb + idx:smtb + idx + off_size] = new_addr.to_bytes(off_size, "little")
+    struct.pack_into("<I", raw, end, jenkins(bytes(raw[smtb:end])))
+
+
+def _sohm_huge_bt2_to_filtered(raw, o, el, declared_decoded, jenkins):
+    """Convert a depth-one type-1 (unfiltered indirect) huge-object B-tree into
+    a type-2 (filtered indirect) one, declaring `declared_decoded` as every
+    record's decoded size.
+
+    Records grow from `O+2L` to `O+3L+4` by gaining a filter mask and that
+    decoded size, but they grow INSIDE fixed-size nodes, so no file offset
+    moves and nothing outside the tree needs fixing up.  The child-pointer
+    record-count width is derived from leaf capacity, which the larger record
+    changes, so it is recomputed rather than carried over.
+    """
+    bt = _bthd_info_for_type(raw, 1)
+    old_rs = bt["record_size"]
+    new_rs = o + 3 * el + 4
+    node = bt["node_size"]
+    if old_rs != o + 2 * el:
+        raise RuntimeError(f"unexpected type-1 huge record size {old_rs}")
+    if bt["depth"] != 1 or raw[bt["root"]:bt["root"] + 4] != b"BTIN":
+        raise RuntimeError("expected a depth-one huge-object B-tree")
+
+    def convert(rec):
+        """addr|len|key  ->  addr|len|filter_mask|decoded_size|key"""
+        return bytes(rec[:o + el]) + struct.pack("<I", 0) \
+            + int(declared_decoded).to_bytes(el, "little") \
+            + bytes(rec[o + el:o + 2 * el])
+
+    old_nrec_w = _bt2_nrec_bytes(node, old_rs, o)
+    new_nrec_w = _bt2_nrec_bytes(node, new_rs, o)
+    root = bt["root"]
+    nroot = bt["nroot"]
+
+    # Read the root's records and child pointers before rewriting either.
+    recs = [raw[root + 6 + i * old_rs:root + 6 + (i + 1) * old_rs]
+            for i in range(nroot)]
+    ptr_base = root + 6 + nroot * old_rs
+    old_ptr_w = o + old_nrec_w
+    children = []
+    for i in range(nroot + 1):
+        p = ptr_base + i * old_ptr_w
+        children.append((
+            int.from_bytes(raw[p:p + o], "little"),
+            int.from_bytes(raw[p + o:p + o + old_nrec_w], "little")))
+
+    # Each leaf first: its records grow in place inside its own node.
+    for child_addr, child_nrec in children:
+        if raw[child_addr:child_addr + 4] != b"BTLF":
+            raise RuntimeError("expected a leaf child of a depth-one root")
+        used = 6 + child_nrec * new_rs
+        if used + 4 > node:
+            raise RuntimeError(
+                f"{child_nrec} type-2 records do not fit a {node}-byte leaf")
+        body = bytearray(raw[child_addr:child_addr + 6])
+        body[5] = 2                                    # node record type
+        for i in range(child_nrec):
+            body += convert(
+                raw[child_addr + 6 + i * old_rs:child_addr + 6 + (i + 1) * old_rs])
+        raw[child_addr:child_addr + len(body)] = body
+        struct.pack_into("<I", raw, child_addr + used,
+                         jenkins(bytes(raw[child_addr:child_addr + used])))
+
+    # Then the internal root, whose pointer block moves within its own node.
+    new_ptr_w = o + new_nrec_w
+    used = 6 + nroot * new_rs + (nroot + 1) * new_ptr_w
+    if used + 4 > node:
+        raise RuntimeError("converted root contents exceed the node size")
+    body = bytearray(raw[root:root + 6])
+    body[5] = 2
+    for rec in recs:
+        body += convert(rec)
+    for child_addr, child_nrec in children:
+        body += child_addr.to_bytes(o, "little")
+        body += child_nrec.to_bytes(new_nrec_w, "little")
+    raw[root:root + len(body)] = body
+    struct.pack_into("<I", raw, root + used,
+                     jenkins(bytes(raw[root:root + used])))
+
+    # Finally the header: record type and size, then its own checksum.
+    raw[bt["bthd"] + 5] = 2
+    struct.pack_into("<H", raw, bt["bthd"] + 10, new_rs)
+    struct.pack_into("<I", raw, bt["checksum"],
+                     jenkins(bytes(raw[bt["bthd"]:bt["checksum"]])))
+
+
+def _sohm_filtered_huge_rewrite(base_path, declared_decoded,
+                                d_nelmts=1024, elem_size=8):
+    """Turn an unfiltered SOHM huge-object fixture into a FILTERED one whose
+    huge records declare `declared_decoded` as their decoded size.
+
+    The heap header has to grow by the filtered fields, and inserting those in
+    place would shift every later offset -- which the dense-link filtered
+    fixtures can get away with only because h5policy stops at their filtered
+    branch before reading anything downstream.  The SOHM walker does read the
+    huge-object B-tree, so the header is instead APPENDED at EOF and the
+    shared-message table repointed at the copy.  Nothing that was already in
+    the file moves.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    o, el = raw[9], raw[10]
+    if o != 8:
+        raise RuntimeError("this rewrite assumes eight-byte offsets")
+    jenkins = _jenkins_lookup3()
+    frhp = _sohm_frhp(raw)
+    if struct.unpack_from("<H", raw, frhp + 7)[0] != 0:
+        raise RuntimeError("the SOHM fractal heap is already filtered")
+    dt = _frhp_dtable_offsets(raw, frhp)
+    start = int.from_bytes(raw[dt["start"]:dt["start"] + el], "little")
+    body = 14 + 2 * o + 10 * el + (8 + 2 * el + o)
+    if dt["checksum"] != frhp + body:
+        raise RuntimeError("unexpected unfiltered fractal-heap header size")
+
+    # One scale-offset filter (id 6) carrying the full twenty-value client-data
+    # block libhdf5 writes for it, so the descriptor is a realistic one rather
+    # than a stub: cd_values[2] is the element count and cd_values[4] the
+    # element size, the pair whose product is the filter's output extent.
+    cd = [0] * 20
+    cd[2] = d_nelmts
+    cd[4] = elem_size
+    pipeline = struct.pack("<BB", 2, 1) + struct.pack("<HHH", 6, 0, len(cd)) \
+        + b"".join(struct.pack("<I", v) for v in cd)
+
+    new_addr = len(raw)
+    hdr = bytearray(raw[frhp:frhp + body])
+    hdr += int(start).to_bytes(el, "little")     # filtered root dblock size
+    hdr += struct.pack("<I", 0)                  # I/O filter mask
+    hdr += pipeline
+    struct.pack_into("<H", hdr, 7, len(pipeline))
+    hdr += struct.pack("<I", jenkins(bytes(hdr)))
+    raw += hdr
+
+    _sohm_repoint_frhp(raw, frhp, new_addr, o, jenkins)
+    _sohm_huge_bt2_to_filtered(raw, o, el, declared_decoded, jenkins)
+
+    struct.pack_into("<Q", raw, 12 + 2 * o, len(raw))
+    _fix_sb_checksum(raw)
+    return bytes(raw)
+
+
+def _make_sohm_filtered_huge(path, base_path):
+    """A filtered SOHM huge-object index whose records declare a decoded size
+    above the heap's managed ceiling: the VALID control for the check below."""
+    _patch(path, _sohm_filtered_huge_rewrite(base_path, 8192))
+
+
+def _make_sohm_filtered_huge_below_managed_max(path, base_path):
+    """A filtered SOHM huge object declaring a 64-byte decoded size against a
+    4096-byte managed ceiling.
+
+    An object is stored huge ONLY because it exceeded that ceiling
+    (H5HF_insert, src/H5HF.c:335), and H5HF__huge_insert asserts as much
+    (src/H5HFhuge.c:291) -- the sole enforcement anywhere.  The read path takes
+    the record's decoded size back out through H5HF__huge_get_obj_len
+    (src/H5HFhuge.c:520) without ever comparing it again, so on an NDEBUG build
+    the value is unbounded from below.  For a filtered record that is a
+    memory-safety defect and not a tidiness one: the decoded size sizes the
+    caller's buffer while the copy length comes from the filter's own output
+    (src/H5HFhuge.c:753-761), and nothing relates the two.  64 against 4096 is
+    the geometry of the promoted specimen in
+    registry/cases/filtered-huge-object-decoded-size-unchecked.yml.
+    """
+    _patch(path, _sohm_filtered_huge_rewrite(base_path, 64))
 
 
 def _fsm_file_sinfo(raw):

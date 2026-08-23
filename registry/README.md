@@ -118,7 +118,7 @@ regenerating, or someone asserted something nothing measured. They are separate
 files on purpose: a generator that rewrites the claim it is checked against
 proves nothing.
 
-Current verdicts, against libhdf5 2.2.0:
+Current verdicts, against libhdf5 2.3.0:
 
 | verdict | families |
 |---|---|
@@ -126,9 +126,13 @@ Current verdicts, against libhdf5 2.2.0:
 | `partial` — some invariants enforced, some not | 9 |
 
 Only `reject_corrupt` specimens count toward a verdict. Activation events
-(`external_open`) and crashes are recorded separately, since a build can enforce
-an invariant and still crash or activate on the way to it. The divergences
-behind the nine `partial` verdicts are written up in [`cases/`](cases/).
+(`external_open`), crashes and hangs are recorded separately, since a build can
+enforce an invariant and still crash, hang or activate on the way to it.
+`crashes_on` is a fault — SIGSEGV, SIGFPE, SIGABRT — and `hangs_on` a
+non-termination the probe killed on its CPU limit; the probe spells both as a
+forbidden `crash` event, so the bucket comes from its `outcome` rather than from
+that name. The divergences behind the nine `partial` verdicts are written up in
+[`cases/`](cases/).
 
 ## §12 verification status
 
@@ -144,7 +148,7 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 | `absent` | mechanically demonstrated to be missing |
 | `not_assessed` | not determinable from artifacts; needs classification |
 
-**57 of 176 requirement-slots are currently `met`.** The distribution matters
+**54 of 176 requirement-slots are currently `met`.** The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -161,7 +165,7 @@ more than the total:
 - Truncation is `met` for 12 families, `partial` for 4 whose seed exceeds the
   sweep budget, and `absent` for 0; see
   [`truncation-sweep.json`](truncation-sweep.json).
-- No-activation-on-failure is `met` for 13 families and `partial` for 3 because
+- No-activation-on-failure is `met` for 10 families and `partial` for 6 because
   the exact-build probe observes an activation or crash in those families.
 
 `check_registry.py` enforces the report's structure — every manifest record

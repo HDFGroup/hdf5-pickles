@@ -120,14 +120,18 @@ inventory from `tools/h5cve` and `registry/validation-coverage.yml` as part of
 
 `h5cve evidence` turns a matrix run into a per-family verdict on the selected
 build (`enforced`, `partial`, `diverges`, `unmeasured`) and writes
-[`registry/libhdf5-evidence.yml`](../registry/libhdf5-evidence.yml). That file is
+[`registry/libhdf5-evidence.yml`](../registry/libhdf5-evidence.yml). Faults and
+non-terminations reach it as separate `crashes_on` and `hangs_on` buckets: the
+probe forbids one `crash` event for both, so the split is read off its
+`outcome`, and a hang reported as a crash would name a fault the specimen never
+caused. That file is
 the **measurement**; `validation-coverage.yml`'s `validators.hdf5` is the
 hand-maintained **claim**, and `tools/check_registry.py` fails on any
 disagreement — so a claim about libhdf5 cannot drift from what was observed.
 Regenerate after changing the build under test or the corpus:
 
 ```sh
-tools/h5cve evidence --libhdf5-version 2.2.0    # ~8s, runs the matrix itself
+tools/h5cve evidence --libhdf5-version 2.3.0    # ~8s, runs the matrix itself
 ```
 
 `h5cve verification` scores each family against the eleven §12 verification

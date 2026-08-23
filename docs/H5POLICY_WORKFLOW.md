@@ -244,12 +244,12 @@ For example, `H5_CORRUPT_DATASPACE_NELEM_OVERFLOW` traces through
 to the local-decode `dataspace.nelem_product` invariant and its emit site in
 `h5_dataspace.pk`. The validation manifest names the malformed product fixture
 and the family canary. The tracked exact-build evidence separately records that
-`libhdf5` 2.2.0 rejected that fixture. The arithmetic invariant is
+`libhdf5` 2.3.0 rejected that fixture. The arithmetic invariant is
 source-derived, its classification mapping is curated, and the corpus and
 exact-build outcomes are measured corroboration.
 
-Registry checks currently account for **318 finding codes** and **0 semantic-
-backlog entries**. Static enumeration resolves **978 in-pickle message
+Registry checks currently account for **319 finding codes** and **0 semantic-
+backlog entries**. Static enumeration resolves **979 in-pickle message
 variants**, with **0 unrouted** and **0 unanalyzable** variants. That is complete
 classification coverage for the current emission surface, not complete
 invariant coverage for the HDF5 format.
@@ -258,7 +258,7 @@ invariant coverage for the HDF5 format.
 
 It is broad and explicitly measured, but it is not complete.
 
-The current invariant manifest contains **390 named invariants across 16
+The current invariant manifest contains **391 named invariants across 16
 selected record families**. Those families are security-oriented groupings,
 not a claim that every legal HDF5 representation, payload behavior, or
 application activation has been modeled.
@@ -275,8 +275,8 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **57
-are `met`, 40 `partial`, 52 `not_assessed`, and 27 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **54
+are `met`, 43 `partial`, 52 `not_assessed`, and 27 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 
@@ -288,11 +288,12 @@ the HDF5 specification. Major visible gaps include:
   absent for 0;
 - lazy-validation behavior measured for the oracle as a whole, but not yet
   discharged independently for every family;
-- no-activation-on-failure evidence met for 13 families and partial for 3 where
-  the selected native build still activates an external resource or crashes.
+- no-activation-on-failure evidence met for 10 families and partial for 6 where
+  the selected native build still activates an external resource, crashes, or
+  fails to terminate.
 
 Every registered family has an exact-build canary contract. In the tracked
-measurement for `libhdf5` 2.2.0, **7 families are measured `enforced`, 9
+measurement for `libhdf5` 2.3.0, **7 families are measured `enforced`, 9
 `partial`, 0 `diverges`, and 0 `unmeasured`**. This describes that native build,
 not `h5policy` coverage, and must not be generalized to another build without
 remeasurement.
