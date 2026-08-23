@@ -1295,6 +1295,11 @@ def _gen_malformed(root):
     _make_bad_snod_cache_type(f"{root}/malformed/bad_snod_cache_type.h5")
     _make_bad_snod_version(f"{root}/malformed/bad_snod_version.h5")
     _make_bad_snod_empty_name(f"{root}/malformed/bad_snod_empty_name.h5")
+    _make_softlink_empty_name(f"{root}/malformed/softlink_empty_name.h5")
+    _make_softlink_name_offset_oob(
+        f"{root}/malformed/softlink_name_offset_oob.h5")
+    _make_softlink_value_offset_oob(
+        f"{root}/malformed/softlink_value_offset_oob.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_heap_free_list_size_wrap(
@@ -1323,6 +1328,8 @@ def _gen_malformed(root):
     _make_chunk_internal_separator_order(
         f"{root}/malformed/chunk_internal_separator_order.h5",
         f"{root}/valid/chunked_v1_btree_deep.h5")
+    _make_compound_member_overlap(
+        f"{root}/malformed/compound_member_overlap.h5")
     _make_contiguous_data_over_metadata(
         f"{root}/malformed/contiguous_data_over_metadata.h5")
     _make_fixed_array_paged_element_over_metadata(
@@ -5604,6 +5611,131 @@ def _make_bad_snod_empty_name(path):
     _patch(path, bytes(raw))
 
 
+def _snod_slink_entry(raw):
+    """Locate a cache-type-2 (symbolic link) symbol-table entry plus the local
+    heap that holds its name.  Returns ``(entry_off, seg_addr, seg_size)``.
+
+    A version-0 symbol-table entry is link name offset (8) | object header
+    address (8) | cache type (4) | reserved (4) | scratch pad (16) = 40 bytes,
+    following the 8-byte SNOD header (signature, version, reserved, symbol
+    count).
+
+    THE REGIME THIS ASSERTS is cache type 2.  A soft link has no object header,
+    which is exactly why the checks under test used to skip it -- so a fixture
+    built on a cache-type-0 entry would prove nothing, because the pre-fix code
+    rejected those already.  If h5py ever stops writing soft links into symbol
+    tables this must fail loudly rather than quietly emit a vacuous fixture.
+    """
+    if not raw.startswith(b"\x89HDF\r\n\x1a\n"):
+        raise RuntimeError("fixture base has a user block; the heap data "
+                           "segment address would need base translation")
+    snod = raw.find(b"SNOD")
+    if snod < 0:
+        raise RuntimeError("could not locate the symbol table node")
+    nsyms = struct.unpack_from("<H", raw, snod + 6)[0]
+    ent = None
+    for i in range(nsyms):
+        cand = snod + 8 + i * 40
+        if struct.unpack_from("<I", raw, cand + 16)[0] == 2:
+            ent = cand
+            break
+    if ent is None:
+        raise RuntimeError("no cache-type-2 (soft link) symbol table entry in "
+                           f"{nsyms} entries; h5py no longer writes soft links "
+                           "into symbol tables and this fixture is vacuous")
+    heap = raw.find(b"HEAP")
+    if heap < 0:
+        raise RuntimeError("could not locate the local heap prefix")
+    # HEAP(4) + version(1) + reserved(3), then the data-segment size, the
+    # free-list head and the data-segment address.
+    seg_size = struct.unpack_from("<Q", raw, heap + 8)[0]
+    seg_addr = struct.unpack_from("<Q", raw, heap + 24)[0]
+    if seg_addr + seg_size > len(raw):
+        raise RuntimeError("local heap data segment runs past the file")
+    return ent, seg_addr, seg_size
+
+
+def _build_snod_softlink(h):
+    h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    h["slink1"] = h5py.SoftLink("/d")
+
+
+def _make_softlink_empty_name(path):
+    """Symbol table whose SOFT LINK entry names an empty heap string.
+
+    libhdf5 resolves the link name for every entry it converts and rejects an
+    empty one ("invalid link name"), and it does so BEFORE it looks at the cache
+    type or at the object header address (H5Gent.c:379-385).  h5policy used to
+    check the name only inside its `cache type != 2` branch and, deeper, only
+    when the object header address was defined and inside the file, so a soft
+    link's name was never examined at all.  MEASURED: two h5stat-corpus
+    specimens land exactly here.
+    """
+    raw = _base_bytes(_build_snod_softlink, libver="earliest")
+    ent, seg_addr, seg_size = _snod_slink_entry(raw)
+    # In bounds matters: an offset past the data segment is a different defect
+    # with a different finding and would not reach the empty-name path.
+    off = None
+    for cand in range(seg_size - 1, -1, -1):
+        if raw[seg_addr + cand] == 0:
+            off = cand
+            break
+    if off is None:
+        raise RuntimeError("no NUL byte in the local heap data segment")
+    struct.pack_into("<Q", raw, ent, off)
+    _patch(path, bytes(raw))
+
+
+def _make_softlink_name_offset_oob(path):
+    """Symbol table whose SOFT LINK entry names a heap offset past the data
+    segment.  libhdf5 resolves that name through H5HL_offset_into, whose bound
+    (H5HL.c:391) is a real error return and applies to every entry whatever its
+    cache type; h5policy used to apply its own bound only to non-soft-link
+    entries.
+
+    The offset stays inside the FILE and is past only the SEGMENT, so the
+    fixture tests the segment bound rather than a trivially out-of-file address.
+    """
+    raw = _base_bytes(_build_snod_softlink, libver="earliest")
+    ent, seg_addr, seg_size = _snod_slink_entry(raw)
+    off = seg_size + 8
+    if seg_addr + off >= len(raw):
+        raise RuntimeError("chosen offset leaves the file, so the fixture would "
+                           "test the wrong bound")
+    struct.pack_into("<Q", raw, ent, off)
+    _patch(path, bytes(raw))
+
+
+def _make_softlink_value_offset_oob(path):
+    """Symbol table whose SOFT LINK entry names a TARGET PATH past the local
+    heap data segment.
+
+    A soft link's target lives in the same heap as the names, named by a 4-byte
+    little-endian offset at the start of the entry's 16-byte scratch pad
+    (H5Gent.c:155).  libhdf5 resolves it through the same H5HL_offset_into as
+    the name (H5Gent.c:391), whose bound (H5HL.c:391) is a real error return, so
+    an offset past the segment makes the open fail.  h5policy read no part of the
+    scratch pad, so it accepted this outright.
+
+    The offset is past the SEGMENT but still inside the FILE, so the fixture
+    tests the segment bound rather than a trivially out-of-file address.
+    """
+    raw = _base_bytes(_build_snod_softlink, libver="earliest")
+    ent, seg_addr, seg_size = _snod_slink_entry(raw)
+    # 2 * offset size + 8 = cache type (4) and reserved (4) past the two
+    # address-sized fields, i.e. the first scratch-pad word.
+    scratch = ent + 2 * 8 + 8
+    if struct.unpack_from("<I", raw, scratch)[0] >= seg_size:
+        raise RuntimeError("the base file's soft link value offset is already "
+                           "out of bounds; the fixture would prove nothing")
+    off = seg_size + 16
+    if seg_addr + off >= len(raw):
+        raise RuntimeError("chosen offset leaves the file, so the fixture would "
+                           "test the wrong bound")
+    struct.pack_into("<I", raw, scratch, off)
+    _patch(path, bytes(raw))
+
+
 def _make_bad_heap_segment(path):
     """Old-style group whose local heap declares a ~1 TB data-segment size, far
     past the file; libhdf5 rejects the oversized heap segment."""
@@ -6374,6 +6506,50 @@ def _make_chunk_internal_separator_order(path, base_path):
             f"separator parse looks wrong: {first} then {second} not increasing")
     for w in range(ndims):
         struct.pack_into("<Q", raw, k1 + 8 + 8 * w, first[w])
+    _patch(path, bytes(raw))
+
+
+def _make_compound_member_overlap(path):
+    """Two compound members whose byte extents overlap.
+
+    Members must occupy disjoint bytes of the parent element.  libhdf5 tests this
+    pairwise while decoding the datatype and refuses outright -- its own comment
+    says an overlap "probably indicates that the file is corrupt"
+    (H5Odtype.c:594-610) -- so a file failing it is one no reader can open the
+    dataset from.  h5policy accepted such files until
+    datatype.compound_members_disjoint landed; this fixture came out of triaging
+    corpus files libhdf5 refused to read while h5policy said accept.
+
+    The second member's OFFSET is moved back onto the first, rather than its size
+    being grown.  That keeps both members inside the parent element, so the
+    pre-existing datatype.compound_member_bounds rule stays satisfied and the
+    only broken rule is disjointness -- otherwise the fixture would be caught by
+    the older check and prove nothing about the new one.
+
+    The offset field's width is version-dependent: a version-1 compound stores it
+    in 4 bytes, and later versions shrink it to the smallest width that holds the
+    parent size.  The generator asserts it read the expected original offset
+    before patching, so a datatype-version change fails loudly instead of
+    silently writing into a neighbouring field.
+    """
+    values = np.zeros(4, dtype=[("a", "i4"), ("b", "i4")])
+    values["a"] = np.arange(4)
+    values["b"] = np.arange(4) + 100
+    raw = _base_bytes(lambda h: h.create_dataset("d", data=values),
+                      libver="earliest")
+
+    # Locate the compound's second member by its NUL-terminated name, then the
+    # 4-byte offset field that follows the name padding in a version-1 compound.
+    at = raw.find(b"b\x00")
+    if at < 0:
+        raise RuntimeError("could not locate member 'b' in the datatype message")
+    # v1 pads each member name to an 8-byte boundary; the offset follows.
+    name_end = at + 8
+    off = struct.unpack_from("<I", raw, name_end)[0]
+    if off != 4:
+        raise RuntimeError(
+            f"expected member 'b' at offset 4, read {off} -- datatype layout changed")
+    struct.pack_into("<I", raw, name_end, 2)     # overlap 'a' at [0,4)
     _patch(path, bytes(raw))
 
 

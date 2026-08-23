@@ -344,33 +344,51 @@ fun h5policy_walk_snod = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                 h5policy_emit_error("H5_CORRUPT_SYMBOL_TABLE_CACHE_TYPE",
                                     "corrupt", eoff#B, parent_path,
                                     "symbol table entry has an unknown cache type");
+            /* THE NAME BELONGS TO THE ENTRY, not to whether the entry has a
+               followable object header.  libhdf5's H5G__ent_to_link
+               (src/H5Gent.c:379-385) resolves the name through
+               H5HL_offset_into and rejects an empty one for EVERY entry it
+               converts -- any cache type, whatever the address field holds.
+               These two checks used to sit inside the `cache_type != 2` branch
+               and, deeper, inside a "object header defined and in file" gate, so
+               three kinds of entry escaped them entirely: a soft link (cache
+               type 2, which has no object header at all), an entry with an
+               undefined address, and one whose address is out of file.
+               MEASURED on two corpus specimens: a symbol table whose soft-link
+               entry names heap offset 0, where the name is the empty string.
+               libhdf5 refuses the file ("invalid link name"); h5policy accepted
+               it, because the empty name sat behind the cache-type gate.
+               Only the ENQUEUE is a property of having an object header, so only
+               the enqueue stays gated below.  */
+            var name_off = h5policy_msg_u64_at(ios, profile, eoff#B, o);
+            var entry_name = "";
+            if (name_off >= h5policy_heap_data_seg_size)
+                h5policy_emit_error("H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS",
+                                    "corrupt", eoff#B, parent_path,
+                                    "link name offset is beyond the local heap data segment");
+            else
+                {
+                    entry_name = h5policy_heap_name(ios, profile, data_seg_addr,
+                                                    name_off, file_size);
+                    if (entry_name == "")
+                        h5policy_emit_error("H5_CORRUPT_LINK_NAME_EMPTY",
+                                            "corrupt", eoff#B, parent_path,
+                                            "symbol table entry link name is empty");
+                }
+
             if (cache_type != 2UL)   /* 2 = symbolic (soft) link: no object header */
                 {
-                    var name_off = h5policy_msg_u64_at(ios, profile, eoff#B, o);
                     var ohdr_raw = h5policy_msg_bytes(ios, profile, eoff#B + o#B, o);
                     var ohdr_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(ohdr_raw));
-
-                    if (name_off >= h5policy_heap_data_seg_size)
-                        h5policy_emit_error("H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS",
-                                            "corrupt", eoff#B, parent_path,
-                                            "link name offset is beyond the local heap data segment");
 
                     if (!h5policy_msg_addr_is_undef(ohdr_raw))
                         {
                             if (ohdr_addr < file_size)
                                 {
-                                    var name = h5policy_heap_name(ios, profile,
-                                                                  data_seg_addr,
-                                                                  name_off, file_size);
-                                    if (name == "")
-                                        h5policy_emit_error("H5_CORRUPT_LINK_NAME_EMPTY",
-                                                            "corrupt", eoff#B,
-                                                            parent_path,
-                                                            "symbol table entry link name is empty");
-                                    else
+                                    if (entry_name != "")
                                         h5policy_enqueue_ohdr(profile, ohdr_addr,
                                                               obj_depth + 1UL,
-                                                              h5policy_join_path(parent_path, name),
+                                                              h5policy_join_path(parent_path, entry_name),
                                                               eoff#B, parent_path);
                                 }
                             else
@@ -378,6 +396,37 @@ fun h5policy_walk_snod = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                                     "corrupt", eoff#B, parent_path,
                                                     "symbol table entry object header address outside file");
                         }
+                }
+            else
+                {
+                    /* A SOFT LINK'S TARGET PATH lives in the same local heap as
+                       the names, and the entry's scratch pad names it: a 4-byte
+                       little-endian offset (H5Gent.c:155, UINT32DECODE into
+                       cache.slink.lval_offset) at the start of the 16-byte
+                       scratch field, so 2*o + 8 into the entry.
+
+                       libhdf5 resolves it through the same H5HL_offset_into as
+                       the name (H5Gent.c:391), whose bound at H5HL.c:391 is a
+                       real error return, not an assert -- so an offset past the
+                       data segment makes the open fail.  h5policy read no part
+                       of the scratch pad at all, so this was accepted outright.
+                       MEASURED: patching this field past the segment gives
+                       `rejected_in_traversal` from libhdf5 2.3.0 and an internal
+                       error from h5dump, while h5policy said accept.
+
+                       BOUND ONLY, DO NOT REQUIRE NON-EMPTY.  The name is
+                       strndup'd and then rejected when empty (H5Gent.c:382-385);
+                       the VALUE is strndup'd with no such check
+                       (H5Gent.c:395-396).  An empty soft-link target is a
+                       dangling link, which libhdf5 accepts, so demanding a
+                       non-empty value here would be a false positive.  */
+                    var lval_scratch = eoff + (2UL * o) + 8UL;
+                    var lval_off = h5policy_msg_u64_at(ios, profile,
+                                                       lval_scratch#B, 4UL);
+                    if (lval_off >= h5policy_heap_data_seg_size)
+                        h5policy_emit_error("H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS",
+                                            "corrupt", lval_scratch#B, parent_path,
+                                            "soft link value offset is beyond the local heap data segment");
                 }
             i = i + 1UL;
         }
