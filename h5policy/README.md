@@ -352,6 +352,12 @@ workflows, and a detailed explanation of the differential cross-invariants.
   installed HDF5 tools and triages crashers with h5policy.
 - [`tools/h5policy-fuzzlib`](tools/h5policy-fuzzlib): shared fuzzing engine
   (mutation strategies, seed loading, guided corpus) imported by both fuzzers.
+  Its `struct` strategy edits a field inside a checksummed block and repairs the
+  block's checksum, for blocks whose extent is derivable. `struct_deep` does the
+  same for the ones that size themselves from elsewhere -- v2 B-tree nodes,
+  continuation chunks, section lists, fractal-heap blocks -- locating each by
+  verifying its trailing Jenkins checksum instead of deriving the extent, which
+  is what puts the v2 B-tree walkers within the fuzzer's reach at all.
 - [`tools/h5policy-gencorpus`](tools/h5policy-gencorpus): regenerates the valid,
   malformed, policy, resource, coverage, integration, and CVE regression
   fixtures. Cache-image helper executables automatically match an

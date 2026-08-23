@@ -175,6 +175,65 @@ def mut_dict(data, rng):
 # 4 bytes are lookup3_hashlittle(body, 0) over everything before them.
 CKSUM_SIGS = (b"OHDR", b"BTHD", b"FAHD", b"EAHD", b"FRHP")
 
+# The blocks above are reachable because their extent is CLOSED-FORM -- derivable
+# from the block itself plus the superblock widths.  The rest of the format's
+# checksummed structures are not: a v2 B-tree node's record count lives in its
+# PARENT's child pointer, a continuation chunk's size lives in the message that
+# points at it, a section list's size lives in its free-space header.  Deriving
+# those needs a walker per structure, which is why `struct` could not reach any
+# of them -- and they are where most of the validation lives (every dense-link,
+# dense-attribute, chunk-index and shared-message walker is a v2 B-tree walk).
+#
+# They do not need a walker.  A trailing Jenkins checksum is self-locating: scan
+# forward until the stored four bytes equal the hash of everything before them,
+# and that offset IS the block end.  One coincidental match costs 2**-32 per
+# candidate offset, so a hit is the real boundary.  This buys the whole set for
+# one helper instead of a walker each.
+PROBED_SIGS = (b"BTLF", b"BTIN", b"OCHK", b"SMTB", b"FSHD", b"FSSE",
+               b"FHDB", b"FHIB", b"EADB", b"EAIB", b"EASB", b"FADB")
+
+PROBE_MIN = 12          # signature + version + a field + checksum
+PROBE_LIMIT = 1024      # scan bound; nodes in the corpus are 512 bytes
+PROBE_BUDGET = 2        # probed candidates tried per mutation, at most
+
+# (signature, offset) -> span.  A probe is O(span**2) in hashing, so the span is
+# remembered: a mutant differs from its parent in a few bytes, `struct` reseals
+# whatever it mutates, and every other block keeps the span its parent had -- so
+# after the first sighting the cache hit costs one hash.
+_PROBE_SPANS = {}
+
+
+def probe_extent(b, off, sig):
+    """End offset of a checksummed block whose extent is NOT self-describing,
+    found by verifying the trailing checksum rather than by deriving it."""
+    span = _PROBE_SPANS.get((sig, off))
+    if span is not None and off + span <= len(b):
+        end = off + span
+        if int.from_bytes(b[end - 4:end], "little") \
+                == jenkins_lookup3(bytes(b[off:end - 4])):
+            return end
+    hi = min(len(b), off + PROBE_LIMIT)
+    for end in range(off + PROBE_MIN, hi + 1):
+        if int.from_bytes(b[end - 4:end], "little") \
+                == jenkins_lookup3(bytes(b[off:end - 4])):
+            _PROBE_SPANS[(sig, off)] = end - off
+            return end
+    return None
+
+
+def probed_candidates(b):
+    """Every occurrence of a probed signature, WITHOUT hashing.  Most will
+    verify; a signature that appears inside raw data will not, and is skipped
+    when the probe is actually run."""
+    out = []
+    for sig in PROBED_SIGS:
+        i = b.find(sig)
+        while i != -1:
+            if i + PROBE_MIN <= len(b):
+                out.append((i, sig))
+            i = b.find(sig, i + 1)
+    return out
+
 
 def superblock_ol(b):
     """(size_of_offsets, size_of_lengths) from the superblock, or None."""
@@ -252,6 +311,12 @@ def mutable_offsets(b, start, end, sig):
     elif sig == b"FRHP":
         forbid = {start + 7, start + 8}
     else:
+        # Fixed-extent and PROBED blocks alike: nothing inside them moves the
+        # span this mutation reseals.  A probed block's span was verified, not
+        # derived, so a field that changes how the READER sizes the block (a
+        # node's record count, say, which lives in its parent) can still make the
+        # mutant die at the gate -- that is a wasted mutation, not a wrong one,
+        # and the coverage measurement below is what says whether it pays.
         return range(lo, hi)
     return [i for i in range(lo, hi) if i not in forbid]
 
@@ -284,6 +349,66 @@ def mut_struct(data, rng):
     return b
 
 
+def mut_struct_deep(data, rng):
+    """`struct`, but for the blocks whose extent is not self-describing.
+
+    A SEPARATE strategy rather than an extension of `struct`.  Measured on
+    valid/sohm_btree.h5 with --coverage-only, counting distinct finding codes:
+
+      struct alone, HEAD and here          400 iters   43
+      one strategy, both pools 50/50       400 iters   63
+      struct + struct_deep                 400 iters   61
+      one strategy, choice weighted by pool membership
+                                            80 iters   24   (vs 40 for 50/50)
+
+    Two readings matter.  Weighting by membership starves the probed pool: a
+    shared-message seed offers twenty probed candidates to five closed-form
+    blocks, so proportional choice spends the budget where the signatures are
+    rather than where the reach is.  And folding both pools into one strategy
+    costs closed-form reach -- codes `struct` reaches alone stop appearing, and
+    they did not come back at five times the budget, so it is the halved
+    closed-form share and not sampling noise.
+
+    Splitting the strategies does NOT make the new reach free.  The driver picks
+    one strategy per iteration, so adding any strategy dilutes every other one at
+    a fixed --iters, which is why the pair at 400 still reaches fewer
+    closed-form codes than `struct` alone at 400.  That is a budget property of
+    the whole table, not of this strategy.  What the split does buy is that
+    `--strategy struct` still means exactly what it meant before, and that an
+    operator can aim a run at either pool instead of at a hardcoded coin flip.
+    """
+    b = bytearray(data)
+    if superblock_ol(b) is None:
+        return None
+    cands = probed_candidates(b)
+    if not cands:
+        return None
+    rng.shuffle(cands)
+    picked = None
+    for off, sig in cands[:PROBE_BUDGET]:
+        end = probe_extent(b, off, sig)
+        if end is not None and end - 4 > off + 4:
+            picked = (off, end, sig)
+            break
+    if picked is None:
+        return None
+    start, end, sig = picked
+    pool = mutable_offsets(b, start, end, sig)
+    if not pool:
+        return None
+    for _ in range(rng.randint(1, 3)):
+        i = rng.choice(pool)
+        how = rng.choice(["interesting", "delta", "wild"])
+        if how == "interesting":
+            b[i] = rng.choice(INTERESTING)
+        elif how == "delta":
+            b[i] = (b[i] + rng.choice([-8, -1, 1, 8])) & 0xFF
+        else:
+            b[i] = rng.getrandbits(8)
+    b[end - 4:end] = jenkins_lookup3(bytes(b[start:end - 4])).to_bytes(4, "little")
+    return b
+
+
 MUTATORS = {
     "bitflip": mut_bitflip,
     "interesting": mut_interesting,
@@ -291,6 +416,7 @@ MUTATORS = {
     "super": mut_super,
     "dict": mut_dict,
     "struct": mut_struct,
+    "struct_deep": mut_struct_deep,
 }
 
 
