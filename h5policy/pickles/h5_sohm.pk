@@ -53,7 +53,8 @@ fun h5policy_validate_sohm_v2_records = (
     int ios, H5PolicyProfile profile, uint<64> records_addr, uint<64> nrec,
     uint<64> record_type, uint<64> record_size, uint<64> types,
     uint<64> nfilters, uint<64> storage_heap_addr, uint<64> huge_key_size,
-    uint<64> max_man_size, uint<64> file_size, string object) void:
+    uint<64> max_man_size, uint<64> decode_extent,
+    uint<64> file_size, string object) void:
 {
     var o = global_sizeof_offsets as uint<64>;
     var el = global_sizeof_lengths as uint<64>;
@@ -187,6 +188,34 @@ fun h5policy_validate_sohm_v2_records = (
                        (src/H5HFhuge.c:753-761), and the two are never related.
                        A zero size is already reported above, so it is excluded
                        here rather than counted twice.  */
+                    /* The equality arm.  libhdf5 reads the record's STORED
+                       length, hands it to the pipeline, then overwrites the
+                       object size with whatever the pipeline returns and copies
+                       THAT many bytes into a buffer the caller sized from the
+                       record's declared decoded size (src/H5HFhuge.c:749-761).
+                       Two lengths in one record, never compared.  h5policy will
+                       not run the transform, but where the transform's output
+                       extent is a function of its client data the expectation is
+                       arithmetic on metadata -- so require equality then, and
+                       stay silent when the extent is not decidable.  */
+                    if (decode_extent != 0UL && decoded != 0UL
+                        && (record_type == 2UL || record_type == 4UL)
+                        && decoded != decode_extent)
+                        h5policy_emit_error_ev(
+                            "H5_CORRUPT_SOHM_FILTERED_HUGE_DECODED_SIZE",
+                            "corrupt", decoded_off, object,
+                            "filtered SOHM huge object's decoded size differs from its pipeline's output extent",
+                            H5Evidence {
+                                field = "huge.filtered_decoded_size",
+                                actual = decoded,
+                                expected = decode_extent,
+                                comparison = "equal",
+                                has_loc1 = 1, loc1_role = "actual",
+                                loc1 = decoded_off, loc1_len = el,
+                                has_loc2 = 1, loc2_role = "expected",
+                                loc2 = h5policy_heap_decode_extent_offset#B,
+                                loc2_len = 4UL,
+                            });
                     if (max_man_size != 0UL && decoded != 0UL
                         && decoded <= max_man_size)
                         h5policy_emit_error_ev(
@@ -215,7 +244,8 @@ fun h5policy_walk_sohm_v2_btree = (
     int ios, H5PolicyProfile profile, H5WalkContext ctx,
     uint<64> btree_addr, uint<64> expected_type, uint<64> types,
     uint<64> nfilters, uint<64> storage_heap_addr, uint<64> huge_key_size,
-    uint<64> max_man_size, uint<64> expected_total, uint<8> enforce_total,
+    uint<64> max_man_size, uint<64> decode_extent,
+    uint<64> expected_total, uint<8> enforce_total,
     off64 loc, string object) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
@@ -364,7 +394,8 @@ fun h5policy_walk_sohm_v2_btree = (
                 h5policy_validate_sohm_v2_records(
                     vios, vprofile, vrecords_addr, vnrec, record_type,
                     record_size, types, nfilters, storage_heap_addr,
-                    huge_key_size, max_man_size, vfile_size, vobject);
+                    huge_key_size, max_man_size, decode_extent,
+                    vfile_size, vobject);
             },
     };
     return h5policy_walk_v2_btree_node(
@@ -378,11 +409,11 @@ fun h5policy_validate_sohm_huge_objects = (
     int ios, H5PolicyProfile profile, H5WalkContext ctx,
     uint<64> btree_addr, uint<64> expected_type, uint<64> nfilters,
     uint<64> storage_heap_addr, uint<64> huge_key_size, uint<64> max_man_size,
-    off64 loc, string object) H5WalkContext:
+    uint<64> decode_extent, off64 loc, string object) H5WalkContext:
 {
     return h5policy_walk_sohm_v2_btree(
         ios, profile, ctx, btree_addr, expected_type, 0UL, nfilters,
-        storage_heap_addr, huge_key_size, max_man_size,
+        storage_heap_addr, huge_key_size, max_man_size, decode_extent,
         0UL, 0UB, loc, object);
 }
 
@@ -458,14 +489,26 @@ fun h5policy_validate_sohm_heap_envelope = (
     if (ctx.metadata_count_exceeded != 0UB)
         return ctx;
     var nfilters = 0UL;
+    /* The pipeline-extent capture is per HEAP and a file may name several, so
+       clear it for EVERY heap rather than only inside the filtered branch: an
+       unfiltered heap that inherited a previous heap's extent would carry a
+       stale expectation into its own records.  Nothing downstream can currently
+       reach that -- an unfiltered heap's records are type 1 or 3 and the check
+       requires 2 or 4 -- but the ordering should not be what makes it safe.  */
+    h5policy_heap_decode_extent = 0UL;
+    h5policy_heap_decode_extent_offset = 0UL;
+    h5policy_heap_decode_filters = 0UL;
+    h5policy_heap_decode_undecidable = 0UB;
     if (filter_len != 0UL)
         {
             var pipeline_off = h5policy_frhp_filter_pipeline_off(heap_addr);
             if (filter_len >= 2UL)
                 nfilters = h5policy_msg_u64_at(ios, profile,
                                                pipeline_off + 1#B, 1UL);
+            /* Mode 2: have the pipeline decoder record the decoded extent its
+               client data implies, for the huge-object decoded-size check below.  */
             h5policy_validate_filter_pipeline_payload(ios, profile, pipeline_off,
-                                                       filter_len, object, 0,
+                                                       filter_len, object, 2,
                                                        "SOHM filtered heap");
             if ((flags & 2UL) == 0UL)
                 h5policy_emit_error("H5_CORRUPT_FILTERED_HEAP_NO_DBLOCK_CHECKSUM",
@@ -487,11 +530,19 @@ fun h5policy_validate_sohm_heap_envelope = (
                the floor every huge object's decoded size must clear.  */
             var max_man_size = h5policy_msg_u64_at(ios, profile,
                                                    heap_addr#B + 10#B, 4UL);
+            /* The pipeline's implied decoded extent is usable only when ONE
+               filter was seen and none was undecidable; otherwise 0 leaves the
+               record's declared size unchecked against it, which is the correct
+               fallback -- the advisory already tells a consumer it must decode.  */
+            var decode_extent = 0UL;
+            if (h5policy_heap_decode_filters == 1UL
+                && h5policy_heap_decode_undecidable == 0UB)
+                decode_extent = h5policy_heap_decode_extent;
             ctx = h5policy_validate_sohm_huge_objects(
                 ios, profile, ctx,
                 hdf5_addr_to_file_u64(bytes_to_u64_le(huge_raw)),
                 expected_type, nfilters, heap_addr, huge_key_size,
-                max_man_size, heap_addr#B, object);
+                max_man_size, decode_extent, heap_addr#B, object);
         }
     return ctx;
 }
@@ -552,7 +603,7 @@ fun h5policy_validate_sohm_list = (
         return ctx;
     h5policy_validate_sohm_v2_records(
         ios, profile, addr + 4UL, nmessages, 7UL, entry_size,
-        types, 0UL, 0UL, 0UL, 0UL, file_size, object);
+        types, 0UL, 0UL, 0UL, 0UL, 0UL, file_size, object);
     return ctx;
 }
 
@@ -685,7 +736,7 @@ fun h5policy_validate_sohm_payload = (
             else if (it == 1UL && !h5policy_msg_addr_is_undef(index_raw))
                 ctx = h5policy_walk_sohm_v2_btree(
                     ios, profile, ctx, index_addr, 7UL, types, 0UL,
-                    0UL, 0UL, 0UL, nmessages, 1UB, p#B, object);
+                    0UL, 0UL, 0UL, 0UL, nmessages, 1UB, p#B, object);
             if (ctx.metadata_count_exceeded != 0UB)
                 return ctx;
             i = i + 1UL;

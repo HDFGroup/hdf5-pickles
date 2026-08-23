@@ -248,8 +248,8 @@ and the family canary. The tracked exact-build evidence separately records that
 source-derived, its classification mapping is curated, and the corpus and
 exact-build outcomes are measured corroboration.
 
-Registry checks currently account for **319 finding codes** and **0 semantic-
-backlog entries**. Static enumeration resolves **979 in-pickle message
+Registry checks currently account for **320 finding codes** and **0 semantic-
+backlog entries**. Static enumeration resolves **980 in-pickle message
 variants**, with **0 unrouted** and **0 unanalyzable** variants. That is complete
 classification coverage for the current emission surface, not complete
 invariant coverage for the HDF5 format.
@@ -258,7 +258,7 @@ invariant coverage for the HDF5 format.
 
 It is broad and explicitly measured, but it is not complete.
 
-The current invariant manifest contains **391 named invariants across 16
+The current invariant manifest contains **392 named invariants across 16
 selected record families**. Those families are security-oriented groupings,
 not a claim that every legal HDF5 representation, payload behavior, or
 application activation has been modeled.
@@ -275,15 +275,19 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **54
-are `met`, 43 `partial`, 52 `not_assessed`, and 27 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **56
+are `met`, 67 `partial`, 26 `not_assessed`, and 27 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 
 - dedicated typed fuzz targets for only 1 of 16 families and no repository
   OSS-Fuzz integration;
 - family-by-family boundary, overflow/allocation, nesting, and progress cases
-  that are still partial or not assessed;
+  that are still partial or not assessed. Reviewed fixture annotations now
+  classify most of these: `count_and_extent_boundaries` is `not_assessed` for
+  only 2 families of 16, but `met` for 1, so what the sweep mostly established
+  is which boundary values the corpus genuinely lacks -- `n` and `n_minus_1` are
+  thin almost everywhere, and `allocation_budget` exists for one family;
 - truncation coverage that is met for 12 families, sampled/partial for 4, and
   absent for 0;
 - lazy-validation behavior measured for the oracle as a whole, but not yet

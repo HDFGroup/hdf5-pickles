@@ -148,17 +148,21 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 | `absent` | mechanically demonstrated to be missing |
 | `not_assessed` | not determinable from artifacts; needs classification |
 
-**54 of 176 requirement-slots are currently `met`.** The distribution matters
+**56 of 176 requirement-slots are currently `met`.** The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
 - Lazy validation is `partial` everywhere: measured, and holding, but on the
   oracle as a whole rather than family by family.
-- Reviewed fixture/recipe annotations now supply some boundary, arithmetic, and
-  progress evidence. Most families remain `not_assessed` in those columns:
-  13 for count/extent boundaries and 14 each for integer-overflow/allocation
-  budget and deep-nesting/non-progress. Missing categories are deliberately not
-  inferred from finding-code spelling.
+- Reviewed fixture/recipe annotations now carry most of the boundary,
+  arithmetic, nesting and reference-semantics evidence: `not_assessed` in those
+  four columns is down to 2, 9, 9 and 6 families respectively. The annotations
+  are a review of what each fixture's documented mechanism actually exercises,
+  never an inference from finding-code spelling, which is why a family with many
+  fixtures can still be `not_assessed` -- version, flag and checksum fixtures
+  exercise none of these categories. What the sweep establishes is mostly which
+  boundary VALUES the corpus lacks: `n` and `n_minus_1` are thin nearly
+  everywhere, and `allocation_budget` is demonstrated for one family.
 - Dedicated fuzz targets exist for 1 family of 16.
 - 14 families pin evidence locations as well as finding codes; the remaining
   2 need cursor arithmetic at the emit site rather than test metadata.

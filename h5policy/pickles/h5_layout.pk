@@ -1078,10 +1078,81 @@ fun h5policy_nbit_walk_params = (int ios, H5PolicyProfile profile,
 /* Validate the filter-pipeline message envelope.  Filter definitions are
    metadata; actual decode/decompression is intentionally outside h5policy's
    boundary and is reported as an advisory or policy finding.  */
-/* `record_decode_nelmts` is set only on the dataset dispatch path: when true the
-   walk records an n-bit/scale-offset filter's cd_values[2] (the chunk element
-   count) into h5policy_pipeline_decode_nelmts for the finalize-time consistency
-   check.  Fractal-heap pipeline checks pass false so dense storage can't seed it.  */
+/* `record_decode_nelmts` selects which capture the walk feeds, and the three
+   modes must stay disjoint -- a heap pipeline seeding a DATASET's chunk
+   consistency check was the original reason this parameter exists:
+     0  record nothing (dense link/attr heaps: their pipelines are validated
+        structurally, and nothing downstream consumes an extent from them)
+     1  dataset dispatch path: record an n-bit/scale-offset filter's cd_values[2]
+        (the chunk element count) and cd_values[4] into
+        h5policy_pipeline_decode_nelmts / _decode_size for the finalize-time
+        consistency check
+     2  filtered fractal-heap path: record the pipeline's implied decoded extent
+        into h5policy_heap_decode_extent, for the huge-object decoded-size check.
+        Only the SOHM heap uses this, because only its huge-object index is
+        walked.  */
+/* Record what a FILTERED FRACTAL-HEAP pipeline's declared output extent would
+   be, for the one filter class where that is a function of client data rather
+   than of the data itself.  Never runs a transform.
+
+   Both size-computable built-ins have the same shape -- output is
+   cd_values[2] * cd_values[4], an element count times an element size:
+     n-bit (5)        size_out = d_nelmts * cd_values[4]   (H5Znbit.c:949)
+     scale-offset (6) size_out = d_nelmts * p.size         (H5Zscaleoffset.c:1217)
+   and both have a PASS-THROUGH branch on which the output is instead the input
+   length, which no metadata makes computable:
+     n-bit        cd_values[1] nonzero            (H5Znbit.c:941)
+     scale-offset scale_type is H5Z_SO_INT (2) and the scale factor equals
+                  cd_values[4] * 8                (H5Zscaleoffset.c:1188)
+   Scale-offset's H5Z_SO_FLOAT_ESCALE (1) is rejected outright by libhdf5
+   (H5Zscaleoffset.c:1177), so it is not a decidable extent either.
+   n-bit puts a self-describing type tree at cd_values[3..], so cd_values[4] is a
+   flat element size ONLY when the root type is atomic (cd_values[3] == 1); on a
+   compound or array root it is structural and the product means nothing.  The
+   dataset-side capture makes the same distinction for the same reason.
+   Deflate, szip and every dynamically registered filter are undecidable by
+   construction: their output length is discovered by decompressing.  */
+fun h5policy_pipeline_record_heap_extent = (int ios, H5PolicyProfile profile,
+                                            uint<64> filter_id,
+                                            offset<uint<64>,B> cd_base,
+                                            uint<64> cd_nelmts) void:
+{
+    h5policy_heap_decode_filters = h5policy_heap_decode_filters + 1UL;
+    if ((filter_id != 5UL && filter_id != 6UL) || cd_nelmts < 5UL)
+        {
+            h5policy_heap_decode_undecidable = 1UB;
+            return;
+        }
+    var v1 = h5policy_msg_u64_at(ios, profile, cd_base + 4#B, 4UL);
+    var v2 = h5policy_msg_u64_at(ios, profile, cd_base + 8#B, 4UL);
+    var v3 = h5policy_msg_u64_at(ios, profile, cd_base + 12#B, 4UL);
+    var v4 = h5policy_msg_u64_at(ios, profile, cd_base + 16#B, 4UL);
+    var decidable = 1;
+    if (filter_id == 5UL)
+        {
+            if (v1 != 0UL || v3 != 1UL)      /* pass-through, or structural size */
+                decidable = 0;
+        }
+    else
+        {
+            var scale_type = h5policy_msg_u64_at(ios, profile, cd_base, 4UL);
+            if (scale_type == 1UL)                       /* E-scale: libhdf5 errors */
+                decidable = 0;
+            else if (scale_type == 2UL && v1 == v4 * 8UL) /* full precision: verbatim */
+                decidable = 0;
+        }
+    /* The product itself must not wrap the 64-bit accumulator; if it would, the
+       extent is not a usable expectation and the record is left undecided.  */
+    if (!decidable || v2 == 0UL || v4 == 0UL
+        || v2 > 0xffffffffffffffffUL / v4)
+        {
+            h5policy_heap_decode_undecidable = 1UB;
+            return;
+        }
+    h5policy_heap_decode_extent = v2 * v4;
+    h5policy_heap_decode_extent_offset = (cd_base + 8#B)/#B;
+}
+
 /* A filter pipeline is encoded identically wherever it appears, so this one
    decoder serves four clients: a dataset's object-header PLINE message
    (h5_dispatch.pk) and the pipeline embedded in a filtered fractal heap header
@@ -1410,7 +1481,14 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                whole descriptor, client data included, is confirmed in range
                above) for the chunk-consistency check at object finalization,
                where the chunk element count is known regardless of message order.  */
-            if (record_decode_nelmts != 0
+            /* Mode 2 is a heap pipeline: record the extent its client data
+               implies, for EVERY filter, because an undecidable one has to latch
+               the poison flag rather than be skipped.  */
+            if (record_decode_nelmts == 2)
+                h5policy_pipeline_record_heap_extent(
+                    ios, profile, filter_id,
+                    payload_off + (cur + desc_header + name_len)#B, cd_nelmts);
+            if (record_decode_nelmts == 1
                 && (filter_id == 5UL || filter_id == 6UL) && cd_nelmts >= 3UL)
                 {
                     var d_nelmts_off = payload_off
