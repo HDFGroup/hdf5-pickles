@@ -249,6 +249,116 @@ def recipe_alias_prior_chunk(raw, ch):
     return changed, resealed, "continuation aliases an already-decoded chunk"
 
 
+# ---- fractal-heap doubling table (heap_structures) --------------------------
+# The second family, and the one that made the engine's shape general: its
+# locator finds a structure by signature rather than by walking a chain from the
+# superblock, and its reseal is a single trailing checksum rather than an
+# enclosing object header.  Nothing in the continuation family had to change to
+# accommodate it, which is the property the split exists to give.
+
+def reseal_frhp(raw, off, chksum_off):
+    struct.pack_into("<I", raw, chksum_off, JENKINS(bytes(raw[off:chksum_off])))
+    return ("FRHP", off)
+
+
+def locate_frhp(raw):
+    """The first fractal-heap header, with the offsets of its doubling-table
+    fields and its own trailing checksum.
+
+    Field order is the format's (pickles/fheap.pk fheap_hdr): a fixed 14-byte
+    prefix, ten length-sized and two offset-sized counters, then the doubling
+    table.  A filtered heap carries three more fields before the checksum, so
+    the checksum offset is computed rather than assumed.
+    """
+    off = raw.find(b"FRHP")
+    if off < 0:
+        raise ValueError("no fractal-heap header in this seed")
+    if raw[off + 4] != 0:
+        raise ValueError("unsupported fractal-heap header version")
+    soff, loff = raw[9], raw[10]
+    filter_len = struct.unpack_from("<H", raw, off + 7)[0]
+    dtable = off + 14 + (10 * loff) + (2 * soff)
+    body = 14 + (2 * soff) + (10 * loff) + (8 + 2 * loff + soff)
+    if filter_len:
+        body += loff + 4 + filter_len
+    chksum = off + body
+    if chksum + 4 > len(raw):
+        raise ValueError("fractal-heap header runs past the seed")
+    width = struct.unpack_from("<H", raw, dtable)[0]
+    start = int.from_bytes(raw[dtable + 2:dtable + 2 + loff], "little")
+    return {
+        "off": off, "soff": soff, "loff": loff, "chksum": chksum,
+        "width_off": dtable, "start_off": dtable + 2,
+        "max_direct_off": dtable + 2 + loff,
+        "max_heap_bits_off": dtable + 2 + 2 * loff,
+        "width": width, "start": start,
+    }
+
+
+def _frhp_edit(raw, fh, off, width, value):
+    changed = [_set_uint(raw, off, width, value)]
+    return changed, [reseal_frhp(raw, fh["off"], fh["chksum"])]
+
+
+def _log2_exact(n):
+    """floor(log2(n)); the caller only uses it on powers of two."""
+    b = -1
+    while n:
+        n >>= 1
+        b += 1
+    return b
+
+
+def recipe_frhp_width_zero(raw, fh):
+    changed, resealed = _frhp_edit(raw, fh, fh["width_off"], 2, 0)
+    return changed, resealed, "doubling-table width of zero"
+
+
+def recipe_frhp_width_not_power_of_two(raw, fh):
+    changed, resealed = _frhp_edit(raw, fh, fh["width_off"], 2, 3)
+    return changed, resealed, "doubling-table width of 3, which is not a power of two"
+
+
+def _first_row_bits(fh):
+    """Bits addressed by the doubling table's first row: log2(start block size)
+    + log2(width).  libhdf5 derives max_root_rows by subtracting this from the
+    declared maximum heap size in bits, so a declared size below it underflows
+    (H5HFdtable.c)."""
+    if fh["width"] == 0 or fh["start"] == 0:
+        return None
+    return _log2_exact(fh["start"]) + _log2_exact(fh["width"])
+
+
+def recipe_frhp_no_root_rows(raw, fh):
+    bits = _first_row_bits(fh)
+    if bits is None or bits < 1:
+        return None
+    changed, resealed = _frhp_edit(raw, fh, fh["max_heap_bits_off"], 2, bits - 1)
+    return changed, resealed, "declared heap size exactly one bit under the first row"
+
+
+def recipe_frhp_first_row_overflow(raw, fh):
+    bits = _first_row_bits(fh)
+    if bits is None or bits < 2:
+        return None
+    changed, resealed = _frhp_edit(raw, fh, fh["max_heap_bits_off"], 2, bits - 2)
+    return changed, resealed, "declared heap size two bits under the first row, wrapping max_root_rows"
+
+
+# NOT A RECIPE: a start block size of one byte (below a direct block's own
+# prefix) was tried and REJECTED as unsound for this engine.  Measured on four
+# heap-bearing seeds -- valid/dense_links.h5, valid/dense_attribute.h5,
+# valid/sohm_btree.h5, coverage/sohm_huge_btree.h5 -- it never produced the
+# intended H5_CORRUPT_LENGTH_OVERFLOW: the dense seeds reject it as
+# H5_CORRUPT_FRACTAL_HEAP_ID instead, because every heap ID becomes unresolvable
+# before any extent is measured, and the SOHM seed does not reject it at all --
+# the resolver reports a coverage gap.  The field is consumed by several checks
+# whose order depends on the seed, so no single intended finding is a sound
+# contract for it, which is exactly what a typed recipe has to promise.  The
+# committed malformed/dblock_size_below_floor.h5 fixture stays the right
+# instrument for that invariant, because it pins one base file.
+
+
 # recipe name -> (fn, intended invariant, intended finding)
 RECIPES = {
     "cont_overlap_source_start":
@@ -272,23 +382,77 @@ RECIPES = {
 }
 
 
+FRHP_RECIPES = {
+    "frhp_width_zero":
+        (recipe_frhp_width_zero, "heap.fractal_doubling_table",
+         "H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE"),
+    "frhp_width_not_power_of_two":
+        (recipe_frhp_width_not_power_of_two, "heap.fractal_doubling_table",
+         "H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE"),
+    "frhp_no_root_rows":
+        (recipe_frhp_no_root_rows, "heap.fractal_doubling_table",
+         "H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE"),
+    "frhp_first_row_overflow":
+        (recipe_frhp_first_row_overflow, "heap.fractal_doubling_table",
+         "H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE"),
+}
+
+
+# ------------------------------------------------------------- families -------
+# A family is a LOCATOR plus a recipe table, and the split is what lets one
+# engine serve several record families.  The locator turns a seed into whatever
+# context that family's recipes need, and raises when the seed does not carry the
+# structure at all -- a plain dataset is not a continuation seed, and that is a
+# skip, not an error.  Recipes never parse the file: they edit fields the locator
+# already found and reseal what the locator says encloses them.
+#
+# `record` names the row in registry/validation-coverage.yml whose fuzz_targets
+# block these recipes are the evidence for, so the two cannot drift silently.
+
+FAMILIES = {
+    "object_header_continuation": {
+        "record": "object_header_continuation",
+        "analyze": walk_chain,
+        "recipes": RECIPES,
+    },
+    "heap_structures": {
+        "record": "heap_structures",
+        "analyze": locate_frhp,
+        "recipes": FRHP_RECIPES,
+    },
+}
+
+ALL_RECIPES = {name: (fn, inv, finding, family)
+               for family, spec in FAMILIES.items()
+               for name, (fn, inv, finding) in spec["recipes"].items()}
+
+
+def _analyze(spec, raw):
+    """Run a family's locator, or return None when the seed does not carry its
+    structure.  Locators are allowed to fail in the ordinary parse ways."""
+    try:
+        return spec["analyze"](raw)
+    except (ValueError, AssertionError, struct.error, IndexError, KeyError):
+        return None
+
+
 def sha256(b):
     return hashlib.sha256(b).hexdigest()
 
 
 def apply_recipe(seed_bytes, name):
-    fn, invariant, finding = RECIPES[name]
+    fn, invariant, finding, family = ALL_RECIPES[name]
     raw = bytearray(seed_bytes)
-    try:
-        ch = walk_chain(raw)
-    except (ValueError, AssertionError, struct.error, IndexError):
-        return None            # seed is not a mutatable v2 continuation-bearing header
-    result = fn(raw, ch)
+    ctx = _analyze(FAMILIES[family], raw)
+    if ctx is None:
+        return None            # the seed does not carry this family's structure
+    result = fn(raw, ctx)
     if result is None:
         return None
     changed, resealed, note = result
     sidecar = {
         "recipe": name,
+        "family": family,
         "note": note,
         "parent_sha256": sha256(bytes(seed_bytes)),
         "mutant_sha256": sha256(bytes(raw)),
@@ -303,23 +467,30 @@ def apply_recipe(seed_bytes, name):
 # ------------------------------------------------------------------ cli -------
 
 def cmd_list(args):
-    seed = None
-    if args.seed:
-        try:
-            seed = walk_chain(bytearray(open(args.seed, "rb").read()))
-        except Exception as e:
-            print(f"# seed not parseable as a continuation chain: {e}")
-    for name, (_, inv, finding) in RECIPES.items():
-        note = ""
-        if seed is not None and name == "cont_alias_prior_chunk" \
-                and len(seed["edges"]) < 3:
-            note = "  (N/A: seed has < 3 continuation chunks)"
-        print(f"{name:30} {inv:34} -> {finding}{note}")
+    raw = bytearray(open(args.seed, "rb").read()) if args.seed else None
+    for family, spec in FAMILIES.items():
+        ctx = _analyze(spec, raw) if raw is not None else None
+        head = f"# {family}"
+        if raw is not None:
+            head += "  (seed carries this structure)" if ctx is not None \
+                    else "  (N/A: seed does not carry this structure)"
+        print(head)
+        for name, (fn, inv, finding) in spec["recipes"].items():
+            note = ""
+            # Applicability beyond "does the structure exist": a recipe that
+            # needs more of it than this seed has returns None, and saying so
+            # here is cheaper than a failed apply.
+            if ctx is not None:
+                probe = bytearray(raw)
+                pctx = _analyze(spec, probe)
+                if pctx is None or fn(probe, pctx) is None:
+                    note = "  (N/A for this seed)"
+            print(f"  {name:28} {inv:34} -> {finding}{note}")
     return 0
 
 
 def cmd_apply(args):
-    if args.recipe not in RECIPES:
+    if args.recipe not in ALL_RECIPES:
         sys.exit(f"h5mutate: unknown recipe {args.recipe!r}")
     seed = open(args.seed, "rb").read()
     out = apply_recipe(seed, args.recipe)
@@ -351,7 +522,12 @@ def cmd_family(args):
     os.makedirs(args.out_dir, exist_ok=True)
     rc = 0
     made = 0
-    for name in RECIPES:
+    names = [n for n, (_, _, _, fam) in ALL_RECIPES.items()
+             if args.family is None or fam == args.family]
+    if args.family is not None and args.family not in FAMILIES:
+        sys.exit(f"h5mutate: unknown family {args.family!r}; "
+                 f"known: {', '.join(FAMILIES)}")
+    for name in names:
         out = apply_recipe(seed, name)
         if out is None:
             print(f"{name:30} SKIP (not applicable to seed)")
@@ -398,6 +574,7 @@ def main():
     p.add_argument("--out-dir", required=True)
     p.add_argument("--verify", action="store_true",
                    help="assert each mutant triggers its intended h5policy finding")
+    p.add_argument("--family", help="restrict to one family (default: all)")
     p.set_defaults(fn=cmd_family)
 
     args = ap.parse_args()

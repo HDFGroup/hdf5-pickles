@@ -148,7 +148,7 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 | `absent` | mechanically demonstrated to be missing |
 | `not_assessed` | not determinable from artifacts; needs classification |
 
-**56 of 176 requirement-slots are currently `met`.** The distribution matters
+**57 of 176 requirement-slots are currently `met`.** The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -163,7 +163,12 @@ more than the total:
   exercise none of these categories. What the sweep establishes is mostly which
   boundary VALUES the corpus lacks: `n` and `n_minus_1` are thin nearly
   everywhere, and `allocation_budget` is demonstrated for one family.
-- Dedicated fuzz targets exist for 1 family of 16.
+- Dedicated fuzz targets exist for 2 families of 16. `h5mutate` is a locator
+  plus a recipe table per family, so the cost of the next family is its locator.
+  A recipe is only counted once it emits its intended finding on seeds other
+  than the one it was written against -- the heap recipes were verified on four
+  structurally different heaps, and a fifth candidate was rejected for failing
+  that bar.
 - 14 families pin evidence locations as well as finding codes; the remaining
   2 need cursor arithmetic at the emit site rather than test metadata.
 - Truncation is `met` for 12 families, `partial` for 4 whose seed exceeds the

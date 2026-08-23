@@ -262,15 +262,33 @@ self-validating — `family --verify` asserts h5policy emits the intended findin
 
 ```text
 h5mutate list  [--seed FILE]
-h5mutate apply --seed FILE --recipe NAME --out FILE
-h5mutate family --seed FILE --out-dir DIR [--verify]
+h5mutate apply  --seed FILE --recipe NAME --out FILE
+h5mutate family --seed FILE --out-dir DIR [--verify] [--family NAME]
 ```
 
-The current slice covers the object-header continuation family (the interval
-model): target overlapping the source chunk at start/interior/end, zero-size,
-out-of-file, and alias onto an already-decoded chunk.  `run.sh` runs
-`family --verify` as a pinned check, and `h5cve variants` uses it to populate a
-case bundle.  The structure-aware **reducer** (`h5cve minimize`) is the
+A **family** is a locator plus a recipe table. The locator turns a seed into the
+context its recipes need and reports when the seed does not carry the structure
+at all -- a plain dataset is not a continuation seed, which is a skip and not an
+error -- and the recipes never parse the file, they edit fields the locator found
+and reseal what it says encloses them. Adding a family costs its locator; the
+recipes are then a few lines each.
+
+Two families exist:
+
+| family | recipes | mutations |
+| --- | --- | --- |
+| `object_header_continuation` | 6 | target overlapping the source chunk at start/interior/end, zero-size, out-of-file, alias onto an already-decoded chunk |
+| `heap_structures` | 4 | doubling-table width zero and non-power-of-two, declared heap size one and two bits under the first row |
+
+The bar for counting a recipe is that it emits its intended finding on seeds
+other than the one it was developed against: the heap recipes were verified on
+four structurally different heaps (dense-link, dense-attribute, shared-message,
+and shared-message huge-object), which is what a recipe has over a committed
+fixture -- one mutation where the corpus needs four base files. A fifth
+candidate was rejected for failing that bar, and the reason is recorded in the
+tool and in the family's `fuzz_targets` block. `run.sh` runs `family --verify`
+for both families as pinned checks, on different seeds, and `h5cve variants`
+uses the engine to populate a case bundle.  The structure-aware **reducer** (`h5cve minimize`) is the
 remaining half of roadmap change #5.
 
 Bundles live under `cases/<id>/` (git-ignored working scratch); `promote` is
