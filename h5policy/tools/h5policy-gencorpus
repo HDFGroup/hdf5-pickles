@@ -1473,6 +1473,9 @@ def _gen_malformed(root):
     _make_bad_fsm_section_extent(
         f"{root}/malformed/bad_fsm_section_extent.h5",
         f"{root}/valid/fsm_persist.h5")
+    _make_bad_fsm_class_count(
+        f"{root}/malformed/bad_fsm_class_count.h5",
+        f"{root}/valid/fsm_persist.h5")
     _make_bad_fsm_section_type(
         f"{root}/malformed/bad_fsm_section_type.h5",
         f"{root}/valid/fsm_persist.h5")
@@ -3947,6 +3950,43 @@ def _make_sohm_filtered_huge_below_managed_max(path, base_path):
     registry/cases/filtered-huge-object-decoded-size-unchecked.yml.
     """
     _patch(path, _sohm_filtered_huge_rewrite(base_path, 64))
+
+
+def _make_bad_fsm_class_count(path, base_path):
+    """A file free-space manager header declaring more section classes than the
+    file client has.
+
+    libhdf5 registers exactly three classes for the file client
+    (H5MF_FSPACE_SECT_CLS_SIMPLE/SMALL/LARGE, src/H5MF.c:292 and :366) and
+    refuses a stored count above the client's --
+        if (fspace->nclasses > 0 && nclasses > fspace->nclasses)
+            HGOTO_ERROR(... "section class count mismatch")   H5FScache.c:270
+    -- so H5Fget_free_sections fails on this file.
+
+    A MEASURED invariant-A' gap before the check existed: h5policy accepted it
+    with zero findings under every profile, including forensic on a complete
+    walk, while libhdf5 refused it.  The inflated count also made
+    control.fsm_section_type vacuous, because that bound is `s_type >=
+    nclasses` against the STORED count -- so one field both slipped past the
+    oracle and disabled one of its checks.  Found by driving h5mutate/fuzzlib
+    struct_deep mutants past h5policy and the probe's free_space canary, which
+    is the only entry point that deserializes FSHD/FSSE at all.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    o, l = raw[9], raw[10]
+    i = raw.find(b"FSHD")
+    while i >= 0 and raw[i + 5] != 1:          # client 1 == the file client
+        i = raw.find(b"FSHD", i + 1)
+    if i < 0:
+        raise RuntimeError("no file-client free-space manager header in the base")
+    # sig4 ver1 client1 | 4L counters | nclasses2 shrink2 expand2 maxaddr2
+    # | max_sect_size L | sect_addr O | sect_size L | alloc_sect_size L | chksum4
+    hdr_size = 18 + 7 * l + o
+    struct.pack_into("<H", raw, i + 6 + 4 * l, 32515)
+    chksum = i + hdr_size - 4
+    struct.pack_into("<I", raw, chksum,
+                     _jenkins_lookup3()(bytes(raw[i:chksum])))
+    _patch(path, bytes(raw))
 
 
 def _fsm_file_sinfo(raw):
