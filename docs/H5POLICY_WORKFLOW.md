@@ -248,8 +248,8 @@ and the family canary. The tracked exact-build evidence separately records that
 source-derived, its classification mapping is curated, and the corpus and
 exact-build outcomes are measured corroboration.
 
-Registry checks currently account for **321 finding codes** and **0 semantic-
-backlog entries**. Static enumeration resolves **983 in-pickle message
+Registry checks currently account for **323 finding codes** and **0 semantic-
+backlog entries**. Static enumeration resolves **987 in-pickle message
 variants**, with **0 unrouted** and **0 unanalyzable** variants. That is complete
 classification coverage for the current emission surface, not complete
 invariant coverage for the HDF5 format.
@@ -258,7 +258,7 @@ invariant coverage for the HDF5 format.
 
 It is broad and explicitly measured, but it is not complete.
 
-The current invariant manifest contains **393 named invariants across 16
+The current invariant manifest contains **396 named invariants across 16
 selected record families**. Those families are security-oriented groupings,
 not a claim that every legal HDF5 representation, payload behavior, or
 application activation has been modeled.
@@ -275,8 +275,8 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **57
-are `met`, 67 `partial`, 26 `not_assessed`, and 26 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **56
+are `met`, 68 `partial`, 26 `not_assessed`, and 26 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 

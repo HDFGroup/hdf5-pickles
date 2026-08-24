@@ -1277,8 +1277,36 @@ def _gen_malformed(root):
         f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
     _make_scaleoffset_size_mismatch(
         f"{root}/malformed/scaleoffset_size_mismatch.h5")
-    _make_chunk_size_uint32_wrap(
-        f"{root}/malformed/chunk_size_uint32_wrap.h5")
+    # The chunk-size matrix.  A chunk above 4 GiB is format-legal and, since
+    # libhdf5 2.0.0, writable, so what it means depends on the layout version
+    # and the chunk index type -- and the arithmetic fault that actually
+    # threatens memory safety is the 64-bit product wrap, not the 32-bit one.
+    # These five fixtures pin one cell each.  See
+    # registry/cases/chunk-dim-product-64bit-overflow.yml.
+    _make_layout_version(f"{root}/valid/chunk_4gib_layout_v5.h5",
+                         _layout_chunk_enc4_1d, 5, _layout_chunk_dim_4gib)
+    _make_layout_version(f"{root}/policy/chunk_4gib_layout_v4.h5",
+                         _layout_chunk_enc4_1d, 4, _layout_chunk_dim_4gib)
+    _make_chunk_4gib_v1_btree(
+        f"{root}/malformed/chunk_4gib_v1_btree_index.h5")
+    _make_layout_version(f"{root}/malformed/chunk_dim_product_wrap_v4.h5",
+                         _layout_chunk_enc4_2d, 4, _layout_chunk_dim_product_wrap)
+    # The same wrap at the version in which a large chunk is legitimate: a fix
+    # that only gated the 32-bit bound on the layout version would accept this.
+    _make_layout_version(f"{root}/malformed/chunk_dim_product_wrap_v5.h5",
+                         _layout_chunk_enc4_2d, 5, _layout_chunk_dim_product_wrap)
+    # The Single Chunk index keeps no records, so its one raw-data extent was
+    # the only one that never reached the data/metadata disjointness check.
+    _make_single_chunk_over_metadata(
+        f"{root}/malformed/single_chunk_over_metadata.h5",
+        lambda h: h.create_dataset(
+            "d", data=np.arange(24, dtype="i4").reshape(4, 6), chunks=(4, 6)),
+        False)
+    # The filtered form, whose size and filter mask precede the address: this
+    # one pins the address offset as well as the extent rule.
+    _make_single_chunk_over_metadata(
+        f"{root}/malformed/single_chunk_filtered_over_metadata.h5",
+        _layout_v5_single_filtered, True)
     # Layout version 6 does not exist: H5O_LAYOUT_VERSION_LATEST is 5.  Guards
     # the upper end of the version gate that was widened to admit v5.
     _make_layout_version(f"{root}/malformed/layout_unsupported_version.h5",
@@ -2536,44 +2564,149 @@ def _layout_v5_single_filtered(h):
                      chunks=(8, 8), shuffle=True)
 
 
-def _make_chunk_size_uint32_wrap(path):
-    """A v4 chunked layout whose encoded chunk dimensions multiply to a byte size
-    of 2**32 + 256.  Vulnerable libhdf5 versions store the per-chunk byte size in
-    a uint32_t (H5O_layout_chunk_t.size), so the product wraps to 256 and can
-    under-allocate the read buffer; newer versions reject the oversized legacy
-    chunk.  No valid file reaches this state -- H5Pset_chunk rejects chunks >=
-    4 GiB at creation -- so build a single-chunk dataset whose chunk dimension
-    needs four encoded bytes (2**24, no data written -> tiny file) and patch that
-    dimension to 0x40000040, repairing the object-header checksum."""
+def _layout_set_chunk_dim(raw, mbody, index, value):
+    """Overwrite one encoded chunk dimension of a v4/v5 chunked layout message.
+
+    Only a four-byte encoding is accepted: a narrower one has no room for the
+    values these fixtures need, and a wider one would leave the high bytes of
+    the field untouched.  The trailing dimension is the element size, which
+    ``H5D__chunk_set_sizes`` cross-checks against the datatype, so patching it
+    would produce a different fault than the one under test.
+    """
+    ndims, enc = raw[mbody + 3], raw[mbody + 4]
+    if enc != 4:
+        raise RuntimeError(f"chunk dim encoding is {enc} bytes, expected 4")
+    if index >= ndims - 1:
+        raise RuntimeError("refusing to patch the trailing element-size dimension")
+    struct.pack_into("<I", raw, mbody + 5 + index * enc, value)
+
+
+def _layout_chunk_enc4_1d(h):
+    """One chunk covering a 2**24-element dataset.
+
+    2**24 is the smallest dimension that needs four encoded bytes, so the
+    dimension field has room for the values patched in below, and nothing is
+    written so the fixture stays a few hundred bytes.  Shape == chunks gives the
+    single-chunk index, whose records carry no chunk size, so the bytes are
+    identical under layout v4 and v5.
+    """
+    h.create_dataset("d", shape=(1 << 24,), chunks=(1 << 24,), dtype="i4")
+
+
+def _layout_chunk_enc4_2d(h):
+    """The same, rank 2: two data dimensions of four encoded bytes each.
+
+    A product above 2**64 needs two dimensions to multiply: the largest product
+    two 32-bit dimensions and a four-byte element size can reach is
+    (2**32 - 1)**2 * 4, but reaching exactly 2**64 needs 2**31 * 2**31 * 4.
+    """
+    h.create_dataset("d", shape=(1 << 24, 1), chunks=(1 << 24, 1), dtype="i4")
+
+
+def _layout_chunk_dim_4gib(raw, mbody):
+    """Make the dimension product 2**32 + 256 -- just past the 32-bit field.
+
+    Representable in 64 bits, so this is not an arithmetic fault.  What it means
+    depends on the chunk index: unrepresentable in a v1 B-tree index record,
+    merely unreadable by pre-2.0.0 libraries below layout version 5, and fully
+    legitimate at version 5.
+    """
+    _layout_set_chunk_dim(raw, mbody, 0, 0x40000040)
+
+
+def _layout_chunk_dim_product_wrap(raw, mbody):
+    """Make the dimension product exactly 2**64, so it wraps to zero.
+
+    2**31 * 2**31 * 4 (the trailing dimension is the four-byte element size).
+    libhdf5 accumulates this product with no overflow check on the read path,
+    and zero then passes its own >4 GiB guard *because* it is zero, leaving only
+    an assert that release builds do not contain.  See
+    registry/cases/chunk-dim-product-64bit-overflow.yml.
+    """
+    _layout_set_chunk_dim(raw, mbody, 0, 0x80000000)
+    _layout_set_chunk_dim(raw, mbody, 1, 0x80000000)
+
+
+def _make_single_chunk_over_metadata(path, build, filtered):
+    """Point a Single Chunk index at the root object header.
+
+    Every other chunk index stores its chunks in RECORDS, which a chunk-index
+    walker decodes and bounds against the file's accounted metadata.  The Single
+    Chunk index stores no records at all -- the layout message's address field
+    IS the chunk -- so its one raw-data extent was the only one in the format
+    that never reached that check.  Measured before the fix: h5policy accepted a
+    writer-produced single-chunk dataset repointed at the root object header, and
+    ``h5dump -d`` printed the header bytes as dataset values (1380206671, the
+    little-endian int32 of ``OHDR``).  See
+    registry/cases/single-chunk-index-data-extent.yml.
+
+    ``filtered`` selects the form whose FILTERED size and filter mask sit in the
+    layout message ahead of the address (H5O_LAYOUT_CHUNK_SINGLE_INDEX_WITH_
+    FILTER).  That fixture pins the address OFFSET as much as the extent rule:
+    h5policy used to read the address from the size field, twelve bytes early,
+    and land on a value that happened to be inside the file.
+    """
+    raw = _base_bytes(build)
+    ohdr, mbody = _v4_layout_message(raw)
+    if raw[mbody + 1] != 2:
+        raise RuntimeError("expected a chunked layout message")
+    ndims, enc = raw[mbody + 3], raw[mbody + 4]
+    idx_type_off = mbody + 5 + ndims * enc
+    if raw[idx_type_off] != 1:
+        raise RuntimeError(
+            f"expected the single-chunk index, got type {raw[idx_type_off]}")
+    with_filter = bool(raw[mbody + 2] & 0x02)
+    if with_filter != filtered:
+        raise RuntimeError(
+            f"expected filtered={filtered}, got flags {raw[mbody + 2]:#04x}")
+    # size-of-lengths bytes of filtered size plus a four-byte filter mask.
+    addr_off = idx_type_off + 1 + ((8 + 4) if with_filter else 0)
+    # The root group's object header is the first OHDR in the file and is always
+    # accounted metadata, so any overlap with it is unambiguous.
+    root_ohdr = raw.find(b"OHDR")
+    if root_ohdr < 0:
+        raise RuntimeError("no object header signature to aim the chunk at")
+    struct.pack_into("<Q", raw, addr_off, root_ohdr)
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_4gib_v1_btree(path):
+    """A legacy chunked layout whose chunk exceeds the v1 B-tree size field.
+
+    Layout message versions 1 through 3 encode no chunk index type: the index is
+    always the v1 B-tree, whose record stores the chunk's byte size in four
+    bytes.  A chunk above 4 GiB therefore cannot be represented on disk, and
+    libhdf5 refuses the dataset at open (H5Dchunk.c:1185) rather than at create.
+    That is the one combination the 32-bit rule still describes.
+
+    Built on an earliest-libver file so the layout message sits in a version-1
+    object header, which carries no checksum to repair.  The v3 chunked message
+    is version, class, rank, the B-tree address, then four-byte dimensions.
+    """
     raw = _base_bytes(
         lambda h: h.create_dataset("d", shape=(1 << 24,), chunks=(1 << 24,),
-                                   dtype="i4"))
-    for o in range(len(raw) - 4):
-        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
-            continue
-        flags = raw[o + 5]
-        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
-        size_w = 1 << (flags & 3)
-        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
-        p = cur + size_w
-        end = cur + size_w + chunk0
-        while p < end - 3:
-            mtype = raw[p]
-            msize = struct.unpack_from("<H", raw, p + 1)[0]
-            mbody = p + 4 + (2 if flags & 0x04 else 0)
-            # Data Layout (0x08), version 4, class 2 (chunked): dims follow
-            # version/class/flags/dimensionality/enc_bytes_per_dim.
-            if mtype == 0x08 and raw[mbody] == 4 and raw[mbody + 1] == 2:
-                enc = raw[mbody + 4]
-                if enc < 4:
-                    raise RuntimeError(
-                        "chunk dim encoding too narrow to patch a wrapping value")
-                struct.pack_into("<I", raw, mbody + 5, 0x40000040)
-                _fix_v2_ohdr_checksum(raw, o)
-                _patch(path, bytes(raw))
-                return
-            p = mbody + msize
-    raise RuntimeError("could not locate the v4 chunked layout message")
+                                   dtype="i4"),
+        libver="earliest")
+    msg_off, msg_size = _v1_object_header(raw, 0x0008)
+    mbody = msg_off + 8
+    version, layout_class = raw[mbody], raw[mbody + 1]
+    if version not in (1, 2, 3) or layout_class != 2:
+        raise RuntimeError(
+            f"expected a legacy chunked layout message, got version {version} "
+            f"class {layout_class}")
+    # v1/v2 put the rank at byte 1 and the address at byte 8; v3 puts the rank
+    # at byte 2 and the address straight after it.  The address is sizeof_addr
+    # wide, which every fixture in this corpus writes as 8.
+    addr_width = 8
+    if version == 3:
+        ndims, dims_off = raw[mbody + 2], mbody + 3 + addr_width
+    else:
+        ndims, dims_off = raw[mbody + 1], mbody + 8 + addr_width
+    if ndims < 2 or dims_off + ndims * 4 > mbody + msg_size:
+        raise RuntimeError("legacy chunked layout dimensions do not fit the message")
+    struct.pack_into("<I", raw, dims_off, 0x40000040)
+    _patch(path, bytes(raw))
 
 
 # Three v1 object headers lifted verbatim from the libhdf5 ``invalid_read`` seed,

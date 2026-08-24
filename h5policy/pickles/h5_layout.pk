@@ -148,85 +148,163 @@ fun h5policy_check_contiguous_extent = (int ios, H5PolicyProfile profile,
     return ctx;
 }
 
-/* Accumulate a chunk's byte size across its encoded dimensions, guarding the
-   legacy 32-bit field used for it.  H5O_layout_chunk_t.size is computed as the
-   product of *all* encoded chunk dims (the trailing dim is the element size in
-   bytes).  Vulnerable libhdf5 versions can wrap that product and under-allocate
-   the per-chunk buffer; newer versions reject the oversized legacy chunk.
-   No valid writer-produced file reaches here: H5Pset_chunk rejects chunks
-   >= 4 GiB at creation.
+/* Poison sentinel for a chunk byte size this validator could not compute.
+   The chunk-index walkers in h5_chunkindex.pk already treat 0xffff...ff as
+   "stored size unknown, skip the extent check", so reusing that value keeps one
+   convention instead of two.  A geometry whose TRUE product is exactly this
+   value is therefore not extent-checked -- a deliberate false negative on an
+   absurd shape, never a false positive.  */
+var H5POLICY_CHUNK_SIZE_UNKNOWN = 0xffffffffffffffffUL;
+
+/* Accumulate a chunk's byte size across its encoded dimensions.
+
+   libhdf5 computes H5O_layout_chunk_t.size as the product of *all* encoded
+   chunk dims (the trailing dim is the element size in bytes) and never bounds
+   the accumulation.  H5Olayout.c multiplies straight through in both the
+   pre-v4 and the shared v4/v5 arm, and H5D__chunk_set_sizes recomputes the same
+   product on OPEN (H5Dchunk.c:849-860, reached via the open_op branch at
+   :1179) behind a guard -- `(uint64_t)size != chunk_size` -- that compares two
+   64-bit values and cannot fire.  A product that wraps to zero then walks past
+   libhdf5's own >4 GiB guard *because* it is zero, leaving only
+   assert(layout->u.chunk.size > 0) in H5D__chunk_lock, which no release build
+   contains.  Measured: heap-buffer-overflow read AND write from a 479-byte
+   file, read-only through h5dump.  See
+   registry/cases/chunk-dim-product-64bit-overflow.yml.
+
+   So the bound enforced here is 64-bit representability, NOT the legacy 32-bit
+   field.  A chunk above 4 GiB has been legal to write since libhdf5 2.0.0
+   (layout message version 5) and is legal to READ at any layout version --
+   H5Dchunk.c:1181-1187 says so in as many words -- so bounding the product at
+   0xffffffff rejects writer-produced files.  The narrower 32-bit rules depend
+   on the chunk index type, which is encoded AFTER the dimensions, and are
+   applied by h5policy_chunk_size32_verdict once the caller knows it.
 
    Call once per (nonzero) dimension with the running product, starting at 1.
-   Returns the new product, or a poison sentinel once the 32-bit bound is blown;
-   the sentinel emits the finding exactly once and is carried through the rest of
-   the loop.  The `dim != 0` division guard is safe because zero dims are rejected
-   separately by the caller before this runs.  */
-fun h5policy_chunk_size32_accum_with_sources = (
+   Returns the new product, or the poison sentinel once 64-bit representability
+   is blown; the sentinel emits the finding exactly once and is then carried
+   through the rest of the loop.  Both divisions are safe: `acc` starts at 1 and
+   only ever grows, and zero dims are rejected by the caller before this runs.  */
+fun h5policy_chunk_size_accum_with_sources = (
     uint<64> acc, uint<64> dim, off64 loc, uint<64> field_width,
     uint<64>[] source_offsets, uint<64>[] source_lengths,
     string object) uint<64>:
 {
-    if (acc == 0xffffffffffffffffUL)
+    if (acc == H5POLICY_CHUNK_SIZE_UNKNOWN)
         return acc;                     /* already flagged; stay poisoned */
-    if (dim != 0UL && acc > 0xffffffffUL / dim)
+    if (dim != 0UL && acc != 0UL && dim > H5POLICY_CHUNK_SIZE_UNKNOWN / acc)
         {
-            var observed = 0xffffffffffffffffUL;
-            if (acc <= 0xffffffffffffffffUL / dim)
-                observed = acc * dim;
+            /* The product itself is not representable, so the evidence names
+               the operands instead: the dimension that overflowed it, against
+               the largest dimension that would still have fit.  */
+            var largest = H5POLICY_CHUNK_SIZE_UNKNOWN / acc;
             if (source_offsets'length != 0UL
                 && source_offsets'length == source_lengths'length)
                 h5policy_emit_error_ev(
-                    "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
+                    "H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW", "corrupt",
                     loc, object,
-                    "chunk byte size exceeds the legacy 32-bit chunk-size field",
+                    "chunk dimensions multiply past a representable byte size",
                     H5Evidence {
-                        field = "layout.chunk_size_overflow_product",
-                        actual = observed, expected = 0xffffffffUL,
+                        field = "layout.chunk_size_product_dimension",
+                        actual = dim, expected = largest,
                         comparison = "less_than_or_equal",
                         source_offsets = source_offsets,
                         source_lengths = source_lengths,
                     });
             else if (field_width != 0UL)
                 h5policy_emit_error_ev(
-                    "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
+                    "H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW", "corrupt",
                     loc, object,
-                    "chunk byte size exceeds the legacy 32-bit chunk-size field",
+                    "chunk dimensions multiply past a representable byte size",
                     H5Evidence {
-                        field = "layout.chunk_size_overflow_product",
-                        actual = observed, expected = 0xffffffffUL,
+                        field = "layout.chunk_size_product_dimension",
+                        actual = dim, expected = largest,
                         comparison = "less_than_or_equal",
                         has_loc1 = 1, loc1_role = "actual_source",
                         loc1 = loc, loc1_len = field_width,
                     });
             else
                 h5policy_emit_error_ev(
-                    "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
+                    "H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW", "corrupt",
                     loc, object,
-                    "chunk byte size exceeds the legacy 32-bit chunk-size field",
+                    "chunk dimensions multiply past a representable byte size",
                     H5Evidence {
-                        field = "layout.chunk_size_overflow_product",
-                        actual = observed, expected = 0xffffffffUL,
+                        field = "layout.chunk_size_product_dimension",
+                        actual = dim, expected = largest,
                         comparison = "less_than_or_equal",
                     });
-            return 0xffffffffffffffffUL;
+            return H5POLICY_CHUNK_SIZE_UNKNOWN;
         }
     return acc * dim;
 }
 
-fun h5policy_chunk_size32_accum_at = (uint<64> acc, uint<64> dim,
-                                      off64 loc, uint<64> field_width,
-                                      string object) uint<64>:
-{
-    return h5policy_chunk_size32_accum_with_sources(
-        acc, dim, loc, field_width, uint<64>[](), uint<64>[](), object);
-}
-
 /* Compatibility seam for arithmetic unit tests that have a value but no
    corresponding encoded field width.  */
-fun h5policy_chunk_size32_accum = (uint<64> acc, uint<64> dim,
-                                   off64 loc, string object) uint<64>:
+fun h5policy_chunk_size_accum = (uint<64> acc, uint<64> dim,
+                                 off64 loc, string object) uint<64>:
 {
-    return h5policy_chunk_size32_accum_at(acc, dim, loc, 0UL, object);
+    return h5policy_chunk_size_accum_with_sources(
+        acc, dim, loc, 0UL, uint<64>[](), uint<64>[](), object);
+}
+
+/* Apply the 32-bit chunk-size rules once the whole dimension vector and the
+   chunk index type are known.  Two DIFFERENT statements, which the previous
+   single unconditional bound conflated:
+
+     * A chunk above 4 GiB cannot be indexed by a v1 B-tree.  That index's
+       record carries the chunk byte size in a four-byte field, so the geometry
+       is unrepresentable on disk and libhdf5 refuses the dataset at open
+       (H5Dchunk.c:1185).  Corruption, and the oracle and the library agree.
+
+     * A chunk above 4 GiB below layout message version 5 is FORMAT-LEGAL.
+       libhdf5 declines to create one (H5Dchunk.c:917) but deliberately opens
+       one, because "they're not disallowed by the file format".  A library
+       older than 2.0.0 cannot read it, so this is a compatibility statement --
+       an advisory, the same shape as the external-link path advisories -- and
+       not a defect in the file.
+
+   Layout versions 1, 2 and 3 have no encoded index type: the index is always
+   the v1 B-tree, so those callers pass idx_is_v1_btree.  Layout versions 4 and
+   5 cannot legitimately carry one (a v1 B-tree index type in a v4 message is
+   rejected as an unknown index type, matching libhdf5), so they pass 0 and
+   reach at most the advisory.  */
+fun h5policy_chunk_size32_verdict = (
+    uint<64> product, uint<8> idx_is_v1_btree, uint<64> layout_version,
+    off64 loc, uint<64>[] source_offsets, uint<64>[] source_lengths,
+    string object) void:
+{
+    if (product == H5POLICY_CHUNK_SIZE_UNKNOWN || product <= 0xffffffffUL)
+        return;
+    var has_sources = source_offsets'length != 0UL
+                      && source_offsets'length == source_lengths'length;
+    if (idx_is_v1_btree != 0UB)
+        {
+            if (has_sources)
+                h5policy_emit_error_ev(
+                    "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
+                    loc, object,
+                    "chunk byte size exceeds the 32-bit size field of a v1 B-tree chunk index",
+                    H5Evidence {
+                        field = "layout.chunk_size_overflow_product",
+                        actual = product, expected = 0xffffffffUL,
+                        comparison = "less_than_or_equal",
+                        source_offsets = source_offsets,
+                        source_lengths = source_lengths,
+                    });
+            else
+                h5policy_emit_error_ev(
+                    "H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT", "corrupt",
+                    loc, object,
+                    "chunk byte size exceeds the 32-bit size field of a v1 B-tree chunk index",
+                    H5Evidence {
+                        field = "layout.chunk_size_overflow_product",
+                        actual = product, expected = 0xffffffffUL,
+                        comparison = "less_than_or_equal",
+                    });
+        }
+    else if (layout_version < 5UL)
+        h5policy_emit_warning(
+            "H5_ADVISORY_CHUNK_SIZE_REQUIRES_LAYOUT_V5", loc, object,
+            "chunk byte size above 4 GiB is only readable by libhdf5 2.0.0 or later at this layout version");
 }
 
 /* v4/v5 chunked layout: validate the chunk dimensions and dispatch on the
@@ -240,8 +318,14 @@ fun h5policy_chunk_size32_accum = (uint<64> acc, uint<64> dim,
 fun h5policy_layout_chunked_v4_v5 = (int ios, H5PolicyProfile profile,
                                     H5WalkContext ctx,
                                     offset<uint<64>,B> payload_off,
-                                    uint<64> msg_size, string object) H5WalkContext:
+                                    uint<64> msg_size, uint<64> version,
+                                    string object) H5WalkContext:
 {
+    /* Byte 2 is the chunked-layout flags field; the only bit this validator
+       needs is the filtered single-chunk marker, read where the index type is
+       resolved below.  */
+    var chunk_flags = h5policy_msg_u64_at(ios, profile,
+                                          payload_off + 2#B, 1UL);
     var ndims4 = h5policy_msg_u64_at(ios, profile,
                                      payload_off + 3#B, 1UL);
     if (ndims4 == 0UL || ndims4 > H5O_LAYOUT_NDIMS)
@@ -309,7 +393,7 @@ fun h5policy_layout_chunked_v4_v5 = (int ios, H5PolicyProfile profile,
                             /* All dims (incl. the trailing element-size dim)
                                multiply into libhdf5's 32-bit chunk.size. */
                             chunk_byte_size =
-                                h5policy_chunk_size32_accum_with_sources(
+                                h5policy_chunk_size_accum_with_sources(
                                     chunk_byte_size, dim4, dim4_off, enc,
                                     chunk_source_offsets4, chunk_source_lengths4,
                                     object);
@@ -318,6 +402,11 @@ fun h5policy_layout_chunked_v4_v5 = (int ios, H5PolicyProfile profile,
                 }
             if (chunk_dims_ok != 0UB)
                 {
+                    h5policy_chunk_size32_verdict(chunk_byte_size, 0UB, version,
+                                                  payload_off + dims_rel4#B,
+                                                  chunk_source_offsets4,
+                                                  chunk_source_lengths4,
+                                                  object);
                     ctx.has_chunked_layout = 1UB;
                     ctx.chunk_dataset_element_count = chunk_elem_count;
                 }
@@ -332,10 +421,24 @@ fun h5policy_layout_chunked_v4_v5 = (int ios, H5PolicyProfile profile,
                                                1UL);
             var idx_info_len = 0UL;
             /* Index-type-specific payload before the shared address field.
-               Types 1 and 2 have no extra bytes; fixed/extensible/v2 B-tree
-               indexes carry small creation parameters before the address.  */
+               Type 2 has no extra bytes; fixed/extensible/v2 B-tree indexes
+               carry small creation parameters before the address.
+
+               A SINGLE CHUNK index normally has none either -- but when the
+               chunked-layout flags carry H5O_LAYOUT_CHUNK_SINGLE_INDEX_WITH_
+               FILTER (0x02) it keeps the one chunk's FILTERED size and filter
+               mask in the layout message itself, ahead of the address
+               (H5Olayout.c, case H5D_CHUNK_IDX_SINGLE).  Missing that shifted
+               the address read by size-of-lengths plus four and made h5policy
+               decode a filtered single-chunk dataset's address from the size
+               field -- silently, because the value it landed on was still
+               inside the file.  Measured on valid/layout_v5_single_filtered.h5:
+               the address read as 256 where the file stores 2048.  */
+            var single_filtered = (chunk_flags & 0x2UL) != 0UL;
+            var single_size_rel = idx_type_rel + 1UL;
             if (idx_type == 1UL)
-                idx_info_len = 0UL;
+                idx_info_len = single_filtered
+                               ? (global_sizeof_lengths as uint<64>) + 4UL : 0UL;
             else if (idx_type == 2UL)
                 idx_info_len = 0UL;
             else if (idx_type == 3UL)
@@ -439,7 +542,52 @@ fun h5policy_layout_chunked_v4_v5 = (int ios, H5PolicyProfile profile,
                                         ctx, profile, 1UL,
                                         payload_off + idx_addr_rel#B, object,
                                         "chunk count exceeds the selected profile limit");
-                                    if (idx_addr4 >= (h5policy_ceiling(ios)))
+                                    /* The extent, not just the start address.
+                                       This index keeps no records, so it never
+                                       reached a chunk-index walker and its one
+                                       chunk was the only raw-data extent in the
+                                       format that went undeclared -- measured:
+                                       a writer-produced single-chunk dataset
+                                       repointed at the root object header was
+                                       ACCEPTED, and h5dump returned the header
+                                       bytes as dataset values.  Same invariant
+                                       as every other chunk record, missing for
+                                       one index type; see
+                                       registry/cases/single-chunk-index-data-
+                                       extent.yml.
+
+                                       The stored size is the FILTERED size when
+                                       the layout carries one, exactly as a
+                                       filtered index record's is, and otherwise
+                                       the dimension product.  A poisoned
+                                       product declares nothing: the overflow
+                                       has already been reported and an extent
+                                       derived from it would be fiction.  */
+                                    var stored = chunk_byte_size;
+                                    if (single_filtered)
+                                        stored = h5policy_msg_u64_at(
+                                            ios, profile,
+                                            payload_off + single_size_rel#B,
+                                            global_sizeof_lengths as uint<64>);
+                                    if (stored != H5POLICY_CHUNK_SIZE_UNKNOWN
+                                        && h5policy_chunk_record_size_ok(
+                                               stored,
+                                               payload_off + idx_addr_rel#B,
+                                               object, "single-chunk"))
+                                        {
+                                            var ok = h5policy_checked_addr_range(
+                                                idx_addr4, stored,
+                                                h5policy_ceiling(ios),
+                                                "single-chunk data outside file",
+                                                payload_off + idx_addr_rel#B,
+                                                object);
+                                            if (ok)
+                                                ok = h5policy_data_extent_disjoint(
+                                                    idx_addr4, stored,
+                                                    payload_off + idx_addr_rel#B,
+                                                    object, "chunk");
+                                        }
+                                    else if (idx_addr4 >= (h5policy_ceiling(ios)))
                                         h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
                                                             payload_off + idx_addr_rel#B, object,
                                                             "single-chunk data address outside file");
@@ -633,7 +781,7 @@ fun h5policy_validate_layout_payload = (int ios,
                                                dim) multiply into libhdf5's 32-bit
                                                chunk.size. */
                                             chunk_byte_size =
-                                                h5policy_chunk_size32_accum_with_sources(
+                                                h5policy_chunk_size_accum_with_sources(
                                                     chunk_byte_size, dim,
                                                     dim_off, 4UL,
                                                     chunk_source_offsets,
@@ -644,6 +792,11 @@ fun h5policy_validate_layout_payload = (int ios,
                                 }
                             if (chunk_dims_ok != 0UB)
                                 {
+                                    h5policy_chunk_size32_verdict(
+                                        chunk_byte_size, 1UB, version,
+                                        payload_off + dims_rel#B,
+                                        chunk_source_offsets,
+                                        chunk_source_lengths, object);
                                     ctx.has_chunked_layout = 1UB;
                                     ctx.chunk_dataset_element_count = chunk_elem_count;
                                 }
@@ -811,7 +964,7 @@ fun h5policy_validate_layout_payload = (int ios,
                                                        element-size dim) multiply into
                                                        libhdf5's 32-bit chunk.size. */
                                                     chunk_byte3_size =
-                                                        h5policy_chunk_size32_accum_with_sources(
+                                                        h5policy_chunk_size_accum_with_sources(
                                                             chunk_byte3_size, dim3,
                                                             dim3_off, 4UL,
                                                             chunk_source_offsets3,
@@ -822,6 +975,11 @@ fun h5policy_validate_layout_payload = (int ios,
                                         }
                                     if (chunk_dims3_ok != 0UB)
                                         {
+                                            h5policy_chunk_size32_verdict(
+                                                chunk_byte3_size, 1UB, version,
+                                                payload_off + dims_rel3#B,
+                                                chunk_source_offsets3,
+                                                chunk_source_lengths3, object);
                                             ctx.has_chunked_layout = 1UB;
                                             ctx.chunk_dataset_element_count = chunk_elem3_count;
                                         }
@@ -890,7 +1048,7 @@ fun h5policy_validate_layout_payload = (int ios,
                        matrix is larger than the other classes.  */
                     ctx = h5policy_layout_chunked_v4_v5(ios, profile, ctx,
                                                         payload_off, msg_size,
-                                                        object);
+                                                        version, object);
         }
     else
         h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_LAYOUT_VERSION",

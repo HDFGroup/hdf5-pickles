@@ -299,14 +299,29 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
             swept = nsel > 0;
         }
         if (!swept) {
+            /* One element, at the LAST coordinate rather than the origin.
+             *
+             * A calloc'd coordinate array selects element (0,...,0), whose byte
+             * offset within its chunk -- and within any record the element sits
+             * in -- is zero.  That is the one element an offset arithmetic
+             * defect cannot reach past: measured on a chunked dataset whose
+             * dimension product wraps to zero, reading the origin lands inside
+             * the (8-byte) allocation and returns cleanly, while reading
+             * element (1,0) segfaults, so the canary reported outcome=accepted
+             * on a specimen that segfaults h5dump.  See
+             * registry/cases/chunk-dim-product-64bit-overflow.yml.
+             *
+             * The last coordinate reaches the same code with a nonzero offset
+             * and costs nothing: the selection is still a single element, so
+             * the memory and file bounds are unchanged.
+             */
             nsel = 1;
             coord = (hsize_t *)calloc((size_t)rank, sizeof *coord);
             if (!coord) goto done;
-            if (st->exercise_chunk_index) {
+            if (st->exercise_chunk_index)
                 st->chunk_sweep_skipped++;
-                for (int i = 0; i < rank; i++)
-                    coord[i] = dims[i] ? dims[i] - 1 : 0;
-            }
+            for (int i = 0; i < rank; i++)
+                coord[i] = dims[i] ? dims[i] - 1 : 0;
         }
         if (H5Sselect_elements(space, H5S_SELECT_SET, (size_t)nsel, coord) < 0) {
             entry_point_result(st, EP_H5SSELECT_ELEMENTS, 0);

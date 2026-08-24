@@ -22,7 +22,7 @@ Registry files plus a case directory, one schema version:
 | [`verification-coverage.yml`](verification-coverage.yml) | **Generated.** Which of the [§12](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) verification requirements each record family demonstrably meets. |
 | [`ssp-control-evidence.yml`](ssp-control-evidence.yml) | Checked, deliberately narrow mapping from selected HDF5 SSP controls to record/invariant/finding, fixture, canary, and exact-build measurement. It is technical evidence, not complete control attestation. |
 | [`cve-case.yml`](cve-case.yml) | The annotated **template** for a per-case record. Its fields are the §11.5 containment/systemic tracking block. |
-| [`cases/`](cases/) | Real per-case records: two oracle-hardened memory-safety cases, one proactive hardening case, and six libhdf5 divergence records, including one open backlog of uninvestigated items. |
+| [`cases/`](cases/) | Real per-case records, mostly `oracle-hardened` -- h5policy rejects, the libhdf5 side is unfixed -- alongside contained, upstream-fixed and proactive-hardening entries. Two are `uninvestigated`: filed divergences held as a tracked queue rather than waved through as benign. The enumeration is deliberately not spelled out here, because it drifts; `check_registry.py` counts them. |
 
 [`../tools/check_registry.py`](../tools/check_registry.py) derives the production
 emit inventory from the pickle validators and the wrapper-generated timeout
@@ -148,7 +148,7 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 | `absent` | mechanically demonstrated to be missing |
 | `not_assessed` | not determinable from artifacts; needs classification |
 
-**57 of 176 requirement-slots are currently `met`.** The distribution matters
+**56 of 176 requirement-slots are currently `met`.** The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -174,8 +174,14 @@ more than the total:
 - Truncation is `met` for 12 families, `partial` for 4 whose seed exceeds the
   sweep budget, and `absent` for 0; see
   [`truncation-sweep.json`](truncation-sweep.json).
-- No-activation-on-failure is `met` for 10 families and `partial` for 6 because
+- No-activation-on-failure is `met` for 9 families and `partial` for 7 because
   the exact-build probe observes an activation or crash in those families.
+  `external_file_list` joined that list on 2026-08-24 without libhdf5 changing:
+  the probe's fallback single-element read moved from the origin to the last
+  element, and the wrapped EFL segment it now reaches is opened before it is
+  rejected. A count that goes DOWN because the harness asks a harder question is
+  the intended direction -- see
+  the EFL entry under [`cases/`](cases/).
 
 `check_registry.py` enforces the report's structure — every manifest record
 present and every requirement scored — and derives the summary counts above.

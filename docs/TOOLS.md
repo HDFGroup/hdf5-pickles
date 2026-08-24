@@ -213,9 +213,9 @@ field can cost a few operations without any payload being touched, while a
 validator that read payload would grow with `n`. In the current tracked
 measurement, the unfiltered ladder's `metadata_bytes_seen`/`walk_operations`
 remain exactly 447/219 across the 3,031× physical-file increase. The filtered
-ladder remains at 447 metadata bytes while operations move only 231 → 235
+ladder remains at 447 metadata bytes while operations move only 247 → 251
 across 1,061× physical growth. The sensitivity control rises
-408 → 2,010 → 89,310 operations. These ratios are derived from the
+410 → 2,012 → 89,312 operations. These ratios are derived from the
 `physical_bytes` endpoints in
 [`registry/lazy-validation.json`](../registry/lazy-validation.json), not from the
 nominal element-count ratio.
