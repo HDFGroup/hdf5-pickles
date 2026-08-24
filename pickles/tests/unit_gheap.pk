@@ -1,0 +1,162 @@
+/* Global-heap collection walk regressions: forward progress and bounded
+ * extents.
+ *
+ * Both walkers in gheap.pk step by a value computed from a declared length in
+ * modular 64-bit arithmetic -- the same expression libhdf5 evaluates in a
+ * size_t (H5HG__cache_heap_deserialize, src/H5HGcache.c:353 and :358) -- and
+ * neither form is guaranteed positive.  Before the progress guard, the four
+ * (walker, shape) combinations failed in three different ways:
+ *
+ *                                | gheap_gcol_find_obj | print_global_heap
+ *   ---------------------------- | ------------------- | -----------------------
+ *   idx == 0, span 0             | HANG                | HANG
+ *   idx  > 0, length 2**64-16    | HANG                | unhandled EOF exception
+ *
+ * The exception came from mapping `byte[data_size]` to print the object before
+ * anything checked the length, which is why the dumper now vets the extent
+ * BEFORE it prints: a check placed after the map can never be reached.
+ *
+ * Every case below asserts that the call RETURNS.  A regression therefore shows
+ * up as this test timing out (its ctest TIMEOUT is the real assertion for the
+ * hang) or as an unhandled exception, not as a quiet wrong answer.
+ *
+ * The defect these mirror is recorded in
+ * registry/cases/global-heap-zero-progress-sentinel.yml.
+ */
+load "common.pk";
+load "gheap.pk";
+
+var failures = 0;
+fun expect_gheap = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else {
+        printf("FAIL %s\n", name);
+        failures = failures + 1;
+    }
+}
+
+set_global_sizeof_offsets(8UB);
+set_global_sizeof_lengths(8UB);
+set_global_hdf5_base_addr([0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB]);
+set_global_hdf5_declared_eof([0UB, 16UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB]);
+
+var ios = open("*unit-gheap*");
+
+/* A 64-byte collection at `at` holding ONE object header: index `idx` with
+ * declared length `len`.  With 8-byte lengths the collection header and each
+ * object header are both 16 bytes, so the object sits at at+16 and its data,
+ * where the length is honest, at at+32. */
+fun put_collection = (uint<64> at, uint<64> idx, uint<64> len) void:
+{
+    byte[4] @ ios : at#B        = ['G', 'C', 'O', 'L'];
+    byte    @ ios : (at + 4)#B  = 1UB;
+    byte[3] @ ios : (at + 5)#B  = [0UB, 0UB, 0UB];
+    byte[8] @ ios : (at + 8)#B  = [64UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB];
+    byte[2] @ ios : (at + 16)#B = [(idx & 0xffUL) as byte,
+                                   ((idx .>> 8) & 0xffUL) as byte];
+    byte[2] @ ios : (at + 18)#B = [0UB, 0UB];
+    byte[4] @ ios : (at + 20)#B = [0UB, 0UB, 0UB, 0UB];
+    var i = 0UL;
+    while (i < 8UL) {
+        byte @ ios : (at + 24 + i)#B = ((len .>> (8UL * i)) & 0xffUL) as byte;
+        i = i + 1UL;
+    }
+}
+
+/* Append the free-space sentinel that closes a well-formed collection: it
+ * starts at `at + rel` and its declared span reaches the collection end. */
+fun put_sentinel = (uint<64> at, uint<64> rel) void:
+{
+    byte[2] @ ios : (at + rel)#B      = [0UB, 0UB];
+    byte[2] @ ios : (at + rel + 2)#B  = [0UB, 0UB];
+    byte[4] @ ios : (at + rel + 4)#B  = [0UB, 0UB, 0UB, 0UB];
+    var span = 64UL - rel;
+    var i = 0UL;
+    while (i < 8UL) {
+        byte @ ios : (at + rel + 8 + i)#B = ((span .>> (8UL * i)) & 0xffUL) as byte;
+        i = i + 1UL;
+    }
+}
+
+/* ---- the step helper itself -------------------------------------------- */
+
+expect_gheap("step_of_a_normal_object_is_header_plus_aligned_payload",
+             gheap_obj_step(1UL, 8UL, 16UL) == 24UL);
+expect_gheap("step_of_the_sentinel_is_its_raw_span",
+             gheap_obj_step(0UL, 24UL, 16UL) == 24UL);
+/* The eight lengths [2**64-23, 2**64-16] wrap the sum to zero; the interval is
+ * closed, so check both ends and the neighbour just below it. */
+expect_gheap("step_wraps_to_zero_at_the_top_of_the_window",
+             gheap_obj_step(1UL, 0xFFFFFFFFFFFFFFF0UL, 16UL) == 0UL);
+expect_gheap("step_wraps_to_zero_at_the_bottom_of_the_window",
+             gheap_obj_step(1UL, 0xFFFFFFFFFFFFFFE9UL, 16UL) == 0UL);
+expect_gheap("step_just_below_the_window_does_not_wrap_to_zero",
+             gheap_obj_step(1UL, 0xFFFFFFFFFFFFFFE8UL, 16UL) != 0UL);
+
+/* ---- 1. a well-formed collection is walked exactly as before ----------- */
+
+put_collection(0UL, 1UL, 8UL);
+put_sentinel(0UL, 40UL);
+var found = gheap_gcol_find_obj(0#B, 1UL);
+expect_gheap("valid_collection_locates_its_object",
+             found == 32#B && global_gheap_last_obj_size == 8UL);
+var missing = gheap_gcol_find_obj(0#B, 7UL);
+expect_gheap("valid_collection_reports_a_missing_index_without_looping",
+             missing == 0#B);
+var walked = 0;
+print_global_heap(0#B);
+walked = 1;
+expect_gheap("valid_collection_dump_completes", walked);
+
+/* ---- 2. the index-0 sentinel with a zero span -------------------------- */
+
+put_collection(128UL, 0UL, 0UL);
+var sentinel_found = gheap_gcol_find_obj(128#B, 1UL);
+expect_gheap("zero_span_sentinel_does_not_hang_the_finder",
+             sentinel_found == 0#B);
+var sentinel_dumped = 0;
+print_global_heap(128#B);
+sentinel_dumped = 1;
+expect_gheap("zero_span_sentinel_does_not_hang_the_dumper", sentinel_dumped);
+
+/* ---- 3. a normal object whose step wraps to zero ----------------------- */
+
+put_collection(256UL, 1UL, 0xFFFFFFFFFFFFFFF0UL);
+/* Search for an index that is NOT present, so the walk has to get PAST the
+ * offending header instead of short-circuiting on it.  Asking for index 1
+ * would return immediately and prove nothing about progress. */
+var wrap_found = gheap_gcol_find_obj(256#B, 9999UL);
+expect_gheap("wrapping_step_does_not_hang_the_finder", wrap_found == 0#B);
+var wrap_dumped = 0;
+print_global_heap(256#B);
+wrap_dumped = 1;
+expect_gheap("wrapping_step_does_not_hang_or_throw_in_the_dumper", wrap_dumped);
+
+/* ---- 4. the adjacent control: huge but non-wrapping -------------------- */
+
+put_collection(384UL, 1UL, 0xFFFFFFFFFFFFFFE8UL);
+var control_found = gheap_gcol_find_obj(384#B, 9999UL);
+expect_gheap("non_wrapping_overrun_terminates_the_finder",
+             control_found == 0#B);
+var control_dumped = 0;
+print_global_heap(384#B);
+control_dumped = 1;
+expect_gheap("non_wrapping_overrun_is_reported_not_mapped", control_dumped);
+
+/* ---- 5. an honest length that simply overruns the collection ----------- */
+
+put_collection(512UL, 1UL, 4096UL);
+var overrun_dumped = 0;
+print_global_heap(512#B);
+overrun_dumped = 1;
+expect_gheap("declared_length_past_the_collection_end_is_reported",
+             overrun_dumped);
+
+close(ios);
+if (failures != 0) {
+    printf("UNIT GHEAP: %i32d failure(s)\n", failures);
+    exit(1);
+}
+printf("UNIT GHEAP: all passed\n");

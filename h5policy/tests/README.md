@@ -10,7 +10,8 @@ controlled outcome; a change that alters any decision is surfaced for review.
   required finding codes, and forbidden outcomes (`crash`, `timeout`,
   `external_open`, `plugin_load`, `write`). A fixture can be reused by several
   expectations. Every report is also checked for schema version 1 and internally
-  consistent file geometry; `expected_geometry` can pin individual values.
+  consistent file geometry, and the `utf-8-percent-v1` path contract;
+  `expected_geometry` can pin individual values.
   An optional `h5cve` block declares the fixture's exact-build canary contract:
 
   ```yaml
@@ -55,10 +56,18 @@ controlled outcome; a change that alters any decision is surfaced for review.
   saturation, finding classes, profile validation, deterministic walk budgets,
   compound rules, feature switches, and run-mode defaults.
 - `unit_report_wrapper.sh` — a deterministic hard-timeout simulation that
-  validates the shell-generated partial report and its nullable geometry.
+  validates the shell-generated partial report, its nullable geometry, and its
+  byte-path encoding.
+- `unit_paths.pk` — byte-level checks for valid and malformed UTF-8, percent
+  ambiguity, controls, DEL, and uppercase `%HH` encoding.
+- `check_path_encoding.py` — end-to-end strict-UTF-8 JSON and byte round-trip
+  checks for arbitrary-byte file and HDF5 object paths.
 - `check_cache_image_docs.py` — a focused documentation contract that checks
   the cache-image boundary text and compares it with live reports from all four
   profiles plus an explicit continuation override.
+- `check_workflow_docs.py` — ties the operator assessment workflow's profiles
+  and decisions to the CLI, and derives its finding, message-routing,
+  invariant-family, verification, and exact-build counts from the registries.
 - `check_lazy_docs.py` — derives the documented lazy-validation growth ratios
   from the tracked artifact and reproduces its deterministic ladder fields.
 - `valid/ malformed/ policy/ resource/ coverage/ integration/ cve/` — generated
@@ -78,7 +87,8 @@ then runs every gate in one pass:
 |---|---|
 | corpus generation | every fixture referenced by the tracked expectations is created before consistency checks inspect it |
 | registry consistency | the cross-file constraints, including that the manifest's claim about libhdf5 matches what was measured |
-| unit checks | datatype, message, file-space-info, profile limits, reachability, consumer API, `h5policy_analyze` seam, timeout report |
+| unit checks | datatype, message, file-space-info, profile limits, reachability, consumer API, byte-path serializer, `h5policy_analyze` seam, timeout report |
+| byte-path JSON report | arbitrary-byte host and HDF5 paths produce strict UTF-8 JSON and round-trip through `utf-8-percent-v1` |
 | corpus cases | every `expected/*.yml`: decision, exit code, required findings, evidence locations, forbidden outcomes |
 | differential | h5policy's parse against libhdf5 via h5py / h5dump / h5debug |
 | exact-build probe + canary matrix | what the selected libhdf5 build actually does per fixture (skipped without `h5cc`) |
@@ -102,6 +112,11 @@ The smaller `cache_image_docs_regression` CTest test runs the cache-image
 documentation contract directly. It is also part of the top-level
 `docs-check` target, so a profile, decision, analysis-state, or documentation
 change at that hard boundary is reviewed as documentation drift.
+
+`h5policy_workflow_docs_regression` checks the operator workflow without
+running an HDF5 analysis. It fails when the CLI profiles or decisions, finding
+or message inventory, invariant-family status, verification score, or pinned
+exact-build evidence changes without a matching documentation update.
 
 `lazy_validation_docs_regression` similarly checks the narrative against
 `registry/lazy-validation.json`, reruns the measurement when its optional

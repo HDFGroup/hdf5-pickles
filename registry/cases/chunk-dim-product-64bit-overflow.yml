@@ -1,0 +1,218 @@
+# The product of a chunked layout's encoded dimensions is accumulated with no
+# overflow check, on the READ path as well as on create.  A product of exactly
+# 2**64 wraps to zero, and zero then walks past libhdf5's own >4 GiB guard
+# BECAUSE it is zero, leaving only an assert that no release build contains.
+# H5D__chunk_lock allocates a zero-size chunk buffer and the gather/scatter
+# paths index it with offsets derived from the unwrapped dimensions.
+#
+# Found 2026-08-24 while closing item 1 of arithmetic-divergences-backlog.yml.
+# That item asked whether a uint32 wrap under-allocates the chunk buffer; the
+# answer is no -- the field has been hsize_t since libhdf5 2.0.0 -- but the same
+# question one width up answers yes, with a measured out-of-bounds read and
+# write.  Local analysis only.
+schema_version: 1
+
+id: chunk-dim-product-64bit-overflow
+title: chunked layout dimensions multiply without an overflow check, so a
+  product of 2**64 wraps to a zero chunk size and libhdf5 reads and writes past
+  a zero-size chunk buffer
+status: oracle-hardened          # h5policy rejects as of 2026-08-24; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  Nothing was reported upstream from here, no
+  advisory database was consulted, and no identifier was looked up.  The
+  handoff draft lives outside the tracked tree.
+
+# -- Triage -------------------------------------------------------------------
+record: dataset_layout_filter_fill
+versions: [1, 2, 3, 4, 5]        # every layout version that encodes chunk dims
+root_cause_classification: local_decode
+violated_invariant:
+  - layout.chunk_size_product
+validation_closure: >-
+  one layout message: the encoded chunk dimension vector, and nothing else.  The
+  dimensions are self-contradictory on their own terms -- they name a chunk
+  whose byte size is not representable -- so no cross-record context is needed,
+  which is what makes this a one-clause check on the dimension loop.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-08-24"
+  - "libhdf5 H5Fopen -> H5Dopen2 -> H5D__chunk_init (src/H5Dchunk.c:1179) -> H5D__chunk_set_sizes (src/H5Dchunk.c:849-860)"
+  - "libhdf5 H5Dread -> H5D__chunk_read (src/H5Dchunk.c:3141) -> H5D__chunk_lock (src/H5Dchunk.c:4829) -> H5D__compact_readvv (src/H5Dcompact.c:409) -> H5VM_memcpyvv (src/H5VM.c:1383)  <-- OOB read"
+  - "libhdf5 H5Dwrite -> H5D__chunk_write (src/H5Dchunk.c:3600) -> H5D__chunk_lock (src/H5Dchunk.c:4887) -> H5D__compact_writevv (src/H5Dcompact.c:467) -> H5VM_memcpyvv (src/H5VM.c:1426)  <-- OOB write"
+  - "shipped consumers: h5dump -d with a subset whose start coordinate is nonzero; any H5Dread or H5Dwrite. NOT h5dump -H / h5ls -v, which never materialize a chunk"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0, develop 51b92ccee54) -
+defect: >-
+  The chunked branch of H5O__layout_decode multiplies the decoded dimensions
+  straight through, in both the pre-v4 arm and the shared v4/v5 arm:
+    mesg->u.chunk.size = mesg->u.chunk.dim[0];
+    for (unsigned u = 1; u < mesg->u.chunk.ndims; u++)
+        mesg->u.chunk.size *= mesg->u.chunk.dim[u];
+  Per-dimension validation is exactly one test -- dim[u] == 0 is rejected -- and
+  nothing bounds the product.  H5D__chunk_set_sizes then recomputes the same
+  product on OPEN (src/H5Dchunk.c:849-860, reached through the open_op branch at
+  :1179) and follows it with a guard that cannot fire:
+    if ((uint64_t)dset->shared->layout.u.chunk.size != chunk_size)
+        HGOTO_ERROR(... "chunk size too big to fit in hsize_t");
+  Both sides are 64 bits wide, so the comparison is vacuous -- while the comment
+  above the loop claims the 64-bit accumulation exists "to ensure that we can
+  detect >4GB chunks", which is exactly what the wrap defeats.
+  The encoded dimensions are attacker data: enc_bytes_per_dim may be 1 to 8 and
+  H5O_LAYOUT_NDIMS dimensions are permitted, so a product of 2**64 is easy to
+  reach -- 2**31 * 2**31 * 4 fits in three four-byte fields.
+  A wrapped product of ZERO is the dangerous landing point, because the
+  library's own size guard is an upper bound:
+    if (dset->shared->layout.u.chunk.size > (hsize_t)0xffffffff &&
+        dset->shared->layout.u.chunk.idx_type == H5D_CHUNK_IDX_BTREE)   -- :1185
+  Zero passes it.  What remains is
+    assert(layout->u.chunk.size > 0);                                   -- :4638
+  in H5D__chunk_lock, and the baseline build's libhdf5.settings records
+  -DNDEBUG.  H5FL_blk_malloc(0) then returns an 8-byte free-list block
+  (src/H5FL.c:773) and H5VM_memcpyvv indexes it with in-chunk offsets computed
+  from the unwrapped dimensions.
+  THE FIX IS A BOUND ON THE ACCUMULATION, in H5O__layout_decode and again in
+  H5D__chunk_set_sizes: refuse when the running product would exceed
+  HSIZE_MAX / dim[u].  Promoting the assert at :4638 to an error would also stop
+  the crash, but later than the invariant is knowable, and it would leave the
+  wrapped size in the layout for everything else that reads it.
+
+# -- What was measured --------------------------------------------------------
+measured:
+  builds:
+    - role: baseline
+      libhdf5_version: 2.3.0
+      build_mode: RelWithDebInfo
+      asserts: false
+      sanitizers: []
+      abi: x86-64
+      settings_sha256: 7ce6203229fbd356cbdbaab0e1b333c4319c0063743003226a9fb8d05f47819c
+    - role: candidate-asan
+      libhdf5_version: 2.3.0
+      build_mode: RelWithDebInfo
+      asserts: true
+      sanitizers: [address]
+      abi: x86-64
+      settings_sha256: 970f83354e89722436502d348e12c8a33ec783724c3f48adf2d7dd9ae081d219
+    - role: candidate-asan-assert-free
+      libhdf5_version: 2.3.0
+      build_mode: RelWithDebInfo
+      asserts: false
+      sanitizers: [address]
+      abi: x86-64
+      settings_sha256: bff2c7271e5415ae394ef5424d5ca64d8f386f977231038e9c92c98772204431
+      note: >-
+        built for this case in a temporary build directory.  The shipped ASan
+        build has asserts live, so it stops at H5Dchunk.c:4638 before the
+        access; turning them off is what lets the sanitizer reach and describe
+        the real out-of-bounds.
+    - role: baseline-i386
+      libhdf5_version: 2.3.0
+      build_mode: RelWithDebInfo
+      asserts: false
+      sanitizers: []
+      abi: i386
+      settings_sha256: ef807c88281cc8210e658e3ad02c169ddc92978526d58dc1cf4f126aa48c7e62
+    - role: bundled-in-h5py
+      libhdf5_version: 1.14.5
+      abi: x86-64
+      note: h5py 3.13.0 wheel; no settings file ships with it
+  results:
+    - "candidate-asan-assert-free, read: heap-buffer-overflow, READ of size 4, 0 bytes after an 8-byte region; H5VM_memcpyvv (H5VM.c:1383) <- H5D__compact_readvv <- H5D__chunk_read <- H5Dread; region from H5FL_blk_malloc (H5FL.c:773) <- H5D__chunk_lock (H5Dchunk.c:4829)"
+    - "candidate-asan-assert-free, write: heap-buffer-overflow, WRITE of size 4 of caller data, same 8-byte region; H5VM_memcpyvv (H5VM.c:1426) <- H5D__compact_writevv <- H5D__chunk_write <- H5Dwrite; allocation site H5Dchunk.c:4887"
+    - "candidate-asan, either direction: H5D__chunk_lock: Assertion `layout->u.chunk.size > 0' failed -- which is what establishes the guard as assert-only rather than absent"
+    - "baseline, read-only: SIGSEGV from a 479-byte file, including through h5dump -d /d -s \"1,0\" -c \"1,1\""
+    - "baseline, write: SIGSEGV through H5Dwrite on the tracked fixtures malformed/chunk_dim_product_wrap_v4.h5 and _v5.h5, both of which h5dump -H opens with exit 0"
+    - "bundled-in-h5py (1.14.5), read-only: SIGSEGV on a v4-encoded specimen -- the product wraps in uint32_t and reaches zero by the same route"
+    - "baseline-i386: NO fault.  Returns fill values instead of the stored bytes on every wrapping specimen, on both the read and the single-element path.  Silent wrong data, not a memory-safety outcome; the mechanism was not traced"
+  minimal_trigger: >-
+    one element whose in-chunk byte offset is NONZERO.  Element (0,...,0) sits
+    at offset 0 and reads 4 of the 8 bytes the allocator returned, so it does
+    not fault -- which is why the exact-build canary, whose fallback selection
+    is a single point at a calloc'd coordinate array
+    (h5policy/tools/probe/h5probe.c:302-311), reported outcome=accepted on a
+    specimen that segfaults h5dump.  The canary now picks a nonzero coordinate;
+    that change also altered exactly one other measurement, recorded in
+    registry/cases/efl-external-open-before-segment-validation.yml, where an
+    origin read had likewise been asking an easier question.
+  reachable_read_only: true
+  smallest_crasher_bytes: 479
+
+# -- Oracle behaviour ---------------------------------------------------------
+oracle:
+  profile: untrusted-strict
+  decision: reject_corrupt
+  primary_finding: H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW
+  object_path: /d
+
+# -- Containment vs systemic --------------------------------------------------
+containment:
+  status: landed          # in h5policy; the libhdf5 side is untouched
+  description: >-
+    h5policy_chunk_size_accum_with_sources in h5policy/pickles/h5_layout.pk
+    bounds the running product at 64-bit representability and poisons it on
+    overflow, replacing an unconditional 32-bit bound that was wrong in both
+    directions -- it rejected files libhdf5 2.x writes by default, and it caught
+    this wrap only incidentally, because the partial product crossed 2**32 on
+    the way.
+systemic:
+  semantic_boundary: layout dimensions and filter/fill-size arithmetic
+  status: linked-followup
+  owner: n/a
+  note: >-
+    The same unchecked multiply pattern is worth a sweep across pickles/, which
+    inherits libhdf5's arithmetic by construction: any accumulation of a
+    file-supplied dimension vector must be bounded before the result is used.
+backports: []
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  direct_fixture: h5policy/tests/malformed/chunk_dim_product_wrap_v5.h5
+  generator: >-
+    h5policy/tools/h5policy-gencorpus, _layout_chunk_dim_product_wrap over
+    _layout_chunk_enc4_2d: write a rank-2 single-chunk dataset whose chunk
+    dimensions need four encoded bytes, patch two of them to 0x80000000, stamp
+    the layout version, and repair the object-header checksum.
+  integration_poc: >-
+    n/a as a tracked artifact.  An H5Fopen(RDONLY) + H5Dread of one element at a
+    nonzero coordinate is the whole reproducer; the case bundle carries it.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: true
+
+# -- Variants and coverage ----------------------------------------------------
+sibling_audit: >-
+  Measured across layout versions 3, 4 and 5 and across the v1 B-tree, Single
+  Chunk and unallocated cases.  A PRE-EXISTING v1 B-tree index closes the read
+  path: H5D__btree_decode_key (src/H5Dbtree.c:647, "bad coordinate offset")
+  rejects keys that are no longer multiples of the patched dimensions, so the
+  read-only crashers use the Single Chunk index, which stores no coordinates.
+  The write path is reachable at every layout version tested.  NOT covered:
+  filtered chunks, and the fixed-array / extensible-array / v2-B-tree index
+  types.
+fuzz_seed: n/a
+coverage_manifest_change: >-
+  layout.chunk_size_32bit was one invariant doing three jobs and is now three:
+  layout.chunk_size_product (this case), layout.chunk_size_32bit narrowed to the
+  v1-B-tree index, and layout.chunk_size_version_advisory for the portability
+  statement.  Five fixtures pin one cell each of the version/index matrix.
+compatibility_backport_risks: >-
+  The narrowing REMOVES false positives rather than creating risk: the old bound
+  rejected valid/chunk_4gib_layout_v5.h5, whose geometry libhdf5 2.3.0 writes
+  for an ordinary H5Pset_chunk call.  The narrowing must not be a bare
+  layout-version gate, though -- malformed/chunk_dim_product_wrap_v5.h5 carries
+  the wrap at version 5 and crashes the baseline build just the same, which is
+  why the overflow finding is version-independent.
+
+provenance:
+  h5policy_commit: "branch updates/20260821, developed against 71ffe55"
+  libhdf5_source: {branch: develop, commit: 51b92ccee54ed3f14af3509c9ac5e4f3c82e58ce, version: 2.3.0}
+  found_by: >-
+    closing item 1 of registry/cases/arithmetic-divergences-backlog.yml, by
+    re-measuring its premise against the newest build rather than inheriting the
+    record's verdict

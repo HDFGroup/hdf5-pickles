@@ -131,6 +131,8 @@ add_custom_target(docs-check
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_cache_image_docs.py"
     COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_workflow_docs.py"
+    COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/check_docs.py"
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/h5explain/tests/check_docs.py"
@@ -182,6 +184,14 @@ add_test(
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 set_tests_properties(lazy_validation_docs_regression PROPERTIES TIMEOUT 90)
+
+add_test(
+    NAME h5policy_workflow_docs_regression
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/check_workflow_docs.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+set_tests_properties(h5policy_workflow_docs_regression PROPERTIES TIMEOUT 30)
 
 add_test(
     NAME tool_overview_docs_regression
@@ -288,6 +298,20 @@ if(POKE_EXECUTABLE)
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
     set_tests_properties(pickle_ref_enc_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
+    # The global-heap walk cases assert TERMINATION, so the timeout is part of
+    # the assertion rather than a safety net: before the progress guard in
+    # gheap.pk these inputs spun forever and this test would hang here instead
+    # of reporting a failed expectation.
+    add_test(
+        NAME pickle_gheap_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_gheap.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(pickle_gheap_regression PROPERTIES
         TIMEOUT 30
         ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
     )

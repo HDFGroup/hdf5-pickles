@@ -817,6 +817,24 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
             var seen_off = uint<64>[]();
             var seen_len = uint<64>[]();
 
+            /* Member byte extents for THIS compound, for the overlap check at
+               the bottom of the loop.  Members must occupy disjoint bytes of the
+               parent element; libhdf5 rejects an overlap outright and its own
+               comment says it "probably indicates that the file is corrupt"
+               (H5Odtype.c:594-610).  h5policy accepted such files -- measured on
+               three specimens that libhdf5 refuses to read at all.
+
+               COST: guarded by a high-water mark exactly as libhdf5 guards its
+               own loop.  A member starting at or after every previous member's
+               end cannot overlap anything, so the ordered layout every writer
+               produces costs O(1) per member and never scans.  Only an
+               out-of-order member pays the linear scan, and the recorded set is
+               capped -- the member count is a 16-bit attacker-controlled field,
+               so an uncapped pairwise loop is 2**31 comparisons. */
+            var memb_lo = uint<64>[]();
+            var memb_hi = uint<64>[]();
+            var memb_high_water = 0UL;
+
             if (num == 0UL)
                 h5policy_emit_error("H5_CORRUPT_DATATYPE_ZERO_MEMBERS",
                                     "corrupt", blob_off, object,
@@ -982,6 +1000,51 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
                         h5policy_emit_error("H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_BOUNDS",
                                             "corrupt", child_off, object,
                                             "compound member type extends outside its parent type");
+                    else if (member_size != 0UL)
+                        {
+                            /* In bounds and nonempty: does it collide with a
+                               member already seen?  Zero-size members are
+                               skipped rather than reported -- they occupy no
+                               bytes, so they cannot overlap, and a separate rule
+                               owns whether they are legal at all. */
+                            var mlo = member_off;
+                            var mhi = member_off + member_size;
+                            if (mlo < memb_high_water)
+                                {
+                                    var n = memb_lo'length as uint<64>;
+                                    h5policy_walk_tick(n + 1UL);
+                                    var q = 0UL;
+                                    while (q < n)
+                                        {
+                                            if (h5policy_intervals_overlap(
+                                                    mlo, mhi, memb_lo[q], memb_hi[q]))
+                                                {
+                                                    h5policy_emit_error_ev(
+                                                        "H5_CORRUPT_DATATYPE_COMPOUND_MEMBER_OVERLAP",
+                                                        "corrupt", child_off, object,
+                                                        "compound member overlaps an earlier member",
+                                                        H5Evidence {
+                                                            field = "datatype.compound_members_disjoint",
+                                                            actual = mlo,
+                                                            expected = memb_hi[q],
+                                                            comparison = "at_least",
+                                                            has_loc1 = 1, loc1_role = "actual",
+                                                            loc1 = child_off, loc1_len = 4UL,
+                                                        });
+                                                    q = n;
+                                                }
+                                            else
+                                                q = q + 1UL;
+                                        }
+                                }
+                            if (mhi > memb_high_water)
+                                memb_high_water = mhi;
+                            if (memb_lo'length as uint<64> < 4096UL)
+                                {
+                                    memb_lo += [mlo];
+                                    memb_hi += [mhi];
+                                }
+                        }
                     used = used + child;
                     m = m + 1UL;
                 }
@@ -1034,7 +1097,11 @@ fun h5policy_validate_dtype_payload = (int ios,
     ctx.datatype_size = elm_size;
     ctx.datatype_size_offset = (payload_off + 4#B)/#B;
     ctx.datatype_logical_size = logical_size;
+    ctx.datatype_class = ctype;
+    /* Meaningful only for class 7; harmless for the rest, and reading it here
+       keeps the class bit field decoded in exactly one place.  */
+    ctx.datatype_reference_type = (flags .>> 8) & 0xfUL;
     ctx = h5policy_update_fill_value_size(ctx, payload_off, object);
-    return h5policy_update_logical_dataset_size(ctx, profile,
+    return h5policy_update_logical_dataset_size(ios, ctx, profile,
                                                 payload_off, object);
 }

@@ -22,7 +22,7 @@ Registry files plus a case directory, one schema version:
 | [`verification-coverage.yml`](verification-coverage.yml) | **Generated.** Which of the [§12](../docs/A%20CVE%20strategy%20for%20the%20HDF5%20library.md) verification requirements each record family demonstrably meets. |
 | [`ssp-control-evidence.yml`](ssp-control-evidence.yml) | Checked, deliberately narrow mapping from selected HDF5 SSP controls to record/invariant/finding, fixture, canary, and exact-build measurement. It is technical evidence, not complete control attestation. |
 | [`cve-case.yml`](cve-case.yml) | The annotated **template** for a per-case record. Its fields are the §11.5 containment/systemic tracking block. |
-| [`cases/`](cases/) | Real per-case records: two oracle-hardened memory-safety cases, one proactive hardening case, and six libhdf5 divergence records, including one open backlog of uninvestigated items. |
+| [`cases/`](cases/) | Real per-case records, mostly `oracle-hardened` -- h5policy rejects, the libhdf5 side is unfixed -- alongside contained, upstream-fixed and proactive-hardening entries. Two are `uninvestigated`: filed divergences held as a tracked queue rather than waved through as benign. The enumeration is deliberately not spelled out here, because it drifts; `check_registry.py` counts them. |
 
 [`../tools/check_registry.py`](../tools/check_registry.py) derives the production
 emit inventory from the pickle validators and the wrapper-generated timeout
@@ -118,7 +118,7 @@ regenerating, or someone asserted something nothing measured. They are separate
 files on purpose: a generator that rewrites the claim it is checked against
 proves nothing.
 
-Current verdicts, against libhdf5 2.2.0:
+Current verdicts, against libhdf5 2.3.0:
 
 | verdict | families |
 |---|---|
@@ -126,9 +126,13 @@ Current verdicts, against libhdf5 2.2.0:
 | `partial` — some invariants enforced, some not | 9 |
 
 Only `reject_corrupt` specimens count toward a verdict. Activation events
-(`external_open`) and crashes are recorded separately, since a build can enforce
-an invariant and still crash or activate on the way to it. The divergences
-behind the nine `partial` verdicts are written up in [`cases/`](cases/).
+(`external_open`), crashes and hangs are recorded separately, since a build can
+enforce an invariant and still crash, hang or activate on the way to it.
+`crashes_on` is a fault — SIGSEGV, SIGFPE, SIGABRT — and `hangs_on` a
+non-termination the probe killed on its CPU limit; the probe spells both as a
+forbidden `crash` event, so the bucket comes from its `outcome` rather than from
+that name. The divergences behind the nine `partial` verdicts are written up in
+[`cases/`](cases/).
 
 ## §12 verification status
 
@@ -150,19 +154,34 @@ more than the total:
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
 - Lazy validation is `partial` everywhere: measured, and holding, but on the
   oracle as a whole rather than family by family.
-- Reviewed fixture/recipe annotations now supply some boundary, arithmetic, and
-  progress evidence. Most families remain `not_assessed` in those columns:
-  13 for count/extent boundaries and 14 each for integer-overflow/allocation
-  budget and deep-nesting/non-progress. Missing categories are deliberately not
-  inferred from finding-code spelling.
-- Dedicated fuzz targets exist for 1 family of 16.
+- Reviewed fixture/recipe annotations now carry most of the boundary,
+  arithmetic, nesting and reference-semantics evidence: `not_assessed` in those
+  four columns is down to 2, 9, 9 and 6 families respectively. The annotations
+  are a review of what each fixture's documented mechanism actually exercises,
+  never an inference from finding-code spelling, which is why a family with many
+  fixtures can still be `not_assessed` -- version, flag and checksum fixtures
+  exercise none of these categories. What the sweep establishes is mostly which
+  boundary VALUES the corpus lacks: `n` and `n_minus_1` are thin nearly
+  everywhere, and `allocation_budget` is demonstrated for one family.
+- Dedicated fuzz targets exist for 2 families of 16. `h5mutate` is a locator
+  plus a recipe table per family, so the cost of the next family is its locator.
+  A recipe is only counted once it emits its intended finding on seeds other
+  than the one it was written against -- the heap recipes were verified on four
+  structurally different heaps, and a fifth candidate was rejected for failing
+  that bar.
 - 14 families pin evidence locations as well as finding codes; the remaining
   2 need cursor arithmetic at the emit site rather than test metadata.
-- Truncation is `met` for 12 families, `partial` for 3 whose seed exceeds the
-  sweep budget, and `absent` for 1; see
+- Truncation is `met` for 12 families, `partial` for 4 whose seed exceeds the
+  sweep budget, and `absent` for 0; see
   [`truncation-sweep.json`](truncation-sweep.json).
-- No-activation-on-failure is `met` for 13 families and `partial` for 3 because
+- No-activation-on-failure is `met` for 9 families and `partial` for 7 because
   the exact-build probe observes an activation or crash in those families.
+  `external_file_list` joined that list on 2026-08-24 without libhdf5 changing:
+  the probe's fallback single-element read moved from the origin to the last
+  element, and the wrapped EFL segment it now reaches is opened before it is
+  rejected. A count that goes DOWN because the harness asks a harder question is
+  the intended direction -- see
+  the EFL entry under [`cases/`](cases/).
 
 `check_registry.py` enforces the report's structure — every manifest record
 present and every requirement scored — and derives the summary counts above.

@@ -120,14 +120,18 @@ inventory from `tools/h5cve` and `registry/validation-coverage.yml` as part of
 
 `h5cve evidence` turns a matrix run into a per-family verdict on the selected
 build (`enforced`, `partial`, `diverges`, `unmeasured`) and writes
-[`registry/libhdf5-evidence.yml`](../registry/libhdf5-evidence.yml). That file is
+[`registry/libhdf5-evidence.yml`](../registry/libhdf5-evidence.yml). Faults and
+non-terminations reach it as separate `crashes_on` and `hangs_on` buckets: the
+probe forbids one `crash` event for both, so the split is read off its
+`outcome`, and a hang reported as a crash would name a fault the specimen never
+caused. That file is
 the **measurement**; `validation-coverage.yml`'s `validators.hdf5` is the
 hand-maintained **claim**, and `tools/check_registry.py` fails on any
 disagreement — so a claim about libhdf5 cannot drift from what was observed.
 Regenerate after changing the build under test or the corpus:
 
 ```sh
-tools/h5cve evidence --libhdf5-version 2.2.0    # ~8s, runs the matrix itself
+tools/h5cve evidence --libhdf5-version 2.3.0    # ~8s, runs the matrix itself
 ```
 
 `h5cve verification` scores each family against the eleven §12 verification
@@ -193,14 +197,25 @@ Without the control, flat counters could equally mean the counters are broken.
 The `filtered` ladder pins the chunk count deliberately: letting it vary with
 `n` would measure metadata growth rather than data volume.
 
+The control's rise is steeply superlinear, and deliberately so: the extent
+checks behind `chunk.data_disjoint_from_metadata` and
+`chunk.data_disjoint_from_data` compare each data extent against those recorded
+so far, which is quadratic in chunk count until their caps are reached. It is
+bounded, not runaway — measured on one-element-chunk files, `walk_operations`
+goes 60,786 (256 chunks) → 629,909 (1,024) and then flattens to 724,346 (2,048)
+and 920,679 (4,096) once the 1,024-check cap engages, i.e. ~9% of the tightest
+profile's 10,000,000-operation budget rather than an unbounded term.
+`analysis.extent_overlap_truncated` reports when a cap was reached, so a clean
+result from those checks can be told apart from a partial one.
+
 Counters are bounded by ratio, not equality — decoding a larger stored-size
 field can cost a few operations without any payload being touched, while a
 validator that read payload would grow with `n`. In the current tracked
 measurement, the unfiltered ladder's `metadata_bytes_seen`/`walk_operations`
-remain exactly 447/212 across the 3,031× physical-file increase. The filtered
-ladder remains at 447 metadata bytes while operations move only 229 → 233
+remain exactly 447/219 across the 3,031× physical-file increase. The filtered
+ladder remains at 447 metadata bytes while operations move only 247 → 251
 across 1,061× physical growth. The sensitivity control rises
-375 → 987 → 7,107 operations. These ratios are derived from the
+410 → 2,012 → 89,312 operations. These ratios are derived from the
 `physical_bytes` endpoints in
 [`registry/lazy-validation.json`](../registry/lazy-validation.json), not from the
 nominal element-count ratio.
@@ -247,15 +262,33 @@ self-validating — `family --verify` asserts h5policy emits the intended findin
 
 ```text
 h5mutate list  [--seed FILE]
-h5mutate apply --seed FILE --recipe NAME --out FILE
-h5mutate family --seed FILE --out-dir DIR [--verify]
+h5mutate apply  --seed FILE --recipe NAME --out FILE
+h5mutate family --seed FILE --out-dir DIR [--verify] [--family NAME]
 ```
 
-The current slice covers the object-header continuation family (the interval
-model): target overlapping the source chunk at start/interior/end, zero-size,
-out-of-file, and alias onto an already-decoded chunk.  `run.sh` runs
-`family --verify` as a pinned check, and `h5cve variants` uses it to populate a
-case bundle.  The structure-aware **reducer** (`h5cve minimize`) is the
+A **family** is a locator plus a recipe table. The locator turns a seed into the
+context its recipes need and reports when the seed does not carry the structure
+at all -- a plain dataset is not a continuation seed, which is a skip and not an
+error -- and the recipes never parse the file, they edit fields the locator found
+and reseal what it says encloses them. Adding a family costs its locator; the
+recipes are then a few lines each.
+
+Two families exist:
+
+| family | recipes | mutations |
+| --- | --- | --- |
+| `object_header_continuation` | 6 | target overlapping the source chunk at start/interior/end, zero-size, out-of-file, alias onto an already-decoded chunk |
+| `heap_structures` | 4 | doubling-table width zero and non-power-of-two, declared heap size one and two bits under the first row |
+
+The bar for counting a recipe is that it emits its intended finding on seeds
+other than the one it was developed against: the heap recipes were verified on
+four structurally different heaps (dense-link, dense-attribute, shared-message,
+and shared-message huge-object), which is what a recipe has over a committed
+fixture -- one mutation where the corpus needs four base files. A fifth
+candidate was rejected for failing that bar, and the reason is recorded in the
+tool and in the family's `fuzz_targets` block. `run.sh` runs `family --verify`
+for both families as pinned checks, on different seeds, and `h5cve variants`
+uses the engine to populate a case bundle.  The structure-aware **reducer** (`h5cve minimize`) is the
 remaining half of roadmap change #5.
 
 Bundles live under `cases/<id>/` (git-ignored working scratch); `promote` is

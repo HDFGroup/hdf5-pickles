@@ -607,6 +607,31 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
                 loc1 = h5policy_pipeline_decode_nelmts_offset#B, loc1_len = 4UL,
             });
 
+    /* A filtered chunk must be at least as large as the fixed framing its own
+       pipeline consumes.  fletcher32 and szip each strip four bytes by plain
+       subtraction on a size_t (H5Zfletcher32.c:73, H5Zszip.c:298), so a stored
+       size of 1, 2 or 3 wraps the length to near SIZE_MAX exactly as 0 does --
+       all four values were measured to SIGSEGV the shipped build.  The zero case
+       is reported at the record itself, since it is invalid with or without
+       filters; this is the rest of the rule, and it has to be here because the
+       pipeline message and the chunk index arrive in either order.  */
+    if (h5policy_pipeline_has_framing != 0UB
+        && h5policy_chunk_has_stored != 0UB
+        && h5policy_chunk_min_stored < h5policy_pipeline_chunk_framing)
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_CHUNK_STORED_SIZE", "corrupt", loc, object,
+            "filtered chunk record is smaller than the pipeline's fixed framing",
+            H5Evidence {
+                field = "chunk.stored_size",
+                actual = h5policy_chunk_min_stored,
+                expected = h5policy_pipeline_chunk_framing,
+                comparison = "at_least",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = h5policy_chunk_min_stored_offset#B, loc1_len = 4UL,
+                has_loc2 = 1, loc2_role = "expected",
+                loc2 = h5policy_pipeline_framing_offset#B, loc2_len = 1UL,
+            });
+
     /* The other decompressed-buffer factor: the filter's cd_values[4] element
        size must be the real datatype element size.  Inflating it overflows
        nelmts * size just as an inflated element count does, even when the count is
@@ -818,6 +843,7 @@ fun h5policy_validate_ohdr_raw = (int ios,
     ctx.has_link_message = 0UB;
     ctx.has_compact_layout = 0UB;
     ctx.has_contiguous_layout = 0UB;
+    ctx.has_contiguous_stored_size = 0UB;
     ctx.has_legacy_chunked_layout = 0UB;
     ctx.dataset_element_count_overflowed = 0UB;
     ctx.dataset_dim_exceeds_max = 0UB;
@@ -831,6 +857,10 @@ fun h5policy_validate_ohdr_raw = (int ios,
     ctx.fill_value_size = 0UL;
     ctx.compact_layout_size = 0UL;
     ctx.contiguous_layout_size = 0UL;
+    ctx.contiguous_stored_size = 0UL;
+    ctx.contiguous_stored_size_offset = 0UL;
+    ctx.contiguous_layout_addr = 0xffffffffffffffffUL;
+    ctx.contiguous_layout_addr_offset = 0UL;
     ctx.legacy_chunked_layout_ndims = 0UL;
     ctx.legacy_chunked_layout_ndims_offset = 0UL;
     ctx.chunk_dataset_element_count = 0UL;
@@ -843,6 +873,12 @@ fun h5policy_validate_ohdr_raw = (int ios,
     h5policy_pipeline_decode_size = 0UL;
     h5policy_pipeline_has_decode_size = 0UB;
     h5policy_pipeline_decode_size_offset = 0UL;
+    h5policy_pipeline_chunk_framing = 0UL;
+    h5policy_pipeline_has_framing = 0UB;
+    h5policy_pipeline_framing_offset = 0UL;
+    h5policy_chunk_min_stored = 0UL;
+    h5policy_chunk_min_stored_offset = 0UL;
+    h5policy_chunk_has_stored = 0UB;
     /* Fresh arrays, not truncations: assigning an existing array would alias
        it, and the finalize cross-check must see only this object's shape.  */
     h5policy_dataspace_max_dims = uint<64>[]();
@@ -1181,20 +1217,70 @@ fun h5policy_walk_reachable_metadata = (int ios,
 }
 
 /* ---- Forensic global-heap sweep -------------------------------------------
-   Global heap collections (GCOL) are only reached through global-heap IDs in
-   vlen/reference *data*, which this metadata-only oracle does not decode, so a
-   malformed collection is normally outside the reachable graph.  A collection
-   whose free-space object (heap index 0) is encoded with a zero length makes
-   libhdf5's H5HG__cache_heap_deserialize loop forever: for index 0 the parse
-   advance is `need = obj size`, so a zero there never moves the cursor.  The
-   reachability walk cannot see that, so the forensic profile -- whose job is to
-   report anomalies, not to follow references -- sweeps the raw bytes for GCOL
-   signatures and walks each collection's object list, flagging any entry whose
-   size advances the parser by zero bytes.  */
+   Global heap collections (GCOL) are reached through global-heap IDs held in
+   vlen/reference values.  Where that value is DATASET raw data the ID is
+   outside this metadata-only oracle's boundary, so such a collection is not on
+   the reachable graph and only this sweep can see it.
+
+   Two kinds of ID are NOT in that category, and this comment used to claim
+   otherwise: a VDS layout message names a collection (h5_vds.pk), and so does an
+   ATTRIBUTE value, because an attribute's value is stored inside its
+   object-header message (h5policy_validate_attr_heap_ids in h5_messages.pk).
+   Both are metadata and both are validated on the reachable graph.  The sweep
+   remains the only route to a collection reached from dataset data, or to an
+   orphaned one no reference names at all.  An object that
+   does not advance the parse cursor makes libhdf5's
+   H5HG__cache_heap_deserialize loop forever, and there are TWO ways in:
+
+     * index 0, the free-space object, whose advance is `need = obj size` raw
+       (H5HGcache.c:358) -- a declared zero never moves the cursor;
+     * any other index, whose advance is
+       `need = H5HG_SIZEOF_OBJHDR(f) + H5HG_ALIGN(size)` (H5HGcache.c:353) in
+       UNCHECKED size_t arithmetic -- eight declared lengths per size_t width,
+       the interval [SIZE_MAX-22, SIZE_MAX-15], wrap that sum to zero.
+
+   The second entrance was measured, not deduced: rewriting one object length to
+   2^64-16 in an otherwise clean file makes both a release and an
+   AddressSanitizer build of libhdf5 2.3.0 fail to terminate on an ordinary
+   H5Aread, with no sanitizer report -- it is a liveness failure, nothing is read
+   out of bounds.  libhdf5's own bounds check cannot catch it:
+   H5_IS_BUFFER_OVERFLOW short-circuits on `(size) != 0`, so a `need` of zero is
+   exactly the value it is defined to ignore.
+
+   The reachability walk cannot see any of this, so the forensic profile --
+   whose job is to report anomalies, not to follow references -- sweeps the raw
+   bytes for GCOL signatures and walks each collection's object list, flagging
+   any entry whose size advances the parser by zero bytes AT ANY SUPPORTED
+   size_t WIDTH.  The width qualifier matters: this validator's own arithmetic
+   is uint<64>, which reproduces an LP64 reader exactly, and a length of
+   2^32-16 therefore looks like a harmless overrun here while a 32-bit reader
+   computes zero from it and hangs.  h5policy_gcol_advance models both.  */
 
 fun h5policy_align8 = (uint<64> n) uint<64>:
 {
     return ((n + 7UL) / 8UL) * 8UL;
+}
+
+/* H5HG_ALIGN(X) evaluated in a size_t as wide as `mask`, so the wraparound is
+   the target's and not this validator's.  `mask` truncates the decoded length
+   the way the assignment to the size_t field `H5HG_obj_t.size` does
+   (UINT64DECODE: "WE DON'T CHECK FOR OVERFLOW!"), and again after each unchecked
+   operation.  Pass 0xFFFFFFFFFFFFFFFF for LP64 and 0xFFFFFFFF for ILP32.  */
+fun h5policy_align8_at_width = (uint<64> n, uint<64> mask) uint<64>:
+{
+    return (((((n & mask) + 7UL) & mask) / 8UL) * 8UL) & mask;
+}
+
+/* The parse advance H5HG__cache_heap_deserialize computes for one object, in a
+   size_t of the given width.  Index 0 uses its declared size raw; every other
+   index adds the object-header size to the aligned payload.  Both are unchecked
+   in libhdf5, so both are masked here.  */
+fun h5policy_gcol_advance = (uint<64> idx, uint<64> osize, uint<64> objhdr,
+                             uint<64> mask) uint<64>:
+{
+    if (idx == 0UL)
+        return osize & mask;
+    return (objhdr + h5policy_align8_at_width(osize, mask)) & mask;
 }
 
 /* Inspect one candidate GCOL at file offset `g`.  Returns without a finding
@@ -1239,7 +1325,7 @@ fun h5policy_check_gcol = (int ios, H5PolicyProfile profile,
             var osize = h5policy_read_u64_le_at(ios, profile, (p + 8UL)#B, len_size);
             /* index 0 is the free-space object, sized to its whole extent;
                every other object is a header plus its aligned payload.  */
-            var need = (idx == 0UL) ? osize : objhdr + h5policy_align8(osize);
+            var need = h5policy_gcol_advance(idx, osize, objhdr, 0xFFFFFFFFFFFFFFFFUL);
 
             if (need == 0UL)
                 {
@@ -1251,6 +1337,21 @@ fun h5policy_check_gcol = (int ios, H5PolicyProfile profile,
                     h5policy_emit_error("H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP",
                                         "resource", p#B, "global-heap",
                                         "global heap collection object advances the parser by zero bytes; a reader loops indefinitely");
+                    return;
+                }
+            /* The same object in a 32-bit size_t.  Only reported when the 64-bit
+               advance is fine, so this clause adds the width-dependent shape and
+               never restates the one above.  It is gated on a collection a
+               32-bit reader could actually hold: above 4 GiB the chunk
+               allocation fails first, and without the gate a genuinely huge
+               collection whose index-0 extent happened to be a multiple of 2^32
+               would be flagged for a reader that could never load it.  */
+            if (csize <= 0xFFFFFFFFUL
+                && h5policy_gcol_advance(idx, osize, objhdr, 0xFFFFFFFFUL) == 0UL)
+                {
+                    h5policy_emit_error("H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP",
+                                        "resource", p#B, "global-heap",
+                                        "global heap collection object advances the parser by zero bytes in a 32-bit size_t; a 32-bit reader loops indefinitely");
                     return;
                 }
             if (need > end - p)
