@@ -188,6 +188,13 @@ ROLE_PARAMS = {
     # owner back-pointer at the same prefix offset, so one comparison serves
     # both and names which block kind it read.
     "h5policy_frhp_owner_ok": 4,
+    # h5_vds.pk: a global-heap ID is the same record wherever it is stored, and
+    # the whole collection has to be parsed before any one object can be read --
+    # so one bounded collection walker serves both clients that hold an ID in
+    # METADATA: a VDS layout message and an attribute value.  Two clients, two
+    # families, because `record` selects the exact-build canary and those differ
+    # (a VDS source open vs. an attribute read).
+    "h5policy_find_gheap_object": 6,
 }
 
 

@@ -1,16 +1,101 @@
 /* h5_vds.pk - Bounded virtual-dataset global-heap mapping validation. */
 
-type H5PolicyVdsHeapRef = struct
+type H5PolicyHeapRef = struct
 {
     uint<8> found;
     offset<uint<64>,B> data_off;
     uint<64> data_size;
 };
 
-fun h5policy_vds_ref_none = H5PolicyVdsHeapRef:
+fun h5policy_heap_ref_none = H5PolicyHeapRef:
 {
-    return H5PolicyVdsHeapRef { found = 0UB, data_off = 0UL#B,
-                                data_size = 0UL };
+    return H5PolicyHeapRef { found = 0UB, data_off = 0UL#B,
+                             data_size = 0UL };
+}
+
+/* ---- Collection walk memo ---------------------------------------------------
+   The walker below parses a WHOLE collection to answer for one index, which is
+   correct -- a global heap has no per-object access path, so a defect anywhere
+   in it blocks the open regardless of which object was asked for.  But it makes
+   a per-descriptor caller quadratic, and one exists: an attribute value can hold
+   an array of global-heap IDs (h5policy_validate_attr_heap_ids).
+
+   Measured before this memo: a valid file with 60 vlen string attributes of 80
+   elements each took 11.1 s against 0.8 s without the attribute checks, and
+   tripped the profile's wall-clock budget -- turning a perfectly ordinary file
+   into unsupported_coverage_gap.  Metadata-heavy files with many vlen attributes
+   are common, so that was a false positive, not a corner case.
+
+   So the walk records every object it accepts, keyed by the collection address,
+   and repeat lookups against the SAME collection are served from the record.
+   One collection at a time is enough: descriptors in one attribute overwhelmingly
+   name one collection, and a second address simply refills the memo.
+
+   A cache HIT deliberately re-emits nothing.  A malformed collection is reported
+   by the first descriptor that reaches it and stays reported; repeating the same
+   finding once per element would bury the report in duplicates.  */
+/* The cost unit is the WALK, not the descriptor: a memo hit is a few
+   comparisons, a miss re-parses a whole collection.  So the budget is counted in
+   walks.  A file's vlen values do not all land in one collection -- 4800 short
+   strings fill about fifteen 4 KiB collections -- so a per-descriptor caller
+   striding across them thrashes a single-entry memo, and bounding descriptors
+   would not bound the work.  Bounding walks does.
+
+   Set high enough that ordinary files are fully checked and low enough that no
+   file can spend the wall-clock budget here.  Exceeding it stops FURTHER
+   validation; it never turns into a finding, because running out of budget is
+   not evidence about the file.  */
+var H5_GHEAP_WALK_BUDGET = 64UL;
+var h5policy_gheap_walks_left = 64UL;
+
+var h5policy_gheap_memo_addr = 0xffffffffffffffffUL;
+var h5policy_gheap_memo_valid = 0UB;      /* the collection parsed to its end */
+var h5policy_gheap_memo_idxs = uint<64>[]();
+var h5policy_gheap_memo_offs = uint<64>[]();
+var h5policy_gheap_memo_sizes = uint<64>[]();
+
+fun h5policy_reset_gheap_memo = void:
+{
+    h5policy_gheap_walks_left = H5_GHEAP_WALK_BUDGET;
+    h5policy_gheap_memo_addr = 0xffffffffffffffffUL;
+    h5policy_gheap_memo_valid = 0UB;
+    h5policy_gheap_memo_idxs = uint<64>[]();
+    h5policy_gheap_memo_offs = uint<64>[]();
+    h5policy_gheap_memo_sizes = uint<64>[]();
+}
+
+/* Serve `wanted` from the memo.  found = 0 with memo_valid set means the
+   collection really has no such object, which is a finding the CALLER must
+   still make -- the memo cannot emit it, because it does not know the role.  */
+fun h5policy_gheap_memo_lookup = (uint<64> heap_addr, uint<64> wanted) H5PolicyHeapRef:
+{
+    if (h5policy_gheap_memo_addr != heap_addr || h5policy_gheap_memo_valid == 0UB)
+        return h5policy_heap_ref_none;
+    var total = h5policy_gheap_memo_idxs'length as uint<64>;
+    /* Fast path.  libhdf5 allocates object indexes sequentially from 1 and the
+       walk records them in file order, so `wanted` is almost always at
+       wanted - 1.  Guess-and-verify, so an out-of-order or sparse collection
+       just falls through to the scan below and stays correct.
+
+       This is not a micro-optimization: a collection can hold thousands of
+       objects (one per vlen element in the file), and a linear scan per
+       descriptor made the memo itself quadratic -- 3.45 s on the 60-attribute
+       measurement, against 0.35 s with this path.  */
+    if (wanted >= 1UL && wanted <= total
+        && h5policy_gheap_memo_idxs[wanted - 1UL] == wanted)
+        return H5PolicyHeapRef { found = 1UB,
+                                 data_off = h5policy_gheap_memo_offs[wanted - 1UL]#B,
+                                 data_size = h5policy_gheap_memo_sizes[wanted - 1UL] };
+    var n = 0UL;
+    while (n < total)
+        {
+            if (h5policy_gheap_memo_idxs[n] == wanted)
+                return H5PolicyHeapRef { found = 1UB,
+                                         data_off = h5policy_gheap_memo_offs[n]#B,
+                                         data_size = h5policy_gheap_memo_sizes[n] };
+            n = n + 1UL;
+        }
+    return h5policy_heap_ref_none;
 }
 
 /* Find one indexed object in a GCOL while validating every cursor advance.
@@ -36,24 +121,25 @@ fun h5policy_vds_ref_none = H5PolicyVdsHeapRef:
  *     check appears to be unreachable there too, and no construction we tried
  *     reached it.
  */
-fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
-                                      uint<64> heap_addr, uint<64> wanted,
-                                      off64 loc, string object) H5PolicyVdsHeapRef:
+fun h5policy_find_gheap_object = (int ios, H5PolicyProfile profile,
+                                  uint<64> heap_addr, uint<64> wanted,
+                                  off64 loc, string object,
+                                  string role, string field_ns) H5PolicyHeapRef:
 {
     var l = global_sizeof_lengths as uint<64>;
     var file_size = h5policy_ceiling(ios);
     var hdr_size = align8(8UL + l);
     if (!h5policy_checked_addr_range(heap_addr, hdr_size, file_size,
-                                     "VDS global heap header outside file",
+                                     role + " global heap header outside file",
                                      loc, object))
-        return h5policy_vds_ref_none;
+        return h5policy_heap_ref_none;
     if (h5policy_msg_bytes(ios, profile, heap_addr#B, 4UL)
         != H5_FORMAT_GCOL_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
                                 heap_addr#B, object,
-                                "VDS global heap signature mismatch");
-            return h5policy_vds_ref_none;
+                                role + " global heap signature mismatch");
+            return h5policy_heap_ref_none;
         }
     h5policy_mark_reached(heap_addr, "GCOL");
     if (h5policy_msg_u64_at(ios, profile, heap_addr#B + 4#B, 1UL) != 1UL
@@ -61,8 +147,8 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
         {
             h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_HEADER", "corrupt",
                                 heap_addr#B, object,
-                                "VDS global heap version or reserved bytes are invalid");
-            return h5policy_vds_ref_none;
+                                role + " global heap version or reserved bytes are invalid");
+            return h5policy_heap_ref_none;
         }
     var coll_size = h5policy_msg_u64_at(ios, profile, heap_addr#B + 8#B, l);
     /* H5HG__hdr_deserialize refuses a collection that declares itself smaller
@@ -73,21 +159,31 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
         {
             h5policy_emit_error_ev("H5_CORRUPT_GLOBAL_HEAP_HEADER", "corrupt",
                                    heap_addr#B + 8#B, object,
-                                   "VDS global heap collection size is below the format minimum",
+                                   role + " global heap collection size is below the format minimum",
                                    H5Evidence {
-                                       field = "vds.global_heap_collection_size",
+                                       field = field_ns + ".global_heap_collection_size",
                                        actual = coll_size,
                                        expected = H5_FORMAT_GCOL_MIN_COLLECTION_SIZE,
                                        comparison = "at_least",
                                        has_loc1 = 1, loc1_role = "actual",
                                        loc1 = heap_addr#B + 8#B, loc1_len = l,
                                    });
-            return h5policy_vds_ref_none;
+            return h5policy_heap_ref_none;
         }
     if (!h5policy_checked_addr_range(heap_addr, coll_size, file_size,
-                                     "VDS global heap collection outside file",
+                                     role + " global heap collection outside file",
                                      loc, object))
-        return h5policy_vds_ref_none;
+        return h5policy_heap_ref_none;
+    /* Start a fresh memo for this collection.  Invalidated up front so an
+       early return on a malformed collection cannot leave a half-filled record
+       that a later lookup would trust.  The WALK BUDGET is deliberately not
+       touched here -- it is per analysis, and this function is the thing it
+       counts.  */
+    h5policy_gheap_memo_valid = 0UB;
+    h5policy_gheap_memo_idxs = uint<64>[]();
+    h5policy_gheap_memo_offs = uint<64>[]();
+    h5policy_gheap_memo_sizes = uint<64>[]();
+    h5policy_gheap_memo_addr = heap_addr;
     var pos = hdr_size;
     var found = 0UB;
     var found_off = 0UL#B;
@@ -112,8 +208,8 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
                             h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT",
                                                 "corrupt", heap_addr#B + pos#B,
                                                 object,
-                                                "VDS global heap has a trailing free-space region after an explicit free-space object");
-                            return h5policy_vds_ref_none;
+                                                role + " global heap has a trailing free-space region after an explicit free-space object");
+                            return h5policy_heap_ref_none;
                         }
                     free_seen = 1UB;
                     free_size = coll_size - pos;
@@ -125,16 +221,29 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
             var idx = h5policy_msg_u64_at(ios, profile, oh, 2UL);
             var reserved = h5policy_msg_u64_at(ios, profile, oh + 4#B, 4UL);
             var data_size = h5policy_msg_u64_at(ios, profile, oh + 8#B, l);
-            /* A zero length is the denial-of-service shape: for index 0 the
-               parse advance IS the length, so libhdf5 re-reads the same header
-               forever.  Reached through a VDS layout this happens at H5Dopen,
-               not only in an orphaned collection.  */
-            if (reserved != 0UL || data_size == 0UL)
+            /* A zero length is the denial-of-service shape FOR INDEX 0 ONLY:
+               there the parse advance IS the length, so libhdf5 re-reads the
+               same header forever.  Reached through a VDS layout this happens at
+               H5Dopen, not only in an orphaned collection.
+
+               For any other index the advance is H5HG_SIZEOF_OBJHDR(f) +
+               H5HG_ALIGN(size), which is 16 even at size zero -- so the parse
+               progresses and there is nothing to reject.  This test used to
+               refuse a zero length at EVERY index, which was broader than its
+               own justification and WRONG: libhdf5 writes a size-zero heap
+               object for an EMPTY variable-length element, so the rule rejected
+               files libhdf5 itself had just written.  Latent while only a VDS
+               layout reached this walker -- a VDS collection is unlikely to hold
+               an unrelated empty vlen -- and immediate once attribute values
+               reached it, where h5py writing attrs["x"] = "" produces exactly
+               this shape (measured: collection object idx 1, size 0, and
+               h5dump -A exits 0).  */
+            if (reserved != 0UL || (data_size == 0UL && idx == 0UL))
                 {
                     h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT", "corrupt",
                                         oh, object,
-                                        "VDS global heap object header is invalid");
-                    return h5policy_vds_ref_none;
+                                        role + " global heap object header is invalid");
+                    return h5policy_heap_ref_none;
                 }
             if (idx == 0UL)
                 {
@@ -145,8 +254,8 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
                         {
                             h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT",
                                                 "corrupt", oh, object,
-                                                "VDS global heap free-space object overruns the collection");
-                            return h5policy_vds_ref_none;
+                                                role + " global heap free-space object overruns the collection");
+                            return h5policy_heap_ref_none;
                         }
                     free_seen = 1UB;
                     free_size = data_size;
@@ -160,14 +269,17 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
                                                         0xffffffffffffffffUL,
                                                         "H5_CORRUPT_LENGTH_OVERFLOW",
                                                         "corrupt", oh, object,
-                                                        "VDS global heap object size overflow");
+                                                        role + " global heap object size overflow");
                     if (span > coll_size - pos)
                         {
                             h5policy_emit_error("H5_CORRUPT_GLOBAL_HEAP_OBJECT",
                                                 "corrupt", oh, object,
-                                                "VDS global heap object overruns the collection");
-                            return h5policy_vds_ref_none;
+                                                role + " global heap object overruns the collection");
+                            return h5policy_heap_ref_none;
                         }
+                    h5policy_gheap_memo_idxs += [idx];
+                    h5policy_gheap_memo_offs += [(oh + hdr_size#B)/#B];
+                    h5policy_gheap_memo_sizes += [data_size];
                     if (idx == wanted && found == 0UB)
                         {
                             found = 1UB;
@@ -184,25 +296,28 @@ fun h5policy_vds_find_gheap_object = (int ios, H5PolicyProfile profile,
         {
             h5policy_emit_error_ev("H5_CORRUPT_GLOBAL_HEAP_OBJECT", "corrupt",
                                    free_len_off, object,
-                                   "VDS global heap free-space object length is not 8-aligned",
+                                   role + " global heap free-space object length is not 8-aligned",
                                    H5Evidence {
-                                       field = "vds.global_heap_free_space_alignment",
+                                       field = field_ns + ".global_heap_free_space_alignment",
                                        actual = free_size,
                                        expected = 8UL,
                                        comparison = "multiple_of",
                                        has_loc1 = 1, loc1_role = "actual",
                                        loc1 = free_len_off, loc1_len = l,
                                    });
-            return h5policy_vds_ref_none;
+            return h5policy_heap_ref_none;
         }
+    /* The collection parsed to its declared end, so the record is complete and
+       repeat lookups may be served from it.  */
+    h5policy_gheap_memo_valid = 1UB;
     if (found != 0UB)
-        return H5PolicyVdsHeapRef { found = 1UB,
-                                    data_off = found_off,
-                                    data_size = found_size };
-    h5policy_emit_error("H5_CORRUPT_VDS_HEAP_OBJECT_MISSING", "corrupt",
+        return H5PolicyHeapRef { found = 1UB,
+                                 data_off = found_off,
+                                 data_size = found_size };
+    h5policy_emit_error("H5_CORRUPT_HEAP_OBJECT_MISSING", "corrupt",
                         loc, object,
-                        "VDS layout references a missing global heap object");
-    return h5policy_vds_ref_none;
+                        role + " reference names a missing global heap object");
+    return h5policy_heap_ref_none;
 }
 
 /* Serialized H5S selections are the one FILE-RESIDENT use of the H5S selection
@@ -528,8 +643,9 @@ fun h5policy_validate_vds_layout = (int ios, H5PolicyProfile profile,
     var heap_addr = h5policy_msg_addr_at(ios, profile, payload_off + 2#B, o);
     var heap_idx = h5policy_msg_u64_at(ios, profile,
                                        payload_off + (2UL + o)#B, 4UL);
-    var ref = h5policy_vds_find_gheap_object(ios, profile, heap_addr, heap_idx,
-                                             payload_off + 2#B, object);
+    var ref = h5policy_find_gheap_object(ios, profile, heap_addr, heap_idx,
+                                         payload_off + 2#B, object,
+                                         "VDS", "vds");
     if (ref.found == 0UB) return;
     if (ref.data_size < l + 5UL)
         {

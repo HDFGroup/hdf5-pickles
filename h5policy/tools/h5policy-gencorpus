@@ -204,6 +204,18 @@ def _gen_valid(root):
     _write(simple_path,
            lambda h: h.create_dataset("a", data=np.arange(6, dtype="i4")))
     _write_cache_image(f"{root}/valid/cache_image.h5")
+    _make_attr_null_vlen_userblock(f"{root}/valid/attr_null_vlen_userblock.h5")
+    _make_attr_vlen_array_heap_ids(f"{root}/valid/attr_vlen_array_heap_ids.h5")
+    _make_attr_empty_vlen_heap_id(f"{root}/valid/attr_empty_vlen_heap_id.h5")
+    # The control for the attribute heap-ID invariants: a vlen string attribute
+    # and a legacy dataset-region-reference attribute, both of which store a
+    # global-heap ID in the object-header message.  Their whole point is to be
+    # ACCEPTED -- the checks in h5policy_validate_attr_heap_ids walk a real
+    # collection here, so a bound stated one step too tight shows up as this
+    # fixture failing rather than as silence.  Without it the new rules could
+    # pass the suite while never resolving a valid ID at all.
+    _patch(f"{root}/valid/attr_heap_ids.h5",
+           bytes(_attr_heap_ids_valid_bytes()))
     # Extra physical bytes after the superblock's declared EOA are legal and
     # remain outside the metadata address space.  This fixture pins geometry
     # reporting without turning a trailer into a corruption finding.
@@ -1629,6 +1641,14 @@ def _gen_malformed(root):
         f"{root}/malformed/attr_reference_size_under.h5")
     _make_attr_vlen_size_under(
         f"{root}/malformed/attr_vlen_size_under.h5")
+    _make_attr_vlen_heap_idx_missing(
+        f"{root}/malformed/attr_vlen_heap_idx_missing.h5")
+    _make_attr_vlen_heap_idx_past_nalloc(
+        f"{root}/malformed/attr_vlen_heap_idx_past_nalloc.h5")
+    _make_attr_vlen_heap_addr_out_of_file(
+        f"{root}/malformed/attr_vlen_heap_addr_out_of_file.h5")
+    _make_attr_vlen_heap_seq_len_over(
+        f"{root}/malformed/attr_vlen_heap_seq_len_over.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -5356,6 +5376,261 @@ def _make_attr_vlen_size_under(path):
     # 0x19: version 1, class 9 (variable-length).  The disk sequence size is
     # 4 + blob_id_size == sizeof_addr + 8 == 16.
     _patch_dtype_size(raw, 0x19, 16, 1, "variable-length")
+    _patch(path, bytes(raw))
+
+
+def _make_attr_empty_vlen_heap_id(path):
+    """An EMPTY vlen string attribute -- a heap object of declared size ZERO.
+
+    libhdf5 writes `attrs["x"] = ""` as a real global-heap object whose size
+    field is 0 (measured: collection object idx 1, size 0, refcount 0), and
+    reads it back happily -- h5dump -A exits 0.
+
+    The regression control for a rule that was broader than its justification.
+    The collection walker refused a zero length at EVERY object index, on the
+    strength of a comment explaining the INDEX-0 case: there the parse advance is
+    the length itself, so zero means libhdf5 loops forever.  At any other index
+    the advance is H5HG_SIZEOF_OBJHDR(f) + H5HG_ALIGN(size), which is 16 even at
+    size zero, so there is nothing to reject -- and rejecting it refused files
+    libhdf5 had just written.
+
+    The bug was latent while only a VDS layout reached that walker, since a VDS
+    collection is unlikely to hold an unrelated empty vlen.  It fired the moment
+    attribute values reached it.  Keep this fixture: it is the only one in the
+    corpus whose heap object is legitimately zero-length.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.zeros(1, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("empty", "", dtype=h5py.special_dtype(vlen=str))
+
+    _patch(path, bytes(_base_bytes(build, libver="earliest")))
+
+
+def _make_attr_vlen_array_heap_ids(path):
+    """A MULTI-ELEMENT vlen attribute: 12 heap IDs in one value region.
+
+    Every other attribute heap-ID fixture is scalar, so the stride loop only
+    ever ran at element 0 -- `value_off + (i * width)` was never exercised for
+    i > 0 and a wrong width would have passed the whole suite.  This fixture is
+    the one that walks it.
+
+    It also covers the collection memo: the twelve IDs name the same collection,
+    so the first costs a parse and the rest are served from the record.  Without
+    the memo a per-element re-parse made a valid file with many such attributes
+    spend the profile's wall-clock budget and be rejected -- see h5_vds.pk.  A
+    dozen elements is far too few to reproduce that timing, deliberately: a
+    fixture whose verdict depends on how loaded the host is would be worse than
+    no fixture (valid/dense_links_deep.h5 already sits near that deadline).  The
+    timing bound is held by the walk budget and its recorded measurement, not by
+    a test.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        arr = np.array([f"element-{i:02d}" for i in range(12)], dtype=object)
+        d.attrs.create("vlarray", arr, dtype=h5py.special_dtype(vlen=str))
+
+    _patch(path, bytes(_base_bytes(build, libver="earliest")))
+
+
+def _attr_heap_ids_valid_bytes():
+    """A file whose attributes exercise BOTH attribute global-heap encodings.
+
+    class 9 (vlen) carries `length | collection address | object index`; class 7
+    reference type 1 (legacy dataset region) carries the bare heap ID with no
+    length in front.  The two widths differ, so a control holding only one of
+    them would leave the other stride untested.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(8, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("vl", "attribute value in the object header",
+                       dtype=h5py.special_dtype(vlen=str))
+        d.attrs.create("reg", d.regionref[0:4],
+                       dtype=h5py.special_dtype(ref=h5py.RegionReference))
+
+    return _base_bytes(build, libver="earliest")
+
+
+def _attr_vlen_heap_base(libver="earliest"):
+    """A file whose ONLY global-heap ID is a vlen string attribute's value.
+
+    The attribute value of a vlen or legacy-region-reference type is stored
+    inside its object-header message, so the global-heap ID it holds is
+    METADATA.  That is the regime the attribute heap-ID checks cover, and it is
+    the one no fixture expressed before: every other vlen in the corpus is
+    dataset raw data, where the descriptors are deliberately out of scope.
+
+    The dataset is plain integers precisely so the file contains exactly one
+    descriptor -- putting vlen data in the dataset too would leave a second
+    16-byte pattern in the raw payload and make the locator ambiguous.
+    """
+    def build(h):
+        h.create_dataset("d", data=np.arange(4, dtype="i4"), track_times=False)
+        h["d"].attrs.create("vl", "the attribute value lives in the header",
+                            dtype=h5py.special_dtype(vlen=str))
+
+    return _base_bytes(build, libver=libver)
+
+
+def _make_attr_null_vlen_userblock(path):
+    """A NULL vlen attribute element in a file with a USER BLOCK.
+
+    The regression control for a false positive the attribute heap-ID checks had
+    when first written.  A NULL vlen element is encoded as heap address ZERO
+    (H5VL_BLOB_SETNULL writes it; H5VLnative_blob.c reports such an element as
+    null), and stored addresses are base-relative.  Testing the sentinel on the
+    address AFTER the base-relative conversion therefore compares
+    `base_addr + 0` against 0, which does not match in a file with a user block
+    -- so the walker treated a perfectly good NULL element as an ID naming the
+    user block and rejected the file H5_CORRUPT_BAD_SIGNATURE.
+
+    Measured, not hypothesised: with the sentinel tested post-conversion this
+    fixture is reject_corrupt, and with it tested on the raw field it is accept.
+    A file with no user block cannot show the difference, because there
+    base_addr is 0 and the two tests agree -- which is exactly why this fixture
+    needs the user block.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("vl", "value", dtype=h5py.special_dtype(vlen=str))
+
+    fd, base = tempfile.mkstemp(suffix=".h5")
+    os.close(fd)
+    try:
+        with h5py.File(base, "w", userblock_size=512, libver="earliest") as h:
+            build(h)
+        raw = bytearray(open(base, "rb").read())
+    finally:
+        os.unlink(base)
+
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError("null-vlen user block: no GCOL in the base file")
+    # Stored addresses are base-relative, so the descriptor names gcol - 512.
+    needle = struct.pack("<Q", gcol - 512)
+    hits = []
+    start = 0
+    while True:
+        i = raw.find(needle, start)
+        if i < 0:
+            break
+        start = i + 1
+        if i + 12 <= len(raw) and 1 <= struct.unpack_from("<I", raw, i + 8)[0] <= 255:
+            hits.append(i)
+    if len(hits) != 1:
+        raise RuntimeError(f"null-vlen user block: expected one attribute heap "
+                           f"ID naming the collection, found {len(hits)}")
+    struct.pack_into("<Q", raw, hits[0], 0)      # the NULL-element encoding
+    _patch(path, bytes(raw))
+
+
+def _find_attr_heap_id(raw, what):
+    """Offset of the one attribute vlen descriptor: length(4) addr(8) idx(4).
+
+    Anchored on the collection address libhdf5 actually wrote -- located from
+    the GCOL signature rather than guessed -- and required to be unique, so an
+    h5py layout change fails loudly instead of patching unrelated bytes.  The
+    index and length are range-checked as well, because a raw-data byte pattern
+    that happens to repeat the collection address would otherwise qualify.
+    """
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError(f"{what}: no GCOL collection in the base file")
+    needle = struct.pack("<Q", gcol)
+    hits = []
+    start = 0
+    while True:
+        i = raw.find(needle, start)
+        if i < 0:
+            break
+        start = i + 1
+        if i < 4 or i + 12 > len(raw):
+            continue
+        seq = struct.unpack_from("<I", raw, i - 4)[0]
+        idx = struct.unpack_from("<I", raw, i + 8)[0]
+        if 1 <= idx <= 255 and 0 < seq <= len(raw):
+            hits.append(i - 4)
+    if len(hits) != 1:
+        raise RuntimeError(f"{what}: expected exactly one attribute global-heap "
+                           f"ID naming the collection at {gcol}, "
+                           f"found {len(hits)}")
+    return hits[0]
+
+
+def _make_attr_vlen_heap_idx_missing(path):
+    """An attribute whose vlen global-heap ID names an object index that the
+    collection does not contain.
+
+    Before the fix at 1.14.4 libhdf5 indexed heap->obj[] with the stored index
+    behind nothing but `assert(hobj->idx < heap->nused)`, so a Release build read
+    a slot the collection never filled.  The guards are real errors now
+    (H5HG.c:570 and :573), which is why the current library rejects this file
+    cleanly -- and why the oracle accepting it was invisible to any test that
+    only asked whether libhdf5 survived the specimen.
+
+    The index is raised to 200: past the objects the collection holds, but still
+    inside the obj[] array libhdf5 allocates from the collection SIZE
+    (H5HG_NOBJS of a 4 KiB collection is 257).  That is the regime the CVE
+    specimen this came from actually occupied; the out-of-bounds regime needs an
+    index past 257 and is covered by attr_vlen_heap_idx_past_nalloc.
+    """
+    raw = _attr_vlen_heap_base()
+    d = _find_attr_heap_id(raw, "vlen attribute heap index")
+    struct.pack_into("<I", raw, d + 12, 200)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_vlen_heap_idx_past_nalloc(path):
+    """The sibling of attr_vlen_heap_idx_missing in the out-of-bounds regime.
+
+    H5HG_NOBJS(f, 4096) is 257, so an index of 400 is past the end of the
+    calloc'd obj[] array rather than merely past the objects in use.  A pre-fix
+    Release build reads `size` and `begin` from beyond the allocation, and those
+    values then drive the copy -- the heap buffer overflow the advisory for this
+    family describes, which an index inside the array does NOT reach.
+
+    Two fixtures because the two regimes fail differently in the library even
+    though the oracle refuses both for the same reason: a check that bounded the
+    index only against the allocation would still pass one of them.
+    """
+    raw = _attr_vlen_heap_base()
+    d = _find_attr_heap_id(raw, "vlen attribute heap index (nalloc)")
+    struct.pack_into("<I", raw, d + 12, 400)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_vlen_heap_addr_out_of_file(path):
+    """An attribute vlen global-heap ID whose collection address is past EOF.
+
+    Worth its own fixture because it is the sharpest form of the gap that was
+    closed: h5policy bounds addresses against the declared end of file in every
+    other metadata context, and this one metadata address escaped only because
+    the value region was never read at all.
+    """
+    raw = _attr_vlen_heap_base()
+    d = _find_attr_heap_id(raw, "vlen attribute heap address")
+    struct.pack_into("<Q", raw, d + 4, 1 << 40)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_vlen_heap_seq_len_over(path):
+    """An attribute vlen sequence length larger than its global-heap object.
+
+    libhdf5 sizes the destination from the stored length and copies the heap
+    object into it, so a length exceeding the object over-reads the collection.
+    The address and index are left valid, which is what makes this a distinct
+    case: the ID resolves, and only the count beside it is wrong.
+
+    Raised to 2^32 - 1 rather than to object_size + 1: the bound the oracle can
+    state without decoding the vlen base type is the object's BYTE size, so the
+    fixture is written to violate that weakest sound form unambiguously.
+    """
+    raw = _attr_vlen_heap_base()
+    d = _find_attr_heap_id(raw, "vlen attribute sequence length")
+    struct.pack_into("<I", raw, d, 0xFFFFFFFF)
     _patch(path, bytes(raw))
 
 
