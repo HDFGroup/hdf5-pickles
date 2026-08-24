@@ -1,0 +1,147 @@
+# A v3+ contiguous layout's stored size was examined only when the data address
+# was defined, so an UNALLOCATED dataset could declare any size at all. The stored
+# size is a property of the MESSAGE, not of the storage: libhdf5's own writer
+# emits nelmts * dt_size whether or not the data has been allocated, and
+# H5O__layout_copy_file requires that equality on the copy path for v3+.
+#
+# The severity is the substance of this record. On the READ path libhdf5 ignores
+# the field entirely, so a mismatch must be a WARNING; making it corruption would
+# repeat a false positive this repository has already made and measured on this
+# exact field. See registry/cases/ for the earlier record and the h5_layout.pk
+# comment that carries the measurement.
+schema_version: 1
+
+id: contiguous-stored-size-unallocated
+title: a contiguous layout's stored size was unchecked whenever the data address
+  was undefined, and the rule libhdf5 enforces on it is equality with the
+  computed extent -- on the copy path only
+status: oracle-hardened          # h5policy warns; libhdf5 fixed at 1.14.4
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The upstream corpus entry
+  that led here is cited as provenance, not as classification.
+
+# -- Triage -------------------------------------------------------------------
+record: dataset_layout_filter_fill
+versions: [3, 4, 5]
+root_cause_classification: record_local
+violated_invariant:
+  - layout.contiguous_stored_size_equals_extent
+validation_closure: >-
+  the layout message's version, class and stored size, plus the dataspace element
+  count and the RAW on-disk datatype size.  No data address is required, which is
+  the whole point: the previous gate needed one.
+activation_before_validation:
+  - public_id                    # h5repack / H5Ocopy reach it through the API
+entry_points:
+  - h5policy (oracle) -- accepted with no findings before this change
+  - "libhdf5 H5O__layout_copy_file (src/H5Olayout.c), H5D_CONTIGUOUS arm"
+  - "tools: h5repack, and H5Ocopy by the same path (H5Ocopy NOT measured)"
+
+# -- The defect, on both sides ------------------------------------------------
+defect: >-
+  ORACLE SIDE (this repository, now warned about): everything in
+  h5policy_check_contiguous_extent sat inside
+      if (!h5policy_msg_addr_is_undef(data_addr_raw))
+  so for an unallocated dataset the stored size was neither recorded nor examined,
+  and H5_ADVISORY_CONTIGUOUS_STORED_SIZE_PAST_EOF could not reach that shape.
+  The gate is correct for what it guards -- an extent with no address has nothing
+  to bound against the file and nothing to intersect with metadata -- so the fix
+  is not to widen it but to add a rule that needs no address.
+  LIBRARY SIDE (fixed upstream at 1.14.4): H5O__layout_copy_file gained
+      if (layout_dst->storage.u.contig.size != (nelmts * dt_size))
+          HGOTO_ERROR(H5E_OHDR, H5E_BADVALUE, NULL, "invalid layout storage size ")
+  for layout version 3 and later, alongside a call to H5D__contig_check.  Before
+  that the stored size propagated into the destination and drove the copy.
+
+severity_reasoning: >-
+  EQUALITY AS CORRUPTION WOULD BE WRONG, and the measurement is the reason.
+  H5D__contig_check recomputes data_size = nelmts * dt_size and bounds only that,
+  and only when the address is defined; it never compares the stored field.  So
+  the read path is unaffected: on the specimen h5dump exits 0 and prints the
+  scalar value, and h5ls reports "4 logical bytes, 0 allocated bytes" -- the
+  recomputed extent, with the 20,971,524 stored claim ignored.  "libhdf5 opens"
+  must imply "not reject_corrupt".
+  The condition is nonetheless real, because libhdf5 enforces it on the COPY path
+  and because for v3+ it keeps the stored value and uses it elsewhere (the I/O
+  path, the length handed to H5MF_xfree on delete, the sieve-buffer bound, and the
+  answer H5Dget_storage_size returns).  Write-path-fatal and read-path harmless is
+  exactly the shape that stays a warning.
+
+version_gate: >-
+  MANDATORY, not defensive.  For layout v1/v2 libhdf5 DISCARDS the stored size and
+  recomputes it (H5Dcontig.c:536-551), so an equality rule there would be a fresh
+  false positive in the other direction.  The gate needs no explicit test: the new
+  flag is set only by h5policy_check_contiguous_extent, which the v1/v2 branch
+  deliberately never calls -- a property that branch's own comment already
+  documents and relies on.
+
+# -- Evidence -----------------------------------------------------------------
+writer_reference: >-
+  libhdf5 emits the equality universally.  Measured on three h5py shapes,
+  libver="earliest", layout v3 contiguous: an unwritten (10,) int32 stores size 40
+  with an UNDEFINED address; the same dataset written stores 40 at a real address;
+  an unwritten scalar int32 stores 4.  An undefined address does not mean a zero
+  size, which is what makes equality a usable rule rather than a guess.
+measured: >-
+  Specimen (scalar int32, stored size 20971524, address undefined, 1028-byte
+  file): h5dump rc=0 printing the value; h5ls "4 logical bytes, 0 allocated";
+  h5repack "Error occurred while repacking" on both the Release baseline and the
+  AddressSanitizer candidate, with no sanitizer report.
+  Oracle before: accept, zero findings, all three profiles.  After:
+  accept_with_warnings with actual 20971524 / expected 4 cited at the size field.
+false_positive_surface: >-
+  Measured, not argued.  Over the whole valid corpus exactly ONE fixture gains the
+  advisory -- valid/contiguous_stored_size_past_eof.h5, whose stored size is
+  deliberately inflated and which already expected accept_with_warnings, so no
+  decision changes anywhere.  All three h5py reference shapes stay clean.  The
+  both-nonzero guard keeps this off the zero-versus-nonzero disagreement that
+  H5_CORRUPT_CONTIGUOUS_LAYOUT_SIZE_MISMATCH already reports as corruption, so one
+  defect never draws two findings.
+
+tooling_note: >-
+  h5repack prints "Error occurred while repacking" and exits ZERO.  Any harness
+  that judges by exit status -- including the upstream corpus's own "the tool
+  exited normally" criterion -- scores such a specimen as a pass whether the
+  defect is caught or not.  Judge by output, not by rc, on this path.  Also cap
+  output size: h5repack driven by a corrupt contiguous layout has been observed to
+  emit a multi-terabyte sparse file from a small input, so ulimit -f matters as
+  much as ulimit -v.
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    THE V1/V2 NEGATIVE IS UNTESTED.  The version gate is derived from the source,
+    not from a fixture: a v1 contiguous layout with a mismatched stored size should
+    be ACCEPTED and nothing asserts it.  h5py writes v3 even at
+    libver="earliest", so such a fixture has to re-emit the layout message by
+    hand -- the same obstacle recorded for the earlier v1-contiguous blind spot.
+  - >-
+    H5Ocopy IS NOT MEASURED, only h5repack.  Both reach H5O__layout_copy_file, but
+    only one was run.
+  - >-
+    NO PRE-FIX BUILD, so the heap overflow itself is source-derived.  What is
+    measured is that the current library refuses the copy and that the read path is
+    unaffected.
+  - >-
+    THE 4-BYTE ADDRESS WIDTH IS UNTESTED.  The originating specimen used
+    sizeof_offsets 4, which no local h5py writes; the fixture built here uses 8.
+    The check reads the size through the existing width-aware helper, but no
+    fixture exercises the narrow width.
+  - >-
+    UNCHASED LEAD, inherited: an out-of-file stored size reaching H5MF_xfree on
+    dataset delete frees a range past EOF.  Plausibly free-space-manager
+    corruption, still never measured -- it needs a write-path harness.
+
+provenance:
+  found_by: >-
+    triage of one upstream corpus specimen while evaluating whether to integrate
+    an external CVE specimen corpus.  The specimen's record named
+    H5O__layout_encode -- the frame where the pre-fix overflow surfaced -- while
+    the fix and the invariant are in H5O__layout_copy_file; classification here is
+    by violated invariant, and the identifier is provenance only.
+  hdf5_build: >-
+    baseline 2.3.0 Release; candidate 2.3.0 RelWithDebInfo with AddressSanitizer;
+    source audit against hdf5 51b92ccee54.  Workstation-local installs; paths not
+    recorded.
+  poke_version: GNU poke 4.3

@@ -205,6 +205,8 @@ def _gen_valid(root):
            lambda h: h.create_dataset("a", data=np.arange(6, dtype="i4")))
     _write_cache_image(f"{root}/valid/cache_image.h5")
     _make_attr_null_vlen_userblock(f"{root}/valid/attr_null_vlen_userblock.h5")
+    _make_contig_unalloc_size_mismatch(
+        f"{root}/valid/contig_unalloc_size_mismatch.h5")
     _make_attr_vlen_array_heap_ids(f"{root}/valid/attr_vlen_array_heap_ids.h5")
     _make_attr_empty_vlen_heap_id(f"{root}/valid/attr_empty_vlen_heap_id.h5")
     # The control for the attribute heap-ID invariants: a vlen string attribute
@@ -5472,6 +5474,62 @@ def _attr_vlen_heap_base(libver="earliest"):
                             dtype=h5py.special_dtype(vlen=str))
 
     return _base_bytes(build, libver=libver)
+
+
+def _sizeof_offsets(raw):
+    """Superblock `sizeof_offsets`, which moves between v0/v1 and v2/v3."""
+    return raw[13] if raw[8] < 2 else raw[9]
+
+
+def _sizeof_lengths(raw):
+    """Superblock `sizeof_lengths`; see _sizeof_offsets."""
+    return raw[14] if raw[8] < 2 else raw[10]
+
+
+def _make_contig_unalloc_size_mismatch(path):
+    """An UNALLOCATED contiguous dataset whose stored size is not the extent.
+
+    The stored size of a v3+ contiguous layout is a property of the message, not
+    of the storage: libhdf5's writer emits `nelmts * dt_size` whether or not the
+    data has been allocated (measured -- an unwritten (10,) int32 stores 40 with
+    an UNDEFINED address, an unwritten scalar stores 4), and
+    H5O__layout_copy_file requires that equality on the copy path for v3+.
+    h5policy recorded the field only inside its allocation gate, so an
+    unallocated dataset's stored size was never examined at all.
+
+    A WARNING and not corruption, deliberately: on the read path libhdf5 ignores
+    the field entirely -- H5D__contig_check recomputes the extent and bounds only
+    that -- so h5dump opens such a dataset and returns every correct value.
+    Demanding equality as a rejection would be an invariant-A false positive, and
+    this repository has already made and measured that mistake on this exact
+    field.
+
+    The dataset is created and never written, so libhdf5 leaves the address
+    undefined; only the size field is patched. 40 -> 4096 keeps it plausible
+    rather than absurd, so the case pins the equality and not merely a big number.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", shape=(10,), dtype="i4",
+                                   track_times=False),
+        libver="earliest")
+    o = _sizeof_offsets(raw)
+    l = _sizeof_lengths(raw)
+    undef = (1 << (8 * o)) - 1
+    hits = []
+    for i in range(len(raw) - 2 - o - l):
+        if raw[i] != 3 or raw[i + 1] != 1:          # layout v3, class contiguous
+            continue
+        if int.from_bytes(raw[i + 2:i + 2 + o], "little") != undef:
+            continue
+        if int.from_bytes(raw[i + 2 + o:i + 2 + o + l], "little") != 40:
+            continue
+        hits.append(i)
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one unallocated v3 contiguous layout with "
+                           f"stored size 40, found {len(hits)}")
+    off = hits[0] + 2 + o
+    raw[off:off + l] = (4096).to_bytes(l, "little")
+    _patch(path, bytes(raw))
 
 
 def _make_attr_null_vlen_userblock(path):

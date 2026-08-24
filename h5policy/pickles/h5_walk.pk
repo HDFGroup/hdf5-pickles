@@ -51,6 +51,13 @@ type H5WalkContext = struct
     uint<64> fill_value_size;
     uint<64> compact_layout_size;
     uint<64> contiguous_layout_size;
+    /* The stored size of a v3+ contiguous layout, recorded whether or not the
+       data address is defined -- unlike contiguous_layout_size, whose companion
+       flag deliberately means "allocated".  libhdf5 requires this field to equal
+       the computed extent on the COPY path even for an unallocated dataset, so
+       the equality advisory needs it in both cases.  */
+    uint<64> contiguous_stored_size;
+    uint<64> contiguous_stored_size_offset;
     /* The contiguous data ADDRESS, kept so the finalize-time updater can bound
        addr + (nelmts * datatype_size) the way H5D__contig_check does.  Undefined
        (all ones) when there is no contiguous layout or no allocated data.  */
@@ -81,6 +88,11 @@ type H5WalkContext = struct
     uint<8> has_fill_value;
     uint<8> has_compact_layout;
     uint<8> has_contiguous_layout;
+    /* Set for any v3+ contiguous layout message, allocated or not.  Distinct
+       from has_contiguous_layout, which additionally requires a defined
+       address; keeping them separate is what stops the equality advisory from
+       inheriting the allocation gate.  */
+    uint<8> has_contiguous_stored_size;
     uint<8> has_legacy_chunked_layout;
     uint<8> has_chunked_layout;
     /* Group-shape message presence.  A group's link storage is declared by
@@ -784,6 +796,8 @@ fun h5policy_new_walk_context = H5WalkContext:
         fill_value_size = 0UL,
         compact_layout_size = 0UL,
         contiguous_layout_size = 0UL,
+        contiguous_stored_size = 0UL,
+        contiguous_stored_size_offset = 0UL,
         contiguous_layout_addr = 0xffffffffffffffffUL,
         contiguous_layout_addr_offset = 0UL,
         legacy_chunked_layout_ndims = 0UL,
@@ -801,6 +815,7 @@ fun h5policy_new_walk_context = H5WalkContext:
         has_fill_value = 0UB,
         has_compact_layout = 0UB,
         has_contiguous_layout = 0UB,
+        has_contiguous_stored_size = 0UB,
         has_legacy_chunked_layout = 0UB,
         has_chunked_layout = 0UB,
         has_link_info = 0UB,
@@ -1308,6 +1323,57 @@ fun h5policy_update_logical_dataset_size = (int ios,
                 h5policy_emit_error("H5_CORRUPT_CONTIGUOUS_LAYOUT_SIZE_MISMATCH",
                                     "corrupt", loc, object,
                                     "contiguous layout data size does not match the dataspace and datatype");
+
+            /* THE SAME FIELD, THE EXACT RULE, AS A WARNING.  The bound above is
+               deliberately loose -- zero versus nonzero -- because on the READ
+               path libhdf5 ignores the stored size entirely: H5D__contig_check
+               recomputes nelmts * dt_size and bounds only that, so inflating the
+               stored field leaves the library opening the dataset and returning
+               every correct value.  Demanding equality as CORRUPTION would be a
+               live invariant-A false positive, and this repository has already
+               made and measured that mistake on this field.
+
+               But libhdf5 does demand equality, on the COPY path, for layout
+               version 3 and later:
+
+                   if (layout_dst->storage.u.contig.size != (nelmts * dt_size))
+                       HGOTO_ERROR(... "invalid layout storage size ")
+
+               added to H5O__layout_copy_file by the same upstream change that
+               closed the h5repack overflow this rule comes from.  h5repack and
+               H5Ocopy reach it; an ordinary open does not.  So the condition is
+               real, statically decidable, and write-path-fatal only -- which is
+               precisely the shape that must stay a warning rather than become a
+               rejection.
+
+               The version gate needs no test of its own: has_contiguous_stored_size
+               is set only by h5policy_check_contiguous_extent, which the v1/v2
+               branch deliberately never calls, because libhdf5 RECOMPUTES the
+               stored size for those versions (H5Dcontig.c:536-551) and an
+               equality rule there would be a fresh false positive in the other
+               direction.
+
+               Both sizes must be nonzero: the zero-versus-nonzero disagreement is
+               already reported as corruption just above, and repeating it as a
+               warning would put two findings on one defect.  */
+            if (ctx.has_dataset_layout != 0UB
+                && ctx.has_contiguous_stored_size != 0UB
+                && ctx.contiguous_stored_size != 0UL
+                && storage_dataset_bytes != 0UL
+                && ctx.contiguous_stored_size != storage_dataset_bytes)
+                h5policy_emit_warning_ev(
+                    "H5_ADVISORY_CONTIGUOUS_STORED_SIZE_MISMATCH",
+                    ctx.contiguous_stored_size_offset#B, object,
+                    "contiguous layout stored size does not equal the computed extent",
+                    H5Evidence {
+                        field = "layout.contiguous_stored_size",
+                        actual = ctx.contiguous_stored_size,
+                        expected = storage_dataset_bytes,
+                        comparison = "equal",
+                        has_loc1 = 1, loc1_role = "actual",
+                        loc1 = ctx.contiguous_stored_size_offset#B,
+                        loc1_len = global_sizeof_lengths as uint<64>,
+                    });
 
             /* THE EXTENT libhdf5 ENFORCES IS THE COMPUTED ONE, NOT THE STORED
                ONE.  H5D__contig_check recomputes data_size = nelmts * dt_size
