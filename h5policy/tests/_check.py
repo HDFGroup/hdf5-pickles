@@ -371,6 +371,34 @@ def run_case(spec):
         if forbidden_code in codes:
             problems.append(f"forbidden finding present {forbidden_code}")
 
+    # `expected_finding_counts: {CODE: n}` pins HOW MANY times a code is
+    # reported, which `required_findings` cannot express -- it is a set test, so
+    # a rule that reported the same defect once per element still satisfies it.
+    #
+    # The property this exists for is de-duplication.  One malformed structure
+    # reached through many references must be reported ONCE; the alternative
+    # buries the report in copies of itself, and a regression to per-reference
+    # reporting is invisible to every other assertion here.  Deliberately NOT a
+    # metric in the report: nothing in the JSON needs to change, because the
+    # findings array already carries the answer -- only the harness lacked a way
+    # to ask.
+    #
+    # Counted over the whole array rather than the code set, and `findings` may
+    # be truncated for a pathological file, so a fixture using this must be one
+    # whose finding count is small and deliberate.
+    wanted_counts = spec.get("expected_finding_counts") or {}
+    if wanted_counts:
+        if report.get("findings_truncated"):
+            problems.append(
+                "expected_finding_counts is unusable: findings were truncated")
+        else:
+            all_codes = [f["code"] for f in report.get("findings", [])]
+            for code, want in wanted_counts.items():
+                got = all_codes.count(code)
+                if got != want:
+                    problems.append(
+                        f"finding {code} reported {got} time(s), expected {want}")
+
     for finding in report.get("findings", []):
         evidence = finding.get("evidence")
         if not isinstance(evidence, dict):
