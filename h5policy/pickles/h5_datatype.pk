@@ -422,6 +422,60 @@ fun h5policy_dtype_leaf = (int ios, H5PolicyProfile profile,
 }
 
 
+/* ---- Heap-ID slots inside one element of a datatype -----------------------
+   An ATTRIBUTE's value lives inside its object-header message, so when its
+   datatype contains a variable-length or legacy-region-reference component, the
+   global-heap IDs are METADATA at computable offsets.  A top-level vlen sits at
+   offset 0, but a vlen MEMBER of a compound sits at that member's byte offset,
+   and an ARRAY of vlen has one ID per array element.  Nothing computed those
+   offsets, so a compound attribute with a vlen member carried an unvalidated
+   heap ID -- the same gap as the top-level one, a level down.
+
+   The offsets are collected DURING the ordinary validation walk rather than by a
+   second parser: advancing from one compound member to the next needs each
+   child's consumed size, which only this walker computes.  A separate collector
+   would have had to re-derive that, and re-deriving a size computation is how the
+   two copies drift.
+
+   Collection is off unless a caller asks for it, so datasets pay nothing.  */
+var H5_DTYPE_HEAP_SLOT_LIMIT = 64UL;
+var h5policy_dtype_slot_collect = 0UB;
+/* Nonzero inside a vlen's BASE type.  A vlen of vlen has exactly one ID in the
+   element; the inner IDs live in the heap object's bytes, which are not metadata
+   and are not at any element offset.  Recording them would fabricate slots. */
+var h5policy_dtype_slot_suppress = 0UL;
+var h5policy_dtype_slot_off = uint<64>[]();
+var h5policy_dtype_slot_kind = uint<64>[]();
+var h5policy_dtype_slot_base = uint<64>[]();
+/* Set when the slot limit stopped collection, so a caller knows its list is
+   partial and must not be read as "these are all of them". */
+var h5policy_dtype_slot_truncated = 0UB;
+
+fun h5policy_reset_dtype_slots = void:
+{
+    h5policy_dtype_slot_collect = 0UB;
+    h5policy_dtype_slot_suppress = 0UL;
+    h5policy_dtype_slot_off = uint<64>[]();
+    h5policy_dtype_slot_kind = uint<64>[]();
+    h5policy_dtype_slot_base = uint<64>[]();
+    h5policy_dtype_slot_truncated = 0UB;
+}
+
+fun h5policy_dtype_slot_record = (uint<64> off, uint<64> kind,
+                                  uint<64> base) void:
+{
+    if (h5policy_dtype_slot_collect == 0UB || h5policy_dtype_slot_suppress != 0UL)
+        return;
+    if (h5policy_dtype_slot_off'length as uint<64> >= H5_DTYPE_HEAP_SLOT_LIMIT)
+        {
+            h5policy_dtype_slot_truncated = 1UB;
+            return;
+        }
+    h5policy_dtype_slot_off += [off];
+    h5policy_dtype_slot_kind += [kind];
+    h5policy_dtype_slot_base += [base];
+}
+
 /* Bounded, depth-guarded recursive datatype validator.  Returns the total
    consumed size (8-byte header + properties) of the blob at blob_off, or 0 on
    a hard error (after emitting a finding).  `avail` is the number of bytes the
@@ -431,7 +485,7 @@ fun h5policy_dtype_leaf = (int ios, H5PolicyProfile profile,
 fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
                             offset<uint<64>,B> blob_off,
                             uint<64> avail, string object,
-                            uint<64> depth) uint<64>:
+                            uint<64> depth, uint<64> base_off) uint<64>:
 {
     if (depth > profile.resources.max_datatype_recursion_depth)
         {
@@ -545,6 +599,13 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
                 h5policy_emit_error("H5_CORRUPT_DATATYPE_REFERENCE_SIZE",
                                     "corrupt", blob_off, object,
                                     "revised reference size is below the file minimum");
+
+            /* Only sub-type 1, the legacy dataset-region reference, is a bare
+               global-heap ID.  Sub-type 0 is a plain object address with no heap
+               involved, and 2..4 are revised references whose encoded blob is not
+               a bare ID -- a declared gap, not an oversight.  */
+            if (rtype == H5_DTYPE_REF_TYPE_REGION)
+                h5policy_dtype_slot_record(base_off, 7UL, 0UL);
         }
 
     if (elm_size == 0UL)
@@ -593,9 +654,12 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
             return h5policy_dtype_leaf(ios, profile, blob_off, object,
                                        ctype, elm_size, flags, props, avail, used);
 
-    /* Variable-length datatypes store exactly one inline base datatype.  The
-       heap/global-heap data that variable-length values may reference is raw
-       dataset payload, not metadata walked here.  */
+    /* Variable-length datatypes store exactly one inline base datatype.
+       The heap data a vlen VALUE references is raw dataset payload when the
+       value belongs to a dataset -- but an ATTRIBUTE's value is stored inside its
+       object-header message, so there the global-heap ID is metadata at a
+       computable offset.  That is what the slot recording below collects; this
+       comment used to assert the dataset case as though it were the only one. */
     /* ---- class 9: Variable-Length (single inline base type) ---- */
     if (ctype == 9UL)
         {
@@ -609,8 +673,25 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
                                     "corrupt", blob_off, object,
                                     "variable-length datatype size does not match the file sequence size");
 
+            /* The sequence length beside the ID counts ELEMENTS of the base
+               type, and libhdf5 requires the heap object to be exactly
+               length * base_size bytes (H5VL__native_blob_get refuses on
+               `hobj_size != size`).  So the base type's storage size is part of
+               the slot: without it a consumer can only bound the count, not
+               check it.  */
+            var vlen_base = avail - used >= 8UL
+                            ? h5policy_msg_u64_at(ios, profile,
+                                                  blob_off + used#B + 4#B, 4UL)
+                            : 0UL;
+            h5policy_dtype_slot_record(base_off, 9UL, vlen_base);
+
+            /* Suppressed across the recursion: a vlen of vlen has ONE id in the
+               element, and the inner ids live in the heap object's bytes, at no
+               element offset at all. */
+            h5policy_dtype_slot_suppress = h5policy_dtype_slot_suppress + 1UL;
             var child = h5policy_dtype_check(ios, profile, blob_off + used#B,
-                                             avail - used, object, depth + 1UL);
+                                             avail - used, object, depth + 1UL, base_off);
+            h5policy_dtype_slot_suppress = h5policy_dtype_slot_suppress - 1UL;
             if (child == 0UL)
                 return 0UL;
             return used + child;
@@ -641,7 +722,7 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
                                     "unsupported complex datatype encoding");
 
             var child = h5policy_dtype_check(ios, profile, blob_off + used#B,
-                                             avail - used, object, depth + 1UL);
+                                             avail - used, object, depth + 1UL, base_off);
             if (child == 0UL)
                 return 0UL;
 
@@ -726,12 +807,49 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
                 }
 
             var child_off = blob_off + used#B;
+            /* Record where the base type's slots start, so they can be
+               replicated once per array element below. */
+            var slots_before = h5policy_dtype_slot_off'length as uint<64>;
             var child = h5policy_dtype_check(ios, profile, blob_off + used#B,
-                                             avail - used, object, depth + 1UL);
+                                             avail - used, object, depth + 1UL, base_off);
             if (child == 0UL)
                 return 0UL;
             var child_size = h5policy_msg_u64_at(ios, profile,
                                                  child_off + 4#B, 4UL);
+
+            /* An array of N copies of a type holding heap IDs has N ids in the
+               element, one per copy, strided by the base type's storage size.
+               The recursion above collected the copy at index 0; the rest are
+               that set shifted.  Without this an array-of-vlen attribute would
+               have had only its first element checked.  */
+            var slots_after = h5policy_dtype_slot_off'length as uint<64>;
+            if (slots_after > slots_before && child_size != 0UL && nelem > 1UL)
+                {
+                    var span = slots_after - slots_before;
+                    var j = 1UL;
+                    while (j < nelem)
+                        {
+                            var k = 0UL;
+                            while (k < span)
+                                {
+                                    /* Overflow-safe: the product is bounded by
+                                       the element size the array arm already
+                                       cross-checks, and record() caps the
+                                       count.  */
+                                    if (child_size > 0xffffffffffffffffUL / j)
+                                        return used + child;
+                                    h5policy_dtype_slot_record(
+                                        h5policy_dtype_slot_off[slots_before + k]
+                                        + j * child_size,
+                                        h5policy_dtype_slot_kind[slots_before + k],
+                                        h5policy_dtype_slot_base[slots_before + k]);
+                                    k = k + 1UL;
+                                }
+                            if (h5policy_dtype_slot_truncated != 0UB)
+                                break;
+                            j = j + 1UL;
+                        }
+                }
             var expected_size = h5policy_checked_mul_u64(child_size, nelem,
                                                          0xffffffffffffffffUL,
                                                          "H5_CORRUPT_LENGTH_OVERFLOW",
@@ -756,7 +874,7 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
             var base_elm = h5policy_msg_u64_at(ios, profile,
                                                blob_off + used#B + 4#B, 4UL);
             var child = h5policy_dtype_check(ios, profile, blob_off + used#B,
-                                             avail - used, object, depth + 1UL);
+                                             avail - used, object, depth + 1UL, base_off);
             if (child == 0UL)
                 return 0UL;
             if (base_elm != elm_size)
@@ -978,14 +1096,54 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
                         }
 
                     var child_off = blob_off + used#B;
+                    /* A compound MEMBER's heap IDs sit at the member's byte
+                       offset within the parent element, so that is the base the
+                       child collects against.  This is the offset nothing
+                       computed before, and the reason a vlen member of a
+                       compound attribute went unvalidated.  */
+                    var memb_slots_before =
+                        h5policy_dtype_slot_off'length as uint<64>;
                     var child = h5policy_dtype_check(ios, profile,
                                                      blob_off + used#B,
                                                      avail - used, object,
-                                                     depth + 1UL);
+                                                     depth + 1UL,
+                                                     base_off + member_off);
                     if (child == 0UL)
                         return 0UL;
                     var child_size = h5policy_msg_u64_at(ios, profile,
                                                          child_off + 4#B, 4UL);
+
+                    /* A version-1 member using the legacy embedded-array
+                       encoding holds member_nelem copies of the child, exactly
+                       like a class-10 array, so its heap-ID slots replicate the
+                       same way.  member_nelem is 1 for every other member, which
+                       makes this a no-op there.  */
+                    var memb_slots_after =
+                        h5policy_dtype_slot_off'length as uint<64>;
+                    if (memb_slots_after > memb_slots_before
+                        && child_size != 0UL && member_nelem > 1UL)
+                        {
+                            var mspan = memb_slots_after - memb_slots_before;
+                            var mj = 1UL;
+                            while (mj < member_nelem)
+                                {
+                                    var mk = 0UL;
+                                    while (mk < mspan)
+                                        {
+                                            if (child_size > 0xffffffffffffffffUL / mj)
+                                                break;
+                                            h5policy_dtype_slot_record(
+                                                h5policy_dtype_slot_off[memb_slots_before + mk]
+                                                + mj * child_size,
+                                                h5policy_dtype_slot_kind[memb_slots_before + mk],
+                                                h5policy_dtype_slot_base[memb_slots_before + mk]);
+                                            mk = mk + 1UL;
+                                        }
+                                    if (h5policy_dtype_slot_truncated != 0UB)
+                                        break;
+                                    mj = mj + 1UL;
+                                }
+                        }
                     /* A legacy embedded array stores element_count copies of the
                        base type, so its footprint in the parent element is
                        base_size * nelem, not just base_size.  libhdf5 reads that
@@ -1069,7 +1227,7 @@ fun h5policy_validate_dtype_payload = (int ios,
                                                 msg_size, object))
         return ctx;
     var consumed = h5policy_dtype_check(ios, profile, payload_off,
-                                        msg_size, object, 0UL);
+                                        msg_size, object, 0UL, 0UL);
     if (consumed == 0UL)
         return ctx;
 

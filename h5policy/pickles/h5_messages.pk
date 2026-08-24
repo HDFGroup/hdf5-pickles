@@ -251,71 +251,92 @@ fun h5policy_validate_attr_heap_ids = (int ios,
     if (attr_ctx.has_datatype == 0UB)
         return;
 
-    var id_size = o + 4UL;
-    var width = 0UL;
-    if (attr_ctx.datatype_class == H5_DTYPE_CLASS_VLEN)
-        width = 4UL + id_size;
-    else if (attr_ctx.datatype_class == H5_DTYPE_CLASS_REFERENCE
-             && attr_ctx.datatype_reference_type == H5_DTYPE_REF_TYPE_REGION)
-        width = id_size;
-    else
+    var nslots = h5policy_dtype_slot_off'length as uint<64>;
+    if (nslots == 0UL)
         return;
 
-    /* The element count comes from the attribute's own dataspace.  Bound the
-       span it implies against the value region BEFORE striding through it: an
-       attribute whose extent was computed from a rewritten datatype size can
-       claim more elements than its message holds, and iterating on the claim
-       would read past the message.  */
-    var count = attr_ctx.dataset_element_count;
-    if (count == 0UL || value_size < width)
+    /* The element stride is the datatype's own storage size -- the RAW on-disk
+       size, since that is what libhdf5 strides by on the file side.  A slot
+       offset is relative to one element, so element i's slot s sits at
+       value_off + i * stride + slot_off[s].  */
+    var stride = attr_ctx.datatype_size;
+    if (stride == 0UL || value_size < stride)
         return;
-    var available = value_size / width;
+
+    /* The element count comes from the attribute's own dataspace, bounded by
+       what the value region can actually hold BEFORE any striding: an attribute
+       whose extent was computed from a rewritten datatype size can claim more
+       elements than its message carries, and iterating on the claim would read
+       past the message.  */
+    var count = attr_ctx.dataset_element_count;
+    if (count == 0UL)
+        return;
+    var available = value_size / stride;
     if (count > available)
         count = available;
-    if (count > H5_ATTR_HEAP_ID_SWEEP_LIMIT)
-        count = H5_ATTR_HEAP_ID_SWEEP_LIMIT;
 
     var i = 0UL;
     while (i < count)
         {
-            h5policy_walk_tick(1UL);
-            var d = value_off + (i * width)#B;
-            var id_off = attr_ctx.datatype_class == H5_DTYPE_CLASS_VLEN
-                         ? d + 4#B : d;
-            /* Test the sentinel on the RAW field, before the base-relative
-               conversion.  h5policy_msg_addr_at returns
-               global_hdf5_base_addr + raw, so in a file with a user block a
-               NULL element -- raw address 0 -- would come back as the base
-               address and be walked as if it named a collection there.  The
-               undefined sentinel is all-ones at the FILE's address width, which
-               is likewise only visible in the raw bytes.  */
-            var addr_raw = h5policy_msg_bytes(ios, profile, id_off, o);
-            var heap_idx = h5policy_msg_u64_at(ios, profile,
-                                               id_off + o#B, 4UL);
-            /* Address 0 is the NULL-element encoding -- H5VL_BLOB_SETNULL
-               writes it and H5VLnative_blob.c reports such an element as null;
-               an undefined address is the same intent written the other way.
-               Neither is a defect.  */
-            if (h5policy_msg_u64_at(ios, profile, id_off, o) != 0UL
-                && !h5policy_msg_addr_is_undef(addr_raw))
+            var elem = i * stride;
+            var s = 0UL;
+            while (s < nslots)
                 {
-                    var heap_addr = h5policy_msg_addr_at(ios, profile,
-                                                         id_off, o);
-                    /* Consult the collection memo first.  Without it every
-                       element re-parses the whole collection, which on a valid
-                       file with many vlen attributes spends the profile's
-                       wall-clock budget and rejects it -- measured, see
-                       h5_vds.pk.  A hit answers in a linear scan of the
-                       recorded objects.  */
-                    var ref = h5policy_gheap_memo_lookup(heap_addr, heap_idx);
-                    var from_memo = ref.found;
+                    h5policy_walk_tick(1UL);
+                    var kind = h5policy_dtype_slot_kind[s];
+                    var slot = h5policy_dtype_slot_off[s];
+                    /* A vlen descriptor is `length | heap id`; a legacy region
+                       reference is the bare heap id.  Both widths come from the
+                       FILE (H5T__vlen_set_loc / H5T__ref_set_loc overwrite the
+                       encoded element size at read time), so follow the reader,
+                       not the file's claim.  */
+                    var id_rel = kind == 9UL ? slot + 4UL : slot;
+                    var id_size = o + 4UL;
+                    /* Every read below must stay inside the value region.  A slot
+                       offset comes from the datatype, whose member bounds are
+                       validated against the element size -- but the element size
+                       itself is file-supplied, so bound it here too rather than
+                       trusting that chain.  */
+                    if (id_rel > value_size - elem
+                        || id_size > value_size - elem - id_rel)
+                        {
+                            s = s + 1UL;
+                            continue;
+                        }
+                    var id_off = value_off + (elem + id_rel)#B;
+
+                    /* Test the sentinel on the RAW field, before the
+                       base-relative conversion.  h5policy_msg_addr_at returns
+                       global_hdf5_base_addr + raw, so in a file with a user block
+                       a NULL element -- raw address 0 -- would come back as the
+                       base address and be walked as if it named a collection
+                       there.  The undefined sentinel is all-ones at the FILE's
+                       address width, which is likewise only visible in the raw
+                       bytes.  */
+                    var addr_raw = h5policy_msg_bytes(ios, profile, id_off, o);
+                    var heap_idx = h5policy_msg_u64_at(ios, profile,
+                                                       id_off + o#B, 4UL);
+                    /* Address 0 is the NULL-element encoding -- H5VL_BLOB_SETNULL
+                       writes it and H5VLnative_blob.c reports such an element as
+                       null; an undefined address is the same intent written the
+                       other way.  Neither is a defect.  */
+                    if (h5policy_msg_u64_at(ios, profile, id_off, o) == 0UL
+                        || h5policy_msg_addr_is_undef(addr_raw))
+                        {
+                            s = s + 1UL;
+                            continue;
+                        }
+
+                    var heap_addr = h5policy_msg_addr_at(ios, profile, id_off, o);
                     /* Already known bad: reported by the first descriptor that
                        reached it.  Silent and walk-free -- re-reporting one
                        corrupt collection once per element buries it, and
-                       re-walking it is the cost this memo exists to avoid.  */
+                       re-walking it is the cost the memo exists to avoid.  */
                     if (h5policy_gheap_memo_addr == heap_addr
                         && h5policy_gheap_memo_bad != 0UB)
                         return;
+                    var ref = h5policy_gheap_memo_lookup(heap_addr, heap_idx);
+                    var from_memo = ref.found;
                     var on_record = h5policy_gheap_memo_addr == heap_addr
                                     && h5policy_gheap_memo_valid != 0UB;
                     if (from_memo == 0UB && !on_record)
@@ -342,44 +363,53 @@ fun h5policy_validate_attr_heap_ids = (int ios,
                         h5policy_emit_error("H5_CORRUPT_HEAP_OBJECT_MISSING",
                                             "corrupt", id_off, object,
                                             "attribute reference names a missing global heap object");
+
                     /* Index 0 is the collection's free-space object and is
                        never handed out (H5HG_read refuses it outright), so the
                        walker never reports it as found.  */
-                    if (ref.found != 0UB
-                        && attr_ctx.datatype_class == H5_DTYPE_CLASS_VLEN)
+                    if (ref.found != 0UB && kind == 9UL)
                         {
-                            /* For a vlen the sequence length is stored beside
-                               the ID and must agree with the heap object that
-                               holds the data.  libhdf5 sizes the destination
-                               from the stored length and copies the object, so
-                               a length exceeding the object over-reads it.
-
-                               The length counts ELEMENTS, not bytes, and the
-                               base type's size is not available here: a vlen's
-                               encoded datatype size is 4 + H5HG_HEAP_ID_SIZE(f)
-                               whatever it is a sequence OF, and the base type is
-                               a nested datatype message this function does not
-                               decode.  So bound the count by the object's byte
-                               size, which is the base-size-1 case and therefore
-                               the weakest sound bound: any real base size only
-                               makes the true limit smaller, so this cannot
-                               produce a false positive.  It is deliberately
-                               incomplete for base sizes above one byte.  */
-                            var seq = h5policy_msg_u64_at(ios, profile, d, 4UL);
-                            if (seq > ref.data_size)
+                            /* THE RULE IS EQUALITY, and libhdf5 enforces exactly
+                               that: H5VL__native_blob_get calls
+                               H5HG_get_obj_size and refuses on
+                               `hobj_size != size` ("Expected global heap object
+                               size does not match"), where size is the sequence
+                               length scaled by the base type's storage size.  So
+                               an UNDER-declared length is refused by the library
+                               just as an over-declared one is.
+                               This bound used to be `length > object bytes`,
+                               which was sound but strictly weaker than the
+                               library in both directions: it admitted every
+                               under-declaration, and for a base type wider than
+                               one byte it admitted over-declarations too.  The
+                               base size is now carried on the slot, so the exact
+                               rule is available.  */
+                            var seq = h5policy_msg_u64_at(ios, profile,
+                                                          value_off
+                                                          + (elem + slot)#B, 4UL);
+                            var base = h5policy_dtype_slot_base[s];
+                            if (base == 0UL)
+                                base = 1UL;
+                            /* Bound the product before comparing; the count is a
+                               32-bit file-supplied field and the base size is
+                               file-supplied too. */
+                            if (seq <= 0xffffffffffffffffUL / base
+                                && seq * base != ref.data_size)
                                 h5policy_emit_error_ev(
                                     "H5_CORRUPT_ATTRIBUTE_HEAP_ID_LENGTH",
-                                    "corrupt", d, object,
-                                    "attribute vlen sequence length exceeds its global-heap object",
+                                    "corrupt", value_off + (elem + slot)#B, object,
+                                    "attribute vlen sequence length does not match its global-heap object",
                                     H5Evidence {
                                         field = "attribute.heap_sequence_length",
-                                        actual = seq,
+                                        actual = seq * base,
                                         expected = ref.data_size,
-                                        comparison = "at_most",
+                                        comparison = "equal",
                                         has_loc1 = 1, loc1_role = "actual",
-                                        loc1 = d, loc1_len = 4UL,
+                                        loc1 = value_off + (elem + slot)#B,
+                                        loc1_len = 4UL,
                                     });
                         }
+                    s = s + 1UL;
                 }
             i = i + 1UL;
         }
@@ -493,6 +523,12 @@ fun h5policy_validate_attribute_payload = (int ios,
        the same committed-object-header path the dispatcher uses and validate the
        recovered payload.  Unresolvable wrappers (heap-backed SOHM, nested
        sharing) are reported as coverage gaps by the resolver itself.  */
+    /* Collect heap-ID slots while the datatype is validated.  Enabled only here:
+       a DATASET's vlen descriptors are raw payload and out of scope, so datasets
+       must pay nothing for this.  The walk is the same one either way; only the
+       recording differs.  */
+    h5policy_reset_dtype_slots;
+    h5policy_dtype_slot_collect = 1UB;
     if (version >= 2UL && (flags & 1UL) != 0UL)
         {
             var dtype_ref = h5policy_resolve_shared_message(ios, profile, 0x03UL,
@@ -508,6 +544,7 @@ fun h5policy_validate_attribute_payload = (int ios,
         attr_ctx = h5policy_validate_dtype_payload(ios, profile, attr_ctx,
                                                    dtype_off, dtype_size,
                                                    object);
+    h5policy_dtype_slot_collect = 0UB;
 
     if (version >= 2UL && (flags & 2UL) != 0UL)
         {

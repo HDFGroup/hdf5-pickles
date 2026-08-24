@@ -1651,6 +1651,12 @@ def _gen_malformed(root):
         f"{root}/malformed/attr_vlen_heap_addr_out_of_file.h5")
     _make_attr_vlen_heap_seq_len_over(
         f"{root}/malformed/attr_vlen_heap_seq_len_over.h5")
+    _make_attr_vlen_len_under(
+        f"{root}/malformed/attr_vlen_heap_seq_len_under.h5")
+    _make_attr_compound_vlen_member_idx(
+        f"{root}/malformed/attr_compound_vlen_member_idx.h5")
+    _make_attr_array_vlen_last_idx(
+        f"{root}/malformed/attr_array_vlen_last_idx.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -5582,6 +5588,134 @@ def _make_attr_null_vlen_userblock(path):
         raise RuntimeError(f"null-vlen user block: expected one attribute heap "
                            f"ID naming the collection, found {len(hits)}")
     struct.pack_into("<Q", raw, hits[0], 0)      # the NULL-element encoding
+    _patch(path, bytes(raw))
+
+
+def _attr_compound_vlen_base():
+    """A compound attribute with a vlen MEMBER -- two elements, member at +4.
+
+    The element is {int32, vlen str}, so each element is 4 + H5HG_HEAP_ID_SIZE(f)
+    bytes and the heap ID sits at member offset 4, not 0.  Nothing computed member
+    offsets before, so this whole regime carried unvalidated heap IDs.
+    """
+    def build(h):
+        dt = np.dtype([("n", "i4"), ("s", h5py.special_dtype(vlen=str))])
+        d = h.create_dataset("d", data=np.zeros(1, dtype="i4"),
+                             track_times=False)
+        a = np.zeros(2, dtype=dt)
+        a["n"] = [1, 2]
+        a["s"] = ["first", "second"]
+        d.attrs.create("comp", a, dtype=dt)
+
+    return _base_bytes(build, libver="earliest")
+
+
+def _find_compound_vlen_ids(raw, what, expect):
+    """Offsets of the vlen descriptors inside a compound attribute's value.
+
+    Anchored on the collection address libhdf5 wrote, and the count is asserted:
+    an h5py layout change must fail loudly rather than patch the wrong bytes.
+    """
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError(f"{what}: no GCOL in the base file")
+    needle = struct.pack("<Q", gcol)
+    hits = []
+    start = 0
+    while True:
+        i = raw.find(needle, start)
+        if i < 0:
+            break
+        start = i + 1
+        if i >= 4 and 1 <= struct.unpack_from("<I", raw, i + 8)[0] <= 255:
+            hits.append(i - 4)
+    if len(hits) != expect:
+        raise RuntimeError(f"{what}: expected {expect} compound vlen descriptors, "
+                           f"found {len(hits)}")
+    return hits
+
+
+def _make_attr_compound_vlen_member_idx(path):
+    """A vlen member of a COMPOUND attribute naming a missing heap object.
+
+    The regime item 1 of this change exists for.  A top-level vlen attribute has
+    its heap ID at element offset 0; a vlen MEMBER has it at the member's byte
+    offset, and nothing computed that, so h5policy accepted any heap ID a
+    compound attribute carried.  Measured on an unmodified prior build: accepted.
+
+    Element ONE is patched, not element zero, so the fixture pins the element
+    STRIDE as well as the member offset -- a slot offset that is right for the
+    first element and wrong afterwards would still pass a zeroth-element test.
+    libhdf5 refuses the file (h5dump -A exits 1).
+    """
+    raw = _attr_compound_vlen_base()
+    hits = _find_compound_vlen_ids(raw, "compound vlen member index", 2)
+    # element = int32 (4) + vlen descriptor (length 4 + address + index 4)
+    stride = 4 + 4 + _sizeof_offsets(raw) + 4
+    if hits[1] - hits[0] != stride:
+        raise RuntimeError(f"compound element stride is {hits[1] - hits[0]}, "
+                           f"expected {stride}; the compound layout changed")
+    struct.pack_into("<I", raw, hits[1] + 4 + _sizeof_offsets(raw), 222)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_array_vlen_last_idx(path):
+    """An ARRAY-of-vlen attribute whose LAST heap ID names a missing object.
+
+    The only test of the array replication path.  A class-10 array of N copies of
+    a vlen has N heap IDs per element, strided by the base type's storage size --
+    the datatype walk collects the copy at index 0 and the rest are that set
+    shifted.  Two dataspace elements of a 3-entry array give six descriptors, and
+    the LAST one is patched: reaching it requires both the per-array replication
+    and the per-element stride to be right, so a replication that produced only
+    the first entry, or a stride that was right once, would still pass.
+
+    An unmodified prior build accepts this file; libhdf5 refuses to read the
+    attribute (h5py raises OSError).
+    """
+    vs = h5py.special_dtype(vlen=str)
+    adt = np.dtype((vs, (3,)))
+
+    def build(h):
+        d = h.create_dataset("d", data=np.zeros(1, dtype="i4"),
+                             track_times=False)
+        a = np.empty((2,), dtype=adt)
+        for i in range(2):
+            a[i] = np.array([f"a{i}", f"b{i}", f"c{i}"], dtype=object)
+        d.attrs.create("arr", a, dtype=adt)
+
+    raw = _base_bytes(build, libver="earliest")
+    hits = _find_compound_vlen_ids(raw, "array-of-vlen attribute", 6)
+    o = _sizeof_offsets(raw)
+    stride = 4 + o + 4
+    for k in range(1, len(hits)):
+        if hits[k] - hits[k - 1] != stride:
+            raise RuntimeError(f"array-of-vlen descriptors are not {stride} bytes "
+                               f"apart; the layout changed")
+    struct.pack_into("<I", raw, hits[-1] + 4 + o, 222)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_vlen_len_under(path):
+    """A vlen sequence length SHORTER than its global-heap object.
+
+    libhdf5 requires equality, not a bound: H5VL__native_blob_get calls
+    H5HG_get_obj_size and refuses on `hobj_size != size` ("Expected global heap
+    object size does not match").  The oracle's bound used to catch only
+    over-declaration, so every under-declared length libhdf5 refuses was
+    accepted -- measured on an unmodified prior build.
+
+    One less than the true length, so the case pins equality rather than the
+    detection of an implausible number.  Its over-declaring sibling is
+    attr_vlen_heap_seq_len_over.h5; keep both, since a bound in either direction
+    alone would pass one of them.
+    """
+    raw = _attr_vlen_heap_base()
+    d = _find_attr_heap_id(raw, "vlen attribute length under-declaration")
+    true_len = struct.unpack_from("<I", raw, d)[0]
+    if true_len < 2:
+        raise RuntimeError("base vlen attribute is too short to under-declare")
+    struct.pack_into("<I", raw, d, true_len - 1)
     _patch(path, bytes(raw))
 
 
