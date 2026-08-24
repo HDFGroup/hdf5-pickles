@@ -8,7 +8,7 @@ tests_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 tool="$tests_dir/../tools/h5policy"
 case_dir=$(mktemp -d "${TMPDIR:-/tmp}/h5policy-timeout-test.XXXXXX")
 fake_timeout="$case_dir/timeout"
-input_file="$case_dir/input.h5"
+input_file="$case_dir/"$'input%-caf\xc3\xa9-\x89.h5'
 
 cleanup() {
     rm -f -- "$fake_timeout" "$input_file"
@@ -33,7 +33,7 @@ if [[ $tool_status -ne 5 ]]; then
     exit 1
 fi
 
-REPORT_JSON=$report python3 - <<'PY'
+REPORT_JSON=$report CASE_DIR=$case_dir python3 - <<'PY'
 import json
 import os
 import sys
@@ -43,6 +43,10 @@ problems = []
 
 if report.get("schema_version") != 1:
     problems.append("schema_version")
+if report.get("path_encoding") != "utf-8-percent-v1":
+    problems.append("path_encoding")
+if report.get("file") != os.environ["CASE_DIR"] + "/input%25-café-%89.h5":
+    problems.append("file")
 if report.get("decision") != "unsupported_coverage_gap":
     problems.append("decision")
 if report.get("mapping_mode") != "non_strict":

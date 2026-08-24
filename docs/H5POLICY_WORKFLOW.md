@@ -158,8 +158,9 @@ supports an audit or release gate.
 
 Read a report in this order:
 
-1. Confirm it is valid JSON with a supported `schema_version`, the expected
-   `profile`, and the intended input in `file`.
+1. Confirm it is valid JSON encoded as strict UTF-8, with a supported
+   `schema_version`, the expected `profile`, `path_encoding` set to
+   `utf-8-percent-v1`, and the intended input in `file`.
 2. Read `decision`, but also require `analysis.complete` for a claim that the
    reachable walk completed without dropping findings. Use `walk_started`,
    `walk_completed`, `stop_reason`, and `findings_truncated` to explain an
@@ -177,6 +178,16 @@ Read a report in this order:
 An empty finding list is not a substitute for this sequence. In particular, a
 tool failure, incomplete walk, unexpected profile, or unsupported report schema
 must not be treated as a clean file.
+
+`file` and every `findings[].object` are byte paths, not a promise that the
+source names were Unicode. Under `utf-8-percent-v1`, valid UTF-8 stays readable
+without normalization; literal `%`, ASCII controls, DEL, and invalid UTF-8 bytes
+are uppercase `%HH`. After parsing the JSON, UTF-8-encode the field and
+percent-decode it to recover the original bytes. A literal percent is always
+`%25`, so recovery is reversible: `/Rate%89` becomes `/Rate%2589`, while the
+non-UTF-8 bytes in `/ArrayO\x89Stru\x80` become `/ArrayO%89Stru%80`. Do not apply
+Unicode replacement decoding to the raw report stream; failure to decode it as
+strict UTF-8 is a serializer or transport error.
 
 `analysis.complete` is a per-file traversal statement. It means the implemented
 walk finished for this input without dropping findings; it does not mean that

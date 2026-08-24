@@ -633,6 +633,7 @@ fun h5policy_emit_unlocated_warning = (string code,
 }
 
 var H5POLICY_HEX_DIGITS = "0123456789abcdef";
+var H5POLICY_PATH_HEX_DIGITS = "0123456789ABCDEF";
 
 /* JSON escaping is local so reports stay valid even when attacker-controlled
    object names contain control bytes or quotes.  */
@@ -675,9 +676,123 @@ fun h5policy_json_escape = (string value) string:
     return escaped;
 }
 
+/* JSON strings are Unicode, while HDF5 link names and host file names are byte
+   strings.  Report paths therefore use one reversible display encoding:
+
+     * well-formed UTF-8 is emitted unchanged;
+     * a literal '%' is %25, so escape spellings cannot collide with input;
+     * ASCII controls, DEL, and every byte not belonging to a well-formed UTF-8
+       sequence are %HH with uppercase hexadecimal digits.
+
+   '/' remains the path separator.  Consumers percent-decode the JSON string's
+   UTF-8 bytes to recover the original byte path.  This transformation belongs
+   at the serialization boundary: the in-process consumer API continues to
+   expose the byte-oriented object strings used by the validator. */
+fun h5policy_path_hex_nibble = (uint<8> n) string:
+{
+    return (H5POLICY_PATH_HEX_DIGITS[(n & 0xfUB) as uint<64>]) as string;
+}
+
+fun h5policy_path_percent_byte = (uint<8> b) string:
+{
+    return "%"
+           + h5policy_path_hex_nibble((b .>> 4) & 0xfUB)
+           + h5policy_path_hex_nibble(b & 0xfUB);
+}
+
+fun h5policy_path_utf8_continuation = (uint<8> b) int:
+{
+    return b >= 0x80UB && b <= 0xbfUB;
+}
+
+fun h5policy_path_encode = (string value) string:
+{
+    var encoded = "";
+    var i = 0UL;
+
+    while (i < value'length)
+        {
+            var b0 = value[i] as uint<8>;
+
+            if (b0 == 0x25UB || b0 < 0x20UB || b0 == 0x7fUB)
+                {
+                    encoded = encoded + h5policy_path_percent_byte(b0);
+                    i = i + 1UL;
+                }
+            else if (b0 < 0x80UB)
+                {
+                    encoded = encoded + (value[i] as string);
+                    i = i + 1UL;
+                }
+            else
+                {
+                    var sequence_length = 0UL;
+
+                    if (b0 >= 0xc2UB && b0 <= 0xdfUB
+                        && i + 1UL < value'length
+                        && h5policy_path_utf8_continuation(
+                               value[i + 1UL] as uint<8>))
+                        sequence_length = 2UL;
+                    else if (b0 >= 0xe0UB && b0 <= 0xefUB
+                             && i + 2UL < value'length)
+                        {
+                            var b1 = value[i + 1UL] as uint<8>;
+                            var b2 = value[i + 2UL] as uint<8>;
+                            if (h5policy_path_utf8_continuation(b2)
+                                && ((b0 == 0xe0UB
+                                     && b1 >= 0xa0UB && b1 <= 0xbfUB)
+                                    || (b0 == 0xedUB
+                                        && b1 >= 0x80UB && b1 <= 0x9fUB)
+                                    || (b0 != 0xe0UB && b0 != 0xedUB
+                                        && h5policy_path_utf8_continuation(b1))))
+                                sequence_length = 3UL;
+                        }
+                    else if (b0 >= 0xf0UB && b0 <= 0xf4UB
+                             && i + 3UL < value'length)
+                        {
+                            var f1 = value[i + 1UL] as uint<8>;
+                            var f2 = value[i + 2UL] as uint<8>;
+                            var f3 = value[i + 3UL] as uint<8>;
+                            if (h5policy_path_utf8_continuation(f2)
+                                && h5policy_path_utf8_continuation(f3)
+                                && ((b0 == 0xf0UB
+                                     && f1 >= 0x90UB && f1 <= 0xbfUB)
+                                    || (b0 == 0xf4UB
+                                        && f1 >= 0x80UB && f1 <= 0x8fUB)
+                                    || (b0 != 0xf0UB && b0 != 0xf4UB
+                                        && h5policy_path_utf8_continuation(f1))))
+                                sequence_length = 4UL;
+                        }
+
+                    if (sequence_length == 0UL)
+                        {
+                            encoded = encoded + h5policy_path_percent_byte(b0);
+                            i = i + 1UL;
+                        }
+                    else
+                        {
+                            var j = 0UL;
+                            while (j < sequence_length)
+                                {
+                                    encoded = encoded + (value[i + j] as string);
+                                    j = j + 1UL;
+                                }
+                            i = i + sequence_length;
+                        }
+                }
+        }
+
+    return encoded;
+}
+
 fun h5policy_print_json_string = (string value) void:
 {
     printf("\"%s\"", h5policy_json_escape(value));
+}
+
+fun h5policy_print_json_path = (string value) void:
+{
+    h5policy_print_json_string(h5policy_path_encode(value));
 }
 
 fun h5policy_print_json_u64_array = (uint<64>[] values) void:
@@ -726,8 +841,9 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
     printf("  \"profile\": ");
     h5policy_print_json_string(profile_name);
     printf(",\n");
+    printf("  \"path_encoding\": \"utf-8-percent-v1\",\n");
     printf("  \"file\": ");
-    h5policy_print_json_string(file_name);
+    h5policy_print_json_path(file_name);
     printf(",\n");
     printf("  \"mapping_mode\": ");
     h5policy_print_json_string(mapping_mode);
@@ -850,7 +966,7 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
                    h5policy_finding_has_locations[i] != 0UB ? "true" : "false");
             printf("      \"offset\": %u64d,\n", h5policy_finding_offsets[i]);
             printf("      \"object\": ");
-            h5policy_print_json_string(h5policy_finding_objects[i]);
+            h5policy_print_json_path(h5policy_finding_objects[i]);
             printf(",\n");
             printf("      \"message\": ");
             h5policy_print_json_string(h5policy_finding_messages[i]);

@@ -259,6 +259,8 @@ def run_case(spec):
                 capture_output=True, text=True, timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return ["timeout"]
+    except UnicodeError as exc:
+        return [f"crash: report is not UTF-8 ({exc})"]
     except (OSError, ValueError) as exc:
         return [f"invalid test configuration: {exc}"]
 
@@ -285,6 +287,10 @@ def run_case(spec):
             or not isinstance(schema_version, int)
             or schema_version != 1):
         problems.append(f"schema_version {schema_version!r} != 1")
+    if report.get("path_encoding") != "utf-8-percent-v1":
+        problems.append(
+            f"path_encoding {report.get('path_encoding')!r} "
+            "!= 'utf-8-percent-v1'")
 
     geometry = report.get("geometry")
     if not isinstance(geometry, dict):

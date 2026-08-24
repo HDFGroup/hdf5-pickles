@@ -76,6 +76,9 @@ conservatively declines to pass to the selected `libhdf5`.
 JSON output includes:
 
 - `schema_version`: the integer report-contract version (currently `1`).
+- `path_encoding`: the byte-path serialization contract, currently
+  `utf-8-percent-v1`.
+- `file`: the input byte path encoded according to `path_encoding`.
 - `decision`: the final classification.
 - `geometry`: physical file bytes, the superblock's declared EOA, the effective
   address ceiling used by validation, and bytes physically trailing the EOA.
@@ -89,6 +92,18 @@ JSON output includes:
   storage, VDS, dynamic filters, unknown messages, maximum rank, and maximum
   logical dataset bytes.
 - `metrics`: traversal and accounting counters used by profile budgets.
+
+The report itself is strict UTF-8 JSON even when a host file name or HDF5 link
+name is not UTF-8. `utf-8-percent-v1` applies to `file` and every
+`findings[].object`: well-formed UTF-8 is preserved without normalization;
+literal `%`, ASCII controls, DEL, and each byte not consumed by a well-formed
+UTF-8 sequence become uppercase `%HH`. JSON quoting is applied afterward, so
+quotes and backslashes use ordinary JSON escapes. To recover the original byte
+path, a consumer UTF-8-encodes the parsed JSON string and percent-decodes every
+`%HH`. Because an input `%` is always `%25`, this reverse operation is
+unambiguous. For example, `/ArrayO\x89Stru\x80` is reported as
+`/ArrayO%89Stru%80`, while the literal byte name `/Rate%89` is reported as
+`/Rate%2589`.
 
 Evidence comparisons currently use `equal` and `less_than_or_equal`; the
 finding means the reported `actual` value did not satisfy that comparison
@@ -108,6 +123,10 @@ the result through the read-only `h5policy_result_*` functions defined in
 location validity, typed integer evidence and its supporting byte ranges,
 truncation state, reachability queries, and explicit walk
 start/completion/stop state as scalars and strings.
+
+The in-process finding API is below the serialization boundary and continues to
+return the original byte-oriented object strings. `utf-8-percent-v1` applies
+only when those strings are written to a JSON report.
 The parallel finding and traversal vectors remain implementation details. The
 new `h5policy_result_continue_after_rejection` accessor has the deprecated
 `h5policy_result_continue_after_corruption` spelling as an API alias.

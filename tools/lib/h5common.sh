@@ -51,6 +51,74 @@ escape_json_string() {
     printf '%s' "$value"
 }
 
+# Encode a byte-oriented path for the JSON report contract.  Bash cannot hold a
+# NUL (and Unix paths cannot contain one), but every other byte is handled: valid
+# UTF-8 remains readable, while literal percent signs, controls, DEL, and bytes
+# outside well-formed UTF-8 become uppercase %HH escapes.  Keep this in sync
+# with h5policy_path_encode in h5policy/pickles/h5_findings.pk.
+encode_report_path() {
+    local value=$1
+    local LC_ALL=C
+    local encoded="" piece char0
+    local i=0 length=${#value}
+    local b0=0 b1=0 b2=0 b3=0 sequence_length=0
+
+    while ((i < length)); do
+        char0=${value:i:1}
+        printf -v b0 '%d' "'$char0"
+        sequence_length=0
+
+        if ((b0 == 0x25 || b0 < 0x20 || b0 == 0x7f)); then
+            printf -v piece '%%%02X' "$b0"
+            encoded+=$piece
+            i=$((i + 1))
+        elif ((b0 < 0x80)); then
+            encoded+=$char0
+            i=$((i + 1))
+        else
+            if ((b0 >= 0xc2 && b0 <= 0xdf && i + 1 < length)); then
+                printf -v b1 '%d' "'${value:i+1:1}"
+                if ((b1 >= 0x80 && b1 <= 0xbf)); then
+                    sequence_length=2
+                fi
+            elif ((b0 >= 0xe0 && b0 <= 0xef && i + 2 < length)); then
+                printf -v b1 '%d' "'${value:i+1:1}"
+                printf -v b2 '%d' "'${value:i+2:1}"
+                if ((b2 >= 0x80 && b2 <= 0xbf)) \
+                   && { ((b0 == 0xe0 && b1 >= 0xa0 && b1 <= 0xbf)) \
+                        || ((b0 == 0xed && b1 >= 0x80 && b1 <= 0x9f)) \
+                        || ((b0 != 0xe0 && b0 != 0xed \
+                             && b1 >= 0x80 && b1 <= 0xbf)); }; then
+                    sequence_length=3
+                fi
+            elif ((b0 >= 0xf0 && b0 <= 0xf4 && i + 3 < length)); then
+                printf -v b1 '%d' "'${value:i+1:1}"
+                printf -v b2 '%d' "'${value:i+2:1}"
+                printf -v b3 '%d' "'${value:i+3:1}"
+                if ((b2 >= 0x80 && b2 <= 0xbf \
+                      && b3 >= 0x80 && b3 <= 0xbf)) \
+                   && { ((b0 == 0xf0 && b1 >= 0x90 && b1 <= 0xbf)) \
+                        || ((b0 == 0xf4 && b1 >= 0x80 && b1 <= 0x8f)) \
+                        || ((b0 != 0xf0 && b0 != 0xf4 \
+                             && b1 >= 0x80 && b1 <= 0xbf)); }; then
+                    sequence_length=4
+                fi
+            fi
+
+            if ((sequence_length == 0)); then
+                printf -v piece '%%%02X' "$b0"
+                encoded+=$piece
+                i=$((i + 1))
+            else
+                encoded+=${value:i:sequence_length}
+                i=$((i + sequence_length))
+            fi
+        fi
+    done
+
+    printf '%s' "$encoded"
+}
+
 # Resolve an absolute path, preferring readlink -f and falling back to a plain
 # join when readlink is unavailable.
 abs_path() {

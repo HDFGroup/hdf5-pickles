@@ -122,6 +122,35 @@ report synthesized by the shell wrapper after its hard wall timeout. The
 version changes when an incompatible field shape, type, or meaning changes;
 additive fields may retain the current version.
 
+#### Byte-path serialization
+
+Every report declares `path_encoding: "utf-8-percent-v1"`. This contract
+applies to the top-level `file` value and each `findings[].object` value and
+guarantees that the complete report is strict UTF-8 JSON for every byte path
+that reaches the serializer. It does not expand which names an input format,
+operating system, or command-line entry point accepts.
+
+The serializer scans the input bytes from left to right:
+
+1. A well-formed UTF-8 sequence encoding a Unicode scalar value is copied as
+   UTF-8, without normalization.
+2. A literal percent byte (`0x25`), an ASCII control (`0x00` through `0x1f`),
+   DEL (`0x7f`), or any byte not consumed by a well-formed UTF-8 sequence is
+   written as `%HH`, using uppercase hexadecimal digits.
+3. All other ASCII bytes are copied. JSON string quoting is then applied, so a
+   quote or backslash uses the normal JSON escape syntax rather than `%HH`.
+
+To recover the source bytes, UTF-8-encode the string returned by the JSON parser
+and percent-decode each `%HH`. The transform is unambiguous because every input
+percent is encoded as `%25`; an apparent escape spelling in the input therefore
+cannot collide with an encoded byte. For example, the bytes
+`/ArrayO\x89Stru\x80` serialize as `/ArrayO%89Stru%80`, while the literal bytes
+`/Rate%89` serialize as `/Rate%2589`.
+
+The read-only in-process consumer API remains byte-oriented and exposes the
+unencoded object string. Path encoding occurs only at the JSON serialization
+boundary. Adding `path_encoding` is additive under schema version 1.
+
 The `geometry` object makes the address boundary used during validation
 explicit:
 

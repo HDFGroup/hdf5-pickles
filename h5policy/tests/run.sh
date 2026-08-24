@@ -129,6 +129,10 @@ echo "== consumer result API checks =="
 poke --quiet -L "$tests_dir/unit_consumer.pk"
 consumer_status=$?
 
+echo "== byte-path encoder unit checks =="
+poke --quiet -L "$tests_dir/unit_paths.pk"
+path_unit_status=$?
+
 # The seam cases open corpus fixtures, so they need the tests directory; -c is
 # processed before -L, which is what puts the variable in scope for the load.
 echo "== h5policy_analyze seam checks =="
@@ -138,6 +142,10 @@ seam_status=$?
 echo "== wrapper timeout report checks =="
 bash "$tests_dir/unit_report_wrapper.sh"
 report_status=$?
+
+echo "== byte-path JSON report checks =="
+python3 "$tests_dir/check_path_encoding.py"
+path_report_status=$?
 
 echo "== corpus cases =="
 TESTS_DIR="$tests_dir" TOOL="$overlay_dir/tools/h5policy" \
@@ -258,7 +266,9 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $fsinfo_status -eq 0 \
       && $limits_status -eq 0 && $reached_status -eq 0 \
       && $consumer_status -eq 0 \
+      && $path_unit_status -eq 0 \
       && $seam_status -eq 0 && $report_status -eq 0 \
+      && $path_report_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
       && $matrix_status -eq 0 && $mut_status -eq 0 \
@@ -269,5 +279,5 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status seam=$seam_status report=$report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status mutheap=$mut_heap_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status pathunit=$path_unit_status seam=$seam_status report=$report_status pathreport=$path_report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status mutheap=$mut_heap_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
 exit 1
