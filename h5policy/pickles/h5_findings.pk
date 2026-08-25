@@ -197,6 +197,12 @@ fun h5policy_walk_tick = (uint<64> cost) void:
    findings (which otherwise re-fire on every increment past the limit).  */
 var H5POLICY_MAX_FINDINGS = 4096UL;
 var h5policy_findings_truncated = 0;
+/* Set by the raw-data-vs-metadata disjointness check in h5_walk.pk when either
+   of its hard-capped extent registries fills up, and reported in the analysis
+   block below.  Declared HERE rather than beside those registries because this
+   file prints the report and is loaded before h5_walk.pk -- a flag declared
+   there is not visible to the printer.  Reset by h5policy_reset_extents. */
+var h5policy_extents_truncated = 0;
 
 /* Running count of ERROR-class findings.  Message-absence rules need to know
    whether the structure they are judging decoded cleanly, and a warning is not
@@ -612,6 +618,21 @@ fun h5policy_emit_warning = (string code,
     h5policy_emit("warning", code, "warning", loc, object, message);
 }
 
+/* The evidence-carrying warning.  Its error twin already existed; a warning had
+   no way to state actual/expected, which meant an advisory could name a field but
+   not the two numbers that disagreed -- the part a reader actually needs.  */
+fun h5policy_emit_warning_ev = (string code, off64 loc,
+                                string object, string message,
+                                H5Evidence ev) void:
+{
+    h5policy_emit_with_evidence("warning", code, "warning", loc, 1,
+                                object, message, 1, ev.field,
+                                ev.actual, ev.expected, ev.comparison,
+                                ev.has_loc1, ev.loc1_role, ev.loc1, ev.loc1_len,
+                                ev.has_loc2, ev.loc2_role, ev.loc2, ev.loc2_len,
+                                ev.source_offsets, ev.source_lengths);
+}
+
 fun h5policy_emit_unlocated_error = (string code, string klass,
                                      string object, string message) void:
 {
@@ -627,6 +648,7 @@ fun h5policy_emit_unlocated_warning = (string code,
 }
 
 var H5POLICY_HEX_DIGITS = "0123456789abcdef";
+var H5POLICY_PATH_HEX_DIGITS = "0123456789ABCDEF";
 
 /* JSON escaping is local so reports stay valid even when attacker-controlled
    object names contain control bytes or quotes.  */
@@ -669,9 +691,123 @@ fun h5policy_json_escape = (string value) string:
     return escaped;
 }
 
+/* JSON strings are Unicode, while HDF5 link names and host file names are byte
+   strings.  Report paths therefore use one reversible display encoding:
+
+     * well-formed UTF-8 is emitted unchanged;
+     * a literal '%' is %25, so escape spellings cannot collide with input;
+     * ASCII controls, DEL, and every byte not belonging to a well-formed UTF-8
+       sequence are %HH with uppercase hexadecimal digits.
+
+   '/' remains the path separator.  Consumers percent-decode the JSON string's
+   UTF-8 bytes to recover the original byte path.  This transformation belongs
+   at the serialization boundary: the in-process consumer API continues to
+   expose the byte-oriented object strings used by the validator. */
+fun h5policy_path_hex_nibble = (uint<8> n) string:
+{
+    return (H5POLICY_PATH_HEX_DIGITS[(n & 0xfUB) as uint<64>]) as string;
+}
+
+fun h5policy_path_percent_byte = (uint<8> b) string:
+{
+    return "%"
+           + h5policy_path_hex_nibble((b .>> 4) & 0xfUB)
+           + h5policy_path_hex_nibble(b & 0xfUB);
+}
+
+fun h5policy_path_utf8_continuation = (uint<8> b) int:
+{
+    return b >= 0x80UB && b <= 0xbfUB;
+}
+
+fun h5policy_path_encode = (string value) string:
+{
+    var encoded = "";
+    var i = 0UL;
+
+    while (i < value'length)
+        {
+            var b0 = value[i] as uint<8>;
+
+            if (b0 == 0x25UB || b0 < 0x20UB || b0 == 0x7fUB)
+                {
+                    encoded = encoded + h5policy_path_percent_byte(b0);
+                    i = i + 1UL;
+                }
+            else if (b0 < 0x80UB)
+                {
+                    encoded = encoded + (value[i] as string);
+                    i = i + 1UL;
+                }
+            else
+                {
+                    var sequence_length = 0UL;
+
+                    if (b0 >= 0xc2UB && b0 <= 0xdfUB
+                        && i + 1UL < value'length
+                        && h5policy_path_utf8_continuation(
+                               value[i + 1UL] as uint<8>))
+                        sequence_length = 2UL;
+                    else if (b0 >= 0xe0UB && b0 <= 0xefUB
+                             && i + 2UL < value'length)
+                        {
+                            var b1 = value[i + 1UL] as uint<8>;
+                            var b2 = value[i + 2UL] as uint<8>;
+                            if (h5policy_path_utf8_continuation(b2)
+                                && ((b0 == 0xe0UB
+                                     && b1 >= 0xa0UB && b1 <= 0xbfUB)
+                                    || (b0 == 0xedUB
+                                        && b1 >= 0x80UB && b1 <= 0x9fUB)
+                                    || (b0 != 0xe0UB && b0 != 0xedUB
+                                        && h5policy_path_utf8_continuation(b1))))
+                                sequence_length = 3UL;
+                        }
+                    else if (b0 >= 0xf0UB && b0 <= 0xf4UB
+                             && i + 3UL < value'length)
+                        {
+                            var f1 = value[i + 1UL] as uint<8>;
+                            var f2 = value[i + 2UL] as uint<8>;
+                            var f3 = value[i + 3UL] as uint<8>;
+                            if (h5policy_path_utf8_continuation(f2)
+                                && h5policy_path_utf8_continuation(f3)
+                                && ((b0 == 0xf0UB
+                                     && f1 >= 0x90UB && f1 <= 0xbfUB)
+                                    || (b0 == 0xf4UB
+                                        && f1 >= 0x80UB && f1 <= 0x8fUB)
+                                    || (b0 != 0xf0UB && b0 != 0xf4UB
+                                        && h5policy_path_utf8_continuation(f1))))
+                                sequence_length = 4UL;
+                        }
+
+                    if (sequence_length == 0UL)
+                        {
+                            encoded = encoded + h5policy_path_percent_byte(b0);
+                            i = i + 1UL;
+                        }
+                    else
+                        {
+                            var j = 0UL;
+                            while (j < sequence_length)
+                                {
+                                    encoded = encoded + (value[i + j] as string);
+                                    j = j + 1UL;
+                                }
+                            i = i + sequence_length;
+                        }
+                }
+        }
+
+    return encoded;
+}
+
 fun h5policy_print_json_string = (string value) void:
 {
     printf("\"%s\"", h5policy_json_escape(value));
+}
+
+fun h5policy_print_json_path = (string value) void:
+{
+    h5policy_print_json_string(h5policy_path_encode(value));
 }
 
 fun h5policy_print_json_u64_array = (uint<64>[] values) void:
@@ -720,8 +856,9 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
     printf("  \"profile\": ");
     h5policy_print_json_string(profile_name);
     printf(",\n");
+    printf("  \"path_encoding\": \"utf-8-percent-v1\",\n");
     printf("  \"file\": ");
-    h5policy_print_json_string(file_name);
+    h5policy_print_json_path(file_name);
     printf(",\n");
     printf("  \"mapping_mode\": ");
     h5policy_print_json_string(mapping_mode);
@@ -768,8 +905,22 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
     printf(",\n");
     printf("    \"continue_after_rejection\": %s,\n",
            continue_after_rejection ? "true" : "false");
-    printf("    \"findings_truncated\": %s\n",
+    printf("    \"findings_truncated\": %s,\n",
            h5policy_findings_truncated ? "true" : "false");
+    /* Whether the raw-data-vs-metadata disjointness check saw everything.  Its
+       two extent registries are hard-capped so the added cost cannot scale with
+       file size, which means a big file gets PARTIAL coverage by design -- and
+       without this field a reader cannot tell "disjoint" from "we stopped
+       looking", which is the difference between a result and a silence.
+
+       DELIBERATELY NOT FOLDED INTO `complete` ABOVE, which stays
+       walk_completed && !findings_truncated.  That flag is about whether the
+       walk finished and whether findings were dropped; folding a single check's
+       coverage limit into it would silently reclassify large VALID files as
+       incomplete, changing a headline verdict field to report a detail.  A
+       consumer that cares reads this field. */
+    printf("    \"extent_overlap_truncated\": %s\n",
+           h5policy_extents_truncated ? "true" : "false");
     printf("  },\n");
     printf("  \"boundary\": {\n");
     printf("    \"libhdf5\": false,\n");
@@ -830,7 +981,7 @@ fun h5policy_print_json_report = (string profile_name, string file_name,
                    h5policy_finding_has_locations[i] != 0UB ? "true" : "false");
             printf("      \"offset\": %u64d,\n", h5policy_finding_offsets[i]);
             printf("      \"object\": ");
-            h5policy_print_json_string(h5policy_finding_objects[i]);
+            h5policy_print_json_path(h5policy_finding_objects[i]);
             printf(",\n");
             printf("      \"message\": ");
             h5policy_print_json_string(h5policy_finding_messages[i]);

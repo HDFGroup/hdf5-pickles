@@ -299,14 +299,29 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
             swept = nsel > 0;
         }
         if (!swept) {
+            /* One element, at the LAST coordinate rather than the origin.
+             *
+             * A calloc'd coordinate array selects element (0,...,0), whose byte
+             * offset within its chunk -- and within any record the element sits
+             * in -- is zero.  That is the one element an offset arithmetic
+             * defect cannot reach past: measured on a chunked dataset whose
+             * dimension product wraps to zero, reading the origin lands inside
+             * the (8-byte) allocation and returns cleanly, while reading
+             * element (1,0) segfaults, so the canary reported outcome=accepted
+             * on a specimen that segfaults h5dump.  See
+             * registry/cases/chunk-dim-product-64bit-overflow.yml.
+             *
+             * The last coordinate reaches the same code with a nonzero offset
+             * and costs nothing: the selection is still a single element, so
+             * the memory and file bounds are unchanged.
+             */
             nsel = 1;
             coord = (hsize_t *)calloc((size_t)rank, sizeof *coord);
             if (!coord) goto done;
-            if (st->exercise_chunk_index) {
+            if (st->exercise_chunk_index)
                 st->chunk_sweep_skipped++;
-                for (int i = 0; i < rank; i++)
-                    coord[i] = dims[i] ? dims[i] - 1 : 0;
-            }
+            for (int i = 0; i < rank; i++)
+                coord[i] = dims[i] ? dims[i] - 1 : 0;
         }
         if (H5Sselect_elements(space, H5S_SELECT_SET, (size_t)nsel, coord) < 0) {
             entry_point_result(st, EP_H5SSELECT_ELEMENTS, 0);
@@ -705,6 +720,26 @@ int main(int argc, char **argv)
                                        H5O_INFO_BASIC | H5O_INFO_NUM_ATTRS);
             entry_point_result(&st, EP_H5OVISIT3, visited >= 0);
             if (visited < 0) {
+                /* COUNT THE FIRST FAILURE, then retry by name.
+                 *
+                 * The retry was reading every first-attempt failure as "this
+                 * file does not index by creation order", and swallowing it:
+                 * only the final result reached call_errors, so a file whose
+                 * first traversal libhdf5 REFUSED was reported as cleanly
+                 * accepted.  Measured: all 65 accept-side corpus fixtures pass
+                 * the creation-order attempt, so a first-attempt failure is a
+                 * refusal here and not a capability probe.
+                 *
+                 * It mattered most for the metadata cache image, whose load is
+                 * ONE-SHOT: H5C_protect clears load_image before calling
+                 * H5C__load_cache_image (H5Centry.c:3032), so the failing call
+                 * consumes the attempt and every later access succeeds.  Seven
+                 * mdci fixtures were recorded as libhdf5 divergences on that
+                 * basis; six of them libhdf5 actually rejects.
+                 *
+                 * The retry is kept so the walk still gathers materialization
+                 * counts, but the refusal is no longer lost. */
+                st.call_errors++;
                 visited = H5Ovisit3(f, H5_INDEX_NAME, H5_ITER_INC, visit_cb,
                                     &st, H5O_INFO_BASIC | H5O_INFO_NUM_ATTRS);
                 entry_point_result(&st, EP_H5OVISIT3, visited >= 0);

@@ -165,8 +165,11 @@ def check_row(row: dict, records: dict[str, dict], findings: dict,
     # exact-build matrix records it under crashes_on, separate from the
     # rejection verdict) be first-class SSP evidence -- a divide-by-zero or an
     # amplification is precisely the hardening a control like TEST-05 or HARD-04
-    # wants to show, and would otherwise be unrepresentable here.
-    if outcome not in {"enforced", "diverges", "crashes", "not_applicable"}:
+    # wants to show, and would otherwise be unrepresentable here.  `hangs` is
+    # its non-termination sibling, recorded under hangs_on: an availability
+    # defect, not a fault, and a control must cite the one it actually measured.
+    if outcome not in {"enforced", "diverges", "crashes", "hangs",
+                       "not_applicable"}:
         fail(f"{control}: unsupported fixture outcome {outcome!r}")
     if outcome != "not_applicable" and row["fixture"] not in observed.get(f"{outcome}_on", []):
         fail(f"{control}: fixture is not measured as {outcome}")

@@ -1,0 +1,93 @@
+# Two local-heap prefixes declaring the SAME data-segment address.  The
+# violated property is a UNIQUENESS property over the set of prefixes, which is
+# what makes this fixture worth having: every prefix in it is individually
+# well-formed -- version, reserved bytes, segment size, free-list head and
+# segment address all pass their own bounds gates, and the shared segment
+# deserialises cleanly.  No per-heap check of any strictness can see it.  So
+# h5policy checks it at the dedupe point (h5policy_check_lheap_segment_owner in
+# h5_group.pk) against a file-scoped set, exactly as the superblock-extension
+# alias check does.
+#
+# WHY libhdf5 CANNOT CATCH IT EITHER, and why it dies instead.  A local-heap
+# data segment carries no header, no signature and no back-pointer, so there is
+# nothing in the segment to compare against the prefix claiming it.  (The
+# fractal heap has the opposite shape -- its blocks store an owner address on
+# disk, which is what heap.fractal_block_owner reads -- so ownership there is a
+# local check.)  H5HL_protect reaches the segment through
+# H5AC_protect(H5AC_LHEAP_DBLK, heap->dblk_addr, heap, ...), which is keyed by
+# ADDRESS; the heap it passes is udata, used only to deserialize on a MISS.  The
+# second heap therefore gets a cache HIT, its deserialize callback never runs,
+# and H5HL__dblk_new -- the only code that sets heap->dblk and heap->dblk_image
+# -- never runs for it.  The heap goes live with both fields NULL:
+# H5HL_unprotect calls H5AC_unpin_entry(NULL) (H5AC.c:1438), and
+# H5HL_offset_into returns (NULL + name_off), which is non-NULL and so defeats
+# its caller's NULL guard before H5MM_strndup reads it (H5Gent.c:382).
+#
+# MEASURED on this fixture, 2.3.0: h5dump -H, h5ls -vr and h5stat ALL SIGSEGV,
+# and so does a bare H5Ovisit3.  That makes this one of the few malformed
+# fixtures where the shipped consequence is a hard crash on plain open-and-list
+# rather than an error return.
+#
+# INVARIANT A DOES NOT DIVERGE HERE, which is why there is no tolerance entry
+# and no A~ predicate.  libhdf5 does not open the file -- it crashes on it -- so
+# "libhdf5 opens => not reject_corrupt" is satisfied and the oracle and the
+# library agree on the verdict.  Contrast heap_free_list_size_wrap.h5 next door,
+# where libhdf5 opens cleanly and a per-fixture tolerance IS required.
+# Measured with h5policy-diff: "PASS A' libhdf5 rejects => explicit rejection
+# (got reject_corrupt)", 0 hard failures.
+#
+# ONE SOFT WARN IS EXPECTED AND IS NOT A GAP: "h5debug rc=0 vs h5py structural
+# open=False".  h5debug reads the superblock and stops, and this file's
+# superblock is untouched -- the mutation is two heap-prefix fields plus the
+# end-of-address bump -- so h5debug succeeds where a full traversal dies.  That
+# is the tool doing less work, not a disagreement about the bytes.
+#
+# THREE TRAPS for anyone editing the generator, each producing a file that
+# proves nothing:
+#   * The shared segment must be adjacent to NEITHER prefix.  H5HLcache.c:438
+#     sets single_cache_obj from `prfx_addr + prfx_size == dblk_addr`, and a heap
+#     on that path never creates a separate data-block cache entry -- so there is
+#     no shared entry to collide on and no crash.  The generator appends a copy
+#     of a valid segment at EOF for exactly this reason.
+#   * BOTH group prefixes must be patched.  Aliasing a victim onto a donor that
+#     is itself on the single-cache-object path is the same dead end.
+#   * The two prefixes must AGREE on segment size and free-list head.  They do
+#     here because both groups are built identically; a variant that disagrees
+#     dies earlier and elsewhere, in H5HL__fl_deserialize (H5HLcache.c:241,
+#     "bad heap free list"), never reaching the aliasing hole.
+#
+# The prefix carries no checksum and the address edit is size-neutral, so only
+# the superblock end-of-address field has to grow to cover the appended segment.
+#
+# `walk_completed` is false because untrusted-strict stops at the first
+# non-accept finding, which arrives on the second group heap (/g2).  Nothing is
+# truncated -- stop_reason is "rejection", not a budget.  The finding is reported
+# on /g2 because that is the prefix that finds the segment already claimed; the
+# evidence carries the first claimant's matching field as its second location,
+# so both disagreeing prefixes are named.
+#
+# Paired with valid/two_symbol_table_groups.h5, which this fixture is derived
+# from: same three heaps, each correctly owning its own segment.  The pair
+# differs by exactly the aliased field.
+#
+# The libhdf5 defect is recorded in
+# registry/cases/local-heap-dblk-address-aliased-across-heaps.yml.
+#
+# NO h5cve BLOCK YET: the crash is measured by hand (three tools, one direct
+# probe) but no probe canary has been run for this family, and per the
+# coverage-gap note in that record, "accepted" from a probe is not evidence of
+# safety.  Measure with h5policy-probe --exercise heap_structures before
+# claiming a status here.
+file: malformed/lheap_data_segment_alias.h5
+profile: untrusted-strict
+expected_decision: reject_corrupt
+expected_exit: 2
+required_findings: [H5_CORRUPT_LOCAL_HEAP_DATA_SEGMENT_ALIAS]
+expected_analysis:
+  complete: false
+  walk_started: true
+  walk_completed: false
+  stop_reason: rejection
+  continue_after_rejection: false
+  findings_truncated: false
+forbidden: [crash, timeout, external_open, plugin_load, write]

@@ -1,0 +1,80 @@
+# A v1 B-tree chunk record with a DEFINED address and a stored size of zero.
+#
+# WHY A ZERO IS DANGEROUS RATHER THAN MERELY SILLY.  libhdf5 hands the record's
+# stored size to the filter pipeline as `nbytes`, and the fixed-overhead filters
+# subtract from it with no floor.  H5Zfletcher32.c:73:
+#
+#     size_t src_nbytes = nbytes;
+#     src_nbytes -= FLETCHER_LEN;          -- 4, unguarded, on size_t
+#     tmp_src = src + src_nbytes;
+#     UINT32DECODE(tmp_src, stored_fletcher);
+#     fletcher = H5_checksum_fletcher32(src, src_nbytes);
+#
+# With nbytes == 0 that wraps to SIZE_MAX-3, so the code reads a checksum at
+# `src + (2**64-4)` and then checksums 2**64-4 bytes.  MEASURED on the selected
+# build: SIGSEGV in H5_checksum_fletcher32 with _len = 18446744073709551612,
+# from an ordinary H5Dread.  The libhdf5 defect is recorded in
+# registry/cases/filtered-chunk-zero-stored-size.yml.
+#
+# THE FILE OPENS CLEANLY, and that is the point of the fixture.  h5dump -H,
+# h5ls -vr, h5stat and h5debug all exit 0; only a data read faults.  So the
+# header-only differential probe sees agreement and it is the data-forcing probe
+# that supplies the evidence -- which is exactly why this is an A+ WARN rather
+# than a hard A failure, and why NO tolerance and NO A~ predicate are needed:
+#   WARN A+ libhdf5 opens structurally; h5policy eager reject_corrupt has
+#           deeper libhdf5 evidence (probe_error, h5dump-data rc=-11)
+# Contrast malformed/lheap_data_segment_alias.h5, where libhdf5 crashes during
+# the OPEN and the harness reads that as plain agreement (PASS A').
+#
+# WHERE THE CHECK LIVES, and why it was missing.  The rule is
+# h5policy_chunk_record_size_ok in h5_chunkindex.pk, called from all four
+# chunk-index walkers.  Before 2026-08-22 only the extensible-array walker had
+# it; the v1 B-tree, v2 B-tree and fixed-array walkers did not.  The v1 walker
+# already decoded the size and bounded `addr + size` against the file -- and a
+# size of 0 satisfies that bound trivially, which is how the hole survived.
+#
+# fletcher32 specifically, because its overhead is FIXED: it always subtracts 4
+# before looking at the data.  A variable-overhead filter (deflate) fails its own
+# decode first and returns an error instead of wrapping, so a specimen built over
+# deflate would prove nothing.
+#
+# GENERATOR TRAP: a v1 B-tree node holds n+1 KEYS for n children, and the
+# trailing key[n] is a boundary sentinel whose size is legitimately ZERO.
+# Patching that one changes nothing.  The generator patches key[0] and asserts
+# its parse first (nonzero size, in-file address), because the key stride
+# depends on the LAYOUT dimensionality -- rank plus one for the trailing
+# element-size dimension -- and getting that wrong lands on an offset word.
+# The same sentinel is why a naive "scan for a zero size field" sweep reports
+# most well-formed chunked files, including the HDF5 library's own test data.
+#
+# Note `walk_completed: true`: unlike a prewalk rejection, the chunk-index
+# walker records the finding and the walk runs to completion, so the whole index
+# is still measured.  Both records in the specimen behind this fixture are
+# reported for that reason; this minimal fixture carries exactly one.
+#
+# Paired with valid/chunk_v1_btree_fletcher.h5, which this file is patched from
+# and which differs only in that four-byte size field.
+file: malformed/chunk_zero_stored_size.h5
+profile: untrusted-strict
+expected_decision: reject_corrupt
+expected_exit: 2
+required_findings: [H5_CORRUPT_CHUNK_STORED_SIZE]
+# Family named, but NO allowed_statuses here: the canary status is a reasoned
+# exception to a libhdf5 defect, so it lives with the others in
+# registry/h5cve-matrix-policy.yml.  It has to -- cmd_matrix reads an
+# expectation's own allowed_statuses in PREFERENCE to the override, so a value
+# here would silently shadow the reasoned one.
+# MEASURED 2026-08-22 with `--exercise chunk_index`: outcome=crashed,
+# signal 11 (SIGSEGV) -- a genuine fault, not a CPU-limit hang.
+h5cve: {family: chunk_index}
+expected_analysis:
+  complete: true
+  walk_started: true
+  walk_completed: true
+  continue_after_rejection: false
+  findings_truncated: false
+verification:
+  # The stored size is exactly zero with the address still defined -- the
+  # lower boundary, and the one the filter pipeline underflows from.
+  count_and_extent_boundaries: [zero]
+forbidden: [crash, timeout, external_open, plugin_load, write]

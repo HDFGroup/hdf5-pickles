@@ -1,0 +1,495 @@
+# Two local-heap prefixes may name the SAME data-segment address.  The metadata
+# cache keys entries by address, so the second H5AC_protect(H5AC_LHEAP_DBLK, ...)
+# is a HIT: the deserialize callback -- the only code that fills in heap->dblk
+# and heap->dblk_image -- never runs for the second heap, which is then used
+# half-initialised.  Two NULL fields of one object, two crash sites, one cause.
+#
+# Promoted 2026-08-22 from a working bundle (gitignored h5cve scratch; the
+# specimen is identified by provenance.input_sha256 below).
+#
+# THE BUNDLE'S OWN DIAGNOSIS WAS WRONG and that is worth stating first, because
+# the wrong version is the memorable one.  It titled this a "hard-link cycle
+# accepted by h5policy but mishandled by shipped traversal" and recommended a
+# traversal/alias-handling follow-up, on the strength of h5debug dumps showing
+# /g1/g2.1 -> g2 and /g2/g2.1 -> g1.  The cycle is real and it is irrelevant.
+# A symbolised backtrace (which the bundle listed as Unmeasured) plus a
+# synthetic witness with NO cycle at all put the defect in the local-heap cache
+# client instead.  The cycle only guaranteed that one traversal touched both
+# groups' heaps, which is what any full traversal does anyway.
+schema_version: 1
+
+id: local-heap-dblk-address-aliased-across-heaps
+title: two local-heap prefixes naming one data-segment address make the metadata
+  cache hand the second heap the first heap's data block, leaving the second
+  heap's dblk and dblk_image NULL
+status: oracle-hardened   # h5policy rejects as of 2026-08-22; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: heap_structures
+versions: [0]                    # local heap
+root_cause_classification: cross_object_alias
+violated_invariant:
+  - heap.local_data_segment_unique   # landed 2026-08-22; named heap.dblk_addr_unique
+                                     # in this record's first revision, before the
+                                     # heap.local_* naming convention was matched
+validation_closure: >-
+  the SET of local-heap prefixes reachable in one file, not any single prefix.
+  Each prefix here is individually well-formed: version, reserved bytes,
+  data-segment size, free-list head and data-segment address all pass their own
+  bounds gates, and the shared segment deserialises cleanly.  The violated
+  property is a uniqueness property over the whole set, so no amount of
+  per-prefix checking can see it.  This is the same shape as its two
+  neighbours: superblock-extension aliasing and cache-image entry-address
+  uniqueness (see sibling_audit).
+activation_before_validation:
+  - native_construction
+entry_points:
+  - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-08-22 (was: accepts, no findings)"
+  - "libhdf5 H5G__stab_lookup (src/H5Gstab.c:811) -> H5HL_protect -> H5AC_protect(H5AC_LHEAP_DBLK) [cache HIT]"
+  - "libhdf5 H5G__stab_iterate (src/H5Gstab.c:489) -> H5HL_protect -> same hit"
+  - "crash site A: H5HL_unprotect (src/H5HL.c:436) -> H5AC_unpin_entry(NULL) (src/H5AC.c:1438)"
+  - "crash site B: H5G__ent_to_link (src/H5Gent.c:382) -> H5MM_strndup(NULL + name_off) (src/H5MM.c:176)"
+  - "shipped consumers: h5dump -H, h5ls -vr, h5stat, and any H5Ovisit3/H5Gopen2 traversal"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  An H5HL_t is populated by TWO different cache clients, and only one of them is
+  guaranteed to run.
+
+  H5HL__cache_prefix_deserialize (src/H5HLcache.c:436-464) decides how the heap
+  is cached, from the file's own bytes:
+    if (heap->dblk_size) {
+        if (H5_addr_eq((heap->prfx_addr + heap->prfx_size), heap->dblk_addr))
+            heap->single_cache_obj = true;      /* :440  prefix carries the data */
+        else
+            heap->single_cache_obj = false;     /* :464  separate dblk entry     */
+    }
+  In the false branch the prefix deserialize does NOT allocate dblk_image.  The
+  fields heap->dblk and heap->dblk_image are filled in exactly once, by the
+  DATA-BLOCK client: H5HL__cache_datablock_deserialize (:693-719) calls
+  H5HL__dblk_new, which does the linking (src/H5HLdblk.c:98-99):
+    dblk->heap = heap;
+    heap->dblk = dblk;
+
+  H5HL_protect (src/H5HL.c:335-350) then reaches that client through the cache:
+    if (NULL == (dblk = (H5HL_dblk_t *)H5AC_protect(f, H5AC_LHEAP_DBLK,
+                                                    heap->dblk_addr, heap, flags)))
+        HGOTO_ERROR(...);
+    pin_obj = dblk;
+    ...
+    if (H5AC_pin_protected_entry(pin_obj) < 0) ...
+    heap->prots++;
+
+  THE HOLE: H5AC_protect is an address-keyed cache lookup.  `heap` is passed as
+  udata, which the cache uses ONLY on a miss, to deserialize.  If some other
+  heap already loaded the entry at that address, this is a HIT: the deserialize
+  callback does not run, H5HL__dblk_new does not run, and the H5HL_dblk_t handed
+  back belongs to the OTHER heap.  H5HL_protect pins it, increments prots, and
+  returns successfully.  Nothing anywhere compares dblk->heap to heap.
+
+  So the second heap is now live with prots == 1, single_cache_obj == false, and
+  BOTH heap->dblk == NULL and heap->dblk_image == NULL.  Two consumers then
+  dereference those NULLs, and which one you hit is a layout accident:
+
+  (A) H5HL_unprotect (src/H5HL.c:425-437), on the last unprotect:
+        assert(heap->dblk);                         /* :432 -- debug builds only */
+        if (FAIL == H5AC_unpin_entry(heap->dblk))   /* :436 */
+      Under NDEBUG the assert is gone and H5AC_unpin_entry(NULL) executes
+        cache_ptr = entry_ptr->cache_ptr;           /* src/H5AC.c:1438 */
+      on a NULL entry_ptr.  MEASURED, both directions: the shipped Release build
+      SIGSEGVs there, and the assert-enabled build stops at the assert one line
+      earlier.  This is NOT an assert-only defect -- the assert is what HIDES it
+      from a debug build, and removing asserts is what makes it exploitable
+      rather than what contains it.
+
+  (B) H5G__ent_to_link (src/H5Gent.c:379-382):
+        if (NULL == (name = (const char *)H5HL_offset_into(heap, ent->name_off)))
+            HGOTO_ERROR(...);
+        if (NULL == (lnk->name = H5MM_strndup(name, (block_size - ent->name_off))))
+      H5HL_offset_into (src/H5HL.c:391-394) bounds `offset` against dblk_size
+      and then returns `heap->dblk_image + offset` -- it never checks
+      dblk_image itself.  With dblk_image NULL the return value is
+      (char *)0 + name_off, which is non-NULL for any name_off > 0, so the
+      caller's NULL guard passes and strndup reads from the zero page.
+
+  THE FIX IS ONE COMPARISON, in H5HL_protect right after the protect returns:
+    if (dblk->heap != heap)
+        HGOTO_ERROR(H5E_HEAP, H5E_CANTPROTECT, NULL,
+                    "local heap data block is already owned by another heap");
+  This is a strict tightening: for a conforming file the entry at
+  heap->dblk_addr can only ever have been loaded by this heap, so the clause is
+  unreachable.  H5HL_offset_into should also assert-and-check dblk_image, as
+  defence in depth for any other path that reaches a half-initialised heap.
+  Note that H5HL_protect's own re-entrant path (heap->prots != 0, :328) is
+  CORRECT and is not the bug: it skips the protect because the SAME heap
+  already holds a pinned dblk.  The bug is a DIFFERENT heap object arriving at
+  an address whose entry is already owned.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  MEASURED: >-
+    2026-08-22, at HEAD, against libhdf5 2.3.0 (source tree at develop
+    f8f0379c7c5ef3cd4939cb9e115d2fd3502e1748).  Both a fuzzer specimen and a
+    purpose-built synthetic witness were measured; the synthetic one is the
+    better artifact and is described under reproducers.
+  oracle_as_found: >-
+    ACCEPTED.  decision `accept`, ZERO findings, under untrusted-strict AND
+    forensic -- on the specimen and on the synthetic witness alike.  A clean
+    false accept, not a profile artifact and not a coverage_gap: the oracle
+    walked both heaps, validated each prefix, and never compared their
+    data-segment addresses to each other.
+  oracle_now: >-
+    REJECTS, since 2026-08-22.  `reject_corrupt` with exactly one finding,
+    H5_CORRUPT_LOCAL_HEAP_DATA_SEGMENT_ALIAS, under untrusted-strict AND
+    forensic, on both files: on the specimen at offset 1744 (prefix 1720's
+    segment-address field, = 1720 + 8 + 2*8) attributed to the second group
+    reached, and on the tracked fixture at offset 5088.  The finding lands on
+    the field that carries the duplicate address, with the earlier claimant's
+    matching field as the evidence's second location, so both disagreeing
+    prefixes are named rather than just the value they agree on.
+    Verified NOT to over-fire: the code appears on ZERO of the 242 corpus
+    fixtures, and the check keys on the (prefix, segment) PAIR precisely so that
+    a heap decoded twice -- a SOHM-shared external-file-list message is decoded
+    once per referencing object, and duplicate messages run their validator
+    twice -- stays silent.  h5policy-seamcheck passes 40/40 on both clauses over
+    mutants seeded from this fixture and its control, which is the check that
+    would catch the accumulator leaking across the analysis seam.
+  libhdf5_on_the_specimen: >-
+    The specimen is the WEAKER of the two, and its tool matrix is misleading
+    enough to have caused the bundle's misdiagnosis:
+      h5ls -vr    rc=0    (traversal stops on the alias, looks correct)
+      h5dump -H   rc=1    ("internal error")
+      h5stat      rc=1    ("unable to traverse objects/links in file")
+    Only a direct probe reaches the fault: H5Gopen2("/g2/g2.1") SIGSEGVs on the
+    Release build and hits assert(heap->dblk) on the assert-enabled build.  A
+    reader looking only at the three tools would conclude the file is contained.
+  libhdf5_on_the_synthetic_witness: >-
+    ALL THREE SHIPPED TOOLS SIGSEGV -- h5dump -H, h5ls -vr and h5stat all
+    rc=139 -- and so does a bare H5Ovisit3.  The witness carries no hard-link
+    cycle and no other defect; the only edit is the data-segment address of two
+    heap prefixes.  So the honest severity of this record comes from the
+    witness, not from the specimen: a two-field edit to a conforming file turns
+    every shipped reader into a segfault on open-and-list.
+  crash_sites: >-
+    Specimen, symbolised (this closes the bundle's "no full debug backtrace"
+    limit):
+      H5AC_unpin_entry (thing=0x0) at src/H5AC.c:1438
+      H5HL_unprotect (heap=0x...) at src/H5HL.c:436
+      H5G__stab_lookup at src/H5Gstab.c:832
+      H5G__obj_lookup -> H5G__traverse_real -> H5G_traverse -> H5G_loc_find
+      -> H5G__open_name -> H5VL__native_group_open -> H5Gopen2
+    Synthetic witness, ASan:
+      SEGV READ on address 0x8 (zero page) in strndup interceptor
+      H5MM_strndup at src/H5MM.c:176
+      H5G__ent_to_link at src/H5Gent.c:382
+      H5G__node_iterate -> H5B__iterate_helper -> H5B_iterate
+      -> H5G__stab_iterate at src/H5Gstab.c:504 -> H5G__obj_iterate -> H5Ovisit3
+    The 0x8 is literally NULL + name_off, which is the whole of finding (B).
+  state_at_the_fault: >-
+    Captured under gdb on the specimen, breakpointing H5HL_protect and
+    H5HL_unprotect.  The donor heap and the victim heap in full:
+      prefix@744  dblk_addr=3120  prots=1 single=0 dblk=0x...3b00 dblk_size=48
+      prefix@1720 dblk_addr=3120  prots=1 single=0 dblk=(nil)    dblk_size=48
+    Two distinct prefixes, one data-segment address, and the second heap's dblk
+    back-pointer is NULL.  h5debug confirms it from the file side: reading
+    address 744 and address 1720 both report "Address of heap data: 3120",
+    both "Data bytes allocated for heap: 48", both with the same free block.
+    The shared segment deserialises cleanly precisely BECAUSE the two prefixes
+    agree on size and free-list head -- a disagreement makes the first
+    deserialize fail loudly instead (measured: an early witness attempt whose
+    prefixes disagreed produced a clean "bad heap free list" error from
+    H5HL__fl_deserialize, src/H5HLcache.c:241, and never reached the hole).
+    That is the trap for anyone building variants: the alias must be
+    SELF-CONSISTENT to be dangerous.
+  width: >-
+    NOT measured at 32 bits.  Unlike the free-list wrap next door, nothing here
+    is width-dependent -- the defect is a missing ownership comparison, not
+    arithmetic -- so ILP32 is expected to behave identically.  Expected, not
+    measured; do not cite this as evidence.
+  write_path: >-
+    NOT measured.  Read-only traversal is already fatal, so no RDWR probe was
+    needed to establish impact.  Whether the shared segment can be made to
+    corrupt the donor heap's free list through the victim's write path is an
+    open question, not a claim (see open_questions).
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt        # was: accept, until 2026-08-22
+  libhdf5: crash (SIGSEGV; assert on assert-enabled builds)
+  libhdf5_version: 2.3.0 (measured, both Release and RelWithDebInfo+ASan)
+  classification: >-
+    WAS A-prime -- an oracle FALSE ACCEPT, the direction that matters: the
+    oracle called a file safe and libhdf5 died on it.  CLOSED 2026-08-22 by the
+    oracle check; the record is kept because the libhdf5 defect is untouched.
+  note: >-
+    NO TOLERANCE AND NO A~ PREDICATE ARE NEEDED, and that is worth stating
+    because the sibling record next door does need one.  Invariant A is
+    "libhdf5 opens => h5policy must not reject_corrupt".  libhdf5 does not open
+    this file, it crashes on it, so the oracle and the library now AGREE on the
+    verdict and the differential harness has nothing to excuse.  Contrast
+    registry/cases/local-heap-free-list-bound-wraps.yml, where libhdf5 opens
+    cleanly and a per-fixture tolerance is required.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: oracle_only
+  description: >-
+    THE ORACLE SIDE IS NOW CONTAINED; the libhdf5 side is not.
+    libhdf5: add the `dblk->heap != heap` clause in H5HL_protect described
+    under defect, and a dblk_image NULL check in H5HL_offset_into.
+    h5policy: the detection point is a file-scoped set of local-heap
+    data-segment addresses.  h5policy_local_heap_data_addr (h5policy/pickles/
+    h5_group.pk:114-176) already computes and bounds data_seg_addr for every
+    heap it walks and then returns it -- so the address is in hand at exactly
+    the right moment, and the check is a h5policy_seen_u64 membership test
+    against a per-file accumulator plus a new corrupt finding.  Model it on
+    H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS (h5_walk.pk:395), which is the same
+    invariant shape and already carries the reasoning for why an address-alias
+    check belongs at the dedupe point rather than in the per-object walker.
+    NOT a warning: no conforming writer emits two heaps sharing a segment
+    (H5HL_create allocates a fresh data block per heap), and the consequence is
+    a read-path crash, so this is corrupt-on-read and rejectable outright.
+systemic:
+  semantic_boundary: >-
+    address ownership across cache clients.  Any structure whose in-memory
+    representation is populated only by a metadata-cache deserialize callback
+    inherits this hazard: an address-keyed HIT skips the callback, and the
+    caller receives an object belonging to a different owner while its own
+    back-pointers stay NULL.  The local heap is one instance.  The general
+    boundary is "no two logically distinct structures may name one cache
+    address", enforced before any client dereferences what the cache returns.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder) -- landed; libhdf5 cache-client ownership still open
+  description: >-
+    The narrow fix is one comparison in one function.  The systemic question is
+    which other cache clients link themselves to their owner inside their
+    deserialize callback and are therefore reachable in the same
+    half-initialised state.  That sweep has NOT been done -- see sibling_audit
+    for the two neighbours that are already recorded and the list of clients
+    that are not.
+  landed_changes:
+    - h5policy/pickles/h5_group.pk (h5policy_check_lheap_segment_owner; called
+      from h5policy_local_heap_data_addr, so it covers BOTH callers -- the
+      symbol-table group walk and the external-file-list heap)
+    - h5policy/pickles/h5_walk.pk (the (prefix, segment) accumulator, its cap,
+      and its reset in h5policy_reset_traversal_state)
+    - registry/findings/catalog/heap_structures.yml
+      (H5_CORRUPT_LOCAL_HEAP_DATA_SEGMENT_ALIAS, scope reference_graph)
+    - registry/validation-coverage.yml (heap.local_data_segment_unique)
+    - h5policy-gencorpus _make_lheap_data_segment_alias plus the valid control
+      _two_stab_groups, and both expectations under h5policy/tests/expected/
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/lheap_data_segment_alias.h5
+  control_fixture: h5policy/tests/valid/two_symbol_table_groups.h5
+  expectations:
+    - h5policy/tests/expected/malformed-lheap_data_segment_alias.yml
+    - h5policy/tests/expected/valid-two_symbol_table_groups.yml
+  fixture_note: >-
+    The .h5 binaries are gitignored build output (h5policy/tests/.gitignore);
+    the tracked artifacts are the gencorpus generator and the two expectation
+    files.  THE PAIR IS THE POINT, and here for a reason specific to a
+    uniqueness check: it can fail in two directions, and the malformed fixture
+    only catches one.  The control catches the other -- firing on a heap that is
+    merely DECODED TWICE, which is a live path (SOHM-shared external-file-list
+    messages are decoded once per referencing object).  The control is also
+    what makes a seam leak legible, since a segment address surviving from a
+    previous analysis would turn its first heap into a false reject.
+  direct_fixture: >-
+    the synthetic witness, rebuildable from the recipe below in about ten lines
+    of h5py plus struct.  Prefer it over the specimen for every purpose: it is
+    minimal, it isolates this defect from the specimen's unrelated hard-link
+    cycle, and it faults all three shipped tools instead of only a direct probe.
+  generator: >-
+    RECIPE, verified end to end 2026-08-22.  Not yet a gencorpus generator --
+    see coverage_gaps.
+      1. With h5py, write a file containing two sibling groups that each hold a
+         link, so each group gets a symbol table and its own local heap:
+           g1 = f.create_group("g1"); g1["a"] = arange(3)
+           g2 = f.create_group("g2"); g2["b"] = arange(3)
+         Default h5py gives superblock v0 with 8-byte addresses and lengths.
+      2. Locate every local-heap prefix by scanning for the "HEAP" signature.
+         Layout is signature(4) version(1) reserved(3), then data-segment size
+         at +8, free-list head at +16, data-segment address at +24 (all length
+         or offset sized).  Expect three: the root group's and the two groups'.
+      3. Take the FIRST group heap's data-segment bytes and append a copy at
+         end of file; note that offset as `shared`.
+      4. Write `shared` into the data-segment address field (+24) of BOTH group
+         heap prefixes.
+      5. Raise the superblock v0 end-of-address field (offset 40) to the new
+         file length so `shared` is inside the allocated space.
+    WHY EACH STEP MATTERS, because three plausible shortcuts all produce a file
+    that proves nothing:
+      - `shared` must be adjacent to NEITHER prefix.  H5HLcache.c:438 sets
+        single_cache_obj from `prfx_addr + prfx_size == dblk_addr`, and a heap
+        on the single path never creates a separate dblk cache entry at all, so
+        there is no shared entry to collide on.  Appending at EOF guarantees
+        non-adjacency for both.
+      - both prefixes must be patched, not just one.  Aliasing the victim onto
+        a donor that is itself on the single path is the same dead end.
+      - the two prefixes must agree on data-segment size and free-list head.
+        They do so for free here, since both groups are built the same way, but
+        a hand-built variant that disagrees fails in H5HL__fl_deserialize
+        before reaching the hole (measured -- see measured.state_at_the_fault).
+    The local-heap prefix carries NO checksum and the edit is size-neutral, so
+    no repair step is needed.
+  assertions:
+    stable_finding: true      # H5_CORRUPT_LOCAL_HEAP_DATA_SEGMENT_ALIAS, since 2026-08-22
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: false # legacy symbol-table groups are the carrier
+
+backports: []                 # nothing to backport; nothing landed
+
+fuzz_seed: >-
+  The local-heap prefix's data-segment address is a high-value mutation axis and
+  was NOT being mutated as one.  What makes it productive is that the
+  interesting values are not out-of-range -- an out-of-file address is already
+  caught by heap.data_seg_bounds -- but perfectly legal addresses that happen to
+  belong to ANOTHER heap.  A fuzzer that only widens fields will never find
+  this; one that substitutes field values BETWEEN like structures in the same
+  file will find it immediately.  That cross-substitution strategy generalises
+  to every address field in the format and is worth adding on its own merits.
+
+compatibility_backport_risks: >-
+  Effectively none, on both sides.  libhdf5's `dblk->heap != heap` clause is
+  unreachable for any file whose heaps own their own data blocks, which is
+  every file libhdf5 has ever written -- H5HL_create allocates the data block
+  per heap.  The h5policy uniqueness check is likewise unreachable for
+  conforming files.  Neither is a policy decision; both reject only files that
+  already crash the library.
+
+sibling_audit: >-
+  NOT SWEPT.  This field records what is known, and the gap is the point.
+  ALREADY RECORDED, same invariant shape, different structure -- these three
+  should be read together, because the third one arrived independently and
+  nobody connected them:
+    - registry/cases/mdci-reconstruct-cleanup-unsafe.yml -- cache-image entry
+      addresses are not required to be unique, and a duplicate address gives a
+      double free.  That record's own note that entry-address uniqueness is
+      unmodelled by the oracle is the same sentence this record has to write
+      about heap data-segment addresses.
+    - the superblock-extension alias check (H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS,
+      h5policy/pickles/h5_walk.pk:395) -- an address that must never be reached
+      twice, detected at the dedupe point.  It is the model for the h5policy
+      side of this record and the only one of the three that is contained.
+  So the registry now holds THREE instances of "one address, two owners" in
+  three unrelated structures, two of them oracle gaps.  That is a pattern, and
+  it argues for a general address-ownership pass rather than a third one-off
+  check.
+  NOT AUDITED, and each is a real question: every other H5AC cache client that
+  links itself to a parent inside its deserialize callback.  H5HL's dblk is the
+  one measured.  Candidates by the same shape -- fractal-heap direct and
+  indirect blocks (dblock->hdr, iblock->hdr), v2 B-tree leaves and internal
+  nodes (leaf->hdr), the extensible and fixed array clients, and the
+  object-header continuation chunk -- are UNMEASURED and named here so the
+  sweep has a starting list, not because any of them is known to be affected.
+  ALSO UNSWEPT, one level up: whether two symbol-table messages may name the
+  same local-heap PREFIX address (rather than the same data segment).  Cheap to
+  test, not tested, and a different code path from this record.
+  NOT part of this record: the hard-link cycle in the specimen.  It is a real
+  structural feature of that file, it is not a defect, and libhdf5's
+  visited-object sets (H5G_visit in src/H5Gint.c, h5trav in
+  tools/lib/h5trav.c) handle it correctly -- which the bundle itself measured
+  and then discounted.  The project's own strategy text treats group-link
+  cycles as potentially valid; nothing here changes that.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured at 2.3.0 only.  The structure of the
+    defect -- prefix and data-block split across two cache clients, with the
+    linking done in H5HL__dblk_new -- is long-standing, so 1.14.x and 1.10.x
+    are plausible and explicitly NOT audited.
+  label: one point, not a range
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    CLOSED 2026-08-22.  This item read "NO ORACLE CHECK".
+    heap.local_data_segment_unique now exists and rejects both the specimen and
+    the fixture; see measured.oracle_now and systemic.landed_changes.
+  - >-
+    CLOSED 2026-08-22.  This item read "NO TRACKED FIXTURE", and correctly noted
+    it could not be added before the check existed -- a malformed/ fixture the
+    oracle accepts fails the expectation gate.  The order it prescribed is the
+    order that was followed.  Both fixtures and expectations now exist, so this
+    record regresses with the suite.
+  - >-
+    ORACLE COVERAGE ONLY.  What the corpus now guards is that h5policy REJECTS;
+    nothing in the harness observes the libhdf5 crash, because the differential
+    checks invariant A ("libhdf5 opens => not reject_corrupt") and libhdf5 does
+    not open this file.  A libhdf5 fix and a libhdf5 regression are therefore
+    both invisible here, which is the same read-only-harness limit the free-list
+    sibling records for its write-path consequence.
+  - >-
+    NO PROBE CANARY for this family on this fixture.  The three-tool crash was
+    measured by hand.  Per the h5cve-verify false-negative note, a probe
+    reporting "accepted" would not be evidence of safety, so the expectation
+    deliberately carries no h5cve block until
+    `h5policy-probe --exercise heap_structures` has actually been run.
+  - >-
+    THE ASSERT-ENABLED BUILD HIDES CRASH SITE (A).  Anyone re-measuring on the
+    ASan build stops at assert(heap->dblk) (src/H5HL.c:432) and may record this
+    as assert-only.  It is not: the shipped Release build reaches
+    H5AC_unpin_entry(NULL).  Measure both builds or the severity is wrong by a
+    category.
+  - >-
+    No 32-bit measurement (expected identical -- no arithmetic involved -- but
+    unmeasured), and no RDWR/write-path measurement.
+  - >-
+    The other cache clients with the same deserialize-links-to-parent shape are
+    unaudited.  List in sibling_audit.
+open_questions:
+  - >-
+    Can the victim heap's WRITE path corrupt the donor's data block?  Both
+    heaps hold a pinned reference to one H5HL_dblk_t while disagreeing about
+    who owns it; H5HL_insert and H5HL__fl_serialize operate through
+    heap->dblk_image, which is NULL for the victim, so the likely outcome is a
+    NULL write rather than cross-heap corruption -- but that is reasoning, not
+    a measurement.
+  - >-
+    Is H5HL_offset_into's missing dblk_image NULL check reachable from any
+    caller OTHER than a half-initialised heap?  If not, fixing H5HL_protect
+    alone closes both crash sites and the second fix is defence in depth; if
+    so, it is an independent defect and deserves its own record.
+  - >-
+    Does the metadata cache have, or want, a general ownership assertion at
+    protect time -- "the udata I passed matches the entry I got back" -- rather
+    than N per-client comparisons?  This record's fix is the per-client one
+    because it is one line and provably safe; the general form is the systemic
+    answer and is a cache design question, not a heap one.
+
+provenance:
+  found_by: >-
+    a crash-minimised fuzzer specimen, triaged through the h5cve bundle
+    workflow in an untracked working bundle, mis-diagnosed there as a hard-link
+    cycle traversal issue, and re-diagnosed at promotion 2026-08-22 from a
+    symbolised backtrace plus gdb state capture.  The synthetic witness was
+    built during that re-diagnosis specifically to test whether the cycle was
+    load-bearing.  It is not.
+  input_sha256: 650e72205702678edabff0d7e6403a503863d2adf37f53b277644cf36827a804
+  witness_sha256: 9a6e42d9d0ffde97a0d9f799baa014a130038eb90e48c432474652b23ae2099a
+  tracked_fixture_sha256: 487205ffd7be9614e911ddc2c3accff09fbaef854658e9dc4ef30fdc1fb4ef91
+  witness_note: >-
+    Both witness hashes are recorded for identification only and NEITHER is
+    stable across rebuilds -- they depend on the h5py and libhdf5 versions that
+    write step 1 of the recipe.  The two differ from each other for exactly that
+    reason: the promoted fixture is built through gencorpus with
+    libver="earliest", the original witness with h5py's default.  They are the
+    same construction and behave identically (three tools, all SIGSEGV, measured
+    on both).  Rebuild from the recipe and expect a third hash; what must
+    reproduce is the behaviour, not the bytes.
+  hdf5_build: >-
+    HDF5 2.3.0, source tree at develop f8f0379c7c5ef3cd4939cb9e115d2fd3502e1748.
+    Baseline Release and candidate RelWithDebInfo -fsanitize=address, both
+    workstation-local installs; paths not recorded.  The two builds disagree by
+    design here: Release segfaults, ASan asserts.
+  poke_version: GNU poke 4.3

@@ -1,0 +1,359 @@
+# A chunk-index record's stored size reaches the filter pipeline as `nbytes`,
+# and the FIXED-overhead filters subtract from it with no floor.  A stored size
+# of 0 therefore wraps to SIZE_MAX-3 and the fletcher32 filter checksums
+# 2**64-4 bytes.  One unguarded subtraction, two out-of-bounds reads.
+#
+# Promoted 2026-08-22 from a supplied specimen found by sweeping an external
+# crash-specimen store; identified by provenance.input_sha256 below.
+schema_version: 1
+
+id: filtered-chunk-zero-stored-size
+title: the fletcher32 filter subtracts its 4-byte overhead from the chunk's
+  stored size without a floor, so a zero-size chunk record wraps the length and
+  the checksum walks off the buffer
+status: oracle-hardened          # h5policy rejects as of 2026-08-22; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: chunk_index
+versions: [2, 3, 4]              # every layout version that names a chunk index
+root_cause_classification: local_decode
+violated_invariant:
+  - chunk.stored_size
+validation_closure: >-
+  one chunk-index record: the address and the stored size together.  The record
+  is self-contradictory on its own terms -- it names a chunk and then gives it
+  zero bytes -- so unlike the aliasing invariants this needs no cross-record
+  context, which is what makes it a one-clause check.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-08-22 (was: accept_with_warnings, advisory findings only)"
+  - "libhdf5 H5Dread -> H5D__read -> H5D__chunk_read (src/H5Dchunk.c:3141) -> H5D__chunk_lock (src/H5Dchunk.c:4850)"
+  - "-> H5Z_pipeline (src/H5Z.c:1467) -> H5Z__filter_fletcher32 (src/H5Zfletcher32.c:78)"
+  - "-> H5_checksum_fletcher32 (src/H5checksum.c:115)  <-- faults here"
+  - "shipped consumers: h5dump (data), h5ls with data, any H5Dread; NOT h5dump -H / h5ls -v / h5stat / h5debug, which never decode a chunk"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  H5Z__filter_fletcher32's read branch (src/H5Zfletcher32.c:66-78) strips the
+  trailing 4-byte checksum by subtracting from the length it was handed:
+    size_t src_nbytes = nbytes;                 -- :69
+    src_nbytes -= FLETCHER_LEN;                 -- :73  FLETCHER_LEN == 4
+    tmp_src = src + src_nbytes;                 -- :74
+    UINT32DECODE(tmp_src, stored_fletcher);     -- :75
+    fletcher = H5_checksum_fletcher32(src, src_nbytes);   -- :78
+  `nbytes` is a size_t and comes from the chunk-index record; nothing floors it
+  at FLETCHER_LEN.  With nbytes == 0, src_nbytes becomes 2**64-4 and there are
+  TWO distinct out-of-bounds reads, in this order:
+    1. :74-75 forms `src + (2**64-4)` -- a wild pointer -- and UINT32DECODE
+       reads four bytes through it.
+    2. :78 then asks H5_checksum_fletcher32 to sum 2**64-4 bytes starting at
+       src, which walks until it leaves the mapping.
+  MEASURED: the fault lands in (2), at src/H5checksum.c:115, with
+  _len = 18446744073709551612 == (size_t)-4 -- so (1) happened to land on
+  mapped memory and returned garbage rather than faulting.  That ordering is
+  luck, not design: (1) is the more dangerous read of the two because its
+  address is attacker-influenced through `src`, and on a different allocator or
+  a different chunk it faults or leaks instead.
+  THE FIX IS A FLOOR, one line before :73:
+    if (nbytes < FLETCHER_LEN)
+        HGOTO_ERROR(H5E_STORAGE, H5E_READERROR, 0,
+                    "filtered chunk is too small to carry a Fletcher32 checksum");
+  This is a strict tightening and cannot reject a conforming file: a chunk
+  written by the filter always carries its own 4-byte checksum, so nbytes >= 4
+  holds for anything libhdf5 produced.
+  NOTE :107, `ret_value = nbytes - FLETCHER_LEN`, wraps the same way but is
+  UNREACHABLE with nbytes == 0 -- the checksum comparison at :101 rejects first,
+  or, as measured, :78 has already crashed.  Fixing only :107 would fix nothing.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  MEASURED: 2026-08-22, libhdf5 2.3.0 (source tree at develop f8f0379c7c5).
+  oracle_as_found: >-
+    ACCEPT_WITH_WARNINGS on the specimen -- four H5_ADVISORY_DECODE_FILTER
+    warnings and NOTHING about the chunk index, under untrusted-strict and
+    forensic alike.  A false accept in the metadata domain: the stored size is a
+    chunk-index field, so this was inside the oracle's boundary, not beyond it
+    the way a vlen/global-heap DATA corruption would be.
+  oracle_now: >-
+    REJECT_CORRUPT, H5_CORRUPT_CHUNK_STORED_SIZE, for a stored size of 0 OR any
+    value below the pipeline's fixed framing.  Two findings on the specimen (its
+    index carries two zero-size records), one on each tracked fixture.  The
+    first version of the check tested only `size == 0` and left 1, 2 and 3
+    reachable -- see the answered open question below.
+  libhdf5: >-
+    OPENS CLEANLY, FAULTS ON READ.  On the specimen and the tracked fixture
+    alike: h5dump -H, h5ls -vr, h5stat and h5debug all exit 0; h5dump WITH data
+    segfaults (rc 139 / signal 11).  That split is the whole character of this
+    case -- a header-only reader sees a healthy file.
+  specimen_index: >-
+    Enumerated with H5Dget_chunk_info rather than by hand (see
+    coverage_gaps for why by hand was a mistake).  /Fletcher_float_data_be:
+      chunk[0] offset=(0,0) addr=0    size=52
+      chunk[1] offset=(0,0) addr=0    size=0
+      chunk[2] offset=(0,0) addr=3846 size=0     <-- drives the wrap
+      chunk[3] offset=(4,3) addr=3898 size=52
+    The healthy sibling /Fletcher_float_data_le has four records, four distinct
+    offsets, all size 52.  So the corrupt index carries THREE defects, only one
+    of which this record covers -- see coverage_gaps.
+  width: >-
+    NOT measured at 32 bits.  The wrap residue is width-dependent (SIZE_MAX-3
+    on LP64, 2**32-4 on ILP32), so an ILP32 build reaches a different length
+    from the same file; whether it faults as reliably is unmeasured.
+  asan: >-
+    NOT obtained.  The stock build segfaults outright, so there was no
+    accepted-but-unsafe state needing a sanitizer to expose; an ASan run would
+    sharpen read (1) above from "landed on mapped memory" to an exact report,
+    and that is worth doing if this is ever pursued upstream.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt          # was: accept_with_warnings, until 2026-08-22
+  libhdf5: opens; SIGSEGV on H5Dread
+  libhdf5_version: 2.3.0 (measured)
+  classification: >-
+    WAS A-prime -- an oracle FALSE ACCEPT with a hard crash behind it.  Closed
+    on the oracle side 2026-08-22.
+  note: >-
+    NO TOLERANCE AND NO A~ PREDICATE, and the reason is worth recording because
+    the obvious reading is the wrong one.  libhdf5 OPENS this file, so invariant
+    A ("libhdf5 opens => h5policy must not reject_corrupt") looks violated.  It
+    is not, because h5policy-diff also runs a data-forcing probe and takes a
+    nonzero data rc as deeper evidence, demoting the row to a soft A+ warning:
+      WARN A+ libhdf5 opens structurally; h5policy eager reject_corrupt has
+              deeper libhdf5 evidence (probe_error, h5dump-data rc=-11)
+    Measured on the tracked fixture: 0 hard failures.  A per-fixture tolerance
+    or a code-scoped predicate would both have been WRONG here -- they would
+    have suppressed a row the harness already classifies correctly, and hidden
+    the evidence that makes the case.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: oracle_only
+  description: >-
+    libhdf5: add the `nbytes < FLETCHER_LEN` floor described under defect.
+    h5policy: landed -- h5policy_chunk_record_size_ok in h5_chunkindex.pk,
+    called from all four chunk-index walkers.
+    WHY THE ORACLE FIX IS AT THE INDEX AND NOT THE FILTER: h5policy never
+    decodes chunk data, so it cannot see the pipeline at all.  What it can see
+    is the record that supplies the length, and a record naming a chunk with
+    zero bytes is malformed independently of which filters the dataset uses.
+    Fixing it there also covers every OTHER fixed-overhead consumer of the same
+    field, including the szip site in sibling_audit that has no fixture.
+systemic:
+  semantic_boundary: >-
+    the filter pipeline's length contract.  Every filter receives `nbytes` from
+    a caller that read it off disk, and a filter with fixed framing overhead
+    must establish that nbytes covers its own framing BEFORE subtracting.  No
+    filter in the tree does this today (see sibling_audit), so the boundary is
+    unenforced generally and fletcher32 is simply the instance with a witness.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder) -- landed; libhdf5 filter pipeline still open
+  description: >-
+    The oracle now refuses the input that reaches the hole.  The libhdf5 side is
+    untouched, and the general form -- a floor in H5Z_pipeline, or a declared
+    minimum-input property per filter -- is not proposed here.
+  landed_changes:
+    - h5policy/pickles/h5_chunkindex.pk (h5policy_chunk_record_size_ok, plus its
+      call sites in the v1 B-tree, v2 B-tree and fixed-array walkers; the
+      extensible-array walker's existing inline check now routes through it).
+      It also records the smallest stored size seen, for the framing comparison.
+    - h5policy/pickles/h5_layout.pk (records the pipeline's fixed framing for
+      fletcher32 and szip, behind the same dataset-only gate the element-count
+      recording uses)
+    - h5policy/pickles/h5_walk.pk + h5_validate.pk (the per-object framing and
+      minimum-stored-size state, its reset, and the cross-message comparison in
+      h5policy_finalize_ohdr_dataset)
+    - registry/findings/catalog/chunk_index.yml (versions [2] -> [2,3,4])
+    - tools/message_routing.py (COMPOSING_HELPERS entry for the shared helper)
+    - h5policy-gencorpus _make_chunk_zero_stored_size and the valid control
+      chunk_v1_btree_fletcher, plus both expectations
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/chunk_zero_stored_size.h5
+  below_framing_poc: h5policy/tests/malformed/chunk_stored_size_below_framing.h5
+  control_fixture: h5policy/tests/valid/chunk_v1_btree_fletcher.h5
+  expectations:
+    - h5policy/tests/expected/malformed-chunk_zero_stored_size.yml
+    - h5policy/tests/expected/malformed-chunk_stored_size_below_framing.yml
+    - h5policy/tests/expected/valid-chunk_v1_btree_fletcher.yml
+  two_fixtures_why: >-
+    THREE files, two rules, one libhdf5 defect.  The zero fixture is caught
+    inline at the record; the below-framing fixture (stored size 3) is caught at
+    object finalization against the pipeline's framing.  They are different
+    h5policy code paths, so neither covers the other -- the inline check cannot
+    see the 3, and the finalize check would not catch a zero on an UNFILTERED
+    dataset, where the framing is 0 and the comparison is vacuous.  libhdf5
+    behaves identically on both (opens, then SIGSEGV on read).
+  generator: >-
+    h5policy-gencorpus _make_chunk_zero_stored_size, from the valid control.
+    Write a rank-2 chunked dataset with fletcher32=True at libver="earliest" so
+    the index is a v1 B-tree, then set key[0]'s 4-byte stored size to 0, keeping
+    its address.  The prefix carries no checksum and the edit is size-neutral.
+    THE TRAP, and it is the same one that produced a bogus survey (see
+    coverage_gaps): a v1 B-tree node holds n+1 KEYS for n children, laid out
+    key[0], addr[0], key[1], addr[1], ... key[n], and the trailing key[n] is a
+    BOUNDARY SENTINEL whose stored size is legitimately zero in every conforming
+    file.  Patch that one and nothing changes.  The key stride is
+    4 + 4 + ndims*8 where ndims is the LAYOUT dimensionality -- dataset rank
+    PLUS ONE for the trailing element-size dimension -- so a rank-2 dataset has
+    32-byte keys.  The generator asserts key[0] parses to a nonzero size and an
+    in-file address before patching, because getting ndims wrong lands on an
+    offset word and silently produces a file that tests nothing.
+  fletcher32_is_load_bearing: >-
+    The filter must have FIXED overhead.  fletcher32 always subtracts 4 before
+    looking at the data, so a zero length wraps.  A variable-overhead filter
+    fails its own decode first and returns an error: deflate on a zero-length
+    chunk reports a decode failure, not a wrap, so a specimen built over
+    deflate proves nothing about this defect.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true          # h5policy never runs the pipeline
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: false       # the v1 B-tree index is the legacy path
+
+backports: []                       # nothing landed in libhdf5 to backport
+
+fuzz_seed: >-
+  The chunk-index stored-size field is a productive mutation axis and the
+  interesting value is a legal-looking one: not out of range, just zero, on a
+  record whose address stays valid.  Width-widening mutators miss it because
+  zero is not an extreme.  The general lesson is to mutate length fields TOWARD
+  the framing overhead of whatever consumes them -- 0, 1, 2, 3 against a 4-byte
+  overhead -- rather than only toward SIZE_MAX.
+
+compatibility_backport_risks: >-
+  None on either side.  The libhdf5 floor rejects only chunks smaller than the
+  checksum the filter itself writes, which no writer produces.  The oracle check
+  rejects only records that name a chunk and give it no bytes.
+
+sibling_audit: >-
+  SWEPT the filter implementations 2026-08-22.  The second site,
+  src/H5Zszip.c:298, was MEASURED on 2026-08-23 and promoted to its own record:
+  registry/cases/szip-decompress-length-and-alloc.yml.
+  Two things this entry got wrong from source alone, both worth keeping as a
+  caution about auditing by reading:
+    * It called the site "worse" mainly for the out-of-bounds header read at
+      :289.  The measured memory-safety fault is the WRAP, and it lands inside
+      libaec (SEGV under the ASan build for stored sizes 1-3); the stock Release
+      build returns a clean rc=1 on the same files, which looks like a guard and
+      is only allocator luck.  Same "do not trust a Release return code" trap
+      this record already documents one layer up.
+    * It missed the more interesting defect entirely: :293 allocates whatever the
+      chunk's own first four bytes claim, up to 4 GiB from a 116-byte chunk,
+      before validating.  That one is raw-data-driven and therefore outside a
+      metadata-only oracle's boundary -- unreachable for h5policy by design, not
+      by omission.
+  The oracle floor landed here does cover the szip wrap: chunk.stored_size counts
+  szip's 4-byte framing, so sizes 0-3 are rejected and the wrap is unreachable
+  through a file h5policy accepts.  The allocation arm is not.
+  NO FILTER IN THE TREE FLOORS nbytes: `grep -n 'if (nbytes' src/H5Z*.c` returns
+  nothing.  So the property "a fixed-overhead filter checks its input covers its
+  framing" is enforced nowhere, and the two sites above are the ones where that
+  currently bites.
+  NOT AUDITED: the 1.14.x and 1.10.x branches; whether H5Z_pipeline could
+  enforce a per-filter minimum centrally; and the dynamically loaded filters,
+  which are out of scope for a metadata oracle and cannot be audited from here.
+  NOT part of this record: the other two defects in the same specimen index --
+  chunk records at address 0 (the superblock) and three records sharing one
+  chunk offset.  Both are real and neither is checked; see coverage_gaps.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured at 2.3.0.  The subtraction is long-standing
+    in shape, so 1.14.x and 1.10.x are plausible and explicitly NOT audited.
+  label: one point, not a range
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    TWO MORE DEFECTS IN THE SAME SPECIMEN INDEX, both unchecked by h5policy
+    after this change.  (a) Two records give chunk address 0, which is the
+    superblock: libhdf5 would read superblock bytes as chunk data.  Address 0 is
+    NOT the undefined sentinel (that is all-ones), so the existing
+    in-file bound accepts it -- this is the same "raw data aliasing metadata"
+    family as the superblock-extension and local-heap alias checks.  (b) Three
+    records share chunk offset (0,0), which also violates the v1 B-tree's own
+    key ordering.  Both were deliberately left out of this change: each needs
+    its own valid-corpus measurement before it can be trusted not to over-fire,
+    and neither has a crash witness yet -- (a) most likely returns wrong data
+    rather than faulting.
+  - >-
+    NO SZIP FIXTURE for the sibling site (src/H5Zszip.c:298).  See
+    sibling_audit; the local build's szip support was not confirmed.
+  - >-
+    NO ASAN WITNESS.  The stock build segfaults, so nothing was hidden, but the
+    FIRST of the two out-of-bounds reads (the UINT32DECODE through
+    `src + (2**64-4)`) is only inferred from the source -- the measured fault is
+    the second one.  An ASan run would pin it.
+  - >-
+    No 32-bit measurement; the wrap residue is width-dependent.
+  - >-
+    METHOD NOTE, recorded because it cost real time and would cost it again.
+    The specimen's index was first read by hand-parsing the v1 B-tree node, and
+    that parse was WRONG -- it mis-stepped the alternating key/address layout.
+    A structural sweep built on the same misreading then reported 134 files as
+    carrying zero-size records, including deflate.h5, btree_idx_1_6.h5,
+    fill18.h5 and a real ICESat-2 product; every one was the legitimate trailing
+    boundary key.  H5Dget_chunk_info settled it in one run.  Enumerate chunk
+    records through libhdf5's own API, not by hand.
+open_questions:
+  - >-
+    ANSWERED 2026-08-22, and the answer widened the rule -- this was a real gap,
+    not a hypothetical.  YES: sizes 1, 2 and 3 are all reachable and all SIGSEGV
+    the shipped build exactly as 0 does, because fletcher32 subtracts 4
+    regardless.  Measured by patching the tracked control to each value: every
+    one was `accept` under the first version of the check.  So "nonzero" closed
+    ONE OF FOUR reachable values, and the rule is now "at least the pipeline's
+    fixed framing".
+    Implementing it made this a CROSS-MESSAGE check, which is the interesting
+    part: the framing comes from the pipeline message and the sizes from the
+    chunk index, and object-header messages arrive in any order, so an inline
+    gate in the layout dispatch would have been evadable by reordering.  The
+    shape is O(1) per-object state -- the pipeline records its framing, the
+    chunk walk records the SMALLEST stored size it saw and where, and
+    h5policy_finalize_ohdr_dataset compares -- so no index is walked twice.
+    The zero case stays inline, because it is invalid against any pipeline and
+    needs no cross-message context.
+    THE BOUNDARY IS A FLOOR, measured in both directions: a stored size of
+    exactly 4 is ACCEPTED, because the subtraction yields 0 (a legal empty
+    payload) and libhdf5 then rejects cleanly on the checksum rather than
+    faulting.  Sizes 4 and 5 accept and give libhdf5 rc=1.  Refusing them would
+    be h5policy checking that data is correct, which is not its job.
+  - >-
+    Would a floor in H5Z_pipeline be better than one per filter?  It would need
+    a declared minimum-input property per filter, which the filter class struct
+    does not currently carry.
+
+provenance:
+  found_by: >-
+    sweeping an external crash-specimen store with h5policy and triaging every
+    file the oracle did not reject against a libhdf5 data read.  One file out of
+    46 such accepts misbehaved; this is it.  The specimen's own name advertised
+    "heap corruption", which it is not -- the fault is a filter length wrap.
+  input_sha256: f925c76b461e17638296e204b76fbe760a0f4367d5f55bec3161318370a0e504
+  input_note: >-
+    A multi-filter test file, 24 datasets (deflate/fletcher32/nbit/scale-offset/
+    szip, big- and little-endian).  Read per dataset, THREE are not clean and
+    only one of them is this defect:
+      /Fletcher_float_data_be        rc=139  SIGSEGV   <-- this record
+      /Nbit_float_data_be            rc=1    clean error rejection
+      /Scale_offset_float_data_le    rc=1    clean error rejection
+    The other 21, including the fletcher32 little-endian sibling, read cleanly.
+    So the specimen must be read per dataset -- a whole-file h5dump crashes on
+    the first bad one and hides the rest -- and the two rc=1 datasets are
+    SEPARATE, UNINVESTIGATED faults, not part of this record.  h5policy reports
+    only H5_ADVISORY_DECODE_FILTER on both, so if either turns out to be a
+    metadata defect it is a further false accept; neither was triaged.
+  hdf5_build: >-
+    HDF5 2.3.0, source tree at develop f8f0379c7c5ef3cd4939cb9e115d2fd3502e1748;
+    stock Release install.  Workstation-local; paths not recorded.
+  poke_version: GNU poke 4.3

@@ -41,6 +41,10 @@ Run from the repository root:
 Output is JSON (the machine-readable result); it is the only format, so no flag
 is required.  `--json` is still accepted as a no-op for backward compatibility.
 
+For the end-to-end operator procedure, including profile selection, report
+completeness, and actions for each decision, see
+[Assessing an HDF5 File with `h5policy`](../docs/H5POLICY_WORKFLOW.md).
+
 Useful mode flags:
 
 - `--strict` / `--non-strict` force GNU poke strict or non-strict mapping.
@@ -72,6 +76,9 @@ conservatively declines to pass to the selected `libhdf5`.
 JSON output includes:
 
 - `schema_version`: the integer report-contract version (currently `1`).
+- `path_encoding`: the byte-path serialization contract, currently
+  `utf-8-percent-v1`.
+- `file`: the input byte path encoded according to `path_encoding`.
 - `decision`: the final classification.
 - `geometry`: physical file bytes, the superblock's declared EOA, the effective
   address ceiling used by validation, and bytes physically trailing the EOA.
@@ -85,6 +92,18 @@ JSON output includes:
   storage, VDS, dynamic filters, unknown messages, maximum rank, and maximum
   logical dataset bytes.
 - `metrics`: traversal and accounting counters used by profile budgets.
+
+The report itself is strict UTF-8 JSON even when a host file name or HDF5 link
+name is not UTF-8. `utf-8-percent-v1` applies to `file` and every
+`findings[].object`: well-formed UTF-8 is preserved without normalization;
+literal `%`, ASCII controls, DEL, and each byte not consumed by a well-formed
+UTF-8 sequence become uppercase `%HH`. JSON quoting is applied afterward, so
+quotes and backslashes use ordinary JSON escapes. To recover the original byte
+path, a consumer UTF-8-encodes the parsed JSON string and percent-decodes every
+`%HH`. Because an input `%` is always `%25`, this reverse operation is
+unambiguous. For example, `/ArrayO\x89Stru\x80` is reported as
+`/ArrayO%89Stru%80`, while the literal byte name `/Rate%89` is reported as
+`/Rate%2589`.
 
 Evidence comparisons currently use `equal` and `less_than_or_equal`; the
 finding means the reported `actual` value did not satisfy that comparison
@@ -104,6 +123,10 @@ the result through the read-only `h5policy_result_*` functions defined in
 location validity, typed integer evidence and its supporting byte ranges,
 truncation state, reachability queries, and explicit walk
 start/completion/stop state as scalars and strings.
+
+The in-process finding API is below the serialization boundary and continues to
+return the original byte-oriented object strings. `utf-8-percent-v1` applies
+only when those strings are written to a JSON report.
 The parallel finding and traversal vectors remain implementation details. The
 new `h5policy_result_continue_after_rejection` accessor has the deprecated
 `h5policy_result_continue_after_corruption` spelling as an API alias.
@@ -348,6 +371,12 @@ workflows, and a detailed explanation of the differential cross-invariants.
   installed HDF5 tools and triages crashers with h5policy.
 - [`tools/h5policy-fuzzlib`](tools/h5policy-fuzzlib): shared fuzzing engine
   (mutation strategies, seed loading, guided corpus) imported by both fuzzers.
+  Its `struct` strategy edits a field inside a checksummed block and repairs the
+  block's checksum, for blocks whose extent is derivable. `struct_deep` does the
+  same for the ones that size themselves from elsewhere -- v2 B-tree nodes,
+  continuation chunks, section lists, fractal-heap blocks -- locating each by
+  verifying its trailing Jenkins checksum instead of deriving the extent, which
+  is what puts the v2 B-tree walkers within the fuzzer's reach at all.
 - [`tools/h5policy-gencorpus`](tools/h5policy-gencorpus): regenerates the valid,
   malformed, policy, resource, coverage, integration, and CVE regression
   fixtures. Cache-image helper executables automatically match an

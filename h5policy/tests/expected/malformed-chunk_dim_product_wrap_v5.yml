@@ -1,0 +1,55 @@
+# Chunk dimensions 2**31 x 2**31 with a four-byte element size: a product of
+# exactly 2**64, which wraps to ZERO.  Layout message version 5.
+#
+# THIS IS THE ONE THAT THREATENS MEMORY SAFETY, and it is not a 32-bit problem.
+# libhdf5 accumulates the dimension product with no overflow check in
+# H5O__layout_decode, and re-accumulates it on OPEN in H5D__chunk_set_sizes
+# (H5Dchunk.c:849-860, reached through the open_op branch at :1179) behind a
+# guard -- `(uint64_t)size != chunk_size` -- that compares two 64-bit values and
+# cannot fire.  A product of zero then walks past libhdf5's own >4 GiB guard
+# (H5Dchunk.c:1185) precisely BECAUSE it is zero, leaving only
+# `assert(layout->u.chunk.size > 0)` in H5D__chunk_lock (H5Dchunk.c:4638),
+# which no release build contains.  H5D__chunk_lock then allocates a zero-size
+# chunk buffer and the gather/scatter paths index it with offsets derived from
+# the unwrapped dimensions.
+#
+# MEASURED on libhdf5 2.3.0: ASan heap-buffer-overflow READ of size 4 and WRITE
+# of size 4, both 0 bytes past an 8-byte H5FL_blk_malloc region, via
+# H5VM_memcpyvv; SIGSEGV on the stock release build.  Also measured on 1.14.5,
+# where the same product wraps in uint32_t and reaches zero by the same route.
+# See registry/cases/chunk-dim-product-64bit-overflow.yml.
+#
+# THE FILE OPENS CLEANLY.  Nothing is allocated, so h5dump -H exits 0 and a read
+# returns fill values; it is the WRITE direction that faults on this specimen
+# (measured: SIGSEGV through H5Dwrite).  The exact-build canary is read-only,
+# which is why the matrix row is a plain divergence rather than a crash, and why
+# the allowance is reasoned in registry/h5cve-matrix-policy.yml.
+#
+# WHY BOTH VERSION 4 AND VERSION 5.  Version 5 is the version in which a chunk
+# above 4 GiB is legitimate, so a fix that merely gated the 32-bit bound on the
+# layout version would have accepted the v5 sibling -- which crashes just the
+# same.  The overflow rule has to be version-independent, and these two fixtures
+# are what say so.
+file: malformed/chunk_dim_product_wrap_v5.h5
+profile: untrusted-strict
+expected_decision: reject_corrupt
+expected_exit: 2
+required_findings: [H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW]
+expected_finding_evidence:
+  H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW:
+    # The product is not representable, so the evidence names the operands: the
+    # dimension that overflowed it against the largest that would still fit.
+    field: layout.chunk_size_product_dimension
+    actual: 4
+    expected: 3
+    comparison: less_than_or_equal
+h5cve:
+  family: dataset_layout_filter_fill
+  # The divergence is real and must stay visible: libhdf5 accepts a file the
+  # oracle rejects.  The allowance lives in registry/h5cve-matrix-policy.yml
+  # with its reason, not here -- an inline allowed_statuses would shadow it.
+  require_oracle_alignment: true
+verification:
+  # The dimension product is exactly 2**64 -- the wrap boundary itself.
+  integer_overflow_and_allocation_budget: [integer_overflow]
+forbidden: [accept, unsupported_coverage_gap, crash, timeout, external_open, plugin_load, write]

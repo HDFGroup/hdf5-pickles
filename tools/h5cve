@@ -356,8 +356,15 @@ def cmd_matrix(args):
             alignment = _oracle_alignment(rep, expected.get("expected_decision"))
             if effective_policy.get("require_oracle_alignment") and alignment == "divergent":
                 canary["status"] = "violation"
+            # Carry the probe's own outcome and signal into the row.  Without
+            # them a `violation` row spelled ["crash"] is ambiguous between a
+            # fault (SIGSEGV/SIGFPE) and a non-termination (SIGXCPU), which are
+            # different defects supporting different conclusions -- and this row
+            # is where the reasoned override that allows it gets audited.
             rows.append({"expectation": os.path.basename(path), "fixture": expected["file"], "record": record,
                          "exercise": exercise, "oracle_alignment": alignment,
+                         "probe_outcome": rep.get("outcome"),
+                         "probe_signal": rep.get("signal"),
                          "h5cve_policy": effective_policy, **canary})
     for row in rows:
         fixture_policy = row.pop("h5cve_policy", {})
@@ -394,13 +401,23 @@ def _evidence_for_rows(rows, expectations):
 
     out = {}
     for record, rs in sorted(by_record.items()):
-        enforced, diverges, activation, crashes = [], [], [], []
+        enforced, diverges, activation, crashes, hangs = [], [], [], [], []
         for r in rs:
             name = r["expectation"]
             decision = (expectations.get(name) or {}).get("expected_decision")
             viol = r.get("violations") or []
             if "crash" in viol:
-                crashes.append(name)
+                # `crash` is the name of the FORBIDDEN EVENT, and the probe
+                # raises it for a non-termination as well as for a fault: a
+                # hang is killed on RLIMIT_CPU and reported as SIGXCPU.  Those
+                # are different defects supporting different conclusions, so
+                # split on the probe's own outcome rather than on the event
+                # name.  Reporting a hang as `crashes_on` reads as a fault the
+                # specimen never caused.
+                if r.get("probe_outcome") == "timeout":
+                    hangs.append(name)
+                else:
+                    crashes.append(name)
             elif viol:
                 activation.append({"fixture": name, "events": sorted(viol)})
             # Only reject_corrupt is a claim about the FILE that libhdf5 can
@@ -433,6 +450,8 @@ def _evidence_for_rows(rows, expectations):
                                                   key=lambda a: a["fixture"])
         if crashes:
             entry["crashes_on"] = sorted(crashes)
+        if hangs:
+            entry["hangs_on"] = sorted(hangs)
         out[record] = entry
     return out
 
@@ -488,8 +507,11 @@ def cmd_evidence(args):
         "#   diverges   libhdf5 accepts every comparable specimen\n"
         "#   unmeasured no comparable specimen reaches the family surface\n"
         "#\n"
-        "# activation_observed and crashes_on are reported separately: a build\n"
-        "# can enforce an invariant and still crash or activate reaching it.\n")
+        "# activation_observed, crashes_on and hangs_on are reported\n"
+        "# separately: a build can enforce an invariant and still crash, hang\n"
+        "# or activate reaching it.  crashes_on is a FAULT (SIGSEGV, SIGFPE,\n"
+        "# SIGABRT); hangs_on is a non-termination the probe killed on its CPU\n"
+        "# limit.  The two are not interchangeable evidence.\n")
     with open(args.output, "w") as f:
         f.write(header)
         yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
@@ -745,12 +767,14 @@ def _verification_for_record(record, exps, evidence, truncation, lazy):
                   if (exps.get(a["fixture"]) or {}).get("expected_decision")
                   == "reject_corrupt"]
     crashes = ev.get("crashes_on", [])
-    if activating or crashes:
+    hangs = ev.get("hangs_on", [])
+    if activating or crashes or hangs:
         out["no_activation_on_validation_failure"] = _req(
             "partial",
             "The probe forbids activation and the family is exercised, but a "
-            "rejecting fixture still activates or crashes the build under test.",
-            activating + crashes)
+            "rejecting fixture still activates, crashes or hangs the build "
+            "under test.",
+            activating + crashes + hangs)
     elif ev.get("enforced_on") or ev.get("diverges_on"):
         out["no_activation_on_validation_failure"] = _req(
             "met",
@@ -1466,6 +1490,44 @@ def _comparison_verdict(baseline, candidate):
     return "inconclusive"
 
 
+# Canary entry points whose failure says nothing the oracle claims.  Everything
+# NOT listed here -- H5Fopen, H5Ovisit3, H5Oopen, H5Dopen2, H5Aopen_by_idx, the
+# dataspace and datatype queries -- is in scope: those decode metadata, so one of
+# them refusing a file the oracle accepted is a real disagreement.  The list is
+# deliberately the exceptions rather than the rule, so an entry point added to
+# the canary later counts as in scope until someone argues otherwise.
+#
+# Two unrelated reasons to be on it, kept apart because they generalise
+# differently:
+#   * raw-data reads -- h5policy never reads dataset or attribute payloads
+#     (h5_walk.pk: "it never ... reads raw dataset payloads"), so a payload that
+#     will not decode is outside its scope BY CONSTRUCTION, and always will be;
+#   * type-class-dependent queries -- H5Tget_nmembers on a non-compound type
+#     fails BY DESIGN, and the canary calls it on every type it meets, so its
+#     failures are a property of the harness and would be fixed there.
+_OUT_OF_ORACLE_SCOPE_ENTRY_POINTS = frozenset({
+    "H5Dread", "H5Aread", "H5Sselect_elements", "H5Tget_nmembers",
+})
+
+
+def _traversal_failure_is_in_scope(rep):
+    """True when a post-open failure is one the oracle's verdict spoke about.
+
+    Conservative in both directions: an unrecognised failing entry point counts
+    as IN scope, so a new canary call cannot silently turn a real divergence into
+    a shrug, and the answer is only ever consulted for a build that opened the
+    file and then errored.
+    """
+    probe = rep.get("probe") or {}
+    entry_points = probe.get("entry_points") or []
+    if not entry_points:
+        return True                       # no detail: keep the strict reading
+    failed = [e["name"] for e in entry_points if e.get("failures")]
+    if not failed:
+        return True
+    return any(name not in _OUT_OF_ORACLE_SCOPE_ENTRY_POINTS for name in failed)
+
+
 def _oracle_alignment(rep, oracle_decision):
     """Compare the oracle's decision with what the build under test did.
 
@@ -1474,11 +1536,27 @@ def _oracle_alignment(rep, oracle_decision):
     the selected PROFILE -- a traversal budget or a denied feature -- and
     libhdf5 has no equivalent, so it accepting such a file is expected by design
     and must not be reported as a divergence.
+
+    The same asymmetry applies to an `accept` oracle.  h5policy is metadata-only,
+    so its accept is a claim about the metadata graph and about nothing else.  A
+    build that opened the file, traversed it, opened every object -- and then
+    failed only in a raw-data read is not contradicting that claim; it is
+    answering a question the oracle did not ask.  Scoring it `divergent` makes
+    `_comparison_verdict` report `regression` on a case whose accept is correct,
+    which is how the global-heap vlen seed read for two revisions.  Metadata-scope
+    failures still count as divergence, and an outright `rejected_at_open` always
+    does.
     """
     if not oracle_decision:
         return "unknown"
     if oracle_decision == "accept":
-        return "aligned" if rep.get("outcome") == "accepted" else "divergent"
+        outcome = rep.get("outcome")
+        if outcome == "accepted":
+            return "aligned"
+        if outcome == "rejected_in_traversal" and \
+                not _traversal_failure_is_in_scope(rep):
+            return "not_comparable"
+        return "divergent"
     if oracle_decision == "reject_corrupt":
         return "aligned" if rep.get("outcome") != "accepted" else "divergent"
     if oracle_decision.startswith("reject_"):
@@ -1499,8 +1577,9 @@ def cmd_deferred(args, what, change):
 def cmd_variants(args):
     """Generate typed semantic variants with h5mutate.  The seed is a VALID
     neighbor (mutated into invariant-violating variants), not the malformed PoC:
-    default to the PoC when it still parses as a continuation chain, else require
-    an explicit --seed."""
+    default to the PoC when some family's locator still recognises it, else
+    require an explicit --seed.  h5mutate applies every family whose structure
+    the seed carries and skips the rest, so one call covers all of them."""
     cdir = case_dir(args.case)
     case = load_case(cdir)
     seed = args.seed or case.get("fuzz_seed") or os.path.join(cdir, "input.h5")
@@ -1511,9 +1590,9 @@ def cmd_variants(args):
     sys.stdout.write(p.stdout)
     if p.returncode != 0 and "not parseable" in (p.stdout + p.stderr) \
             or "supported" in p.stderr:
-        print("h5cve variants: seed is not a continuation chain; pass a valid "
-              "neighbor with --seed (the mutator slice covers the continuation "
-              "family; other families are roadmap change #5 follow-ups).")
+        print("h5cve variants: no mutation family recognises this seed; pass a "
+              "valid neighbor with --seed.  Run `h5mutate list --seed FILE` to "
+              "see which families a candidate carries.")
         return 0
     # record the produced variants in the case
     variants = []
@@ -1528,10 +1607,10 @@ def cmd_variants(args):
     case["fuzz_seed"] = seed
     save_case(cdir, case)
     if not variants:
-        print("variants: 0 applicable -- the seed has no continuation chain to "
-              "mutate. The mutator slice covers the object-header continuation "
-              "family; pass a continuation-bearing --seed, or this family is a "
-              "roadmap change #5 follow-up.")
+        print("variants: 0 applicable -- no mutation family recognises this "
+              "seed.  `h5mutate list --seed FILE` reports which structures a "
+              "candidate carries; a family this record needs and that does not "
+              "exist yet costs one locator to add.")
     else:
         print(f"variants: {len(variants)} recorded in "
               f"{os.path.relpath(cdir)}/variants/")

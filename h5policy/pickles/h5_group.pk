@@ -109,6 +109,86 @@ fun h5policy_validate_local_heap_free_list = (int ios,
         }
 }
 
+/* One local heap owns its data segment.  Two prefixes naming one segment is
+   corrupt-on-read, and libhdf5 does not survive it.
+
+   WHY THIS CANNOT BE A PER-HEAP CHECK, and why libhdf5 cannot catch it itself:
+   the data segment carries no header, no signature and no back-pointer, so
+   there is nothing in the segment to compare against the prefix that claims it.
+   The fractal heap has the opposite shape -- its blocks store an owner address
+   on disk, which is what heap.fractal_block_owner reads -- so ownership there
+   is a local check.  Here the only witness is the SET of prefixes, which makes
+   this a file-scoped uniqueness invariant and puts it in the same family as the
+   superblock-extension alias check in h5_walk.pk.
+
+   WHAT libhdf5 DOES WITH THE ALIAS: H5HL_protect reaches the data block through
+   H5AC_protect(H5AC_LHEAP_DBLK, heap->dblk_addr, heap, ...), which is keyed by
+   ADDRESS -- the heap it passes is udata, used only to deserialize on a MISS.
+   A second heap naming the same address therefore gets a cache HIT, the
+   deserialize callback never runs, and H5HL__dblk_new -- the only code that
+   sets heap->dblk and heap->dblk_image -- never runs for it either.  The second
+   heap is then live with both fields NULL: H5HL_unprotect calls
+   H5AC_unpin_entry(NULL), and H5HL_offset_into returns (NULL + name_off), which
+   is non-NULL and so defeats its caller's NULL guard before strndup reads it.
+   Release builds segfault; assert-enabled builds stop one line earlier on
+   assert(heap->dblk), which is why measuring only a debug build makes this look
+   assert-only.  It is not.  Full mechanism, crash sites and a generator recipe:
+   registry/cases/local-heap-dblk-address-aliased-across-heaps.yml
+
+   No writer emits this: H5HL_create allocates a data block per heap, so the
+   rejection cannot cost a conforming file.  Hence corrupt, not a warning. */
+fun h5policy_check_lheap_segment_owner = (uint<64> prfx_addr,
+                                          uint<64> seg_addr,
+                                          uint<64> o,
+                                          uint<64> seg_field_off,
+                                          off64 loc, string object) void:
+{
+    var n = h5policy_lheap_seg_addrs'length as uint<64>;
+    /* Charge the linear scan, exactly as h5policy_seen_u64 does: on a file with
+       many heaps this cost is real and the walk budget must see it. */
+    h5policy_walk_tick(n + 1UL);
+
+    var i = 0UL;
+    while (i < n)
+        {
+            if (h5policy_lheap_seg_addrs[i] == seg_addr)
+                {
+                    /* Same prefix: this is a re-decode of one heap, not an
+                       alias.  Nothing to report and nothing to record. */
+                    if (h5policy_lheap_prfx_addrs[i] == prfx_addr)
+                        return;
+
+                    /* The finding points at THIS prefix's segment-address
+                       field, with the earlier claimant's matching field as the
+                       second location, so a reader sees both bytes that
+                       disagree rather than just the value they agree on. */
+                    var other_field_off = h5policy_lheap_prfx_addrs[i]
+                                          + 8UL + (2UL * (global_sizeof_lengths as uint<64>));
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_LOCAL_HEAP_DATA_SEGMENT_ALIAS", "corrupt",
+                        seg_field_off#B, object,
+                        "local heap data segment is already claimed by another local heap",
+                        H5Evidence {
+                            field = "heap.local_data_segment_unique",
+                            actual = prfx_addr,
+                            expected = h5policy_lheap_prfx_addrs[i],
+                            comparison = "not_equal",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = seg_field_off#B, loc1_len = o,
+                            has_loc2 = 1, loc2_role = "expected",
+                            loc2 = other_field_off#B, loc2_len = o
+                        });
+                    return;
+                }
+            i = i + 1UL;
+        }
+
+    if (n >= H5POLICY_MAX_LHEAP_OWNERS)
+        return;
+    h5policy_lheap_prfx_addrs += [prfx_addr];
+    h5policy_lheap_seg_addrs += [seg_addr];
+}
+
 /* Validate a local heap header and return its data-segment address (or the
    undef sentinel on error, after emitting).  */
 fun h5policy_local_heap_data_addr = (int ios, H5PolicyProfile profile,
@@ -166,6 +246,11 @@ fun h5policy_local_heap_data_addr = (int ios, H5PolicyProfile profile,
                                                 loc, object, seg_field_off, o);
     if (!seg_ok)
         return 0xffffffffffffffffUL;
+
+    /* Bounds are not enough: the segment address must also be UNIQUE among the
+       local heaps in this file.  See h5policy_check_lheap_segment_owner. */
+    h5policy_check_lheap_segment_owner(heap_addr, data_seg_addr, o,
+                                       seg_field_off, loc, object);
 
     /* The group walk uses the data segment for names, but validating the free
        list here catches corrupted heap bookkeeping while the heap header is in
@@ -259,33 +344,51 @@ fun h5policy_walk_snod = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                 h5policy_emit_error("H5_CORRUPT_SYMBOL_TABLE_CACHE_TYPE",
                                     "corrupt", eoff#B, parent_path,
                                     "symbol table entry has an unknown cache type");
+            /* THE NAME BELONGS TO THE ENTRY, not to whether the entry has a
+               followable object header.  libhdf5's H5G__ent_to_link
+               (src/H5Gent.c:379-385) resolves the name through
+               H5HL_offset_into and rejects an empty one for EVERY entry it
+               converts -- any cache type, whatever the address field holds.
+               These two checks used to sit inside the `cache_type != 2` branch
+               and, deeper, inside a "object header defined and in file" gate, so
+               three kinds of entry escaped them entirely: a soft link (cache
+               type 2, which has no object header at all), an entry with an
+               undefined address, and one whose address is out of file.
+               MEASURED on two corpus specimens: a symbol table whose soft-link
+               entry names heap offset 0, where the name is the empty string.
+               libhdf5 refuses the file ("invalid link name"); h5policy accepted
+               it, because the empty name sat behind the cache-type gate.
+               Only the ENQUEUE is a property of having an object header, so only
+               the enqueue stays gated below.  */
+            var name_off = h5policy_msg_u64_at(ios, profile, eoff#B, o);
+            var entry_name = "";
+            if (name_off >= h5policy_heap_data_seg_size)
+                h5policy_emit_error("H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS",
+                                    "corrupt", eoff#B, parent_path,
+                                    "link name offset is beyond the local heap data segment");
+            else
+                {
+                    entry_name = h5policy_heap_name(ios, profile, data_seg_addr,
+                                                    name_off, file_size);
+                    if (entry_name == "")
+                        h5policy_emit_error("H5_CORRUPT_LINK_NAME_EMPTY",
+                                            "corrupt", eoff#B, parent_path,
+                                            "symbol table entry link name is empty");
+                }
+
             if (cache_type != 2UL)   /* 2 = symbolic (soft) link: no object header */
                 {
-                    var name_off = h5policy_msg_u64_at(ios, profile, eoff#B, o);
                     var ohdr_raw = h5policy_msg_bytes(ios, profile, eoff#B + o#B, o);
                     var ohdr_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(ohdr_raw));
-
-                    if (name_off >= h5policy_heap_data_seg_size)
-                        h5policy_emit_error("H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS",
-                                            "corrupt", eoff#B, parent_path,
-                                            "link name offset is beyond the local heap data segment");
 
                     if (!h5policy_msg_addr_is_undef(ohdr_raw))
                         {
                             if (ohdr_addr < file_size)
                                 {
-                                    var name = h5policy_heap_name(ios, profile,
-                                                                  data_seg_addr,
-                                                                  name_off, file_size);
-                                    if (name == "")
-                                        h5policy_emit_error("H5_CORRUPT_LINK_NAME_EMPTY",
-                                                            "corrupt", eoff#B,
-                                                            parent_path,
-                                                            "symbol table entry link name is empty");
-                                    else
+                                    if (entry_name != "")
                                         h5policy_enqueue_ohdr(profile, ohdr_addr,
                                                               obj_depth + 1UL,
-                                                              h5policy_join_path(parent_path, name),
+                                                              h5policy_join_path(parent_path, entry_name),
                                                               eoff#B, parent_path);
                                 }
                             else
@@ -293,6 +396,37 @@ fun h5policy_walk_snod = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                                     "corrupt", eoff#B, parent_path,
                                                     "symbol table entry object header address outside file");
                         }
+                }
+            else
+                {
+                    /* A SOFT LINK'S TARGET PATH lives in the same local heap as
+                       the names, and the entry's scratch pad names it: a 4-byte
+                       little-endian offset (H5Gent.c:155, UINT32DECODE into
+                       cache.slink.lval_offset) at the start of the 16-byte
+                       scratch field, so 2*o + 8 into the entry.
+
+                       libhdf5 resolves it through the same H5HL_offset_into as
+                       the name (H5Gent.c:391), whose bound at H5HL.c:391 is a
+                       real error return, not an assert -- so an offset past the
+                       data segment makes the open fail.  h5policy read no part
+                       of the scratch pad at all, so this was accepted outright.
+                       MEASURED: patching this field past the segment gives
+                       `rejected_in_traversal` from libhdf5 2.3.0 and an internal
+                       error from h5dump, while h5policy said accept.
+
+                       BOUND ONLY, DO NOT REQUIRE NON-EMPTY.  The name is
+                       strndup'd and then rejected when empty (H5Gent.c:382-385);
+                       the VALUE is strndup'd with no such check
+                       (H5Gent.c:395-396).  An empty soft-link target is a
+                       dangling link, which libhdf5 accepts, so demanding a
+                       non-empty value here would be a false positive.  */
+                    var lval_scratch = eoff + (2UL * o) + 8UL;
+                    var lval_off = h5policy_msg_u64_at(ios, profile,
+                                                       lval_scratch#B, 4UL);
+                    if (lval_off >= h5policy_heap_data_seg_size)
+                        h5policy_emit_error("H5_CORRUPT_HEAP_OFFSET_OUT_OF_BOUNDS",
+                                            "corrupt", lval_scratch#B, parent_path,
+                                            "soft link value offset is beyond the local heap data segment");
                 }
             i = i + 1UL;
         }
@@ -493,10 +627,46 @@ fun h5policy_validate_stab_payload = (int ios,
     var btree_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(btree_raw));
     var heap_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(heap_raw));
 
-    /* Both addresses are required for an old-style group.  Undefined means the
-       group has no traversable symbol table here, so the validator leaves the
-       current context unchanged.  */
-    if (h5policy_msg_addr_is_undef(btree_raw) || h5policy_msg_addr_is_undef(heap_raw))
+    /* BOTH ADDRESSES ARE MANDATORY.  This used to return early on an undefined
+       address, reading it as "the group has no traversable symbol table here"
+       -- the same conflation of "we will not traverse it" with "it is well
+       formed" that hid the soft-link name checks in the SNOD entry loop above.
+
+       libhdf5 does not treat undefined as absent.  H5G__stab_iterate reads the
+       message and then calls H5HL_protect(oloc->file, stab.heap_addr, ...)
+       UNCONDITIONALLY (src/H5Gstab.c:488); at HADDR_UNDEF that becomes a read
+       at 0xffffffffffffffff and the open fails in the sec2 driver
+       ("addr undefined").  H5G__stab_delete asserts both are defined
+       (src/H5Gstab.c:427-428).
+
+       WHY THIS COSTS NO CONFORMING FILE: H5G__stab_create always allocates both
+       -- H5B_create for the B-tree and H5HL_create for the heap
+       (src/H5Gstab.c:132, :136) -- and a symbol-table message is written only
+       for an old-style group, which by definition has both.  Contrast the
+       link-info message (h5_dense_links.pk), where an undefined fractal-heap
+       address is LEGAL and means compact rather than dense storage; that is a
+       PAIRING invariant (both or neither), while this one is an existence
+       requirement.  Two near-identical shapes with different legal states, which
+       is how this hid.
+
+       MEASURED on a corpus specimen whose stab message names heap address
+       HADDR_UNDEF while a perfectly good HEAP sits at offset 96: libhdf5 fails
+       the open, h5policy accepted the file.
+
+       Reported per address with literal messages rather than one composed
+       string, so tools/message_routing.py can analyze both sites and so a file
+       with both undefined reports both.  */
+    var btree_undef = h5policy_msg_addr_is_undef(btree_raw);
+    var heap_undef = h5policy_msg_addr_is_undef(heap_raw);
+    if (heap_undef)
+        h5policy_emit_error("H5_CORRUPT_SYMBOL_TABLE_ADDRESS_UNDEFINED",
+                            "corrupt", payload_off, object,
+                            "symbol-table message name-heap address is undefined");
+    if (btree_undef)
+        h5policy_emit_error("H5_CORRUPT_SYMBOL_TABLE_ADDRESS_UNDEFINED",
+                            "corrupt", payload_off, object,
+                            "symbol-table message B-tree address is undefined");
+    if (heap_undef || btree_undef)
         return ctx;
 
     var file_size = h5policy_ceiling(ios);

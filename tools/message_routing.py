@@ -85,6 +85,31 @@ COMPOSING_HELPERS = {
     "h5policy_ea_mark_block": (2, {
         "H5_CORRUPT_CHUNK_INDEX_CYCLE": [" repeats a metadata-block address"],
     }),
+    # h5_walk.pk: the shared raw-data-vs-metadata disjointness check, in both
+    # directions.  `what` is the layout role ("chunk", "contiguous") and is what
+    # the finding's route shard splits the record family on -- the two callers
+    # live in chunk_index and dataset_layout_filter_fill respectively.
+    "h5policy_data_extent_disjoint": (4, {
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA":
+            [" data extent overlaps file metadata"],
+    }),
+    "h5policy_report_data_over_data": (0, {
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_DATA":
+            [" data extent overlaps another raw-data extent"],
+    }),
+    "h5policy_report_data_overlapped": (0, {
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA":
+            [" data extent is overlapped by file metadata read later"],
+    }),
+    # h5_chunkindex.pk: the one zero-stored-size rule shared by all four
+    # chunk-index walkers.  `kind` (parameter 3) names which index the record
+    # came from -- "v1 B-tree", "v2 B-tree", "fixed-array", "extensible-array".
+    # Unlike the dense/SOHM helpers above this needs no route shard: every
+    # caller is the chunk_index family, so the prefix is diagnostic only and
+    # does not select a different record.
+    "h5policy_chunk_record_size_ok": (3, {
+        "H5_CORRUPT_CHUNK_STORED_SIZE": [" chunk record has a zero stored size"],
+    }),
     # h5_dense_links.pk: the shared fractal-heap doubling-table validator.  One
     # implementation for the dense-link, dense-attribute and shared-message
     # clients, each of which supplies its own role as `what` (parameter 6), so
@@ -163,6 +188,13 @@ ROLE_PARAMS = {
     # owner back-pointer at the same prefix offset, so one comparison serves
     # both and names which block kind it read.
     "h5policy_frhp_owner_ok": 4,
+    # h5_vds.pk: a global-heap ID is the same record wherever it is stored, and
+    # the whole collection has to be parsed before any one object can be read --
+    # so one bounded collection walker serves both clients that hold an ID in
+    # METADATA: a VDS layout message and an attribute value.  Two clients, two
+    # families, because `record` selects the exact-build canary and those differ
+    # (a VDS source open vs. an attribute read).
+    "h5policy_find_gheap_object": 6,
 }
 
 

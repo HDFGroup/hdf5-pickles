@@ -1,0 +1,292 @@
+# The szip filter's read path takes TWO unvalidated numbers from the chunk it is
+# decoding: the chunk's stored length, which it decrements below zero, and the
+# chunk's own first four bytes, which it allocates from.  One is a memory-safety
+# defect, the other a memory-amplification one, and they are independent.
+#
+# Recorded 2026-08-23 after the fletcher32 sibling
+# (registry/cases/filtered-chunk-zero-stored-size.yml) named this site as an
+# unmeasured look-alike.  It measured differently than expected in both
+# directions -- see measured.CORRECTION.
+schema_version: 1
+
+id: szip-decompress-length-and-alloc
+title: the szip read path subtracts its 4-byte framing from the chunk length
+  without a floor and allocates whatever the chunk's own first four bytes claim,
+  before validating either
+status: draft            # oracle covers one arm; the other is outside its boundary
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: dataset_layout_filter_fill
+versions: [2, 3, 4]
+root_cause_classification: local_decode
+violated_invariant:
+  - chunk.stored_size                  # arm 1 only; arm 2 has no oracle invariant
+validation_closure: >-
+  ARM 1 is one chunk-index record against the pipeline's framing, and h5policy
+  already closes it (chunk.stored_size, which floors a filtered chunk at its
+  pipeline's fixed overhead and counts szip's 4 bytes).
+  ARM 2 has NO metadata closure at all: the hostile value is the first four
+  bytes of the chunk PAYLOAD, which a metadata-only oracle does not read and
+  should not.  Stating that plainly matters more than filing a gap -- see
+  containment.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - "libhdf5 H5Dread -> H5D__chunk_read -> H5D__chunk_lock -> H5Z_pipeline -> H5Z__filter_szip (src/H5Zszip.c:283-299)"
+  - "arm 1 fault site: SZ_BufftoBuffDecompress -> aec_buffer_decode -> aec_decode (libaec)"
+  - "arm 2 site: H5MM_malloc at src/H5Zszip.c:293, sized from src/H5Zszip.c:289"
+  - "shipped consumers: h5dump with data, any H5Dread.  NOT h5dump -H."
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  H5Z__filter_szip's read branch does three things in order, and validates after
+  all of them:
+    newbuf = (unsigned char *)(*buf);
+    UINT32DECODE(newbuf, stored_nalloc);                      -- :289
+    H5_CHECKED_ASSIGN(nalloc, size_t, stored_nalloc, uint32_t);
+    outbuf = H5MM_malloc(nalloc);                             -- :293
+    size_out = nalloc;
+    if (SZ_BufftoBuffDecompress(outbuf, &size_out, newbuf,
+                                nbytes - 4, &sz_param) != SZ_OK)  -- :298
+    assert(size_out == nalloc);                               -- :300
+
+  ARM 1, the length.  `nbytes` is the chunk's stored size and a size_t; nothing
+  floors it at 4.  With nbytes < 4 the subtraction wraps to near SIZE_MAX and
+  that length is handed to an EXTERNAL library, which then reads until it leaves
+  the mapping.  Note :289 has already read four bytes before any of this, so a
+  chunk shorter than four bytes is also over-read there.
+  ARM 2, the allocation.  `stored_nalloc` is read from the chunk's own payload
+  and allocated verbatim, bounded only by the uint32 ceiling -- 4 GiB from an
+  arbitrarily small chunk.  The expected size IS known: H5D__chunk_lock checks it
+  AFTER the pipeline returns ("chunk size is incorrect after being unfiltered",
+  observed).  Checking it BEFORE the malloc is the fix, and needs no new
+  information.
+  UINT32DECODE is LITTLE-endian (src/H5encode.h:178) -- worth stating because a
+  big-endian assumption silently writes a different value and makes the
+  amplification look absent.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  MEASURED: >-
+    2026-08-23, libhdf5 2.3.0 (source at develop f8f0379c7c5), szip provided by
+    LIBAEC (libaec.so.0).  Base specimen: a 20x20 int32 dataset, chunks 10x10,
+    compression szip, libver earliest -- so a v1 B-tree index whose keys are
+    patchable without repairing a checksum.  Stored chunk size 116 bytes.
+  CORRECTION: >-
+    An earlier reading of this site, recorded in the fletcher32 sibling's
+    sibling_audit, called it "worse" than fletcher32 on the strength of the
+    source alone.  Both halves of that were wrong, in opposite directions, and
+    the corrections are the useful content here.
+    FIRST: the stock Release build returns a CLEAN rc=1 for every undersized
+    length, which reads like a guard and is not one -- under the ASan build the
+    same files SEGV inside libaec.  Concluding "safe" from a Release return code
+    is exactly the mistake the fletcher32 case warns about, and this site repeats
+    it one layer down, in a dependency.
+    SECOND: the amplification arm, which that note did not identify as separate,
+    is the one h5policy cannot reach at all.
+  arm1_length_wrap: >-
+    Stored sizes 1, 2 and 3 each produce, under the ASan build:
+      AddressSanitizer: SEGV on unknown address 0x514000010000
+        #0 libaec.so.0+0x5e64
+        #1 aec_decode
+        #2 aec_buffer_decode
+    i.e. the wrapped length reaches libaec and it reads off the end.  The stock
+    Release build returns rc=1 for the same files with
+    "szip_filter: decompression failed" -- the error path at :299 -- so whether
+    the walk faults depends on the allocator's layout, not on any check.
+    Stored size 0 does NOT reach szip on an assert-enabled build: it trips
+    `assert(lt_key->nbytes > 0)` in H5D__btree_found (src/H5Dbtree.c:434) first.
+    So zero is ASSERT-ONLY guarded in the chunk-B-tree lookup and that guard is
+    gone under NDEBUG -- the Release build takes zero to the filter like any
+    other undersized value.
+  arm2_allocation: >-
+    PROVEN by bracketing the address-space limit rather than by running uncapped,
+    which is what makes it a measurement instead of a guess.  With the chunk's
+    stored size left legitimate at 116 bytes and only its first four payload
+    bytes rewritten:
+      claim 512 MiB, ulimit -v 256 MiB -> "memory allocation failed for szip
+        decompression"        (the allocation was attempted and denied)
+      claim 512 MiB, ulimit -v   1 GiB -> "szip_filter: decompression failed"
+        (the 512 MiB allocation SUCCEEDED; libaec then declined the data)
+      claim   2 GiB, ulimit -v   1 GiB -> allocation failed
+      claim   2 GiB, ulimit -v   3 GiB -> allocation succeeded
+    So libhdf5 allocates exactly what the payload claims, before validating
+    anything, up to the uint32 ceiling of 4 GiB from a 116-byte chunk.
+    The uncapped peak was deliberately not measured: an uncapped multi-GiB
+    allocation has taken out this workstation's session before.
+  oracle: >-
+    ARM 1 is CLOSED: h5policy rejects stored sizes 0 through 3 with
+    H5_CORRUPT_CHUNK_STORED_SIZE, because chunk.stored_size floors a filtered
+    chunk at its pipeline's fixed framing and szip (filter id 4) is one of the
+    two filters that framing recording covers.  Measured on all four values.
+    ARM 2 is ACCEPTED and always will be: h5policy reports
+    accept_with_warnings (H5_ADVISORY_DECODE_FILTER only) on both amplification
+    specimens, correctly.  The hostile number is chunk payload; reading it would
+    put a metadata-only oracle inside the data it exists not to touch.
+  width: >-
+    NOT measured at 32 bits.  Arm 1's wrap residue is width-dependent
+    (SIZE_MAX-3 on LP64, 2**32-4 on ILP32) and arm 2's uint32 ceiling is not, so
+    ILP32 plausibly caps the amplification at 4 GiB the same way while reaching a
+    different wrapped length.  Unmeasured either way.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt (arm 1) / accept_with_warnings (arm 2)
+  libhdf5: SEGV under ASan (arm 1); multi-GiB allocation from a small chunk (arm 2)
+  libhdf5_version: 2.3.0 with LIBAEC (measured)
+  classification: >-
+    ARM 1: agreement, no divergence to carry -- h5policy rejects and libhdf5 is
+    unsafe, so nothing needs a tolerance or an A~ predicate.
+    ARM 2: an oracle FALSE ACCEPT by construction, not by omission.  It is
+    outside the stated metadata-only boundary, which is the same disposition the
+    vlen/global-heap data-corruption cases take.
+  note: >-
+    No fixture is added for arm 1 and none is needed: the tracked fixtures for
+    chunk.stored_size already cover the rejected values, and adding a szip
+    variant would test the same oracle clause through a second filter.
+    No fixture is added for arm 2 because h5policy accepts it by design -- a
+    malformed/ fixture the oracle accepts fails the expectation gate, and a
+    valid/ one would assert that the amplification is fine.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: oracle_only_arm1
+  description: >-
+    libhdf5, arm 1: floor the length before subtracting, the same one-line shape
+    the fletcher32 sibling needs --
+      if (nbytes < 4) HGOTO_ERROR(...)
+    libhdf5, arm 2: compare stored_nalloc against the expected chunk size before
+    H5MM_malloc.  H5D__chunk_lock already knows that size and already checks it
+    after the pipeline returns, so this moves an existing comparison earlier
+    rather than inventing one.
+    h5policy: arm 1 already covered.  Arm 2 is NOT a gap to close -- it is the
+    metadata/data boundary working as intended, and a check that read chunk
+    payload to find it would be a worse outcome than the defect.
+systemic:
+  semantic_boundary: >-
+    the filter pipeline's input contract.  A filter receives a length and a
+    buffer from a caller that read both off disk; a filter with fixed framing
+    must establish the length covers its framing before subtracting, and a filter
+    that allocates from its own input must bound that number by something the
+    caller knows.  Neither obligation is enforced anywhere in the tree.
+  status: open
+  owner: unassigned -- both libhdf5 arms unproposed
+  description: >-
+    `grep -n 'if (nbytes' src/H5Z*.c` still returns nothing, so no filter floors
+    its input length.  Arm 2 generalises further: any filter that reads a size
+    from its own payload and allocates from it has this shape, and szip is the
+    one measured.
+  landed_changes: []          # arm 1's oracle side landed with the fletcher32 record
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: >-
+    none tracked, deliberately -- see divergence.note.  Both specimens are
+    rebuildable from the recipe below in a few lines.
+  generator: >-
+    RECIPE, verified 2026-08-23.
+      1. h5py, libver="earliest": a 20x20 int32 dataset, chunks=(10,10),
+         compression="szip".  Earliest gives a v1 B-tree index, whose keys carry
+         no checksum, so both patches are size-neutral and need no repair.
+      2. Locate the type-1 ("TREE", type byte 1) chunk B-tree node.  Keys are
+         `size(4) | filter_mask(4) | offsets(ndims * 8)` with ndims the LAYOUT
+         dimensionality -- rank PLUS ONE -- so a rank-2 dataset has 32-byte keys
+         and key[0]'s size field is at node + 24.
+      3. ARM 1: set that size field to 1, 2 or 3.  (0 is also rejected by the
+         oracle but is assert-shadowed in libhdf5's B-tree lookup, so it is the
+         weaker witness.)
+      4. ARM 2: leave the size field alone and rewrite the first four bytes AT
+         THE CHUNK'S DATA ADDRESS -- key[0] + 8 + ndims*8 -- LITTLE-endian, to
+         the byte count you want allocated.
+    ARM 1 MUST BE OBSERVED UNDER ASan.  The stock Release build returns a clean
+    rc=1 and looks safe.
+    ARM 2 MUST BE BRACKETED, not run uncapped: set `ulimit -v` below the claimed
+    size to see the attempt refused, then above it to see the attempt succeed.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: false      # arm 1's fault is INSIDE the decompressor
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: false
+
+backports: []
+
+fuzz_seed: >-
+  Two axes, and the second is the one a metadata fuzzer will never reach.  The
+  chunk-index stored size wants values just below a filter's framing (0..3 for a
+  4-byte overhead) rather than near SIZE_MAX.  The chunk PAYLOAD's leading bytes
+  want the uint32 ceiling -- that is a raw-data mutation, so it belongs to a
+  data-path fuzzer, and no amount of metadata mutation finds it.
+
+compatibility_backport_risks: >-
+  None for either arm.  A conforming szip chunk carries its 4-byte header, so the
+  length floor is unreachable for anything libhdf5 wrote; and the uncompressed
+  size a writer stores is by construction the dataset's chunk size, which is what
+  arm 2's check would compare against.
+
+sibling_audit: >-
+  THE FLETCHER32 SIBLING is registry/cases/filtered-chunk-zero-stored-size.yml,
+  and its sibling_audit entry for this site should be read together with the
+  CORRECTION above: it called this site "worse" from source alone, which was
+  right about there being more wrong here and wrong about what.
+  STILL UNAUDITED: whether the original szip library (as opposed to LIBAEC)
+  faults on the same input, which decides whether arm 1's Release-build
+  quiet-error is a property of libaec or of luck; the 1.14.x and 1.10.x branches;
+  and every other filter that reads an allocation size from its own payload --
+  arm 2's shape is not szip-specific and only szip was measured.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured at 2.3.0 with LIBAEC.  Both arms are
+    absences rather than defective checks, so they are presumably long-standing;
+    1.14.x and 1.10.x are explicitly NOT audited.
+  label: one point, not a range
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    ARM 2 HAS NO ORACLE COVERAGE AND WILL NOT GET ANY.  It is outside the
+    metadata-only boundary by construction.  Recorded here so the absence is a
+    decision on the record rather than an oversight someone re-discovers.
+  - >-
+    NO UNCAPPED AMPLIFICATION FIGURE.  The peak RSS of a 4 GiB claim was not
+    measured, only bracketed, because an uncapped multi-GiB allocation has taken
+    out this workstation's session before.  A VmRSS probe under a deliberate
+    per-process cap would give the number safely.
+  - >-
+    ARM 1 AT STORED SIZE 0 IS UNMEASURED ON A RELEASE+ASan COMBINATION.  The
+    assert in H5D__btree_found shadows it on the assert-enabled build, and the
+    Release build has no sanitizer, so the one configuration that would show
+    what zero does inside libaec does not exist locally.
+  - >-
+    NO 32-BIT MEASUREMENT for either arm.
+open_questions:
+  - >-
+    Does the original szip library fault where LIBAEC quietly errors?  That
+    decides whether arm 1's Release-build rc=1 is a dependency property or
+    allocator luck -- and the ASan SEGV suggests the latter even for LIBAEC.
+  - >-
+    Which other filters allocate from a size read out of their own payload?  Arm
+    2's shape is general; only szip was measured, and the answer bounds how much
+    of this is one filter's bug versus the pipeline's missing contract.
+
+provenance:
+  found_by: >-
+    following the unmeasured sibling-audit entry in
+    registry/cases/filtered-chunk-zero-stored-size.yml to its end.
+  input_note: >-
+    Both specimens are generated, not supplied; the recipe above rebuilds them.
+    No sha256 is recorded because nothing is tracked -- the base file's bytes
+    depend on the h5py and libaec versions that write it.
+  hdf5_build: >-
+    HDF5 2.3.0, source at develop f8f0379c7c5ef3cd4939cb9e115d2fd3502e1748.
+    Stock Release install for the return codes, the ASan RelWithDebInfo install
+    for arm 1's fault, szip via libaec.so.0 in both.  Workstation-local; paths
+    not recorded.
+  poke_version: GNU poke 4.3

@@ -1,0 +1,142 @@
+# The Single Chunk index stores no records, so its one raw-data extent never
+# reached the data/metadata disjointness check that every chunk RECORD goes
+# through.  A single-chunk dataset's address could therefore be repointed at
+# file metadata and h5policy accepted it, while libhdf5 returned those bytes as
+# dataset values.
+#
+# Found 2026-08-24 while building specimens for
+# chunk-dim-product-64bit-overflow.yml: the read-only crasher there needed a
+# chunk that "exists" without allocating one, and pointing a single-chunk
+# address at bytes already in the file did that -- with no complaint from the
+# oracle, which is the finding.  Local analysis only.
+schema_version: 1
+
+id: single-chunk-index-data-extent
+title: the Single Chunk index's data extent was never declared to the
+  raw-data/metadata disjointness registry, so a single-chunk dataset could serve
+  file metadata as its values
+status: oracle-hardened          # h5policy rejects as of 2026-08-24; libhdf5 unchanged
+disclosure: >-
+  n/a -- local analysis only.  This is an ORACLE completeness gap in a family
+  already recorded as complete, not a new libhdf5 defect: the libhdf5 side is
+  the same absence already recorded in chunk-data-over-metadata.yml.
+
+# -- Triage -------------------------------------------------------------------
+record: dataset_layout_filter_fill
+versions: [4, 5]                 # the layout versions that encode an index type
+root_cause_classification: record_local
+violated_invariant:
+  - layout.single_chunk_data_disjoint_from_metadata
+validation_closure: >-
+  the layout message's index-type and address fields, against the set of
+  metadata extents the walk has accounted.  Cross-record, like every other
+  member of this family: the extent alone is well formed, and only the registry
+  of accounted metadata makes it a violation.
+activation_before_validation:
+  - none
+entry_points:
+  - "h5policy (oracle) -- ACCEPTED before 2026-08-24, rejects now"
+  - "libhdf5 H5Dread -> H5D__chunk_read -> the single-chunk index's address, served verbatim"
+  - "shipped consumers: h5dump -d, h5ls with data, any H5Dread"
+
+# -- The gap ------------------------------------------------------------------
+defect: >-
+  TWO absences in h5policy, one of which hid the other.
+  (1) The disjointness check.  h5_layout.pk's idx_type == 1 branch bounded only
+      the START address against the file ceiling -- `idx_addr4 >= ceiling` -- and
+      declared no extent.  Every other index type reaches
+      h5policy_data_extent_disjoint through a record walker in h5_chunkindex.pk;
+      this one has no records to walk, so it was the single raw-data extent in
+      the format that nothing checked.  Contiguous and compact were already
+      covered (compact needs nothing: its data is inside the message).
+  (2) The address OFFSET, for the filtered form.  When the chunked-layout flags
+      carry H5O_LAYOUT_CHUNK_SINGLE_INDEX_WITH_FILTER (0x02) the chunk's
+      filtered size and filter mask precede the address in the layout message.
+      h5policy never read the flags byte, so it decoded the address out of the
+      size field, twelve bytes early.  MEASURED on
+      valid/layout_v5_single_filtered.h5: the address read as 256 where the file
+      stores 2048.  This stayed silent precisely because (1) was missing -- the
+      wrong address was still in-file, and nothing else consumed it.  Adding the
+      extent check without fixing the offset would have produced a check that
+      bounded the wrong bytes.
+  THE LIBHDF5 SIDE IS UNCHANGED and is not a new defect: the read path seeks to
+  the address it is given and returns what it finds, which is the absence
+  already recorded in chunk-data-over-metadata.yml.  MEASURED on the selected
+  build: h5dump -d exits 0 and the first value of the unfiltered fixture is
+  1380206671 -- the little-endian int32 of "OHDR".
+
+# -- Oracle behaviour ---------------------------------------------------------
+oracle:
+  profile: untrusted-strict
+  decision: reject_corrupt
+  primary_finding: H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA
+  object_path: /d
+
+# -- Containment vs systemic --------------------------------------------------
+containment:
+  status: landed
+  description: >-
+    h5_layout.pk now reads the chunked-layout flags byte, accounts for the
+    filtered single-chunk size and mask when computing the address offset, and
+    declares the chunk's extent with h5policy_checked_addr_range plus
+    h5policy_data_extent_disjoint -- the same two calls every record walker
+    makes.  The stored size is the filtered size when the layout carries one and
+    the dimension product otherwise; a poisoned product declares nothing,
+    because an extent derived from an overflow would be fiction.
+systemic:
+  semantic_boundary: raw-data extents disjoint from accounted metadata
+  status: landed
+  owner: n/a
+  note: >-
+    This closes the last index type.  The family's remaining known limits are
+    unchanged and recorded in chunk-data-over-metadata.yml: the extent-registry
+    caps, and free-space regions as data targets.
+backports: []
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  direct_fixture: h5policy/tests/malformed/single_chunk_over_metadata.h5
+  generator: >-
+    h5policy/tools/h5policy-gencorpus, _make_single_chunk_over_metadata: write a
+    single-chunk dataset, locate the layout message, step over the filtered size
+    and mask when the flag is set, and repoint the address at the first OHDR
+    signature in the file.
+  integration_poc: h5dump -d /d on the fixture, which exits 0 and prints
+    object-header bytes as values
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: true
+
+# -- Variants and coverage ----------------------------------------------------
+sibling_audit: >-
+  Both single-chunk forms are covered: unfiltered
+  (malformed/single_chunk_over_metadata.h5) and filtered
+  (malformed/single_chunk_filtered_over_metadata.h5), the second of which pins
+  the address offset as well as the extent rule.  The other index types were
+  already covered through their record walkers.  The raw-data-over-raw-data
+  direction comes free: the same registry holds data extents, so the new
+  declaration participates in both checks.
+fuzz_seed: n/a
+coverage_manifest_change: >-
+  dataset_layout_filter_fill gains layout.single_chunk_data_disjoint_from_metadata
+  alongside the existing contiguous entries, routed to the same
+  H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA code.
+compatibility_backport_risks: >-
+  The new declaration can only reject a file whose chunk really does overlap
+  accounted metadata, which libhdf5's allocator never produces on write.  The
+  address-offset fix is the one with regression surface: it changes which bytes
+  h5policy reads for every FILTERED single-chunk dataset, so
+  valid/layout_v5_single_filtered.h5 and valid/chunk_single.h5 are the controls,
+  and both still accept.
+
+provenance:
+  h5policy_commit: "branch updates/20260821, developed against 71ffe55"
+  libhdf5_source: {branch: develop, commit: 51b92ccee54ed3f14af3509c9ac5e4f3c82e58ce, version: 2.3.0}
+  found_by: >-
+    building a read-only reproducer for chunk-dim-product-64bit-overflow.yml
+    that needed an allocated chunk without allocating one

@@ -26,6 +26,147 @@
    dimensionality from the layout message (dataset rank + 1); a type-1 key is
    chunk_size(4) + filter_mask(4) + ndims 8-byte offsets.  This validates the
    index structure under budget; it does not read chunk contents.  */
+/* One rule, every chunk index: a record that names a chunk address must give
+   that chunk a nonzero stored size.
+
+   WHY IT IS NOT MERELY A TIDINESS CHECK.  The stored size is what libhdf5 hands
+   the filter pipeline as `nbytes`, and the pipeline's fixed-overhead filters
+   SUBTRACT from it without a floor.  H5Zfletcher32.c:73 is the measured case:
+     size_t src_nbytes = nbytes;
+     src_nbytes -= FLETCHER_LEN;      -- 4, unguarded, on size_t
+     tmp_src = src + src_nbytes;      -- wild pointer when nbytes < 4
+     UINT32DECODE(tmp_src, stored_fletcher);
+     fletcher = H5_checksum_fletcher32(src, src_nbytes);
+   With a stored size of 0 that wraps to SIZE_MAX-3, and the checksum walks off
+   the end of the buffer -- a hard SIGSEGV on an ordinary H5Dread, measured on
+   the specimen behind registry/cases/filtered-chunk-zero-stored-size.yml.
+   A zero-size record is also meaningless on its own terms: no chunk, filtered
+   or not, occupies zero bytes on disk, and libhdf5's own writer never emits one
+   (H5D__chunk_allocate always allocates at least the filtered size).  So this
+   is corrupt-on-read, not a policy choice.
+
+   The bound that already existed here -- checked_addr_range(addr, size) -- is
+   satisfied trivially by size 0, which is exactly why the hole survived: the
+   range check passes and the record proceeds.
+
+   Returns 1 when the caller should go on to range-check the extent, 0 when the
+   record has been rejected.  All four chunk-index walkers route through this so
+   the rule cannot land in three of them and be forgotten in the fourth, which
+   is the state this replaced: only the extensible-array walker had it.  */
+/* Is page P flagged initialized in a page-init bitmap byte?
+
+   libhdf5 stores these bitmaps MSB-FIRST WITHIN EACH BYTE.  H5VM_bit_get tests
+   `buf[off / 8] & H5VM_bit_set_g[off % 8]` with
+   H5VM_bit_set_g = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01}
+   (H5VMprivate.h:453), and its own note spells the convention out: "bit offset 0
+   in the first byte's high-bit position, proceeding down to bit offset 7 in the
+   first byte's low-bit position".
+
+   Both readers here had it LSB-first, which inverts the meaning for every page
+   in a byte.  The consequence was silent and one-directional: page 0 of a
+   conforming file looks UNINITIALIZED, its elements are skipped, and every
+   per-element check -- chunk address in file, chunk stored size, raw-data /
+   metadata disjointness -- does nothing at all.  No finding is produced, so
+   nothing said the coverage had gone.  MEASURED before the fix: a 1200-element
+   paged fixed array whose two pages are both live carries bitmap byte
+   0b11000000, and h5policy walked zero of its 1200 elements.  */
+fun h5policy_page_initialized = (uint<64> bitmap_byte, uint<64> page) int:
+{
+    return ((bitmap_byte & (0x80UL .>> (page % 8UL))) != 0UL) ? 1 : 0;
+}
+
+fun h5policy_chunk_record_size_ok = (uint<64> stored_size, off64 loc,
+                                     string object, string kind) int:
+{
+    if (stored_size != 0UL)
+        {
+            /* ZERO IS ONLY THE EXTREME CASE, not the whole rule.  fletcher32
+               subtracts 4 whatever the size is, so 1, 2 and 3 wrap exactly as 0
+               does -- measured: all four values SIGSEGV the shipped build.  The
+               floor those need is the pipeline's framing, which is not known
+               here (the pipeline message may not have been read yet), so record
+               the smallest size seen and let h5policy_finalize_ohdr_dataset
+               compare.  Zero is handled below instead of here because it is
+               invalid against ANY pipeline, filters or none, and so needs no
+               cross-message context to report.  */
+            if (h5policy_chunk_has_stored == 0UB
+                || stored_size < h5policy_chunk_min_stored)
+                {
+                    h5policy_chunk_min_stored = stored_size;
+                    h5policy_chunk_min_stored_offset = loc/#B;
+                }
+            h5policy_chunk_has_stored = 1UB;
+            return 1;
+        }
+    h5policy_emit_error("H5_CORRUPT_CHUNK_STORED_SIZE", "corrupt", loc, object,
+                        kind + " chunk record has a zero stored size");
+    return 0;
+}
+
+/* Chunk B-tree keys are ordered by chunk offset, and the order is load-bearing:
+   libhdf5 finds a chunk by searching the tree on that ordering, so two keys
+   claiming one offset are not a redundancy -- they make one chunk unreachable
+   and serve the other in its place.
+
+   MEASURED on a v1 B-tree whose key[1] offsets were copied from key[0]: h5dump
+   exits 0 and returns chunk (0,5)'s bytes at logical position (0,0), while the
+   region whose record was displaced comes back as the FILL VALUE.  Silent wrong
+   data, no error -- the same shape as chunk.data_disjoint_from_metadata, and
+   h5policy accepted it.
+
+   Compared lexicographically across the offset words, strictly: a conforming
+   node's keys increase at the first word where they differ, and equality in
+   every word is the duplicate case.  Verified against the corpus controls, whose
+   keys increase strictly INCLUDING the trailing boundary key -- the sentinel has
+   a greater offset than the last real record even though its size is zero.  */
+fun h5policy_chunk_keys_ordered = (int ios, H5PolicyProfile profile,
+                                   uint<64> a_key, uint<64> b_key,
+                                   uint<64> ndims, string object) int:
+{
+    var j = 0UL;
+    while (j < ndims)
+        {
+            var a = h5policy_msg_u64_at(ios, profile,
+                                        (a_key + 8UL + (j * 8UL))#B, 8UL);
+            var b = h5policy_msg_u64_at(ios, profile,
+                                        (b_key + 8UL + (j * 8UL))#B, 8UL);
+            if (a < b)
+                return 1;                       /* strictly increasing: done */
+            if (a > b)
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_CHUNK_KEY_ORDER", "corrupt",
+                        b_key#B, object,
+                        "chunk B-tree keys are not in increasing chunk-offset order",
+                        H5Evidence {
+                            field = "chunk.key_order",
+                            actual = b, expected = a,
+                            comparison = "at_least",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = (b_key + 8UL + (j * 8UL))#B, loc1_len = 8UL,
+                            has_loc2 = 1, loc2_role = "expected",
+                            loc2 = (a_key + 8UL + (j * 8UL))#B, loc2_len = 8UL,
+                        });
+                    return 0;
+                }
+            j = j + 1UL;
+        }
+    h5policy_emit_error_ev(
+        "H5_CORRUPT_CHUNK_KEY_ORDER", "corrupt",
+        b_key#B, object,
+        "two chunk B-tree keys declare the same chunk offset",
+        H5Evidence {
+            field = "chunk.key_order",
+            actual = b_key, expected = a_key,
+            comparison = "not_equal",
+            has_loc1 = 1, loc1_role = "actual",
+            loc1 = b_key#B, loc1_len = 8UL,
+            has_loc2 = 1, loc2_role = "expected",
+            loc2 = a_key#B, loc2_len = 8UL,
+        });
+    return 0;
+}
+
 fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext ctx,
                                  uint<64> btree_addr, uint<64> ndims,
                                  string object, uint<64> btree_depth,
@@ -176,6 +317,12 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext
             while (i < inspect_entries)
                 {
                     var key_off = btree_addr + hdr + (i * pair);
+                    /* Key i against key i+1.  A node holds entries_used + 1
+                       keys, so the successor always exists and the node's whole
+                       extent -- hdr + capacity*pair + key_size -- was
+                       range-checked above.  */
+                    var ordered = h5policy_chunk_keys_ordered(
+                        ios, profile, key_off, key_off + pair, ndims, object);
                     var child_raw = h5policy_msg_bytes(ios, profile,
                                                        (key_off + key_size)#B, o);
                     var child_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(child_raw));
@@ -183,9 +330,22 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext
                                                          key_off#B, 4UL);
                     if (!h5policy_msg_addr_is_undef(child_raw))
                         {
-                            var ok = h5policy_checked_addr_range(
-                                child_addr, chunk_size, file_size,
-                                "chunk data outside file", key_off#B, object);
+                            /* The v1 key carries a size field for filtered and
+                               unfiltered chunks alike, so the rule needs no
+                               client-id split here -- unlike the array indexes,
+                               where an unfiltered record has no size field and
+                               the layout's fixed chunk size stands in.  */
+                            if (h5policy_chunk_record_size_ok(
+                                    chunk_size, key_off#B, object, "v1 B-tree"))
+                                {
+                                    var ok = h5policy_checked_addr_range(
+                                        child_addr, chunk_size, file_size,
+                                        "chunk data outside file", key_off#B, object);
+                                    if (ok)
+                                        ok = h5policy_data_extent_disjoint(
+                                            child_addr, chunk_size,
+                                            key_off#B, object, "chunk");
+                                }
                         }
                     i = i + 1UL;
                 }
@@ -203,6 +363,17 @@ fun h5policy_walk_chunk_btree = (int ios, H5PolicyProfile profile, H5WalkContext
                 return ctx;
 
             var key_off = btree_addr + hdr + (i * pair);
+            /* Separator keys carry the SAME ordering obligation as leaf keys,
+               and breaking it costs more: a leaf duplicate loses one chunk,
+               while a bad separator makes a whole SUBTREE unreachable.
+               MEASURED on a 130-chunk two-level index -- duplicating the root's
+               second separator returned the fill value for elements 0..56 and
+               correct data for 57..129; inverting it lost 57..129 instead.  Both
+               at h5dump rc=0, and h5policy accepted both.
+               Checked before descending, so a node whose own keys disagree is
+               reported even if its children are individually fine.  */
+            var sep_ordered = h5policy_chunk_keys_ordered(
+                ios, profile, key_off, key_off + pair, ndims, object);
             var child_raw = h5policy_msg_bytes(ios, profile,
                                                (key_off + key_size)#B, o);
             var child_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(child_raw));
@@ -286,11 +457,16 @@ fun h5policy_validate_v2_chunk_records = (int ios, H5PolicyProfile profile,
                     if (record_type == 11UL)
                         stored_size = h5policy_msg_u64_at(
                             ios, profile, rec_addr#B + o#B, filtered_size_len);
-                    if (stored_size != 0xffffffffffffffffUL)
+                    if (h5policy_chunk_record_size_ok(
+                            stored_size, rec_addr#B, object, "v2 B-tree")
+                        && stored_size != 0xffffffffffffffffUL)
                         {
                             var ok = h5policy_checked_addr_range(
                                 chunk_addr, stored_size, file_size,
                                 "chunk data outside file", rec_addr#B, object);
+                            if (ok)
+                                ok = h5policy_data_extent_disjoint(
+                                    chunk_addr, stored_size, rec_addr#B, object, "chunk");
                         }
                 }
             i = i + 1UL;
@@ -534,6 +710,13 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                             "fixed array header checksum mismatch");
 
     var raw_elmt_size = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 6#B, 1UL);
+    /* Client 1 (filtered) elements carry a post-filter byte count between the
+       address and the four-byte filter mask, exactly as the extensible array
+       does.  Client 0 stores only an address, so the layout's fixed chunk size
+       is the stored size and a zero there is a dataspace/layout fault caught
+       elsewhere -- hence size_width 0 and the chunk_byte_size fallback below. */
+    var fa_size_width = client_id == 1UL && raw_elmt_size > o + 4UL
+                        ? raw_elmt_size - o - 4UL : 0UL;
     var page_bits = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 7#B, 1UL);
     var nelmts = h5policy_msg_u64_at(ios, profile, hdr_addr#B + 8#B, el);
     var dblk_raw = h5policy_msg_bytes(ios, profile, hdr_addr#B + (8UL + el)#B, o);
@@ -611,9 +794,39 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                     var elem_off = dblk_addr + db_prefix + (i * raw_elmt_size);
                     var caddr_raw = h5policy_msg_bytes(ios, profile, elem_off#B, o);
                     var caddr = hdf5_addr_to_file_u64(bytes_to_u64_le(caddr_raw));
-                    if (!h5policy_msg_addr_is_undef(caddr_raw) && caddr >= file_size)
-                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt", elem_off#B, object,
-                                            "chunk data address outside file");
+                    if (!h5policy_msg_addr_is_undef(caddr_raw))
+                        {
+                            if (caddr >= file_size)
+                                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt", elem_off#B, object,
+                                                    "chunk data address outside file");
+                            /* Filtered elements only.  A client-0 element
+                               carries no size field at all -- its extent is the
+                               layout's fixed chunk size, which is not a
+                               per-record value and is checked where the layout
+                               is -- so there is no per-record zero to find.  */
+                            if (fa_size_width != 0UL)
+                                {
+                                    var fa_stored = h5policy_msg_u64_at(
+                                        ios, profile, elem_off#B + o#B, fa_size_width);
+                                    if (h5policy_chunk_record_size_ok(
+                                            fa_stored, elem_off#B, object, "fixed-array"))
+                                        {
+                                            var fa_ok = h5policy_data_extent_disjoint(
+                                                caddr, fa_stored, elem_off#B, object, "chunk");
+                                        }
+                                }
+                            else
+                                {
+                                    /* Client 0 carries no size field, so the
+                                       extent is unknown here; check the single
+                                       starting byte.  That catches an address
+                                       landing INSIDE metadata -- the measured
+                                       shape -- and misses only a chunk that
+                                       starts in free space and runs into it.  */
+                                    var fa_ok = h5policy_data_extent_disjoint(
+                                        caddr, 1UL, elem_off#B, object, "chunk");
+                                }
+                        }
                     i = i + 1UL;
                 }
 
@@ -637,10 +850,37 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                                  4UL, 0xffffffffffffffffUL,
                                  "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
                                  dblk_addr#B, object, "fixed array page size overflow");
-    var all_pages = h5policy_checked_mul_u64(npages, full_page_bytes, 0xffffffffffffffffUL,
-                                             "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
-                                             dblk_addr#B, object,
-                                             "fixed array data block size overflow");
+    /* The LAST page is short, and charging it as a full one over-estimates the
+       block by (page_nelmts - last_page_nelmts) * raw_elmt_size.  That is not
+       cosmetic: when the over-estimate runs past EOF the bound below rejects a
+       VALID file.  Measured before the fix, with 4-byte elements and a
+       1024-element page: nelmts 1025..1200 and 2049 were reject_corrupt
+       ("fixed array paged data block outside file") while libhdf5 read them
+       fine, and exact multiples (1024, 2048) plus 3000 passed -- 3000 only
+       because its file is big enough to absorb a 576-byte over-count.  The loop
+       below already sized the last page correctly via last_page_nelmts; only
+       this total ignored it.
+       Messages are reused verbatim from the sites above so the finding's route
+       shard needs no new entries.  */
+    var last_page_bytes =
+        h5policy_checked_add_u64(h5policy_checked_mul_u64(last_page_nelmts, raw_elmt_size,
+                                                          0xffffffffffffffffUL,
+                                                          "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                                          dblk_addr#B, object,
+                                                          "fixed array page size overflow"),
+                                 4UL, 0xffffffffffffffffUL,
+                                 "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                 dblk_addr#B, object, "fixed array page size overflow");
+    var all_pages =
+        h5policy_checked_add_u64(h5policy_checked_mul_u64(npages - 1UL, full_page_bytes,
+                                                          0xffffffffffffffffUL,
+                                                          "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                                          dblk_addr#B, object,
+                                                          "fixed array data block size overflow"),
+                                 last_page_bytes, 0xffffffffffffffffUL,
+                                 "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt",
+                                 dblk_addr#B, object,
+                                 "fixed array data block size overflow");
     if (!h5policy_checked_addr_range(dblk_addr, db_prefix + all_pages, file_size,
                                      "fixed array paged data block outside file",
                                      dblk_addr#B, object))
@@ -673,7 +913,7 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
             var pn = (p == npages - 1UL) ? last_page_nelmts : page_nelmts;
             var bmap = h5policy_msg_u64_at(ios, profile,
                                            dblk_addr#B + (6UL + o + (p / 8UL))#B, 1UL);
-            if (((bmap .>> (p % 8UL)) & 1UL) != 0UL)   /* page initialized */
+            if (h5policy_page_initialized(bmap, p))
                 {
                     var page_body =
                         h5policy_checked_mul_u64(pn, raw_elmt_size,
@@ -698,10 +938,29 @@ fun h5policy_walk_fixed_array_chunks = (int ios, H5PolicyProfile profile, H5Walk
                             var elem_off = page_start + (j * raw_elmt_size);
                             var caddr_raw = h5policy_msg_bytes(ios, profile, elem_off#B, o);
                             var caddr = hdf5_addr_to_file_u64(bytes_to_u64_le(caddr_raw));
-                            if (!h5policy_msg_addr_is_undef(caddr_raw) && caddr >= file_size)
-                                h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
-                                                    elem_off#B, object,
-                                                    "chunk data address outside file");
+                            if (!h5policy_msg_addr_is_undef(caddr_raw))
+                                {
+                                    if (caddr >= file_size)
+                                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                                            elem_off#B, object,
+                                                            "chunk data address outside file");
+                                    if (fa_size_width != 0UL)
+                                        {
+                                            var fa_stored = h5policy_msg_u64_at(
+                                                ios, profile, elem_off#B + o#B, fa_size_width);
+                                            if (h5policy_chunk_record_size_ok(
+                                                    fa_stored, elem_off#B, object, "fixed-array"))
+                                                {
+                                                    var fa_ok = h5policy_data_extent_disjoint(
+                                                        caddr, fa_stored, elem_off#B, object, "chunk");
+                                                }
+                                        }
+                                    else
+                                        {
+                                            var fa_ok = h5policy_data_extent_disjoint(
+                                                caddr, 1UL, elem_off#B, object, "chunk");
+                                        }
+                                }
                             j = j + 1UL;
                         }
                 }
@@ -782,16 +1041,17 @@ fun h5policy_validate_ea_elements = (int ios, H5PolicyProfile profile,
                     if (cfg.client_id == 1UL)
                         stored_size = h5policy_msg_u64_at(
                             ios, profile, current#B + o#B, size_width);
-                    if (stored_size == 0UL)
-                        h5policy_emit_error("H5_CORRUPT_CHUNK_STORED_SIZE",
-                                            "corrupt", current#B, object,
-                                            "extensible-array chunk record has a zero stored size");
-                    else if (stored_size != 0xffffffffffffffffUL)
+                    if (h5policy_chunk_record_size_ok(
+                            stored_size, current#B, object, "extensible-array")
+                        && stored_size != 0xffffffffffffffffUL)
                         {
                             var ok = h5policy_checked_addr_range(
                                 addr, stored_size, file_size,
                                 "extensible-array chunk data outside file",
                                 current#B, object);
+                            if (ok)
+                                ok = h5policy_data_extent_disjoint(
+                                    addr, stored_size, current#B, object, "chunk");
                         }
                 }
             i = i + 1UL;
@@ -936,7 +1196,7 @@ fun h5policy_walk_ea_dblock = (int ios, H5PolicyProfile profile,
         {
             var bitmap = h5policy_msg_u64_at(
                 ios, profile, (page_init_addr + (p / 8UL))#B, 1UL);
-            if (((bitmap .>> (p % 8UL)) & 1UL) != 0UL)
+            if (h5policy_page_initialized(bitmap, p))
                 {
                     var page_addr = dblock_addr + prefix_size + (p * page_size);
                     h5policy_mark_reached(page_addr, "EAPG");

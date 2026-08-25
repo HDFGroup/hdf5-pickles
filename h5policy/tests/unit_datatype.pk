@@ -489,50 +489,128 @@ run_layout_blob([1UB, 0UB, 1UB, 0UB, 0UB, 0UB, 0UB, 0UB]);
 expect("layout_zero_dimensionality_rejected",
        has_code("H5_CORRUPT_LAYOUT_DIMENSIONALITY"));
 
-/* 10a. Chunk byte-size 32-bit wrap guard.  Legacy H5O_layout_chunk_t.size is a
-   uint32 formed by multiplying every encoded chunk dim (the trailing dim is
-   the element size); vulnerable readers can wrap and under-allocate while
-   newer readers reject the oversized chunk. h5policy_chunk_size32_accum must
-   flag exactly at the 2^32 boundary, poison the running product, and pass
-   anything representable in 32 bits.  */
+/* 10a. Chunk byte-size arithmetic.  libhdf5 accumulates the product of every
+   encoded chunk dim (the trailing dim is the element size) with no overflow
+   check, on the read path as well as on create, so the bound this validator
+   enforces is 64-bit REPRESENTABILITY.  The legacy 32-bit rules depend on the
+   chunk index type and are applied separately by the verdict helper below --
+   bounding the product at 2**32 unconditionally rejected files libhdf5 2.x
+   writes by default.  See registry/cases/chunk-dim-product-64bit-overflow.yml. */
 h5policy_reset_findings;
-var acc_a = h5policy_chunk_size32_accum(1UL, 0x40000040UL, 0#B, "/u");
-var acc_b = h5policy_chunk_size32_accum(acc_a, 4UL, 0#B, "/u");   /* -> 2^32 + 256 */
-expect("chunk_size32_wrap_flagged",
-       acc_a == 0x40000040UL && acc_b == 0xffffffffffffffffUL
-       && has_u64_evidence("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT",
-                           "layout.chunk_size_overflow_product",
-                           0x100000100UL, 0xffffffffUL,
-                           "less_than_or_equal"));
+var acc_a = h5policy_chunk_size_accum(1UL, 0x80000000UL, 0#B, "/u");
+var acc_b = h5policy_chunk_size_accum(acc_a, 0x80000000UL, 0#B, "/u");  /* 2^62 */
+var acc_c = h5policy_chunk_size_accum(acc_b, 4UL, 0#B, "/u");           /* -> 2^64 */
+expect("chunk_size_product_overflow_flagged",
+       acc_b == 0x4000000000000000UL && acc_c == 0xffffffffffffffffUL
+       && has_u64_evidence("H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW",
+                           "layout.chunk_size_product_dimension",
+                           4UL, 3UL, "less_than_or_equal"));
+
+/* Once poisoned the running product stays poisoned and reports once. */
+h5policy_reset_findings;
+var acc_d = h5policy_chunk_size_accum(0xffffffffffffffffUL, 2UL, 0#B, "/u");
+expect("chunk_size_product_poison_is_sticky",
+       acc_d == 0xffffffffffffffffUL
+       && !has_code("H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW"));
+
+/* A product ABOVE 2**32 is representable and therefore not an overflow.  The
+   old unconditional bound flagged exactly this shape. */
+h5policy_reset_findings;
+var acc_e = h5policy_chunk_size_accum(1UL, 0x40000040UL, 0#B, "/u");
+var acc_f = h5policy_chunk_size_accum(acc_e, 4UL, 0#B, "/u");   /* 2^32 + 256 */
+expect("chunk_size_above_32bit_is_not_an_overflow",
+       acc_f == 0x100000100UL
+       && !has_code("H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW")
+       && !has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT"));
+
+/* 10b. The three verdicts the 32-bit rules split into. */
+h5policy_reset_findings;
+h5policy_chunk_size32_verdict(0x100000100UL, 1UB, 3UL, 0#B,
+                              uint<64>[](), uint<64>[](), "/u");
+expect("chunk_size32_v1_btree_index_rejected",
+       has_u64_evidence("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT",
+                        "layout.chunk_size_overflow_product",
+                        0x100000100UL, 0xffffffffUL,
+                        "less_than_or_equal"));
 
 h5policy_reset_findings;
-var acc_max = h5policy_chunk_size32_accum(1UL, 0xffffffffUL, 0#B, "/u");
-expect("chunk_size32_max_uint32_ok",
-       acc_max == 0xffffffffUL
+h5policy_chunk_size32_verdict(0x100000100UL, 0UB, 4UL, 0#B,
+                              uint<64>[](), uint<64>[](), "/u");
+expect("chunk_size32_layout_v4_is_advisory_only",
+       has_code("H5_ADVISORY_CHUNK_SIZE_REQUIRES_LAYOUT_V5")
        && !has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT"));
 
 h5policy_reset_findings;
-var acc_p = h5policy_chunk_size32_accum(0x80000000UL, 2UL, 0#B, "/u"); /* exactly 2^32 */
-expect("chunk_size32_exact_pow2_flagged",
-       acc_p == 0xffffffffffffffffUL
-       && has_u64_evidence("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT",
-                           "layout.chunk_size_overflow_product",
-                           0x100000000UL, 0xffffffffUL,
-                           "less_than_or_equal"));
+h5policy_chunk_size32_verdict(0x100000100UL, 0UB, 5UL, 0#B,
+                              uint<64>[](), uint<64>[](), "/u");
+expect("chunk_size32_layout_v5_is_clean",
+       !has_code("H5_ADVISORY_CHUNK_SIZE_REQUIRES_LAYOUT_V5")
+       && !has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT"));
 
-/* 10b. End-to-end through the v4 chunked layout validator: dims [0x40000040, 4]
-   (data dim x element size) multiply to 2^32 + 256 -> rejected; the same shape
-   with a small data dim is clean.  Layout payload: version(4) class(2=chunked)
-   flags ndims enc, then enc-byte dims, index type, and address.  */
+/* A 32-bit-representable product says nothing at any version, and a poisoned
+   product must not be re-reported as a 32-bit violation. */
+h5policy_reset_findings;
+h5policy_chunk_size32_verdict(0xffffffffUL, 1UB, 3UL, 0#B,
+                              uint<64>[](), uint<64>[](), "/u");
+h5policy_chunk_size32_verdict(0xffffffffffffffffUL, 1UB, 3UL, 0#B,
+                              uint<64>[](), uint<64>[](), "/u");
+expect("chunk_size32_boundary_and_poison_silent",
+       !has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT")
+       && !has_code("H5_ADVISORY_CHUNK_SIZE_REQUIRES_LAYOUT_V5"));
+
+/* 10c. End-to-end through the layout validator.  Payload shapes:
+   v4/v5 chunked -- version class flags ndims enc, enc-byte dims, index type,
+   address; v3 chunked -- version class ndims, address, four-byte dims.  */
+
+/* v4, product 2^32 + 256: portability advisory, NOT corruption. */
 run_layout_blob([4UB, 2UB, 0UB, 2UB, 4UB,
                  0x40UB, 0UB, 0UB, 0x40UB,          /* dim0 = 0x40000040 */
                  4UB, 0UB, 0UB, 0UB,                /* dim1 = element size 4 */
                  1UB,                               /* single-chunk index */
                  0xffUB, 0xffUB, 0xffUB, 0xffUB,
                  0xffUB, 0xffUB, 0xffUB, 0xffUB]);
-expect("v4_chunk_size_wrap_rejected",
+expect("v4_chunk_above_4gib_is_advisory",
+       has_code("H5_ADVISORY_CHUNK_SIZE_REQUIRES_LAYOUT_V5")
+       && !has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT")
+       && !has_code("H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW"));
+
+/* v5, same geometry: the version in which it is fully legitimate. */
+run_layout_blob([5UB, 2UB, 0UB, 2UB, 4UB,
+                 0x40UB, 0UB, 0UB, 0x40UB,
+                 4UB, 0UB, 0UB, 0UB,
+                 1UB,
+                 0xffUB, 0xffUB, 0xffUB, 0xffUB,
+                 0xffUB, 0xffUB, 0xffUB, 0xffUB]);
+expect("v5_chunk_above_4gib_is_clean",
+       !has_code("H5_ADVISORY_CHUNK_SIZE_REQUIRES_LAYOUT_V5")
+       && !has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT")
+       && !has_code("H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW"));
+
+/* v5, dims 2^31 x 2^31 x 4 == 2^64: the wrap that a layout-version gate alone
+   would have accepted, and the one with a measured out-of-bounds access. */
+run_layout_blob([5UB, 2UB, 0UB, 3UB, 4UB,
+                 0UB, 0UB, 0UB, 0x80UB,             /* dim0 = 0x80000000 */
+                 0UB, 0UB, 0UB, 0x80UB,             /* dim1 = 0x80000000 */
+                 4UB, 0UB, 0UB, 0UB,                /* dim2 = element size 4 */
+                 1UB,
+                 0xffUB, 0xffUB, 0xffUB, 0xffUB,
+                 0xffUB, 0xffUB, 0xffUB, 0xffUB]);
+expect("v5_chunk_product_wrap_rejected",
+       has_code("H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW"));
+
+/* v3 has no encoded index type, so its index is the v1 B-tree and the same
+   2^32 + 256 geometry is unrepresentable on disk.  The address field between
+   the rank and the dimensions is sizeof_offsets wide, which is zero in this
+   harness (no superblock has been parsed), so the dimensions follow the rank
+   directly -- as they do for the v4/v5 blobs above.  */
+run_layout_blob([3UB, 2UB, 3UB,
+                 0x40UB, 0UB, 0UB, 0x40UB,          /* dim0 = 0x40000040 */
+                 1UB, 0UB, 0UB, 0UB,                /* dim1 = 1 */
+                 4UB, 0UB, 0UB, 0UB]);              /* dim2 = element size 4 */
+expect("v3_chunk_above_4gib_rejected",
        has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT"));
 
+/* And a small chunk is clean in every encoding. */
 run_layout_blob([4UB, 2UB, 0UB, 2UB, 4UB,
                  4UB, 0UB, 0UB, 0UB,                /* dim0 = 4 */
                  4UB, 0UB, 0UB, 0UB,                /* dim1 = element size 4 */
@@ -540,7 +618,9 @@ run_layout_blob([4UB, 2UB, 0UB, 2UB, 4UB,
                  0xffUB, 0xffUB, 0xffUB, 0xffUB,
                  0xffUB, 0xffUB, 0xffUB, 0xffUB]);
 expect("v4_chunk_size_small_ok",
-       !has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT"));
+       !has_code("H5_CORRUPT_CHUNK_SIZE_EXCEEDS_32BIT")
+       && !has_code("H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW")
+       && !has_code("H5_ADVISORY_CHUNK_SIZE_REQUIRES_LAYOUT_V5"));
 
 /* 11. n-bit cd_values type tree must stay inside the client-data array.  These
    drive the filter-pipeline validator directly (a malformed n-bit file makes a

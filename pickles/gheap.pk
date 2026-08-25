@@ -148,6 +148,35 @@ type gheap_obj_hdr = struct {
 };
 
 /* ----------------------------------------------------------------------- *
+ * gheap_obj_step -- how far one object header advances a collection walk.
+ *
+ * Stated once because both walkers below need it and because the value is not
+ * trustworthy: it is computed from a declared length, in modular 64-bit
+ * arithmetic, exactly as libhdf5 computes it in a size_t
+ * (H5HG__cache_heap_deserialize, src/H5HGcache.c:353 and :358):
+ *
+ *   idx == 0:  step = data_size                    -- the free-space sentinel's
+ *                                                     span, used RAW
+ *   idx  > 0:  step = objhdr_sz + align8(data_size)
+ *
+ * NEITHER form is guaranteed positive.  A sentinel declaring zero yields zero
+ * directly; for any other index the sum wraps to zero at eight declared lengths
+ * per size_t width -- the interval [2^W-23, 2^W-16] for objhdr_sz 16 -- and poke
+ * uint<64> wraps just as an LP64 size_t does.  Callers must therefore treat the
+ * result as untrusted and require the cursor to advance STRICTLY; a walk that
+ * adds this blindly does not terminate.  libhdf5 has the same defect, recorded
+ * in registry/cases/global-heap-zero-progress-sentinel.yml.
+ * ----------------------------------------------------------------------- */
+
+fun gheap_obj_step = (uint<64> idx, uint<64> data_sz,
+                      uint<64> objhdr_sz) uint<64>:
+{
+    if (idx == 0UL)
+        return data_sz;
+    return objhdr_sz + align8(data_sz);
+}
+
+/* ----------------------------------------------------------------------- *
  * gheap_gcol_find_obj -- locate the data bytes of heap object target_idx
  * within the global heap collection at heap_off.
  *
@@ -189,12 +218,20 @@ fun gheap_gcol_find_obj = (offset<uint<64>,B> heap_off,
             if (idx == target_idx) {
                 found_pos = pos + obj_sz;
                 global_gheap_last_obj_size = data_sz;
+            } else {
+                /* Only step when still searching.  The declared step is
+                   untrusted (see gheap_obj_step), so require the cursor to
+                   advance strictly: `next <= pos` catches a zero step and any
+                   wrap in one test, and without it this loop spins forever on
+                   an input libhdf5 also fails to terminate on.  */
+                var next = pos + gheap_obj_step(idx, data_sz, obj_sz);
+                if (next <= pos) {
+                    printf("gheap: object index %u64d at collection offset %u64d declares a size that does not advance the walk; collection is unwalkable\n",
+                           idx, pos);
+                    return 0#B;
+                }
+                pos = next;
             }
-
-            if (idx == 0UL)
-                pos = pos + data_sz;
-            else
-                pos = pos + obj_sz + align8(data_sz);
         }
     }
 
@@ -243,30 +280,54 @@ fun print_global_heap = (offset<uint<64>,B> off) void:
             var ref_cnt = bytes_to_u64_le(oh.ref_cnt_raw);
             var data_sz = bytes_to_u64_le(oh.data_size_raw);
 
-            if (idx == 0UL) {
-                /* Free-space sentinel.  data_sz is the total span from the
-                 * start of this object header to the end of the free region,
-                 * so actual free data = data_sz - obj_hdr_sz.              */
-                printf("  obj[0] /* free space */ {\n");
-                printf("    ref_cnt=%u64d\n", ref_cnt);
-                printf("    free_space_total=%u64d\n", data_sz);
-                var free_data_sz = 0UL;
-                if (data_sz > obj_hdr_sz)
-                    free_data_sz = data_sz - obj_hdr_sz;
-                printf("    free_data_bytes=%u64d\n", free_data_sz);
-                printf("  }\n");
-                pos = pos + data_sz;
+            /* Vet the declared extent BEFORE printing anything, because
+               printing an object maps its data.  Two independent ways the
+               header can be unusable, and the order matters: the map below
+               would throw on a wild data_sz before any later check could
+               report it, turning a diagnosable file into an unhandled
+               exception.  Both stop the walk with a comment.  */
+            var step   = gheap_obj_step(idx, data_sz, obj_hdr_sz);
+            var next   = pos + step;
+            var fits   = idx == 0UL
+                         ? data_sz <= coll_sz - pos
+                         : data_sz <= coll_sz - pos - obj_hdr_sz;
+
+            if (next <= pos) {
+                /* Zero step, or a step that wrapped -- see gheap_obj_step.
+                   Adding it would leave the cursor where it is and this loop
+                   would not terminate. */
+                printf("  /* obj[%u64d] at offset %u64d declares a size that does not advance the parse; walk stopped */\n",
+                       idx, pos);
+                pos = coll_sz;
+            } else if (!fits) {
+                printf("  /* obj[%u64d] at offset %u64d declares %u64d byte(s), past the end of the collection; walk stopped */\n",
+                       idx, pos, data_sz);
+                pos = coll_sz;
             } else {
-                printf("  obj[%u64d] {\n", idx);
-                printf("    ref_cnt=%u64d\n", ref_cnt);
-                printf("    data_size=%u64d\n", data_sz);
-                if (data_sz > 0UL) {
-                    var data = byte[data_sz] @ (off + (pos + obj_hdr_sz)#B);
-                    printf("    data=%v\n", data);
+                if (idx == 0UL) {
+                    /* Free-space sentinel.  data_sz is the total span from the
+                     * start of this object header to the end of the free region,
+                     * so actual free data = data_sz - obj_hdr_sz.              */
+                    printf("  obj[0] /* free space */ {\n");
+                    printf("    ref_cnt=%u64d\n", ref_cnt);
+                    printf("    free_space_total=%u64d\n", data_sz);
+                    var free_data_sz = 0UL;
+                    if (data_sz > obj_hdr_sz)
+                        free_data_sz = data_sz - obj_hdr_sz;
+                    printf("    free_data_bytes=%u64d\n", free_data_sz);
+                    printf("  }\n");
+                } else {
+                    printf("  obj[%u64d] {\n", idx);
+                    printf("    ref_cnt=%u64d\n", ref_cnt);
+                    printf("    data_size=%u64d\n", data_sz);
+                    if (data_sz > 0UL) {
+                        var data = byte[data_sz] @ (off + (pos + obj_hdr_sz)#B);
+                        printf("    data=%v\n", data);
+                    }
+                    printf("  }\n");
+                    obj_n = obj_n + 1UL;
                 }
-                printf("  }\n");
-                pos = pos + obj_hdr_sz + align8(data_sz);
-                obj_n = obj_n + 1UL;
+                pos = next;
             }
         }
     }

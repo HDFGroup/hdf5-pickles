@@ -1,0 +1,308 @@
+# An attribute's VALUE is stored inside its object-header message.  So when the
+# attribute's datatype is variable-length or a legacy dataset-region reference,
+# the global-heap ID it holds is METADATA -- located by this oracle's walker,
+# measured by it, and until this change never read.  Every field of the ID was
+# unbounded: collection address, object index, and (for a vlen) the sequence
+# length beside it.
+#
+# The premise that produced the gap was written down.  The forensic sweep's
+# rationale in h5_validate.pk said global-heap IDs "are only reached through
+# global-heap IDs in vlen/reference *data*, which this metadata-only oracle does
+# not decode".  True of a DATASET, whose descriptors are raw payload.  False of
+# an attribute -- and the attribute validator in the same codebase said so
+# outright ("attribute raw value bytes are embedded in metadata").  Two comments
+# in one repository contradicted each other and the specimen sat in the gap.
+#
+# Found by triaging a corpus specimen whose own advisory named the wrong
+# function AND overstated its severity; see `provenance`.  What made the gap
+# visible was the oracle-versus-library differential, not the library: current
+# libhdf5 rejects every one of these files cleanly, so any check that asked only
+# "does libhdf5 survive the specimen" scored the whole family as covered.
+schema_version: 1
+
+id: attribute-heap-id-unvalidated
+title: an attribute value's global-heap ID is metadata and was entirely
+  unvalidated -- address, object index and vlen sequence length all unbounded
+status: oracle-hardened          # h5policy now rejects; libhdf5 fixed at 1.14.4
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The upstream corpus
+  entry that led here is cited as provenance, not as classification.
+
+# -- Triage -------------------------------------------------------------------
+record: message_envelope
+versions: [1, 2, 3]              # attribute message versions
+root_cause_classification: reference_graph
+violated_invariant:
+  - attribute.heap_id_in_file
+  - attribute.global_heap_header
+  - attribute.global_heap_object
+  - attribute.heap_object_present
+  - attribute.heap_sequence_length
+validation_closure: >-
+  the attribute message payload -- name, datatype and dataspace sizes -- to
+  locate the value region and bound it; the resolved datatype for the descriptor
+  class, its reference sub-type and the file-determined stride; the dataspace for
+  the element count; and, per descriptor, one complete global heap collection
+  walked to its declared end.
+activation_before_validation:
+  - public_id                    # H5Aread hands the value to the caller
+entry_points:
+  - h5policy (oracle) -- untrusted-strict and forensic both accepted every case
+  - "libhdf5 H5HG_read (src/H5HG.c:548) via H5Aread"
+  - "libhdf5 H5HG_link / H5HG_get_obj_size / H5HG_remove, same guards"
+  - "direct consumer: h5dump -A"
+
+# -- The defect, read out of the source tree (HDF5 51b92ccee54) ---------------
+defect: >-
+  Two defects, one on each side, and they are independent.
+  ORACLE SIDE (this repository, now fixed): the attribute validator located the
+  value region -- `attr_data_size = msg_size - total` -- and bounded its size
+  against the profile, but never interpreted the bytes.  A vlen or region
+  reference descriptor is a bare global-heap ID, so the address could name
+  anything, the object index could be any of 2^32 values, and the vlen length
+  bore no relation to the object it claimed to describe.
+  LIBRARY SIDE (fixed upstream at 1.14.4, commit 136739b37a9): the index was
+  used to subscript heap->obj[] behind nothing but
+      assert(hobj->idx < heap->nused);
+      assert(heap->obj[hobj->idx].begin);
+  in H5HG_read, H5HG_link, H5HG_get_obj_size and H5HG_remove.  Asserts are
+  compiled out of every shipped Release build, so those builds indexed the array
+  with a file-supplied value.  The fix converts all four pairs into real errors.
+  THE TWO REGIMES DIFFER AND THE ADVISORY FOR THIS FAMILY CONFLATES THEM.
+  `nalloc` is derived from the collection SIZE, not from its contents:
+      nalloc = H5HG_NOBJS(f, heap->size);                  /* H5HGcache.c:265 */
+      heap->obj = H5FL_SEQ_CALLOC(H5HG_obj_t, nalloc);     /* zeroed */
+      heap->nused = max_idx + 1;                           /* :377 */
+  with H5HG_NOBJS(f, z) = (z - H5HG_SIZEOF_HDR(f)) / H5HG_SIZEOF_OBJHDR(f) + 2
+  (H5HGpkg.h:99), so a 4 KiB collection allocates 257 slots.  An index at or
+  above nused but BELOW nalloc therefore lands in a calloc'd zero slot: a pre-fix
+  Release build reads size 0 and begin NULL and copies nothing -- a NULL-derived
+  pointer, not an out-of-bounds read.  Only an index at or above nalloc reads
+  past the allocation and lets adjacent heap bytes become `size` and `begin`.
+  That is the heap buffer overflow, and it is NOT the regime the specimen that
+  started this occupied.  Both fixtures exist for that reason.
+
+shape_note: >-
+  The generalizable shape is a BOUNDARY COMMENT THAT OUTLIVED ITS BOUNDARY.
+  "This oracle is metadata-only, therefore X is out of scope" is sound only while
+  X really is outside metadata, and record-by-record that stops being true --
+  here because attribute values are inlined into the object header.  When a
+  scope-limiting comment names a CATEGORY of data rather than a record, look for
+  the record that smuggles that category into the other category.  The same
+  question is open for the other inlined-value regimes: a fill value and a
+  compact layout are also values living in metadata.
+
+# -- Fix ----------------------------------------------------------------------
+fix: >-
+  h5policy_validate_attr_heap_ids (h5_messages.pk), called from the attribute
+  payload validator once the datatype is resolved.  The collection walk is NOT
+  new code: h5policy_find_gheap_object -- previously
+  h5policy_vds_find_gheap_object -- was generalized with a client-role parameter
+  and now serves both metadata clients that can hold a global-heap ID.  The
+  role prefix in each message is what splits the family, via
+  registry/findings/routes/, because `record` selects the exact-build canary and
+  a VDS source open is not an attribute read.
+scope_note: >-
+  Deliberately covers only the two encodings that are a bare heap ID: class 9
+  (vlen, stride 4 + H5HG_HEAP_ID_SIZE(f)) and class 7 reference type 1 (legacy
+  dataset region, stride H5HG_HEAP_ID_SIZE(f)).  Reference type 0 is a plain
+  address with no heap.  See coverage_gaps for what that leaves.
+false_positive_surface: >-
+  Small, and the exemptions are format-sanctioned rather than judgement calls.
+  A zero collection address is the NULL-element encoding -- H5VL_BLOB_SETNULL
+  writes address 0 and H5VLnative_blob.c:162 reports such an element as null --
+  so address 0 and the all-ones undefined address are skipped, not flagged.
+  The stride comes from the FILE, not from the datatype message, because
+  H5T__vlen_set_loc and H5T__ref_set_loc overwrite the encoded element size at
+  read time; following the file's claim instead would stride wrongly on exactly
+  the files the datatype-size checks already reject.  The element count is
+  bounded against the value region before iterating, so an attribute whose
+  extent was computed from a rewritten datatype size cannot walk the oracle past
+  the message.  And the vlen length bound is the object's BYTE size -- the
+  base-size-one case -- because the base type is a nested datatype message this
+  validator does not decode; any real base size only makes the true limit
+  smaller, so the bound cannot over-reject.
+
+# -- Evidence -----------------------------------------------------------------
+oracle_before: accept, zero findings, in untrusted-strict, forensic and legacy
+oracle_after: reject_corrupt on all four fixtures
+libhdf5_behaviour: >-
+  Rejects every case cleanly on both local 2.3.0 builds -- Release baseline and
+  the AddressSanitizer candidate -- h5dump -A exiting 1 with no sanitizer report
+  and no crash.  So h5policy and libhdf5 now agree and no diff tolerance is
+  needed.  Before the fix the disagreement ran the other way on seven of eight
+  probed descriptor mutations, which is the measurement that established the gap.
+corpus_specimens_closed: >-
+  TWO upstream corpus specimens, not one.  The originating specimen is the
+  attribute object-index case.  A second, filed under a different identifier and
+  attributed to H5HG_read, is closed by the same invariant without any additional
+  work: its collection declares an object of size 0xfffffa0000000006 at offset
+  3464 -- over-long, overrunning the collection -- and that collection is reached
+  because it backs the file's attributes.  h5policy now reports reject_corrupt /
+  H5_CORRUPT_GLOBAL_HEAP_OBJECT at 3464 where it previously accepted; libhdf5
+  h5dump -A exits 1 on both builds with no sanitizer report, so the two agree.
+  Worth recording because it is independent evidence that the invariant is at the
+  right altitude: it was derived from one specimen and closed a second whose
+  malformed field is a different one.
+  A THIRD specimen, also attributed to H5HG_read, is NOT closed and correctly so
+  -- its malformed field is a revised reference's declared blob size in DATASET
+  raw data, outside the metadata boundary on one count and inside the
+  revised-reference gap on another.  See the note under
+  `coverage_gaps` about equality versus bounding.
+measured_variants: >-
+  Eight descriptor mutations were probed on the originating specimen: object
+  index 8 (first at nused), 11, 300 (past nalloc) and 2^32-1; collection address
+  naming a non-collection, past EOF, and zero; and a vlen length of 2^32-1.
+  h5policy accepted all eight before the fix and rejects seven after.  The
+  eighth, address zero, is the NULL encoding and is correctly accepted by both
+  h5policy and libhdf5 -- it was never a divergence.
+control_is_non_vacuous: >-
+  Three valid controls, each verified reachable rather than assumed.
+  valid/attr_heap_ids.h5 carries both a vlen and a region-reference attribute:
+  patching either descriptor's object index turns the file into reject_corrupt /
+  H5_CORRUPT_HEAP_OBJECT_MISSING, so neither stride is skipped.
+  valid/attr_vlen_array_heap_ids.h5 holds twelve IDs in one value region --
+  every other fixture is scalar, so before it the stride expression
+  `value_off + (i * width)` had never run for i > 0 and a wrong width would have
+  passed the whole suite; patching element FIVE is caught, at the byte offset
+  that element's descriptor occupies.
+  valid/attr_null_vlen_userblock.h5 guards the base-relative sentinel fix and is
+  confirmed by reverting that one line in an overlay.
+
+# -- A pre-existing bug this work exposed -------------------------------------
+exposed_defect: >-
+  Making the collection walker reachable from attribute values exposed a rule in
+  it that was BROADER THAN ITS OWN JUSTIFICATION.  The object-header test read
+      if (reserved != 0 || data_size == 0)   -> H5_CORRUPT_GLOBAL_HEAP_OBJECT
+  and the comment above it explained the index-0 case only: there the parse
+  advance IS the declared length, so zero means libhdf5 re-reads the same header
+  forever.  At any other index the advance is H5HG_SIZEOF_OBJHDR(f) +
+  H5HG_ALIGN(size), which is 16 even at size zero, so progress is guaranteed and
+  a zero length is not a defect.
+  It is not merely harmless: libhdf5 writes a size-ZERO heap object for an EMPTY
+  variable-length element.  `attrs["x"] = ""` produces collection object idx 1
+  with size 0, and h5dump -A exits 0 on it -- so the rule refused files libhdf5
+  had just written.  Latent while only a VDS layout reached the walker (a VDS
+  collection is unlikely to hold an unrelated empty vlen) and immediate once
+  attribute values did.  Narrowed to `data_size == 0 && idx == 0`.
+  Guard pair, and they must stay a pair: valid/attr_empty_vlen_heap_id.h5 (the
+  only fixture in the corpus with a legitimately zero-length heap object) and
+  malformed/bad_vds_gheap_free_zero_length.h5, whose zero-length object IS index
+  0 and must keep rejecting.
+  Shape worth reusing: when a shared decoder gains a second client, re-read every
+  rule in it against the NEW client's data, and check each rule against the
+  comment that justifies it -- this one had been correct-by-luck for as long as it
+  had a single caller.  Compare
+  registry/cases/global-heap-zero-progress-sentinel.yml, which is the same
+  function and the same branch asymmetry read the other way round.
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    REVISED REFERENCES (types 2, 3, 4) ARE NOT COVERED.  Their encoded blob is
+    not a bare heap ID, and no fixture expresses one in an attribute.
+  - >-
+    NESTED REGIMES ARE NOT COVERED: a vlen or region reference inside a compound
+    or an array datatype puts descriptors at member offsets this validator does
+    not compute.  A compound attribute with a vlen member is therefore still
+    accepted with an arbitrary heap ID, and that is the most likely place the
+    next instance of this gap lives.
+  - >-
+    THE SWEEP IS BOUNDED TWICE, and both bounds mean real descriptors go
+    unchecked: 64 IDs per attribute (H5_ATTR_HEAP_ID_SWEEP_LIMIT) and 64
+    collection WALKS per analysis (H5_GHEAP_WALK_BUDGET).  Neither is a modelled
+    property of the format; they are cost trades, and an ID past either bound is
+    accepted without validation.
+    The second bound exists because the first was not enough, which is worth
+    recording: a collection has no per-object access path, so a memo miss
+    re-parses the whole collection, and a file's vlen values do NOT all land in
+    one collection -- 4800 short strings fill about fifteen 4 KiB collections.
+    A per-descriptor caller striding across them thrashed a single-entry memo, so
+    bounding DESCRIPTORS did not bound the work.  Measured on a valid file with
+    60 vlen string attributes of 80 elements each: 0.8 s with the checks absent,
+    11.1 s with them and no memo -- which tripped the profile's wall-clock budget
+    and reported the file unsupported_coverage_gap, a FALSE POSITIVE on an
+    ordinary metadata-heavy file -- 3.5 s with the memo alone, and 1.8 s with the
+    memo plus the walk budget, accepting.  So the walk is the cost unit and the
+    budget counts walks.
+  - >-
+    NO TEST GUARDS THE DUPLICATE-REPORT DEDUP.  A malformed collection referenced
+    by many descriptors must be reported ONCE; before the failed-walk record it
+    was reported once per element (measured: 4 copies of
+    H5_CORRUPT_GLOBAL_HEAP_OBJECT at one offset under untrusted-strict, 7 under
+    forensic, on the corpus specimen described in corpus_specimens_closed).
+    The expectation model cannot express it: `required_findings` matches CODES, so
+    a regression to per-element reporting still lists the same code and passes.
+    `expected_metrics` has no finding count, and pinning `walk_operations` instead
+    would be brittle for the reason h5policy/tests/_check.py documents about
+    pinned literals -- it moves with any unrelated walk change.
+    Closing this properly means a finding-count metric in the report, which is a
+    change to a versioned schema and deserves its own decision; it was NOT made
+    here.
+  - >-
+    NO TEST GUARDS THE TIMING.  A fixture large enough to reproduce the quadratic
+    behaviour would have a load-dependent verdict, and this corpus already has
+    one fixture (valid/dense_links_deep.h5) that flips to
+    H5_UNSUPPORTED_WALK_TIME_BUDGET on a busy host.  The guard is the budget
+    constant plus the measurement above; a regression to per-descriptor walking
+    would be caught only by re-measuring.
+  - >-
+    THE VLEN LENGTH BOUND IS INCOMPLETE for base types wider than one byte, by
+    construction -- see false_positive_surface.  Sound, not tight.
+    MEASURED HOW MUCH WEAKER, 2026-08-24: libhdf5 requires EQUALITY, not a bound.
+    H5VL__native_blob_get calls H5HG_get_obj_size and refuses on
+    `hobj_size != size` ("Expected global heap object size does not match"), which
+    is what closes the revised-reference specimen described in
+    corpus_specimens_closed.  So the oracle admits every under-declared length
+    that libhdf5 refuses.  Tightening to equality needs the vlen base type's size,
+    which lives in a nested datatype message this validator does not decode -- so
+    it is a real gap with a known price, not an oversight.  An under-declaring
+    attribute fixture would be the case to add if that is ever done; the existing
+    fixture over-declares.
+  - >-
+    NO PRE-FIX LIBHDF5 BUILD WAS CONSTRUCTED.  The two-regime analysis above is
+    read out of the source, not measured, and neither fixture has been shown to
+    fault a vulnerable build.
+  - >-
+    No 32-bit measurement.  The index is a 4-byte field and every collection
+    advance is bounded, so no width dependence is expected, but none was run.
+  - >-
+    OUT OF SCOPE, NOTED WHILE HERE: the walker's own `align8(data_size)` can wrap
+    in uint<64>.  A declared length in [2^64-7, 2^64-1] makes (n + 7) wrap, so
+    align8 returns 0, the checked add of hdr_size + 0 does not trip, and the
+    object is accepted with a bogus enormous declared size.  This is the same
+    arithmetic the forensic sweep models at multiple widths via
+    h5policy_gcol_advance (see registry/cases/global-heap-zero-progress-sentinel.yml)
+    and the VDS/attribute walker does NOT.  Not touched here: it predates this
+    change, is unrelated to the attribute path, and deserves its own fixture.
+open_questions:
+  - >-
+    Do the other inlined-value regimes have the same gap?  A fill value and a
+    compact layout are also values stored in metadata; if either can carry a
+    vlen or reference element, its descriptors are in scope by the same argument
+    that put attributes in scope, and nothing validates them today.
+  - >-
+    Should the attribute canary be exercised so `verified` becomes measurable?
+    Both new expectations declare allowed_statuses [unexercised, verified]
+    because no attribute-read exercise exists for message_envelope; the status is
+    intent, not observation.
+
+provenance:
+  found_by: >-
+    triage of one upstream corpus specimen (a Keras model file byte-patched at a
+    single offset) during an evaluation of whether to integrate an external CVE
+    specimen corpus.  The specimen's own record named H5HG__cache_heap_deserialize
+    and described a heap buffer overflow with instruction-pointer corruption; the
+    cited fix commit actually changes H5HG.c, and the specimen's index lands
+    inside the allocation.  The label was wrong about the function and overstated
+    the impact, which is the reason this record classifies by violated invariant
+    and treats the upstream identifier as provenance only.
+  hdf5_build: >-
+    baseline HDF5 2.3.0 Release, settings_sha256
+    7ce6203229fbd356cbdbaab0e1b333c4319c0063743003226a9fb8d05f47819c; candidate
+    2.3.0 RelWithDebInfo with AddressSanitizer, settings_sha256
+    970f83354e89722436502d348e12c8a33ec783724c3f48adf2d7dd9ae081d219; source
+    audit against hdf5 51b92ccee54.  Workstation-local installs; paths not
+    recorded.
+  poke_version: GNU poke 4.3

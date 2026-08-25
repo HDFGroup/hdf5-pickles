@@ -40,9 +40,33 @@ type H5WalkContext = struct
     uint<64> datatype_size;
     uint<64> datatype_size_offset;
     uint<64> datatype_logical_size;
+    /* The datatype's CLASS, and for class 7 its reference sub-type.  Recorded
+       rather than re-read because a version-2+ attribute may hold its datatype
+       as a shared message, in which case the bytes at the attribute's own
+       datatype offset are a wrapper and not the payload -- so the only place
+       that reliably knows the class is the validator that resolved it.
+       H5_DTYPE_CLASS_NONE when no datatype has been validated yet.  */
+    uint<64> datatype_class;
+    uint<64> datatype_reference_type;
     uint<64> fill_value_size;
     uint<64> compact_layout_size;
     uint<64> contiguous_layout_size;
+    /* The stored size of a v3+ contiguous layout, recorded whether or not the
+       data address is defined -- unlike contiguous_layout_size, whose companion
+       flag deliberately means "allocated".  libhdf5 requires this field to equal
+       the computed extent on the COPY path even for an unallocated dataset, so
+       the equality advisory needs it in both cases.  */
+    uint<64> contiguous_stored_size;
+    uint<64> contiguous_stored_size_offset;
+    /* The contiguous data ADDRESS, kept so the finalize-time updater can bound
+       addr + (nelmts * datatype_size) the way H5D__contig_check does.  Undefined
+       (all ones) when there is no contiguous layout or no allocated data.  */
+    uint<64> contiguous_layout_addr;
+    /* Byte offset of the encoded address field, so the finalize-time finding
+       cites the same bytes the layout-time one did.  Also used as the finding's
+       location, which keeps it independent of the order the object header's
+       messages happen to appear in.  */
+    uint<64> contiguous_layout_addr_offset;
     uint<64> legacy_chunked_layout_ndims;
     uint<64> legacy_chunked_layout_ndims_offset;
     uint<64> chunk_dataset_element_count;
@@ -64,6 +88,11 @@ type H5WalkContext = struct
     uint<8> has_fill_value;
     uint<8> has_compact_layout;
     uint<8> has_contiguous_layout;
+    /* Set for any v3+ contiguous layout message, allocated or not.  Distinct
+       from has_contiguous_layout, which additionally requires a defined
+       address; keeping them separate is what stops the equality advisory from
+       inheriting the allocation gate.  */
+    uint<8> has_contiguous_stored_size;
     uint<8> has_legacy_chunked_layout;
     uint<8> has_chunked_layout;
     /* Group-shape message presence.  A group's link storage is declared by
@@ -87,6 +116,39 @@ type H5WalkContext = struct
    with many duplicate references still terminate under profile control.  */
 var h5policy_visited_ohdrs = uint<64>[]();
 var h5policy_visited_btrees = uint<64>[]();
+
+/* Local-heap segment ownership: parallel arrays of (prefix address, declared
+   data-segment address), one pair per local heap the walk has decoded.
+
+   A PAIR, not a set of segment addresses, and that is the whole design.  The
+   invariant is "no two DISTINCT prefixes claim one segment", so a repeat is a
+   violation only when the segment matches and the prefix does not.  Keying on
+   the segment alone would fire on every legitimate re-decode of the same heap
+   -- and re-decode happens: a shared (SOHM) external-file-list message is
+   decoded once per referencing object, and duplicate messages run their
+   validator twice.  Those all arrive with the SAME prefix address and must stay
+   silent.  Model shared here on datatype.member_name_unique, which is the same
+   "two positions, one value" shape.
+
+   Reset with the rest of the traversal state, which means the second reset (the
+   one at the top of h5policy_walk_reachable_metadata) discards anything decoded
+   before the reachable walk began.  That is deliberate and safe in one
+   direction only: dropping earlier pairs can cost a DETECTION, never invent
+   one, because a forgotten prefix simply re-registers.  The pre-walk window
+   holds only the root object header, which is a group and carries no
+   external-file-list heap, so nothing is lost today -- but a future caller that
+   decodes an EFL before the walk would silently lose its heap from this set. */
+var h5policy_lheap_prfx_addrs = uint<64>[]();
+var h5policy_lheap_seg_addrs = uint<64>[]();
+
+/* Ceiling on the ownership record, in the spirit of H5POLICY_MAX_REACHED: the
+   scan below is linear, so an unbounded set would add an O(N^2) term to the
+   walk budget and could push a large-but-valid file past max_walk_operations --
+   turning a detection into a verdict change on files this check is not about.
+   Past the cap, recording stops and aliases among later heaps go unreported.
+   A file with more than this many local heaps is already far outside anything
+   a conforming writer produces. */
+var H5POLICY_MAX_LHEAP_OWNERS = 4096UL;
 
 /* Continuation chunks are tracked as the [lo, hi) byte intervals they occupy,
    not as bare start addresses.  A start-address set can only reject a target
@@ -225,6 +287,44 @@ var h5policy_pipeline_decode_nelmts_offset = 0UL;
 var h5policy_pipeline_decode_size = 0UL;
 var h5policy_pipeline_has_decode_size = 0UB;
 var h5policy_pipeline_decode_size_offset = 0UL;
+/* The decoded extent a FILTERED FRACTAL-HEAP pipeline would produce, computed
+   from its client data alone -- never by running the transform.  Recorded only
+   under pipeline-capture mode 2 (a heap pipeline), so it can never mix with the
+   dataset chunk-consistency values above.
+   `filters` counts descriptors seen and `undecidable` latches when any filter's
+   output extent is NOT a function of its client data (deflate and szip are the
+   normal cases, and a pass-through branch counts too, since then the extent is
+   the INPUT length rather than a computable constant).  A consumer may use the
+   extent only when exactly one filter was seen and nothing latched: composing
+   extents across a chain is a separate slice, and guessing it in the strict
+   direction would reject valid files.  */
+var h5policy_heap_decode_extent = 0UL;
+var h5policy_heap_decode_extent_offset = 0UL;
+var h5policy_heap_decode_filters = 0UL;
+var h5policy_heap_decode_undecidable = 0UB;
+/* The pipeline's FIXED framing overhead: bytes a filter consumes from the
+   chunk's stored size before it looks at any data, and subtracts without a
+   floor.  Two core filters have one, both 4 bytes:
+     fletcher32 (3) -- `src_nbytes -= FLETCHER_LEN` (H5Zfletcher32.c:73), the
+       trailing checksum;
+     szip (4)       -- `nbytes - 4` (H5Zszip.c:298), after UINT32DECODE has
+       already read the leading uncompressed-size header off the same buffer.
+   A stored size below that framing wraps the subtraction to near SIZE_MAX.
+   Recorded here rather than compared in place because the pipeline message and
+   the chunk index arrive in either order; the comparison is at finalization,
+   where both are known.  Dataset path only, like the two above -- a filtered
+   fractal heap must not set a dataset's floor.  */
+var h5policy_pipeline_chunk_framing = 0UL;
+var h5policy_pipeline_has_framing = 0UB;
+var h5policy_pipeline_framing_offset = 0UL;
+/* The smallest stored size any chunk record in this object declared, and where.
+   The MINIMUM is the right summary: one undersized record is enough to reach
+   the wrap, so tracking the extreme keeps the state O(1) per object instead of
+   one entry per chunk.  Zero is excluded -- it is reported immediately by
+   h5policy_chunk_record_size_ok, which needs no pipeline context.  */
+var h5policy_chunk_min_stored = 0UL;
+var h5policy_chunk_min_stored_offset = 0UL;
+var h5policy_chunk_has_stored = 0UB;
 /* A fixed-array chunk index is pre-sized once, at creation, from the dataset's
    MAXIMUM extent: libhdf5 stores prod(ceil(max_dims[i] / chunk_dim[i])) in the
    FAHD header and never grows it.  Nothing on the read path checks the stored
@@ -265,6 +365,12 @@ fun h5policy_reset_traversal_state = void:
     /* Load-bearing: left set from a previous analysis this would make an
        unrelated address in the next file look like an extension alias. */
     h5policy_ext_ohdr_addr = 0xffffffffffffffffUL;
+    /* Same hazard, same reason: a segment address surviving from an earlier
+       file would make the next file's first local heap look like an alias of
+       it.  That is a false REJECT across the seam, which is worse than the
+       missed detection the other direction costs. */
+    h5policy_lheap_prfx_addrs = uint<64>[]();
+    h5policy_lheap_seg_addrs = uint<64>[]();
     h5policy_current_object_depth = 0UL;
     h5policy_current_object_msg_count = 0UL;
     h5policy_current_object_root_msg_count = 0UL;
@@ -299,12 +405,274 @@ fun h5policy_mark_visited_ohdr = (uint<64> addr) int:
     return 1;
 }
 
+/* Raw chunk data and file metadata must occupy disjoint bytes.  libhdf5's
+   allocator guarantees it on write -- raw data gets its own space -- but nothing
+   RE-checks it on read, so a chunk record whose address points into metadata is
+   served happily: the bytes come back as dataset values with no error at all.
+   MEASURED on an unfiltered chunked dataset (no checksum filter to notice):
+   pointing one chunk at offset 0 returns 0x46444889 and 0x0A1A0A0D as the first
+   two int32 values -- the file's own "\x89HDF\r\n\x1a\n" signature -- and
+   pointing it at a v1 B-tree node returns 0x45455254, "TREE".  h5dump exits 0.
+   So this is an arbitrary in-file read: any offset, returned as data, silently.
+   Not memory-unsafety and not a crash; wrong data always, and a read primitive
+   across a boundary wherever a consumer exposes some datasets of a file but not
+   all of its bytes.
+   The existing bound is only `addr + size <= file_size`, which every in-file
+   address satisfies -- which is why an address of 0 passed.
+
+   TWO REGISTRIES, because either can be seen first: the object graph is walked
+   breadth-first, so a chunk index may be read before or after the metadata its
+   records point at.  Each side scans the other's recorded extents, so the pair
+   is order-independent without a second pass over the file.
+
+   BOTH ARE HARD-CAPPED, and that is a deliberate trade.  The scans are linear
+   and charged to the walk budget, so an uncapped cross-product would scale with
+   file size and could push a large VALID file past max_walk_operations --
+   turning a detection into a verdict change on files this rule is not about.
+   With these caps the added cost is bounded by 512 * 1024 comparisons no matter
+   how big the file is: about 5% of the tightest profile's 10M budget.  Past a
+   cap, checking stops and the flag says so, exactly as H5POLICY_MAX_REACHED
+   does -- a reader must be able to tell "disjoint" from "we stopped looking".  */
+var h5policy_meta_lo = uint<64>[]();
+var h5policy_meta_hi = uint<64>[]();
+var h5policy_chunk_extent_lo = uint<64>[]();
+var h5policy_chunk_extent_hi = uint<64>[]();
+/* The layout role each recorded data extent came from, so the reverse-direction
+   report can name it.  Parallel to the two arrays above; without it a collision
+   found from the metadata side could not say whether it hit a chunk or a
+   contiguous extent, and the route shard would have nothing to split on.  */
+var h5policy_chunk_extent_what = string[]();
+/* The file offset of the RECORD that declared each extent.  It distinguishes
+   two genuinely different records that happen to name identical bytes -- a real
+   alias -- from the same record being decoded twice, which would otherwise
+   report itself as overlapping itself.  Node-level dedup (visited_btrees,
+   h5policy_ea_mark_block) and the once-per-analysis reset make a re-decode
+   unlikely, but "unlikely" is not a basis for a check that can reject a VALID
+   file, so the ambiguity is removed rather than argued away.  */
+var h5policy_chunk_extent_loc = uint<64>[]();
+/* h5policy_extents_truncated is declared in h5_findings.pk, not here: the JSON
+   report is printed from that file and it LOADS FIRST, so a flag declared here
+   would be invisible to the printer.  It lives with the other report-level
+   truncation flags for that reason. */
+var h5policy_chunk_extent_checks = 0UL;
+var H5POLICY_MAX_METADATA_EXTENTS = 512UL;
+var H5POLICY_MAX_CHUNK_EXTENT_CHECKS = 1024UL;
+
+/* Saturating end-of-extent: a decoded length can be adversarial, and an extent
+   that would wrap past the address space is clamped rather than wrapped so the
+   overlap test still sees a plausible interval instead of an inverted one.  */
+fun h5policy_extent_hi = (uint<64> lo, uint<64> bytes) uint<64>:
+{
+    if (bytes > 0xffffffffffffffffUL - lo)
+        return 0xffffffffffffffffUL;
+    return lo + bytes;
+}
+
+/* File-scoped, so reset ONCE per analysis from h5policy_analyze -- NOT from
+   h5policy_reset_traversal_state, which runs again when the reachable walk
+   starts and would discard the superblock's own extent, recorded before it.
+   That extent is the one the measured specimen needs.  */
+fun h5policy_reset_extents = void:
+{
+    h5policy_meta_lo = uint<64>[]();
+    h5policy_meta_hi = uint<64>[]();
+    h5policy_chunk_extent_lo = uint<64>[]();
+    h5policy_chunk_extent_hi = uint<64>[]();
+    h5policy_chunk_extent_what = string[]();
+    h5policy_chunk_extent_loc = uint<64>[]();
+    h5policy_extents_truncated = 0;
+    h5policy_chunk_extent_checks = 0UL;
+}
+
 /* Half-open interval overlap: [a_lo, a_hi) and [b_lo, b_hi) share a byte iff
    each starts strictly before the other ends.  Callers guarantee hi > lo. */
 fun h5policy_intervals_overlap = (uint<64> a_lo, uint<64> a_hi,
                                   uint<64> b_lo, uint<64> b_hi) int:
 {
     return (a_lo < b_hi && b_lo < a_hi) ? 1 : 0;
+}
+
+/* Two raw-data extents overlapping each other.  Separate emitter for the same
+   reason as the reverse-direction one: `what + suffix` with WHAT as parameter 0
+   is the shape tools/message_routing.py can enumerate.  */
+fun h5policy_report_data_over_data = (string what, off64 loc, string object,
+                                      uint<64> this_lo, uint<64> other_lo) void:
+{
+    h5policy_emit_error_ev(
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_DATA", "corrupt", loc, object,
+        what + " data extent overlaps another raw-data extent",
+        H5Evidence {
+            field = what + ".data_disjoint_from_data",
+            actual = this_lo,
+            expected = other_lo,
+            comparison = "not_equal",
+            has_loc1 = 1, loc1_role = "actual",
+            loc1 = loc, loc1_len = 8UL,
+        });
+}
+
+/* Raw-data side: does this data extent hit metadata already recorded?  Emits
+   and returns 0 on overlap.  Also records the extent so metadata read LATER can
+   catch the same collision from its own side.
+
+   WHAT names the layout that declared the extent -- "chunk" or "contiguous" --
+   and selects the record family through the finding's route shard, because the
+   two live in different families (chunk_index and dataset_layout_filter_fill)
+   while the invariant is one and the same.  COMPACT layout is deliberately
+   absent: its data is embedded in the layout message payload and bounded
+   against msg_size, so it has no independent extent to collide with anything.  */
+fun h5policy_data_extent_disjoint = (uint<64> addr, uint<64> size,
+                                     off64 loc, string object,
+                                     string what) int:
+{
+    if (size == 0UL)
+        return 1;
+    if (h5policy_chunk_extent_checks >= H5POLICY_MAX_CHUNK_EXTENT_CHECKS)
+        {
+            h5policy_extents_truncated = 1;
+            return 1;
+        }
+    h5policy_chunk_extent_checks = h5policy_chunk_extent_checks + 1UL;
+
+    var lo = addr;
+    var hi = h5policy_extent_hi(addr, size);
+    var n = h5policy_meta_lo'length as uint<64>;
+    h5policy_walk_tick(n + 1UL);
+    var i = 0UL;
+    while (i < n)
+        {
+            if (h5policy_intervals_overlap(lo, hi,
+                                           h5policy_meta_lo[i],
+                                           h5policy_meta_hi[i]))
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA", "corrupt",
+                        loc, object,
+                        what + " data extent overlaps file metadata",
+                        H5Evidence {
+                            field = what + ".data_disjoint_from_metadata",
+                            actual = lo,
+                            expected = h5policy_meta_hi[i],
+                            comparison = "at_least",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = loc, loc1_len = 8UL,
+                        });
+                    return 0;
+                }
+            i = i + 1UL;
+        }
+
+    /* Raw data must also be disjoint from OTHER raw data.  Two datasets sharing
+       bytes is not a feature HDF5 has: the allocator gives every chunk and every
+       contiguous extent its own space, so an overlap means one dataset serves
+       another's bytes.  MEASURED on two 25-element datasets whose chunks were
+       crossed -- /a's first chunk returned /b's values (222s where 111s belong)
+       and h5dump exited 0.  Same silent-wrong-answer character as the metadata
+       case, and a cross-DATASET read wherever a consumer exposes one dataset of
+       a file without exposing another.
+       Scanned against the extents recorded so far, which is the same list the
+       metadata side already keeps, so this costs one more capped linear pass and
+       nothing new is stored. */
+    var dn = h5policy_chunk_extent_lo'length as uint<64>;
+    h5policy_walk_tick(dn + 1UL);
+    var d = 0UL;
+    while (d < dn)
+        {
+            if (h5policy_intervals_overlap(lo, hi,
+                                           h5policy_chunk_extent_lo[d],
+                                           h5policy_chunk_extent_hi[d])
+                && h5policy_chunk_extent_loc[d] != (loc/#B) as uint<64>)
+                {
+                    h5policy_report_data_over_data(
+                        what, loc, object, lo, h5policy_chunk_extent_lo[d]);
+                    return 0;
+                }
+            d = d + 1UL;
+        }
+
+    if (h5policy_chunk_extent_lo'length as uint<64> < H5POLICY_MAX_CHUNK_EXTENT_CHECKS)
+        {
+            h5policy_chunk_extent_lo += [lo];
+            h5policy_chunk_extent_hi += [hi];
+            h5policy_chunk_extent_what += [what];
+            h5policy_chunk_extent_loc += [(loc/#B) as uint<64>];
+        }
+    else
+        h5policy_extents_truncated = 1;
+    return 1;
+}
+
+/* The reverse-direction report, extracted so its message is `what + suffix`
+   with WHAT as parameter 0 -- the shape tools/message_routing.py can analyse.
+   Composed inline it was UNANALYZABLE, and an unroutable message is invisible to
+   check_registry rather than merely ugly.  The role leads both phrasings for the
+   same reason.  */
+fun h5policy_report_data_overlapped = (string what, off64 loc, string object,
+                                       uint<64> data_lo, uint<64> meta_hi) void:
+{
+    h5policy_emit_error_ev(
+        "H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA", "corrupt", loc, object,
+        what + " data extent is overlapped by file metadata read later",
+        H5Evidence {
+            field = what + ".data_disjoint_from_metadata",
+            actual = data_lo,
+            expected = meta_hi,
+            comparison = "at_least",
+            has_loc1 = 1, loc1_role = "actual",
+            loc1 = loc, loc1_len = 8UL,
+        });
+}
+
+/* Metadata side: record this structure's extent, and catch a chunk recorded
+   EARLIER that lands inside it.  Called from h5policy_account_metadata, so
+   every structure already charged against the metadata budget is covered --
+   the superblock and both object-header versions among them.  */
+fun h5policy_record_metadata_extent = (uint<64> lo, uint<64> bytes,
+                                       off64 loc, string object) void:
+{
+    if (bytes == 0UL)
+        return;
+    var hi = h5policy_extent_hi(lo, bytes);
+
+    var n = h5policy_chunk_extent_lo'length as uint<64>;
+    h5policy_walk_tick(n + 1UL);
+    var i = 0UL;
+    while (i < n)
+        {
+            if (h5policy_intervals_overlap(lo, hi,
+                                           h5policy_chunk_extent_lo[i],
+                                           h5policy_chunk_extent_hi[i]))
+                {
+                    /* Reported at the METADATA, because that is what this call
+                       site can name; the chunk that collides with it was read
+                       earlier and its own record is already past.  */
+                    /* The role is passed as a LITERAL from each branch rather
+                       than as the array element, so tools/message_routing.py can
+                       enumerate both messages: it resolves a composing helper's
+                       `what` from the call site, and an array subscript is not
+                       something it can evaluate.  Two branches for two roles is
+                       the honest cost of keeping the message routable -- an
+                       unroutable message names no record family at all.  */
+                    if (h5policy_chunk_extent_what[i] == "contiguous")
+                        h5policy_report_data_overlapped(
+                            "contiguous", loc, object,
+                            h5policy_chunk_extent_lo[i], hi);
+                    else
+                        h5policy_report_data_overlapped(
+                            "chunk", loc, object,
+                            h5policy_chunk_extent_lo[i], hi);
+                    return;
+                }
+            i = i + 1UL;
+        }
+
+    if (h5policy_meta_lo'length as uint<64> >= H5POLICY_MAX_METADATA_EXTENTS)
+        {
+            h5policy_extents_truncated = 1;
+            return;
+        }
+    h5policy_meta_lo += [lo];
+    h5policy_meta_hi += [hi];
 }
 
 /* Classify a continuation target interval [tgt_lo, tgt_hi) against the source
@@ -423,9 +791,15 @@ fun h5policy_new_walk_context = H5WalkContext:
         datatype_size = 0UL,
         datatype_size_offset = 0UL,
         datatype_logical_size = 0UL,
+        datatype_class = H5_DTYPE_CLASS_NONE,
+        datatype_reference_type = 0UL,
         fill_value_size = 0UL,
         compact_layout_size = 0UL,
         contiguous_layout_size = 0UL,
+        contiguous_stored_size = 0UL,
+        contiguous_stored_size_offset = 0UL,
+        contiguous_layout_addr = 0xffffffffffffffffUL,
+        contiguous_layout_addr_offset = 0UL,
         legacy_chunked_layout_ndims = 0UL,
         legacy_chunked_layout_ndims_offset = 0UL,
         chunk_dataset_element_count = 0UL,
@@ -441,6 +815,7 @@ fun h5policy_new_walk_context = H5WalkContext:
         has_fill_value = 0UB,
         has_compact_layout = 0UB,
         has_contiguous_layout = 0UB,
+        has_contiguous_stored_size = 0UB,
         has_legacy_chunked_layout = 0UB,
         has_chunked_layout = 0UB,
         has_link_info = 0UB,
@@ -490,6 +865,10 @@ fun h5policy_account_metadata = (H5WalkContext ctx,
     ctx.metadata_seen = next;
     if (exceeds)
         ctx.metadata_count_exceeded = 1UB;
+    /* Every accounted structure is also a metadata EXTENT.  Recording it here
+       rather than at 22 call sites is the whole reason this check was cheap:
+       each caller already passes both the byte count and the location.  */
+    h5policy_record_metadata_extent(loc/#B, bytes, loc, object);
     return ctx;
 }
 
@@ -875,7 +1254,8 @@ fun h5policy_update_chunk_resource_pressure = (H5WalkContext ctx,
    messages can arrive in any object-header order, so every validator calls back
    here after updating its part of ctx.  The function is idempotent and only
    emits checks whose prerequisites have been seen.  */
-fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
+fun h5policy_update_logical_dataset_size = (int ios,
+                                            H5WalkContext ctx,
                                             H5PolicyProfile profile,
                                             off64 loc,
                                             string object) H5WalkContext:
@@ -943,6 +1323,117 @@ fun h5policy_update_logical_dataset_size = (H5WalkContext ctx,
                 h5policy_emit_error("H5_CORRUPT_CONTIGUOUS_LAYOUT_SIZE_MISMATCH",
                                     "corrupt", loc, object,
                                     "contiguous layout data size does not match the dataspace and datatype");
+
+            /* THE SAME FIELD, THE EXACT RULE, AS A WARNING.  The bound above is
+               deliberately loose -- zero versus nonzero -- because on the READ
+               path libhdf5 ignores the stored size entirely: H5D__contig_check
+               recomputes nelmts * dt_size and bounds only that, so inflating the
+               stored field leaves the library opening the dataset and returning
+               every correct value.  Demanding equality as CORRUPTION would be a
+               live invariant-A false positive, and this repository has already
+               made and measured that mistake on this field.
+
+               But libhdf5 does demand equality, on the COPY path, for layout
+               version 3 and later:
+
+                   if (layout_dst->storage.u.contig.size != (nelmts * dt_size))
+                       HGOTO_ERROR(... "invalid layout storage size ")
+
+               added to H5O__layout_copy_file by the same upstream change that
+               closed the h5repack overflow this rule comes from.  h5repack and
+               H5Ocopy reach it; an ordinary open does not.  So the condition is
+               real, statically decidable, and write-path-fatal only -- which is
+               precisely the shape that must stay a warning rather than become a
+               rejection.
+
+               The version gate needs no test of its own: has_contiguous_stored_size
+               is set only by h5policy_check_contiguous_extent, which the v1/v2
+               branch deliberately never calls, because libhdf5 RECOMPUTES the
+               stored size for those versions (H5Dcontig.c:536-551) and an
+               equality rule there would be a fresh false positive in the other
+               direction.
+
+               Both sizes must be nonzero: the zero-versus-nonzero disagreement is
+               already reported as corruption just above, and repeating it as a
+               warning would put two findings on one defect.  */
+            if (ctx.has_dataset_layout != 0UB
+                && ctx.has_contiguous_stored_size != 0UB
+                && ctx.contiguous_stored_size != 0UL
+                && storage_dataset_bytes != 0UL
+                && ctx.contiguous_stored_size != storage_dataset_bytes)
+                h5policy_emit_warning_ev(
+                    "H5_ADVISORY_CONTIGUOUS_STORED_SIZE_MISMATCH",
+                    ctx.contiguous_stored_size_offset#B, object,
+                    "contiguous layout stored size does not equal the computed extent",
+                    H5Evidence {
+                        field = "layout.contiguous_stored_size",
+                        actual = ctx.contiguous_stored_size,
+                        expected = storage_dataset_bytes,
+                        comparison = "equal",
+                        has_loc1 = 1, loc1_role = "actual",
+                        loc1 = ctx.contiguous_stored_size_offset#B,
+                        loc1_len = global_sizeof_lengths as uint<64>,
+                    });
+
+            /* THE EXTENT libhdf5 ENFORCES IS THE COMPUTED ONE, NOT THE STORED
+               ONE.  H5D__contig_check recomputes data_size = nelmts * dt_size
+               from the dataspace extent and the datatype and bounds THAT
+               against the raw-data EOA (H5Dcontig.c:391-411); it never compares
+               the size field the layout message carries.  So a layout whose
+               stored size is perfectly in-file can still name an extent that
+               runs off the end once the real element count is applied -- which
+               is exactly the corpus specimen here: stored size 320 at address
+               1016 in a 2072-byte file, while the dataspace says 65546 elements
+               of a 32-byte datatype, so libhdf5 computes 2097472 and refuses
+               the open.  h5policy bounded only the stored size and accepted it.
+
+               dt_size IS THE RAW ON-DISK SIZE, hence ctx.datatype_size and not
+               ctx.datatype_logical_size.  H5D__contig_init passes
+               dset->shared->type (H5Dcontig.c:528), the FILE datatype at
+               H5T_LOC_DISK, so the H5R_REF_BUF_SIZE (64) substitution in
+               H5Tref.c has not been applied.  MEASURED against libhdf5 2.3.0 on
+               a contiguous H5T_STD_REF dataset: on-disk element size 18,
+               8 elements at address 2048 with EOA 2192, so the raw product fits
+               exactly (2192) while the logical product would overrun (2560) --
+               and the library opens the file.  Using the logical size here would
+               reject a valid libhdf5-written file, and no h5py-built fixture
+               could catch it, because h5py writes only old-style 8-byte object
+               references where the two sizes coincide.
+
+               Both bounds mirror the source: the wrap test is H5Dcontig.c:408
+               and the ceiling test is :411, and both sit behind libhdf5's
+               H5_addr_defined guard at :399 -- an unallocated dataset has no
+               extent to check.  Same code and message as the stored-size bound
+               in h5policy_check_contiguous_extent, because it is the same
+               address-space invariant reached with the right quantity.  */
+            /* Gated on the ADDRESS alone, deliberately not on
+               has_contiguous_layout: that flag means "a v3+ contiguous message
+               with a stored size", which is what the size-mismatch check above
+               needs, whereas this bound needs only an allocated address and
+               applies to v1/v2 as well -- where libhdf5 discards the stored size
+               entirely (H5Dcontig.c:536-551) and the computed extent is the only
+               one there is.  */
+            if (ctx.has_dataset_layout != 0UB
+                && ctx.contiguous_layout_addr != 0xffffffffffffffffUL
+                && storage_dataset_bytes != 0UL)
+                {
+                    /* Reuses the shared range helper so the code, the message and
+                       the evidence block are identical to the layout-time bound
+                       this replaces -- only the SIZE differs, which is the whole
+                       point.  It also gives libhdf5's two branches for free:
+                       start-past-ceiling maps to H5Dcontig.c:409 and the range
+                       overflow to :411, and `size > file_size - start` after the
+                       start bound cannot itself wrap.  */
+                    var ignored =
+                        h5policy_checked_addr_range_at(ctx.contiguous_layout_addr,
+                                                       storage_dataset_bytes,
+                                                       h5policy_ceiling(ios),
+                                                       "contiguous data range outside file",
+                                                       ctx.contiguous_layout_addr_offset#B,
+                                                       object,
+                                                       ctx.contiguous_layout_addr_offset,
+                                                       global_sizeof_offsets as uint<64>);
+                }
         }
 
     return ctx;

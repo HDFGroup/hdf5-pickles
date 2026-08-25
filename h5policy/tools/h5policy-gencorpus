@@ -204,6 +204,20 @@ def _gen_valid(root):
     _write(simple_path,
            lambda h: h.create_dataset("a", data=np.arange(6, dtype="i4")))
     _write_cache_image(f"{root}/valid/cache_image.h5")
+    _make_attr_null_vlen_userblock(f"{root}/valid/attr_null_vlen_userblock.h5")
+    _make_contig_unalloc_size_mismatch(
+        f"{root}/valid/contig_unalloc_size_mismatch.h5")
+    _make_attr_vlen_array_heap_ids(f"{root}/valid/attr_vlen_array_heap_ids.h5")
+    _make_attr_empty_vlen_heap_id(f"{root}/valid/attr_empty_vlen_heap_id.h5")
+    # The control for the attribute heap-ID invariants: a vlen string attribute
+    # and a legacy dataset-region-reference attribute, both of which store a
+    # global-heap ID in the object-header message.  Their whole point is to be
+    # ACCEPTED -- the checks in h5policy_validate_attr_heap_ids walk a real
+    # collection here, so a bound stated one step too tight shows up as this
+    # fixture failing rather than as silence.  Without it the new rules could
+    # pass the suite while never resolving a valid ID at all.
+    _patch(f"{root}/valid/attr_heap_ids.h5",
+           bytes(_attr_heap_ids_valid_bytes()))
     # Extra physical bytes after the superblock's declared EOA are legal and
     # remain outside the metadata address space.  This fixture pins geometry
     # reporting without turning a trailer into a corruption finding.
@@ -219,6 +233,14 @@ def _gen_valid(root):
                          maxshape=(None,), chunks=(8,))
     _write_userblock(f"{root}/valid/userblock_latest.h5", "latest",
                      _userblock_content)
+    # Chunked + user block: the control for chunk.data_disjoint_from_metadata at
+    # a nonzero base address, and the base file its malformed sibling is patched
+    # from.  userblock_earliest.h5 below has a chunked dataset too, but this one
+    # exists so the pair differs by exactly one address field.
+    _write_userblock(f"{root}/valid/userblock_chunked.h5", "earliest",
+                     lambda h: h.create_dataset(
+                         "d", data=np.arange(100, dtype="i4").reshape(10, 10),
+                         chunks=(5, 5)))
     _write_userblock(f"{root}/valid/userblock_earliest.h5", "earliest",
                      _userblock_content)
     # A user block and a cache image together.  The image records the address of
@@ -526,8 +548,34 @@ def _gen_resource(root):
     # An orphaned global heap collection whose free-space object has a zero
     # length -> libhdf5's H5HG deserialize loops forever.  The forensic GCOL
     # signature sweep flags it as a resource (DoS) hazard.
-    _make_gheap_infinite_loop(f"{root}/resource/gheap_infinite_loop.h5",
-                              f"{root}/valid/empty.h5")
+    _make_gheap_collection(f"{root}/resource/gheap_infinite_loop.h5",
+                           f"{root}/valid/empty.h5", index=0, length=0)
+    # The same non-termination through the OTHER branch of that loop: a normal
+    # object (index > 0) whose declared length makes the unchecked size_t sum
+    # `H5HG_SIZEOF_OBJHDR(f) + H5HG_ALIGN(size)` wrap to zero.  That length was
+    # measured to hang both a release and an AddressSanitizer build of libhdf5
+    # 2.3.0 -- on a REACHABLE carrier; this fixture is orphaned like its sentinel
+    # sibling, so it exercises the sweep rather than the read path.  The pair
+    # matters: the sentinel fixture alone leaves the impression that only the
+    # index-0 branch can fail to advance.
+    _make_gheap_collection(f"{root}/resource/gheap_need_wrap_zero.h5",
+                           f"{root}/valid/empty.h5",
+                           index=1, length=2 ** 64 - 16)
+    # The same wrap one width down: 2**32-16 gives need == 0 only where size_t
+    # is 32 bits.  A 64-bit reader rejects these bytes cleanly (measured), so
+    # this fixture is what distinguishes a width-parametric progress check from
+    # a 64-bit-only one.
+    _make_gheap_collection(f"{root}/resource/gheap_need_wrap_zero_ilp32.h5",
+                           f"{root}/valid/empty.h5",
+                           index=1, length=2 ** 32 - 16)
+    # The adjacent CONTROL, one below the eight-value wrap window at either
+    # width: need is huge instead of zero, so the collection overruns and
+    # libhdf5 errors cleanly rather than looping.  It must stay `accept` --
+    # this is the false-positive guard on the two fixtures above, and the
+    # reason the sweep returns silently on an overrun at all.
+    _make_gheap_collection(f"{root}/resource/gheap_need_wrap_below.h5",
+                           f"{root}/valid/empty.h5",
+                           index=1, length=2 ** 64 - 24)
 
     # Old-style (pre-1.8) groups: root and nested groups stored via a symbol
     # table -> v1 B-tree -> SNOD -> local heap.  Exercises that traversal, with
@@ -538,6 +586,33 @@ def _gen_resource(root):
         g.create_dataset("beta", data=np.arange(6, dtype="i4"))
         h.create_dataset("top", data=np.arange(3, dtype="i4"))
     _write_earliest(f"{root}/valid/old_style_group.h5", _old_style)
+
+    # Control for heap.local_data_segment_unique: two SIBLING symbol-table
+    # groups, so the file carries three local heaps (root plus one each) that
+    # correctly own three distinct data segments.  old_style_group.h5 above has
+    # two heaps and would nearly do, but the malformed fixture is derived from
+    # this file so the pair differs by exactly the aliased field -- and a
+    # sibling pair is the shape the alias needs, since the mutation points both
+    # group prefixes at one segment.
+    def _two_stab_groups(h):
+        g1 = h.create_group("g1")
+        g1.create_dataset("a", data=np.arange(3, dtype="i4"))
+        g2 = h.create_group("g2")
+        g2.create_dataset("b", data=np.arange(3, dtype="i4"))
+    _write_earliest(f"{root}/valid/two_symbol_table_groups.h5", _two_stab_groups)
+
+    # Control for envelope.symbol_table_addresses_defined: an old-style file
+    # holding ONLY the root group.  It carries a symbol-table message with both
+    # addresses DEFINED, a local heap and a v1 B-tree -- but no SNOD at all,
+    # because no link has been inserted yet.  Verified: b"SNOD" is absent while
+    # b"HEAP" and b"TREE" are present.
+    #
+    # THE REGIME NO OTHER VALID FIXTURE EXPRESSES.  Every other old-style
+    # control has at least one member and therefore a SNOD, so none of them can
+    # tell "this group has no symbol-table NODE yet" apart from "this group's
+    # symbol-table ADDRESSES are undefined".  A future tightening that demanded a
+    # reachable SNOD would pass the whole corpus and reject this file.
+    _write_earliest(f"{root}/valid/old_style_root_only.h5", lambda h: None)
     # Structurally sound, deliberately not `accept`: see _make_drvinfo_block.
     _make_drvinfo_block(f"{root}/valid/drvinfo_block.h5")
 
@@ -547,6 +622,17 @@ def _gen_resource(root):
                     lambda h: h.create_dataset(
                         "d", data=np.arange(100, dtype="i4").reshape(10, 10),
                         chunks=(5, 5)))
+
+    # Control for chunk.stored_size on the LEGACY index, and the base file the
+    # zero-size fixture is patched from.  fletcher32 is deliberate: it is the
+    # filter whose fixed-overhead subtraction turns a zero stored size into a
+    # wrap (H5Zfletcher32.c:73), so the pair carries the crash consequence and
+    # not just the rule.  chunked_v1_btree.h5 above covers the unfiltered v1
+    # path; this one adds the filtered element layout.
+    _write_earliest(f"{root}/valid/chunk_v1_btree_fletcher.h5",
+                    lambda h: h.create_dataset(
+                        "d", data=np.arange(100, dtype="i4").reshape(10, 10),
+                        chunks=(5, 5), fletcher32=True))
 
     # A multi-level legacy chunk index.  A v1 B-tree node holds at most 2*K
     # entries (64 with the generated superblock's indexed-storage K), so 130
@@ -670,6 +756,20 @@ def _gen_resource(root):
         d = h.create_dataset("d", shape=(2000,), chunks=(1,), dtype="i4")
         d[:] = np.arange(2000)
     _write(f"{root}/valid/chunk_fixed_array_paged.h5", _paged)
+
+    # REGRESSION GUARD for a bug that rejected VALID files.  A paged fixed-array
+    # data block whose last page is SHORT: 1200 elements over 1024-element pages
+    # leaves 176 in the second page.  h5policy used to charge every page as full,
+    # over-estimating the block by (1024-176)*8 bytes, and when that ran past EOF
+    # it reported H5_CORRUPT_LENGTH_OVERFLOW ("fixed array paged data block
+    # outside file") on a file libhdf5 reads without complaint.
+    # chunk_fixed_array_paged.h5 above has 2000 elements and did NOT catch it --
+    # its over-count happened to fit inside its larger file, which is exactly how
+    # the bug survived.  The element count here is chosen so it does not.
+    def _partial_last_page(h):
+        d = h.create_dataset("d", shape=(1200,), chunks=(1,), dtype="i4")
+        d[:] = np.arange(1200)
+    _write(f"{root}/valid/chunk_fixed_array_partial_page.h5", _partial_last_page)
 
     # Implicit chunk index (v4 index type 2): fixed dims + early allocation, so
     # chunks are contiguous from a base address with no index structure.
@@ -1191,8 +1291,36 @@ def _gen_malformed(root):
         f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
     _make_scaleoffset_size_mismatch(
         f"{root}/malformed/scaleoffset_size_mismatch.h5")
-    _make_chunk_size_uint32_wrap(
-        f"{root}/malformed/chunk_size_uint32_wrap.h5")
+    # The chunk-size matrix.  A chunk above 4 GiB is format-legal and, since
+    # libhdf5 2.0.0, writable, so what it means depends on the layout version
+    # and the chunk index type -- and the arithmetic fault that actually
+    # threatens memory safety is the 64-bit product wrap, not the 32-bit one.
+    # These five fixtures pin one cell each.  See
+    # registry/cases/chunk-dim-product-64bit-overflow.yml.
+    _make_layout_version(f"{root}/valid/chunk_4gib_layout_v5.h5",
+                         _layout_chunk_enc4_1d, 5, _layout_chunk_dim_4gib)
+    _make_layout_version(f"{root}/policy/chunk_4gib_layout_v4.h5",
+                         _layout_chunk_enc4_1d, 4, _layout_chunk_dim_4gib)
+    _make_chunk_4gib_v1_btree(
+        f"{root}/malformed/chunk_4gib_v1_btree_index.h5")
+    _make_layout_version(f"{root}/malformed/chunk_dim_product_wrap_v4.h5",
+                         _layout_chunk_enc4_2d, 4, _layout_chunk_dim_product_wrap)
+    # The same wrap at the version in which a large chunk is legitimate: a fix
+    # that only gated the 32-bit bound on the layout version would accept this.
+    _make_layout_version(f"{root}/malformed/chunk_dim_product_wrap_v5.h5",
+                         _layout_chunk_enc4_2d, 5, _layout_chunk_dim_product_wrap)
+    # The Single Chunk index keeps no records, so its one raw-data extent was
+    # the only one that never reached the data/metadata disjointness check.
+    _make_single_chunk_over_metadata(
+        f"{root}/malformed/single_chunk_over_metadata.h5",
+        lambda h: h.create_dataset(
+            "d", data=np.arange(24, dtype="i4").reshape(4, 6), chunks=(4, 6)),
+        False)
+    # The filtered form, whose size and filter mask precede the address: this
+    # one pins the address offset as well as the extent rule.
+    _make_single_chunk_over_metadata(
+        f"{root}/malformed/single_chunk_filtered_over_metadata.h5",
+        _layout_v5_single_filtered, True)
     # Layout version 6 does not exist: H5O_LAYOUT_VERSION_LATEST is 5.  Guards
     # the upper end of the version gate that was widened to admit v5.
     _make_layout_version(f"{root}/malformed/layout_unsupported_version.h5",
@@ -1222,10 +1350,67 @@ def _gen_malformed(root):
     _make_bad_snod_cache_type(f"{root}/malformed/bad_snod_cache_type.h5")
     _make_bad_snod_version(f"{root}/malformed/bad_snod_version.h5")
     _make_bad_snod_empty_name(f"{root}/malformed/bad_snod_empty_name.h5")
+    _make_softlink_empty_name(f"{root}/malformed/softlink_empty_name.h5")
+    _make_softlink_name_offset_oob(
+        f"{root}/malformed/softlink_name_offset_oob.h5")
+    _make_softlink_value_offset_oob(
+        f"{root}/malformed/softlink_value_offset_oob.h5")
+    _make_stab_heap_addr_undefined(
+        f"{root}/malformed/stab_heap_addr_undefined.h5")
+    _make_stab_btree_addr_undefined(
+        f"{root}/malformed/stab_btree_addr_undefined.h5")
+    _make_layout_virtual_version_v3(
+        f"{root}/malformed/layout_virtual_version_v3.h5")
+    _make_layout_virtual_version_v1(
+        f"{root}/malformed/layout_virtual_version_v1.h5")
+    _make_contiguous_computed_extent_past_eof(
+        f"{root}/malformed/contiguous_computed_extent_past_eof.h5")
+    _make_contiguous_v1_computed_extent_past_eof(
+        f"{root}/malformed/contiguous_v1_computed_extent_past_eof.h5")
+    _make_contiguous_stored_size_past_eof(
+        f"{root}/valid/contiguous_stored_size_past_eof.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_heap_free_list_size_wrap(
         f"{root}/malformed/heap_free_list_size_wrap.h5")
+    _make_lheap_data_segment_alias(
+        f"{root}/malformed/lheap_data_segment_alias.h5",
+        f"{root}/valid/two_symbol_table_groups.h5")
+    _make_chunk_zero_stored_size(
+        f"{root}/malformed/chunk_zero_stored_size.h5",
+        f"{root}/valid/chunk_v1_btree_fletcher.h5")
+    _make_chunk_stored_size_below_framing(
+        f"{root}/malformed/chunk_stored_size_below_framing.h5",
+        f"{root}/valid/chunk_v1_btree_fletcher.h5")
+    _make_chunk_data_over_metadata(
+        f"{root}/malformed/chunk_data_over_metadata.h5",
+        f"{root}/valid/chunked_v1_btree.h5")
+    # The SAME defect behind a 512-byte user block, because this check compares
+    # two address spaces and getting one of them wrong is a user-block-ONLY bug
+    # -- invisible at base 0, which is where every other fixture sits.
+    _make_chunk_data_over_metadata(
+        f"{root}/malformed/chunk_data_over_metadata_userblock.h5",
+        f"{root}/valid/userblock_chunked.h5")
+    _make_chunk_duplicate_key_offset(
+        f"{root}/malformed/chunk_duplicate_key_offset.h5",
+        f"{root}/valid/chunked_v1_btree.h5")
+    _make_chunk_internal_separator_order(
+        f"{root}/malformed/chunk_internal_separator_order.h5",
+        f"{root}/valid/chunked_v1_btree_deep.h5")
+    _make_compound_member_overlap(
+        f"{root}/malformed/compound_member_overlap.h5")
+    _make_contiguous_data_over_metadata(
+        f"{root}/malformed/contiguous_data_over_metadata.h5")
+    _make_fixed_array_paged_element_over_metadata(
+        f"{root}/malformed/fixed_array_paged_element_over_metadata.h5")
+    _make_chunk_data_over_other_dataset(
+        f"{root}/malformed/chunk_data_over_other_dataset.h5")
+    _make_fsm_section_relative_addr(
+        f"{root}/malformed/fsm_section_relative_addr.h5")
+    _make_scaleoffset_param_count(
+        f"{root}/malformed/scaleoffset_param_count.h5")
+    _make_nbit_param_count(
+        f"{root}/malformed/nbit_param_count.h5")
     _make_bad_message_flag_combination(
         f"{root}/malformed/bad_message_flag_combination.h5")
     _make_bad_link_info_max_corder(
@@ -1307,11 +1492,37 @@ def _gen_malformed(root):
     _make_bad_sohm_huge_object_extent(
         f"{root}/malformed/bad_sohm_huge_object_extent.h5",
         f"{root}/coverage/sohm_huge_btree.h5")
+    # The control lives under coverage/, not valid/: a FILTERED SOHM heap can
+    # never reach `accept`, because resolving a shared message out of it would
+    # mean running the filter, which the oracle refuses by design.  Its job is
+    # to prove the decoded-size check is pinned to the format rule rather than
+    # to the fixture -- the finding must be ABSENT here.
+    _make_sohm_filtered_huge(
+        f"{root}/coverage/sohm_filtered_huge.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
+    _make_sohm_filtered_huge_below_managed_max(
+        f"{root}/malformed/sohm_filtered_huge_below_managed_max.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
+    _make_sohm_filtered_huge_decoded_size_mismatch(
+        f"{root}/malformed/sohm_filtered_huge_decoded_size_mismatch.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
+    _make_sohm_filtered_huge_undecidable_pipeline(
+        f"{root}/coverage/sohm_filtered_huge_undecidable.h5",
+        f"{root}/coverage/sohm_huge_btree.h5")
     _make_bad_fsm_section_list_checksum(
         f"{root}/malformed/bad_fsm_section_list_checksum.h5",
         f"{root}/valid/fsm_persist.h5")
     _make_bad_fsm_section_extent(
         f"{root}/malformed/bad_fsm_section_extent.h5",
+        f"{root}/valid/fsm_persist.h5")
+    _make_dense_name_hash_order(
+        f"{root}/malformed/dense_link_name_hash_order.h5",
+        f"{root}/valid/dense_links.h5", 5, 0)
+    _make_dense_name_hash_order(
+        f"{root}/malformed/dense_attr_name_hash_order.h5",
+        f"{root}/valid/dense_attribute.h5", 8, 13)
+    _make_bad_fsm_class_count(
+        f"{root}/malformed/bad_fsm_class_count.h5",
         f"{root}/valid/fsm_persist.h5")
     _make_bad_fsm_section_type(
         f"{root}/malformed/bad_fsm_section_type.h5",
@@ -1432,6 +1643,14 @@ def _gen_malformed(root):
         f"{root}/malformed/attr_reference_size_under.h5")
     _make_attr_vlen_size_under(
         f"{root}/malformed/attr_vlen_size_under.h5")
+    _make_attr_vlen_heap_idx_missing(
+        f"{root}/malformed/attr_vlen_heap_idx_missing.h5")
+    _make_attr_vlen_heap_idx_past_nalloc(
+        f"{root}/malformed/attr_vlen_heap_idx_past_nalloc.h5")
+    _make_attr_vlen_heap_addr_out_of_file(
+        f"{root}/malformed/attr_vlen_heap_addr_out_of_file.h5")
+    _make_attr_vlen_heap_seq_len_over(
+        f"{root}/malformed/attr_vlen_heap_seq_len_over.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -2367,44 +2586,149 @@ def _layout_v5_single_filtered(h):
                      chunks=(8, 8), shuffle=True)
 
 
-def _make_chunk_size_uint32_wrap(path):
-    """A v4 chunked layout whose encoded chunk dimensions multiply to a byte size
-    of 2**32 + 256.  Vulnerable libhdf5 versions store the per-chunk byte size in
-    a uint32_t (H5O_layout_chunk_t.size), so the product wraps to 256 and can
-    under-allocate the read buffer; newer versions reject the oversized legacy
-    chunk.  No valid file reaches this state -- H5Pset_chunk rejects chunks >=
-    4 GiB at creation -- so build a single-chunk dataset whose chunk dimension
-    needs four encoded bytes (2**24, no data written -> tiny file) and patch that
-    dimension to 0x40000040, repairing the object-header checksum."""
+def _layout_set_chunk_dim(raw, mbody, index, value):
+    """Overwrite one encoded chunk dimension of a v4/v5 chunked layout message.
+
+    Only a four-byte encoding is accepted: a narrower one has no room for the
+    values these fixtures need, and a wider one would leave the high bytes of
+    the field untouched.  The trailing dimension is the element size, which
+    ``H5D__chunk_set_sizes`` cross-checks against the datatype, so patching it
+    would produce a different fault than the one under test.
+    """
+    ndims, enc = raw[mbody + 3], raw[mbody + 4]
+    if enc != 4:
+        raise RuntimeError(f"chunk dim encoding is {enc} bytes, expected 4")
+    if index >= ndims - 1:
+        raise RuntimeError("refusing to patch the trailing element-size dimension")
+    struct.pack_into("<I", raw, mbody + 5 + index * enc, value)
+
+
+def _layout_chunk_enc4_1d(h):
+    """One chunk covering a 2**24-element dataset.
+
+    2**24 is the smallest dimension that needs four encoded bytes, so the
+    dimension field has room for the values patched in below, and nothing is
+    written so the fixture stays a few hundred bytes.  Shape == chunks gives the
+    single-chunk index, whose records carry no chunk size, so the bytes are
+    identical under layout v4 and v5.
+    """
+    h.create_dataset("d", shape=(1 << 24,), chunks=(1 << 24,), dtype="i4")
+
+
+def _layout_chunk_enc4_2d(h):
+    """The same, rank 2: two data dimensions of four encoded bytes each.
+
+    A product above 2**64 needs two dimensions to multiply: the largest product
+    two 32-bit dimensions and a four-byte element size can reach is
+    (2**32 - 1)**2 * 4, but reaching exactly 2**64 needs 2**31 * 2**31 * 4.
+    """
+    h.create_dataset("d", shape=(1 << 24, 1), chunks=(1 << 24, 1), dtype="i4")
+
+
+def _layout_chunk_dim_4gib(raw, mbody):
+    """Make the dimension product 2**32 + 256 -- just past the 32-bit field.
+
+    Representable in 64 bits, so this is not an arithmetic fault.  What it means
+    depends on the chunk index: unrepresentable in a v1 B-tree index record,
+    merely unreadable by pre-2.0.0 libraries below layout version 5, and fully
+    legitimate at version 5.
+    """
+    _layout_set_chunk_dim(raw, mbody, 0, 0x40000040)
+
+
+def _layout_chunk_dim_product_wrap(raw, mbody):
+    """Make the dimension product exactly 2**64, so it wraps to zero.
+
+    2**31 * 2**31 * 4 (the trailing dimension is the four-byte element size).
+    libhdf5 accumulates this product with no overflow check on the read path,
+    and zero then passes its own >4 GiB guard *because* it is zero, leaving only
+    an assert that release builds do not contain.  See
+    registry/cases/chunk-dim-product-64bit-overflow.yml.
+    """
+    _layout_set_chunk_dim(raw, mbody, 0, 0x80000000)
+    _layout_set_chunk_dim(raw, mbody, 1, 0x80000000)
+
+
+def _make_single_chunk_over_metadata(path, build, filtered):
+    """Point a Single Chunk index at the root object header.
+
+    Every other chunk index stores its chunks in RECORDS, which a chunk-index
+    walker decodes and bounds against the file's accounted metadata.  The Single
+    Chunk index stores no records at all -- the layout message's address field
+    IS the chunk -- so its one raw-data extent was the only one in the format
+    that never reached that check.  Measured before the fix: h5policy accepted a
+    writer-produced single-chunk dataset repointed at the root object header, and
+    ``h5dump -d`` printed the header bytes as dataset values (1380206671, the
+    little-endian int32 of ``OHDR``).  See
+    registry/cases/single-chunk-index-data-extent.yml.
+
+    ``filtered`` selects the form whose FILTERED size and filter mask sit in the
+    layout message ahead of the address (H5O_LAYOUT_CHUNK_SINGLE_INDEX_WITH_
+    FILTER).  That fixture pins the address OFFSET as much as the extent rule:
+    h5policy used to read the address from the size field, twelve bytes early,
+    and land on a value that happened to be inside the file.
+    """
+    raw = _base_bytes(build)
+    ohdr, mbody = _v4_layout_message(raw)
+    if raw[mbody + 1] != 2:
+        raise RuntimeError("expected a chunked layout message")
+    ndims, enc = raw[mbody + 3], raw[mbody + 4]
+    idx_type_off = mbody + 5 + ndims * enc
+    if raw[idx_type_off] != 1:
+        raise RuntimeError(
+            f"expected the single-chunk index, got type {raw[idx_type_off]}")
+    with_filter = bool(raw[mbody + 2] & 0x02)
+    if with_filter != filtered:
+        raise RuntimeError(
+            f"expected filtered={filtered}, got flags {raw[mbody + 2]:#04x}")
+    # size-of-lengths bytes of filtered size plus a four-byte filter mask.
+    addr_off = idx_type_off + 1 + ((8 + 4) if with_filter else 0)
+    # The root group's object header is the first OHDR in the file and is always
+    # accounted metadata, so any overlap with it is unambiguous.
+    root_ohdr = raw.find(b"OHDR")
+    if root_ohdr < 0:
+        raise RuntimeError("no object header signature to aim the chunk at")
+    struct.pack_into("<Q", raw, addr_off, root_ohdr)
+    _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_4gib_v1_btree(path):
+    """A legacy chunked layout whose chunk exceeds the v1 B-tree size field.
+
+    Layout message versions 1 through 3 encode no chunk index type: the index is
+    always the v1 B-tree, whose record stores the chunk's byte size in four
+    bytes.  A chunk above 4 GiB therefore cannot be represented on disk, and
+    libhdf5 refuses the dataset at open (H5Dchunk.c:1185) rather than at create.
+    That is the one combination the 32-bit rule still describes.
+
+    Built on an earliest-libver file so the layout message sits in a version-1
+    object header, which carries no checksum to repair.  The v3 chunked message
+    is version, class, rank, the B-tree address, then four-byte dimensions.
+    """
     raw = _base_bytes(
         lambda h: h.create_dataset("d", shape=(1 << 24,), chunks=(1 << 24,),
-                                   dtype="i4"))
-    for o in range(len(raw) - 4):
-        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
-            continue
-        flags = raw[o + 5]
-        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
-        size_w = 1 << (flags & 3)
-        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
-        p = cur + size_w
-        end = cur + size_w + chunk0
-        while p < end - 3:
-            mtype = raw[p]
-            msize = struct.unpack_from("<H", raw, p + 1)[0]
-            mbody = p + 4 + (2 if flags & 0x04 else 0)
-            # Data Layout (0x08), version 4, class 2 (chunked): dims follow
-            # version/class/flags/dimensionality/enc_bytes_per_dim.
-            if mtype == 0x08 and raw[mbody] == 4 and raw[mbody + 1] == 2:
-                enc = raw[mbody + 4]
-                if enc < 4:
-                    raise RuntimeError(
-                        "chunk dim encoding too narrow to patch a wrapping value")
-                struct.pack_into("<I", raw, mbody + 5, 0x40000040)
-                _fix_v2_ohdr_checksum(raw, o)
-                _patch(path, bytes(raw))
-                return
-            p = mbody + msize
-    raise RuntimeError("could not locate the v4 chunked layout message")
+                                   dtype="i4"),
+        libver="earliest")
+    msg_off, msg_size = _v1_object_header(raw, 0x0008)
+    mbody = msg_off + 8
+    version, layout_class = raw[mbody], raw[mbody + 1]
+    if version not in (1, 2, 3) or layout_class != 2:
+        raise RuntimeError(
+            f"expected a legacy chunked layout message, got version {version} "
+            f"class {layout_class}")
+    # v1/v2 put the rank at byte 1 and the address at byte 8; v3 puts the rank
+    # at byte 2 and the address straight after it.  The address is sizeof_addr
+    # wide, which every fixture in this corpus writes as 8.
+    addr_width = 8
+    if version == 3:
+        ndims, dims_off = raw[mbody + 2], mbody + 3 + addr_width
+    else:
+        ndims, dims_off = raw[mbody + 1], mbody + 8 + addr_width
+    if ndims < 2 or dims_off + ndims * 4 > mbody + msg_size:
+        raise RuntimeError("legacy chunked layout dimensions do not fit the message")
+    struct.pack_into("<I", raw, dims_off, 0x40000040)
+    _patch(path, bytes(raw))
 
 
 # Three v1 object headers lifted verbatim from the libhdf5 ``invalid_read`` seed,
@@ -3560,6 +3884,325 @@ def _make_bad_sohm_huge_object_extent(path, base_path):
     checksum = child + 6 + child_nrec * bt["record_size"]
     struct.pack_into("<I", raw, checksum,
                      _jenkins_lookup3()(bytes(raw[child:checksum])))
+    _patch(path, bytes(raw))
+
+
+def _sohm_repoint_frhp(raw, old_addr, new_addr, off_size, jenkins):
+    """Rewrite the shared-message table's fractal-heap address and repair its
+    checksum, so a relocated heap header is the one the table names."""
+    smtb = raw.find(b"SMTB")
+    if smtb < 0:
+        raise RuntimeError("could not locate the shared message table")
+    entry = 13 + 2 * off_size
+    total = None
+    for size in range(9, 4 + 1 + 16 * entry + 4 + 2):
+        end = smtb + size - 4
+        if end + 4 > len(raw):
+            break
+        if struct.unpack_from("<I", raw, end)[0] == jenkins(bytes(raw[smtb:end])):
+            total = size
+            break
+    if total is None:
+        raise RuntimeError("shared message table checksum did not verify")
+    end = smtb + total - 4
+    window = bytes(raw[smtb:end])
+    needle = old_addr.to_bytes(off_size, "little")
+    idx = window.find(needle)
+    if idx < 0 or window.find(needle, idx + 1) >= 0:
+        raise RuntimeError("expected exactly one heap address in the SMTB")
+    raw[smtb + idx:smtb + idx + off_size] = new_addr.to_bytes(off_size, "little")
+    struct.pack_into("<I", raw, end, jenkins(bytes(raw[smtb:end])))
+
+
+def _sohm_huge_bt2_to_filtered(raw, o, el, declared_decoded, jenkins):
+    """Convert a depth-one type-1 (unfiltered indirect) huge-object B-tree into
+    a type-2 (filtered indirect) one, declaring `declared_decoded` as every
+    record's decoded size.
+
+    Records grow from `O+2L` to `O+3L+4` by gaining a filter mask and that
+    decoded size, but they grow INSIDE fixed-size nodes, so no file offset
+    moves and nothing outside the tree needs fixing up.  The child-pointer
+    record-count width is derived from leaf capacity, which the larger record
+    changes, so it is recomputed rather than carried over.
+    """
+    bt = _bthd_info_for_type(raw, 1)
+    old_rs = bt["record_size"]
+    new_rs = o + 3 * el + 4
+    node = bt["node_size"]
+    if old_rs != o + 2 * el:
+        raise RuntimeError(f"unexpected type-1 huge record size {old_rs}")
+    if bt["depth"] != 1 or raw[bt["root"]:bt["root"] + 4] != b"BTIN":
+        raise RuntimeError("expected a depth-one huge-object B-tree")
+
+    def convert(rec):
+        """addr|len|key  ->  addr|len|filter_mask|decoded_size|key"""
+        return bytes(rec[:o + el]) + struct.pack("<I", 0) \
+            + int(declared_decoded).to_bytes(el, "little") \
+            + bytes(rec[o + el:o + 2 * el])
+
+    old_nrec_w = _bt2_nrec_bytes(node, old_rs, o)
+    new_nrec_w = _bt2_nrec_bytes(node, new_rs, o)
+    root = bt["root"]
+    nroot = bt["nroot"]
+
+    # Read the root's records and child pointers before rewriting either.
+    recs = [raw[root + 6 + i * old_rs:root + 6 + (i + 1) * old_rs]
+            for i in range(nroot)]
+    ptr_base = root + 6 + nroot * old_rs
+    old_ptr_w = o + old_nrec_w
+    children = []
+    for i in range(nroot + 1):
+        p = ptr_base + i * old_ptr_w
+        children.append((
+            int.from_bytes(raw[p:p + o], "little"),
+            int.from_bytes(raw[p + o:p + o + old_nrec_w], "little")))
+
+    # Each leaf first: its records grow in place inside its own node.
+    for child_addr, child_nrec in children:
+        if raw[child_addr:child_addr + 4] != b"BTLF":
+            raise RuntimeError("expected a leaf child of a depth-one root")
+        used = 6 + child_nrec * new_rs
+        if used + 4 > node:
+            raise RuntimeError(
+                f"{child_nrec} type-2 records do not fit a {node}-byte leaf")
+        body = bytearray(raw[child_addr:child_addr + 6])
+        body[5] = 2                                    # node record type
+        for i in range(child_nrec):
+            body += convert(
+                raw[child_addr + 6 + i * old_rs:child_addr + 6 + (i + 1) * old_rs])
+        raw[child_addr:child_addr + len(body)] = body
+        struct.pack_into("<I", raw, child_addr + used,
+                         jenkins(bytes(raw[child_addr:child_addr + used])))
+
+    # Then the internal root, whose pointer block moves within its own node.
+    new_ptr_w = o + new_nrec_w
+    used = 6 + nroot * new_rs + (nroot + 1) * new_ptr_w
+    if used + 4 > node:
+        raise RuntimeError("converted root contents exceed the node size")
+    body = bytearray(raw[root:root + 6])
+    body[5] = 2
+    for rec in recs:
+        body += convert(rec)
+    for child_addr, child_nrec in children:
+        body += child_addr.to_bytes(o, "little")
+        body += child_nrec.to_bytes(new_nrec_w, "little")
+    raw[root:root + len(body)] = body
+    struct.pack_into("<I", raw, root + used,
+                     jenkins(bytes(raw[root:root + used])))
+
+    # Finally the header: record type and size, then its own checksum.
+    raw[bt["bthd"] + 5] = 2
+    struct.pack_into("<H", raw, bt["bthd"] + 10, new_rs)
+    struct.pack_into("<I", raw, bt["checksum"],
+                     jenkins(bytes(raw[bt["bthd"]:bt["checksum"]])))
+
+
+def _sohm_filtered_huge_rewrite(base_path, declared_decoded,
+                                d_nelmts=1024, elem_size=8, filter_id=6):
+    """Turn an unfiltered SOHM huge-object fixture into a FILTERED one whose
+    huge records declare `declared_decoded` as their decoded size.
+
+    The heap header has to grow by the filtered fields, and inserting those in
+    place would shift every later offset -- which the dense-link filtered
+    fixtures can get away with only because h5policy stops at their filtered
+    branch before reading anything downstream.  The SOHM walker does read the
+    huge-object B-tree, so the header is instead APPENDED at EOF and the
+    shared-message table repointed at the copy.  Nothing that was already in
+    the file moves.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    o, el = raw[9], raw[10]
+    if o != 8:
+        raise RuntimeError("this rewrite assumes eight-byte offsets")
+    jenkins = _jenkins_lookup3()
+    frhp = _sohm_frhp(raw)
+    if struct.unpack_from("<H", raw, frhp + 7)[0] != 0:
+        raise RuntimeError("the SOHM fractal heap is already filtered")
+    dt = _frhp_dtable_offsets(raw, frhp)
+    start = int.from_bytes(raw[dt["start"]:dt["start"] + el], "little")
+    body = 14 + 2 * o + 10 * el + (8 + 2 * el + o)
+    if dt["checksum"] != frhp + body:
+        raise RuntimeError("unexpected unfiltered fractal-heap header size")
+
+    # Scale-offset (id 6) carries the full twenty-value client-data block
+    # libhdf5 writes for it, so the descriptor is realistic rather than a stub:
+    # cd_values[2] is the element count and cd_values[4] the element size, the
+    # pair whose product is the filter's output extent.  Any other filter id is
+    # written with a single client-data value, which is what makes its output
+    # extent UNDECIDABLE from metadata -- deflate's length is discovered by
+    # inflating.
+    if filter_id == 6:
+        cd = [0] * 20
+        cd[2] = d_nelmts
+        cd[4] = elem_size
+    else:
+        cd = [6]
+    pipeline = struct.pack("<BB", 2, 1) \
+        + struct.pack("<HHH", filter_id, 0, len(cd)) \
+        + b"".join(struct.pack("<I", v) for v in cd)
+
+    new_addr = len(raw)
+    hdr = bytearray(raw[frhp:frhp + body])
+    hdr += int(start).to_bytes(el, "little")     # filtered root dblock size
+    hdr += struct.pack("<I", 0)                  # I/O filter mask
+    hdr += pipeline
+    struct.pack_into("<H", hdr, 7, len(pipeline))
+    hdr += struct.pack("<I", jenkins(bytes(hdr)))
+    raw += hdr
+
+    _sohm_repoint_frhp(raw, frhp, new_addr, o, jenkins)
+    _sohm_huge_bt2_to_filtered(raw, o, el, declared_decoded, jenkins)
+
+    struct.pack_into("<Q", raw, 12 + 2 * o, len(raw))
+    _fix_sb_checksum(raw)
+    return bytes(raw)
+
+
+def _make_sohm_filtered_huge(path, base_path):
+    """A filtered SOHM huge-object index whose records declare a decoded size
+    above the heap's managed ceiling: the VALID control for the check below."""
+    _patch(path, _sohm_filtered_huge_rewrite(base_path, 8192))
+
+
+def _make_sohm_filtered_huge_decoded_size_mismatch(path, base_path):
+    """A filtered SOHM huge object whose declared decoded size CLEARS the
+    managed ceiling but disagrees with its own pipeline's output extent:
+    16384 declared against scale-offset's 1024 * 8 = 8192.
+
+    This isolates the equality arm from the threshold arm.  libhdf5 reads the
+    record's stored length, lets H5Z_pipeline replace the object size with the
+    filter's output length, then copies THAT many bytes into a buffer the caller
+    sized from the declared decoded size (src/H5HFhuge.c:749-761) -- two lengths
+    in one record that nothing relates.  h5policy will not run the transform,
+    but scale-offset's output extent is arithmetic on its client data, so the
+    disagreement is decidable without decoding anything.
+    """
+    _patch(path, _sohm_filtered_huge_rewrite(base_path, 16384))
+
+
+def _make_sohm_filtered_huge_undecidable_pipeline(path, base_path):
+    """The FALLBACK control for the equality arm: the same 16384-versus-real
+    mismatch, but behind deflate, whose output extent no metadata makes
+    computable.
+
+    Both new checks must stay silent -- the threshold arm because 16384 clears
+    the 4096 ceiling, the equality arm because it must not guess.  Getting this
+    wrong in the strict direction would reject valid deflate files, which is the
+    expensive failure mode; this fixture is what makes that a measurement
+    instead of a claim in a comment.
+    """
+    _patch(path, _sohm_filtered_huge_rewrite(base_path, 16384, filter_id=1))
+
+
+def _make_sohm_filtered_huge_below_managed_max(path, base_path):
+    """A filtered SOHM huge object declaring a 64-byte decoded size against a
+    4096-byte managed ceiling.
+
+    An object is stored huge ONLY because it exceeded that ceiling
+    (H5HF_insert, src/H5HF.c:335), and H5HF__huge_insert asserts as much
+    (src/H5HFhuge.c:291) -- the sole enforcement anywhere.  The read path takes
+    the record's decoded size back out through H5HF__huge_get_obj_len
+    (src/H5HFhuge.c:520) without ever comparing it again, so on an NDEBUG build
+    the value is unbounded from below.  For a filtered record that is a
+    memory-safety defect and not a tidiness one: the decoded size sizes the
+    caller's buffer while the copy length comes from the filter's own output
+    (src/H5HFhuge.c:753-761), and nothing relates the two.  64 against 4096 is
+    the geometry of the promoted specimen in
+    registry/cases/filtered-huge-object-decoded-size-unchecked.yml.
+    """
+    _patch(path, _sohm_filtered_huge_rewrite(base_path, 64))
+
+
+def _make_bad_fsm_class_count(path, base_path):
+    """A file free-space manager header declaring more section classes than the
+    file client has.
+
+    libhdf5 registers exactly three classes for the file client
+    (H5MF_FSPACE_SECT_CLS_SIMPLE/SMALL/LARGE, src/H5MF.c:292 and :366) and
+    refuses a stored count above the client's --
+        if (fspace->nclasses > 0 && nclasses > fspace->nclasses)
+            HGOTO_ERROR(... "section class count mismatch")   H5FScache.c:270
+    -- so H5Fget_free_sections fails on this file.
+
+    A MEASURED invariant-A' gap before the check existed: h5policy accepted it
+    with zero findings under every profile, including forensic on a complete
+    walk, while libhdf5 refused it.  The inflated count also made
+    control.fsm_section_type vacuous, because that bound is `s_type >=
+    nclasses` against the STORED count -- so one field both slipped past the
+    oracle and disabled one of its checks.  Found by driving h5mutate/fuzzlib
+    struct_deep mutants past h5policy and the probe's free_space canary, which
+    is the only entry point that deserializes FSHD/FSSE at all.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    o, l = raw[9], raw[10]
+    i = raw.find(b"FSHD")
+    while i >= 0 and raw[i + 5] != 1:          # client 1 == the file client
+        i = raw.find(b"FSHD", i + 1)
+    if i < 0:
+        raise RuntimeError("no file-client free-space manager header in the base")
+    # sig4 ver1 client1 | 4L counters | nclasses2 shrink2 expand2 maxaddr2
+    # | max_sect_size L | sect_addr O | sect_size L | alloc_sect_size L | chksum4
+    hdr_size = 18 + 7 * l + o
+    struct.pack_into("<H", raw, i + 6 + 4 * l, 32515)
+    chksum = i + hdr_size - 4
+    struct.pack_into("<I", raw, chksum,
+                     _jenkins_lookup3()(bytes(raw[i:chksum])))
+    _patch(path, bytes(raw))
+
+
+def _bt2_name_index(raw, record_type):
+    """Locate a name-indexed v2 B-tree and a node holding at least two records.
+
+    Returns (node_off, nrec, record_size).  The dense-LINK name index (type 5)
+    is a depth-0 root, so the root itself carries the records; the dense-ATTR
+    one (type 8) has an internal root whose records live in its children, so the
+    first child is followed.  Child-pointer width comes from leaf capacity, the
+    same derivation libhdf5 uses.
+    """
+    bt = _bthd_info_for_type(raw, record_type)
+    root, rs, node = bt["root"], bt["record_size"], bt["node_size"]
+    if bt["depth"] == 0:
+        return root, bt["nroot"], rs
+    nrec_bytes = _bt2_nrec_bytes(node, rs, bt["off_size"])
+    ptr = root + 6 + bt["nroot"] * rs
+    child = int.from_bytes(raw[ptr:ptr + bt["off_size"]], "little")
+    cnrec = int.from_bytes(raw[ptr + bt["off_size"]:
+                               ptr + bt["off_size"] + nrec_bytes], "little")
+    if raw[child:child + 4] != b"BTLF":
+        raise RuntimeError("expected a leaf child of the name index root")
+    return child, cnrec, rs
+
+
+def _make_dense_name_hash_order(path, base_path, record_type, hash_off):
+    """Swap two adjacent name-hash values in a name-indexed v2 B-tree node, so
+    the node is no longer ordered by hash, and repair the node checksum.
+
+    The name index is ordered by hash and libhdf5 BINARY-SEARCHES it on a
+    by-name lookup.  On equal hashes
+    H5{G,A}__dense_btree2_name_compare falls through to comparing the real names
+    out of the heap (src/H5Gbtree2.c, src/H5Abtree2.c), so collisions are legal
+    and only a decrease is corrupt -- which is why this swaps two real values
+    rather than planting a sentinel.
+
+    A MEASURED invariant-A' gap: a single flipped hash byte made a leaf
+    non-monotonic, h5policy accepted the file with zero findings under every
+    profile, and libhdf5 2.3.0 refused the lookup path.  The pre-existing order
+    check covered only the CREATION-ORDER indexes (types 6 and 9).
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    node, nrec, rs = _bt2_name_index(raw, record_type)
+    if nrec < 2:
+        raise RuntimeError("need two records in one node to invert an order")
+    a = node + 6 + hash_off
+    b = node + 6 + rs + hash_off
+    ha = bytes(raw[a:a + 4])
+    hb = bytes(raw[b:b + 4])
+    if int.from_bytes(ha, "little") >= int.from_bytes(hb, "little"):
+        raise RuntimeError("base name index is not already ascending")
+    raw[a:a + 4], raw[b:b + 4] = hb, ha
+    chksum = node + 6 + nrec * rs
+    struct.pack_into("<I", raw, chksum,
+                     _jenkins_lookup3()(bytes(raw[node:chksum])))
     _patch(path, bytes(raw))
 
 
@@ -4738,6 +5381,317 @@ def _make_attr_vlen_size_under(path):
     _patch(path, bytes(raw))
 
 
+def _make_attr_empty_vlen_heap_id(path):
+    """An EMPTY vlen string attribute -- a heap object of declared size ZERO.
+
+    libhdf5 writes `attrs["x"] = ""` as a real global-heap object whose size
+    field is 0 (measured: collection object idx 1, size 0, refcount 0), and
+    reads it back happily -- h5dump -A exits 0.
+
+    The regression control for a rule that was broader than its justification.
+    The collection walker refused a zero length at EVERY object index, on the
+    strength of a comment explaining the INDEX-0 case: there the parse advance is
+    the length itself, so zero means libhdf5 loops forever.  At any other index
+    the advance is H5HG_SIZEOF_OBJHDR(f) + H5HG_ALIGN(size), which is 16 even at
+    size zero, so there is nothing to reject -- and rejecting it refused files
+    libhdf5 had just written.
+
+    The bug was latent while only a VDS layout reached that walker, since a VDS
+    collection is unlikely to hold an unrelated empty vlen.  It fired the moment
+    attribute values reached it.  Keep this fixture: it is the only one in the
+    corpus whose heap object is legitimately zero-length.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.zeros(1, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("empty", "", dtype=h5py.special_dtype(vlen=str))
+
+    _patch(path, bytes(_base_bytes(build, libver="earliest")))
+
+
+def _make_attr_vlen_array_heap_ids(path):
+    """A MULTI-ELEMENT vlen attribute: 12 heap IDs in one value region.
+
+    Every other attribute heap-ID fixture is scalar, so the stride loop only
+    ever ran at element 0 -- `value_off + (i * width)` was never exercised for
+    i > 0 and a wrong width would have passed the whole suite.  This fixture is
+    the one that walks it.
+
+    It also covers the collection memo: the twelve IDs name the same collection,
+    so the first costs a parse and the rest are served from the record.  Without
+    the memo a per-element re-parse made a valid file with many such attributes
+    spend the profile's wall-clock budget and be rejected -- see h5_vds.pk.  A
+    dozen elements is far too few to reproduce that timing, deliberately: a
+    fixture whose verdict depends on how loaded the host is would be worse than
+    no fixture (valid/dense_links_deep.h5 already sits near that deadline).  The
+    timing bound is held by the walk budget and its recorded measurement, not by
+    a test.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        arr = np.array([f"element-{i:02d}" for i in range(12)], dtype=object)
+        d.attrs.create("vlarray", arr, dtype=h5py.special_dtype(vlen=str))
+
+    _patch(path, bytes(_base_bytes(build, libver="earliest")))
+
+
+def _attr_heap_ids_valid_bytes():
+    """A file whose attributes exercise BOTH attribute global-heap encodings.
+
+    class 9 (vlen) carries `length | collection address | object index`; class 7
+    reference type 1 (legacy dataset region) carries the bare heap ID with no
+    length in front.  The two widths differ, so a control holding only one of
+    them would leave the other stride untested.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(8, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("vl", "attribute value in the object header",
+                       dtype=h5py.special_dtype(vlen=str))
+        d.attrs.create("reg", d.regionref[0:4],
+                       dtype=h5py.special_dtype(ref=h5py.RegionReference))
+
+    return _base_bytes(build, libver="earliest")
+
+
+def _attr_vlen_heap_base(libver="earliest"):
+    """A file whose ONLY global-heap ID is a vlen string attribute's value.
+
+    The attribute value of a vlen or legacy-region-reference type is stored
+    inside its object-header message, so the global-heap ID it holds is
+    METADATA.  That is the regime the attribute heap-ID checks cover, and it is
+    the one no fixture expressed before: every other vlen in the corpus is
+    dataset raw data, where the descriptors are deliberately out of scope.
+
+    The dataset is plain integers precisely so the file contains exactly one
+    descriptor -- putting vlen data in the dataset too would leave a second
+    16-byte pattern in the raw payload and make the locator ambiguous.
+    """
+    def build(h):
+        h.create_dataset("d", data=np.arange(4, dtype="i4"), track_times=False)
+        h["d"].attrs.create("vl", "the attribute value lives in the header",
+                            dtype=h5py.special_dtype(vlen=str))
+
+    return _base_bytes(build, libver=libver)
+
+
+def _sizeof_offsets(raw):
+    """Superblock `sizeof_offsets`, which moves between v0/v1 and v2/v3."""
+    return raw[13] if raw[8] < 2 else raw[9]
+
+
+def _sizeof_lengths(raw):
+    """Superblock `sizeof_lengths`; see _sizeof_offsets."""
+    return raw[14] if raw[8] < 2 else raw[10]
+
+
+def _make_contig_unalloc_size_mismatch(path):
+    """An UNALLOCATED contiguous dataset whose stored size is not the extent.
+
+    The stored size of a v3+ contiguous layout is a property of the message, not
+    of the storage: libhdf5's writer emits `nelmts * dt_size` whether or not the
+    data has been allocated (measured -- an unwritten (10,) int32 stores 40 with
+    an UNDEFINED address, an unwritten scalar stores 4), and
+    H5O__layout_copy_file requires that equality on the copy path for v3+.
+    h5policy recorded the field only inside its allocation gate, so an
+    unallocated dataset's stored size was never examined at all.
+
+    A WARNING and not corruption, deliberately: on the read path libhdf5 ignores
+    the field entirely -- H5D__contig_check recomputes the extent and bounds only
+    that -- so h5dump opens such a dataset and returns every correct value.
+    Demanding equality as a rejection would be an invariant-A false positive, and
+    this repository has already made and measured that mistake on this exact
+    field.
+
+    The dataset is created and never written, so libhdf5 leaves the address
+    undefined; only the size field is patched. 40 -> 4096 keeps it plausible
+    rather than absurd, so the case pins the equality and not merely a big number.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", shape=(10,), dtype="i4",
+                                   track_times=False),
+        libver="earliest")
+    o = _sizeof_offsets(raw)
+    l = _sizeof_lengths(raw)
+    undef = (1 << (8 * o)) - 1
+    hits = []
+    for i in range(len(raw) - 2 - o - l):
+        if raw[i] != 3 or raw[i + 1] != 1:          # layout v3, class contiguous
+            continue
+        if int.from_bytes(raw[i + 2:i + 2 + o], "little") != undef:
+            continue
+        if int.from_bytes(raw[i + 2 + o:i + 2 + o + l], "little") != 40:
+            continue
+        hits.append(i)
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one unallocated v3 contiguous layout with "
+                           f"stored size 40, found {len(hits)}")
+    off = hits[0] + 2 + o
+    raw[off:off + l] = (4096).to_bytes(l, "little")
+    _patch(path, bytes(raw))
+
+
+def _make_attr_null_vlen_userblock(path):
+    """A NULL vlen attribute element in a file with a USER BLOCK.
+
+    The regression control for a false positive the attribute heap-ID checks had
+    when first written.  A NULL vlen element is encoded as heap address ZERO
+    (H5VL_BLOB_SETNULL writes it; H5VLnative_blob.c reports such an element as
+    null), and stored addresses are base-relative.  Testing the sentinel on the
+    address AFTER the base-relative conversion therefore compares
+    `base_addr + 0` against 0, which does not match in a file with a user block
+    -- so the walker treated a perfectly good NULL element as an ID naming the
+    user block and rejected the file H5_CORRUPT_BAD_SIGNATURE.
+
+    Measured, not hypothesised: with the sentinel tested post-conversion this
+    fixture is reject_corrupt, and with it tested on the raw field it is accept.
+    A file with no user block cannot show the difference, because there
+    base_addr is 0 and the two tests agree -- which is exactly why this fixture
+    needs the user block.
+    """
+    def build(h):
+        d = h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                             track_times=False)
+        d.attrs.create("vl", "value", dtype=h5py.special_dtype(vlen=str))
+
+    fd, base = tempfile.mkstemp(suffix=".h5")
+    os.close(fd)
+    try:
+        with h5py.File(base, "w", userblock_size=512, libver="earliest") as h:
+            build(h)
+        raw = bytearray(open(base, "rb").read())
+    finally:
+        os.unlink(base)
+
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError("null-vlen user block: no GCOL in the base file")
+    # Stored addresses are base-relative, so the descriptor names gcol - 512.
+    needle = struct.pack("<Q", gcol - 512)
+    hits = []
+    start = 0
+    while True:
+        i = raw.find(needle, start)
+        if i < 0:
+            break
+        start = i + 1
+        if i + 12 <= len(raw) and 1 <= struct.unpack_from("<I", raw, i + 8)[0] <= 255:
+            hits.append(i)
+    if len(hits) != 1:
+        raise RuntimeError(f"null-vlen user block: expected one attribute heap "
+                           f"ID naming the collection, found {len(hits)}")
+    struct.pack_into("<Q", raw, hits[0], 0)      # the NULL-element encoding
+    _patch(path, bytes(raw))
+
+
+def _find_attr_heap_id(raw, what):
+    """Offset of the one attribute vlen descriptor: length(4) addr(8) idx(4).
+
+    Anchored on the collection address libhdf5 actually wrote -- located from
+    the GCOL signature rather than guessed -- and required to be unique, so an
+    h5py layout change fails loudly instead of patching unrelated bytes.  The
+    index and length are range-checked as well, because a raw-data byte pattern
+    that happens to repeat the collection address would otherwise qualify.
+    """
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError(f"{what}: no GCOL collection in the base file")
+    needle = struct.pack("<Q", gcol)
+    hits = []
+    start = 0
+    while True:
+        i = raw.find(needle, start)
+        if i < 0:
+            break
+        start = i + 1
+        if i < 4 or i + 12 > len(raw):
+            continue
+        seq = struct.unpack_from("<I", raw, i - 4)[0]
+        idx = struct.unpack_from("<I", raw, i + 8)[0]
+        if 1 <= idx <= 255 and 0 < seq <= len(raw):
+            hits.append(i - 4)
+    if len(hits) != 1:
+        raise RuntimeError(f"{what}: expected exactly one attribute global-heap "
+                           f"ID naming the collection at {gcol}, "
+                           f"found {len(hits)}")
+    return hits[0]
+
+
+def _make_attr_vlen_heap_idx_missing(path):
+    """An attribute whose vlen global-heap ID names an object index that the
+    collection does not contain.
+
+    Before the fix at 1.14.4 libhdf5 indexed heap->obj[] with the stored index
+    behind nothing but `assert(hobj->idx < heap->nused)`, so a Release build read
+    a slot the collection never filled.  The guards are real errors now
+    (H5HG.c:570 and :573), which is why the current library rejects this file
+    cleanly -- and why the oracle accepting it was invisible to any test that
+    only asked whether libhdf5 survived the specimen.
+
+    The index is raised to 200: past the objects the collection holds, but still
+    inside the obj[] array libhdf5 allocates from the collection SIZE
+    (H5HG_NOBJS of a 4 KiB collection is 257).  That is the regime the CVE
+    specimen this came from actually occupied; the out-of-bounds regime needs an
+    index past 257 and is covered by attr_vlen_heap_idx_past_nalloc.
+    """
+    raw = _attr_vlen_heap_base()
+    d = _find_attr_heap_id(raw, "vlen attribute heap index")
+    struct.pack_into("<I", raw, d + 12, 200)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_vlen_heap_idx_past_nalloc(path):
+    """The sibling of attr_vlen_heap_idx_missing in the out-of-bounds regime.
+
+    H5HG_NOBJS(f, 4096) is 257, so an index of 400 is past the end of the
+    calloc'd obj[] array rather than merely past the objects in use.  A pre-fix
+    Release build reads `size` and `begin` from beyond the allocation, and those
+    values then drive the copy -- the heap buffer overflow the advisory for this
+    family describes, which an index inside the array does NOT reach.
+
+    Two fixtures because the two regimes fail differently in the library even
+    though the oracle refuses both for the same reason: a check that bounded the
+    index only against the allocation would still pass one of them.
+    """
+    raw = _attr_vlen_heap_base()
+    d = _find_attr_heap_id(raw, "vlen attribute heap index (nalloc)")
+    struct.pack_into("<I", raw, d + 12, 400)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_vlen_heap_addr_out_of_file(path):
+    """An attribute vlen global-heap ID whose collection address is past EOF.
+
+    Worth its own fixture because it is the sharpest form of the gap that was
+    closed: h5policy bounds addresses against the declared end of file in every
+    other metadata context, and this one metadata address escaped only because
+    the value region was never read at all.
+    """
+    raw = _attr_vlen_heap_base()
+    d = _find_attr_heap_id(raw, "vlen attribute heap address")
+    struct.pack_into("<Q", raw, d + 4, 1 << 40)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_vlen_heap_seq_len_over(path):
+    """An attribute vlen sequence length larger than its global-heap object.
+
+    libhdf5 sizes the destination from the stored length and copies the heap
+    object into it, so a length exceeding the object over-reads the collection.
+    The address and index are left valid, which is what makes this a distinct
+    case: the ID resolves, and only the count beside it is wrong.
+
+    Raised to 2^32 - 1 rather than to object_size + 1: the bound the oracle can
+    state without decoding the vlen base type is the object's BYTE size, so the
+    fixture is written to violate that weakest sound form unambiguously.
+    """
+    raw = _attr_vlen_heap_base()
+    d = _find_attr_heap_id(raw, "vlen attribute sequence length")
+    struct.pack_into("<I", raw, d, 0xFFFFFFFF)
+    _patch(path, bytes(raw))
+
+
 def _make_nbit_member_offset_wrap(path):
     """An n-bit compound whose member starts at the compound's own size.
 
@@ -5266,30 +6220,48 @@ def _make_filtered_dense_link_pipeline_overrun(path, base_path):
                                         clear_checksum_flag=False))
 
 
-def _make_gheap_infinite_loop(path, base_path):
-    """Append an orphaned, malformed global heap collection to a valid file.
+def _make_gheap_collection(path, base_path, index, length):
+    """Append an orphaned global heap collection whose first object is ``index``
+    with declared payload ``length``.
 
-    The collection's free-space object (heap index 0) is encoded with a zero
-    length.  libhdf5's H5HG__cache_heap_deserialize advances the parse cursor by
-    obj[0].size for index 0, so a zero there never moves it and any consumer
-    that loads the collection loops forever (h5debug hangs on it).  Nothing
-    references the collection, so the reachability walk never sees it and
-    libhdf5's normal open ignores it; only the forensic profile's GCOL
+    libhdf5 advances the object parse in `H5HG__cache_heap_deserialize` by
+
+        need = obj[idx].size                                   idx == 0  (:358)
+        need = H5HG_SIZEOF_OBJHDR(f) + H5HG_ALIGN(obj[idx].size)  idx > 0 (:353)
+
+    and then checks only that `begin + need` stays inside the collection
+    (:363).  A `need` of zero passes that check trivially -- H5_IS_BUFFER_OVERFLOW
+    short-circuits on `(size) != 0` -- leaving the cursor where it was, so the
+    decode never terminates.  Both branches can reach zero, and this one
+    generator builds either:
+
+      * ``index=0, length=0``  -- the free-space sentinel used raw.
+      * ``index>0, length=2**W-16`` -- the unchecked size_t addition wrapping.
+        Eight lengths per width do it, the interval [2**W-23, 2**W-16]; the
+        callers pick the top of each so the intent reads off the value.
+
+    Nothing references the collection, so the reachability walk never sees it
+    and libhdf5's normal open ignores it; only the forensic profile's GCOL
     signature sweep catches it, reporting a resource (DoS) hazard.
     """
     raw = bytearray(open(base_path, "rb").read())
     assert raw[8] in (2, 3), "expected a v2/v3 superblock"
     len_size = raw[10]
     align8 = lambda n: (n + 7) & ~7
+    len_fmt = {2: "H", 4: "I", 8: "Q"}[len_size]
+    assert length < 1 << (8 * len_size), "declared length does not fit the length field"
 
     csize = 4096                                  # aligned collection size
     coll = bytearray(csize)                        # zero-filled body
     coll[0:4] = b"GCOL"
     coll[4] = 1                                    # version
-    struct.pack_into("<" + {2: "H", 4: "I", 8: "Q"}[len_size], coll, 8, csize)
-    # The first object sits at the aligned header and is left all-zero: heap
-    # index 0 with a zero length -- the non-advancing free-space object.
-    assert align8(4 + 1 + 3 + len_size) == 16 and coll[16:16 + 2 + len_size] == b"\x00" * (2 + len_size)
+    struct.pack_into("<" + len_fmt, coll, 8, csize)
+    # The first object sits at the aligned collection header.  nrefs and the
+    # reserved word stay zero; only the index and the declared length matter to
+    # the advance.
+    assert align8(4 + 1 + 3 + len_size) == 16
+    struct.pack_into("<HH", coll, 16, index, 0)
+    struct.pack_into("<" + len_fmt, coll, 24, length)
 
     raw += coll
     # Declared EOF must cover the appended collection for h5policy's ceiling.
@@ -5477,6 +6449,447 @@ def _make_bad_snod_empty_name(path):
     _patch(path, bytes(raw))
 
 
+def _snod_slink_entry(raw):
+    """Locate a cache-type-2 (symbolic link) symbol-table entry plus the local
+    heap that holds its name.  Returns ``(entry_off, seg_addr, seg_size)``.
+
+    A version-0 symbol-table entry is link name offset (8) | object header
+    address (8) | cache type (4) | reserved (4) | scratch pad (16) = 40 bytes,
+    following the 8-byte SNOD header (signature, version, reserved, symbol
+    count).
+
+    THE REGIME THIS ASSERTS is cache type 2.  A soft link has no object header,
+    which is exactly why the checks under test used to skip it -- so a fixture
+    built on a cache-type-0 entry would prove nothing, because the pre-fix code
+    rejected those already.  If h5py ever stops writing soft links into symbol
+    tables this must fail loudly rather than quietly emit a vacuous fixture.
+    """
+    if not raw.startswith(b"\x89HDF\r\n\x1a\n"):
+        raise RuntimeError("fixture base has a user block; the heap data "
+                           "segment address would need base translation")
+    snod = raw.find(b"SNOD")
+    if snod < 0:
+        raise RuntimeError("could not locate the symbol table node")
+    nsyms = struct.unpack_from("<H", raw, snod + 6)[0]
+    ent = None
+    for i in range(nsyms):
+        cand = snod + 8 + i * 40
+        if struct.unpack_from("<I", raw, cand + 16)[0] == 2:
+            ent = cand
+            break
+    if ent is None:
+        raise RuntimeError("no cache-type-2 (soft link) symbol table entry in "
+                           f"{nsyms} entries; h5py no longer writes soft links "
+                           "into symbol tables and this fixture is vacuous")
+    heap = raw.find(b"HEAP")
+    if heap < 0:
+        raise RuntimeError("could not locate the local heap prefix")
+    # HEAP(4) + version(1) + reserved(3), then the data-segment size, the
+    # free-list head and the data-segment address.
+    seg_size = struct.unpack_from("<Q", raw, heap + 8)[0]
+    seg_addr = struct.unpack_from("<Q", raw, heap + 24)[0]
+    if seg_addr + seg_size > len(raw):
+        raise RuntimeError("local heap data segment runs past the file")
+    return ent, seg_addr, seg_size
+
+
+def _build_snod_softlink(h):
+    h.create_dataset("d", data=np.arange(4, dtype="i4"))
+    h["slink1"] = h5py.SoftLink("/d")
+
+
+def _make_softlink_empty_name(path):
+    """Symbol table whose SOFT LINK entry names an empty heap string.
+
+    libhdf5 resolves the link name for every entry it converts and rejects an
+    empty one ("invalid link name"), and it does so BEFORE it looks at the cache
+    type or at the object header address (H5Gent.c:379-385).  h5policy used to
+    check the name only inside its `cache type != 2` branch and, deeper, only
+    when the object header address was defined and inside the file, so a soft
+    link's name was never examined at all.  MEASURED: two h5stat-corpus
+    specimens land exactly here.
+    """
+    raw = _base_bytes(_build_snod_softlink, libver="earliest")
+    ent, seg_addr, seg_size = _snod_slink_entry(raw)
+    # In bounds matters: an offset past the data segment is a different defect
+    # with a different finding and would not reach the empty-name path.
+    off = None
+    for cand in range(seg_size - 1, -1, -1):
+        if raw[seg_addr + cand] == 0:
+            off = cand
+            break
+    if off is None:
+        raise RuntimeError("no NUL byte in the local heap data segment")
+    struct.pack_into("<Q", raw, ent, off)
+    _patch(path, bytes(raw))
+
+
+def _make_softlink_name_offset_oob(path):
+    """Symbol table whose SOFT LINK entry names a heap offset past the data
+    segment.  libhdf5 resolves that name through H5HL_offset_into, whose bound
+    (H5HL.c:391) is a real error return and applies to every entry whatever its
+    cache type; h5policy used to apply its own bound only to non-soft-link
+    entries.
+
+    The offset stays inside the FILE and is past only the SEGMENT, so the
+    fixture tests the segment bound rather than a trivially out-of-file address.
+    """
+    raw = _base_bytes(_build_snod_softlink, libver="earliest")
+    ent, seg_addr, seg_size = _snod_slink_entry(raw)
+    off = seg_size + 8
+    if seg_addr + off >= len(raw):
+        raise RuntimeError("chosen offset leaves the file, so the fixture would "
+                           "test the wrong bound")
+    struct.pack_into("<Q", raw, ent, off)
+    _patch(path, bytes(raw))
+
+
+def _v1_ohdr_message(raw, mtype=0x08):
+    """Locate the one data-layout message in a version-1 object header.
+
+    Returns ``(body, msize)``.  A version-1 object header carries no checksum,
+    so a caller may patch the message and write the file unchanged -- unlike the
+    version-2 path, which needs ``_fix_v2_ohdr_checksum``.
+
+    The dataset's header is reached through the root group's symbol table rather
+    than by scanning, and exactly one layout message is required, so a layout
+    change from a different h5py raises instead of patching the wrong bytes.
+    """
+    snod = raw.find(b"SNOD")
+    if snod < 0:
+        raise RuntimeError("could not locate the symbol table node")
+    nsyms = struct.unpack_from("<H", raw, snod + 6)[0]
+    hits = []
+
+    def walk(off, count, limit):
+        p, seen = off, 0
+        while seen < count and p + 8 <= limit:
+            mt, msize = struct.unpack_from("<HH", raw, p)
+            body = p + 8
+            if mt == mtype:
+                hits.append((body, msize))
+            elif mtype == 0x10:
+                cont_addr, cont_size = struct.unpack_from("<QQ", raw, body)
+                if cont_addr < len(raw):
+                    walk(cont_addr, 99, min(cont_addr + cont_size, len(raw)))
+            p = body + msize
+            seen += 1
+
+    for i in range(nsyms):
+        ent = snod + 8 + i * 40
+        oh = struct.unpack_from("<Q", raw, ent + 8)[0]
+        if oh >= len(raw) or raw[oh] != 1:
+            continue
+        walk(oh + 16, struct.unpack_from("<H", raw, oh + 2)[0], len(raw))
+    if len(hits) != 1:
+        raise RuntimeError(f"expected exactly one layout message, found {len(hits)}")
+    return hits[0]
+
+
+def _make_layout_virtual_version_v3(path):
+    """A layout message at VERSION 3 declaring the VIRTUAL class (3).
+
+    libhdf5 allows class 3 only from version 4 on.  Version 3 shares the class
+    switch with v4/v5, and `case H5D_VIRTUAL` opens with an explicit version
+    test that fails here (H5Olayout.c:529-530, "invalid layout version with
+    virtual layout").  h5policy only looked at the virtual class inside its
+    v4/v5 branch -- where VDS is a policy feature, not corruption -- so at v3 a
+    class of 3 fell through the contiguous/chunked/compact dispatch in silence,
+    and the unknown-class check could not see it either because 3 IS a valid
+    class value, just not at this version.
+
+    THE BODY IS LEFT AS THE CONTIGUOUS ONE and that is deliberate: the version
+    test is the FIRST statement in `case H5D_VIRTUAL`, before the heap
+    information is read at H5Olayout.c:532, so libhdf5 never reaches the
+    malformed body and the fixture isolates the version rule alone.
+
+    h5py writes layout version 3 even for libver="earliest", and a version-1
+    object header carries no checksum, so this is a single byte with nothing to
+    repair.  MEASURED: a corpus specimen has exactly this shape.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(10, dtype="i4")),
+        libver="earliest")
+    body, _ = _v1_ohdr_message(raw)
+    if raw[body] != 3:
+        raise RuntimeError(f"expected a version-3 layout message, got {raw[body]}")
+    if raw[body + 1] != 1:
+        raise RuntimeError(f"expected the contiguous class, got {raw[body + 1]}")
+    raw[body + 1] = 3                                  # H5D_VIRTUAL
+    _patch(path, bytes(raw))
+
+
+def _make_layout_virtual_version_v1(path):
+    """The OTHER door to the same rule: a VERSION 1 layout message declaring the
+    virtual class.
+
+    Versions 1 and 2 take their own decode block in libhdf5 and permit only
+    contiguous, chunked and compact -- anything else is "bad layout type for
+    layout message" (H5Olayout.c:122-123).  So the upstream MESSAGE differs from
+    the version-3 case above while the verdict is the same, and one h5policy
+    predicate (virtual class requires version >= 4) covers both.
+
+    REGIME THE CORPUS CANNOT OTHERWISE EXPRESS: h5py writes version 3 even at
+    libver="earliest", so no h5py call produces a v1 or v2 layout message at all
+    and this branch of the predicate would otherwise be untested.  The message is
+    therefore re-emitted by hand in the v1 shape -- version, dimensionality,
+    class, five reserved bytes, the data address, then one 4-byte dimension --
+    which is 20 bytes and so fits inside the 24 the v3 contiguous message
+    already occupies, leaving the object header's geometry untouched.
+
+    ndims is 1 and the class is 3, so neither the chunked two-dimension floor
+    (which requires class 2) nor the dimensionality range check fires: the
+    fixture yields the one finding under test.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(10, dtype="i4")),
+        libver="earliest")
+    body, msize = _v1_ohdr_message(raw)
+    if raw[body] != 3 or raw[body + 1] != 1:
+        raise RuntimeError("base layout message is not v3 contiguous")
+    if msize < 20:
+        raise RuntimeError(f"layout message is {msize} bytes, too small for the "
+                           "version-1 shape")
+    data_addr = struct.unpack_from("<Q", raw, body + 2)[0]
+    rewritten = bytes([1, 1, 3]) + bytes(5) + struct.pack("<Q", data_addr) \
+        + struct.pack("<I", 4)
+    raw[body:body + len(rewritten)] = rewritten
+    raw[body + len(rewritten):body + msize] = bytes(msize - len(rewritten))
+    _patch(path, bytes(raw))
+
+
+def _set_dataspace_nelmts(raw, nelmts):
+    """Rewrite the one simple-dataspace message to declare ``nelmts`` elements.
+
+    A version-1 or 2 simple dataspace is version, rank, flags, one reserved byte
+    and four more reserved bytes, then rank 8-byte current dimensions, then --
+    when bit 0 of flags is set -- rank 8-byte maximum dimensions.
+
+    BOTH VECTORS ARE REWRITTEN.  Raising only the current dimension leaves it
+    above the stored maximum, which is a *different* defect
+    (H5_CORRUPT_DATASPACE_DIMENSION_EXCEEDS_MAX) and may be what libhdf5 rejects
+    first -- so the fixture would no longer isolate the extent bound under test.
+    """
+    body, msize = _v1_ohdr_message(raw, 0x01)
+    if raw[body] not in (1, 2):
+        raise RuntimeError(f"unexpected dataspace version {raw[body]}")
+    rank = raw[body + 1]
+    if rank != 1:
+        raise RuntimeError(f"expected a rank-1 dataspace, got {rank}")
+    has_max = bool(raw[body + 2] & 1)
+    need = 8 + 8 * rank + (8 * rank if has_max else 0)
+    if msize < need:
+        raise RuntimeError("dataspace message is too small for its dimensions")
+    struct.pack_into("<Q", raw, body + 8, nelmts)
+    if has_max:
+        struct.pack_into("<Q", raw, body + 8 + 8 * rank, nelmts)
+
+
+def _make_contiguous_computed_extent_past_eof(path):
+    """Contiguous dataset whose STORED size is perfectly in-file while the
+    extent libhdf5 actually computes runs off the end.
+
+    H5D__contig_check recomputes data_size = nelmts * dt_size from the dataspace
+    and the datatype and bounds only THAT against the raw-data EOA
+    (H5Dcontig.c:391-411); it never looks at the size field the layout message
+    carries.  So inflating the dataspace alone yields a file whose every stored
+    field is in range and which libhdf5 still refuses to open.  h5policy bounded
+    only the stored size and accepted it.
+
+    The element count is kept modest (100k elements of 4 bytes = 400 KB) so the
+    logical-dataset-byte resource budget is not tripped first: the point is the
+    address-space bound, not a resource refusal.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(10, dtype="i4")),
+        libver="earliest")
+    _set_dataspace_nelmts(raw, 100_000)
+    _patch(path, bytes(raw))
+
+
+def _make_contiguous_v1_computed_extent_past_eof(path):
+    """The same rule reached through a VERSION 1 contiguous layout.
+
+    REGIME THE CORPUS COULD NOT EXPRESS, and the shape of the corpus specimen
+    that exposed this gap.  h5py writes layout version 3 even at
+    libver="earliest", and h5policy's v1/v2 branch previously handled only
+    chunked and compact -- so a v1 contiguous layout's data address was never
+    even decoded, and neither the extent bound nor the metadata-overlap check
+    could see such a dataset at all.
+
+    Version 1 also matters because it is the case where the stored size is
+    provably irrelevant: libhdf5 DISCARDS it and recomputes from the dataspace
+    (H5Dcontig.c:536-551), so the computed extent is the only one that exists.
+
+    The message is re-emitted in the v1 shape -- version, dimensionality, class,
+    five reserved bytes, the data address, then one 4-byte dimension = 20 bytes
+    -- which fits inside the 24 the v3 contiguous message occupied, so the
+    object header's geometry is untouched.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(10, dtype="i4")),
+        libver="earliest")
+    layout, msize = _v1_ohdr_message(raw)
+    if raw[layout] != 3 or raw[layout + 1] != 1:
+        raise RuntimeError("base layout message is not v3 contiguous")
+    if msize < 20:
+        raise RuntimeError("layout message too small for the version-1 shape")
+    data_addr = struct.unpack_from("<Q", raw, layout + 2)[0]
+    rewritten = bytes([1, 2, 1]) + bytes(5) + struct.pack("<Q", data_addr) \
+        + struct.pack("<I", 4)
+    raw[layout:layout + len(rewritten)] = rewritten
+    raw[layout + len(rewritten):layout + msize] = bytes(msize - len(rewritten))
+    _set_dataspace_nelmts(raw, 100_000)
+    _patch(path, bytes(raw))
+
+
+def _make_contiguous_stored_size_past_eof(path):
+    """Contiguous dataset whose STORED size alone reaches past the end of file,
+    with a valid address and a valid dataspace.
+
+    THIS FILE MUST NOT BE REJECTED.  libhdf5 opens it and returns every correct
+    value, because it never bounds the stored size -- so calling it corrupt is an
+    invariant-A violation.  MEASURED: with the field set to 10,000,000 in a
+    ~2.4 KB file, h5dump -H and h5dump -d both exit 0 and all 100 values read
+    back.  h5policy therefore reports a WARNING, which this fixture pins.
+
+    Reported rather than ignored because the field is live for layout version 3
+    and later: libhdf5 keeps it and uses it as store.contig.dset_size on the I/O
+    path (H5Dcontig.c:227, :637), as the length handed to H5MF_xfree when the
+    dataset is deleted (:352), as the sieve-buffer bound (:559), and as the
+    answer H5Dget_storage_size gives the application (H5Dint.c:2572).
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(100, dtype="i4")),
+        libver="earliest")
+    layout, _ = _v1_ohdr_message(raw)
+    if raw[layout] != 3 or raw[layout + 1] != 1:
+        raise RuntimeError("base layout message is not v3 contiguous")
+    if struct.unpack_from("<Q", raw, layout + 10)[0] != 400:
+        raise RuntimeError("unexpected stored contiguous size")
+    struct.pack_into("<Q", raw, layout + 10, 10_000_000)
+    _patch(path, bytes(raw))
+
+
+def _stab_message_body(raw):
+    """Byte offset of the one symbol-table message payload in a fixture base.
+
+    The payload is B-tree address then name-heap address, each offset-sized.
+
+    The root object header address is read from the superblock rather than found
+    by scanning for a plausible header, so a layout change fails loudly instead
+    of patching whatever byte happened to look right.  A version-0 superblock is
+    signature(8), seven version/size bytes plus two reserved, leaf/internal K
+    (2+2), consistency flags (4), then base / free-space / EOF / driver-info
+    addresses, then the root group's symbol-table entry -- whose object header
+    address is its second field, so at 56 + 8 for 8-byte offsets.
+
+    A version-1 object header is version(1) reserved(1) nmesgs(2) nlink(4)
+    hdrsize(4) pad(4), then messages of type(2) size(2) flags(1) reserved(3)
+    plus body.  Requires exactly one symbol-table message.
+    """
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    if raw[13] != 8:
+        raise RuntimeError(f"expected 8-byte offsets, got {raw[13]}")
+    root_oh = struct.unpack_from("<Q", raw, 64)[0]
+    if root_oh >= len(raw) or raw[root_oh] != 1:
+        raise RuntimeError(f"root object header at {root_oh} is not version 1")
+    hits = []
+
+    def walk(off, count, limit):
+        p, seen = off, 0
+        while seen < count and p + 8 <= limit:
+            mtype, msize = struct.unpack_from("<HH", raw, p)
+            body = p + 8
+            if mtype == 17:                      # symbol table
+                if msize < 16:
+                    raise RuntimeError("symbol-table message is too small to patch")
+                hits.append(body)
+            elif mtype == 16:                    # continuation
+                cont_addr, cont_size = struct.unpack_from("<QQ", raw, body)
+                if cont_addr < len(raw):
+                    walk(cont_addr, 99, min(cont_addr + cont_size, len(raw)))
+            p = body + msize
+            seen += 1
+
+    walk(root_oh + 16, struct.unpack_from("<H", raw, root_oh + 2)[0], len(raw))
+    if len(hits) != 1:
+        raise RuntimeError(f"expected exactly one symbol-table message, found {len(hits)}")
+    return hits[0]
+
+
+def _make_stab_heap_addr_undefined(path):
+    """Old-style group whose symbol-table message names an UNDEFINED name-heap
+    address, while a perfectly good local heap sits elsewhere in the file.
+
+    libhdf5 does not read undefined as absent: H5G__stab_iterate protects the
+    heap unconditionally (H5Gstab.c:488), so at HADDR_UNDEF the open fails in the
+    sec2 driver with "addr undefined".  h5policy used to return early here,
+    treating an undefined address as "no traversable symbol table" -- accepting
+    the file.  H5G__stab_create always allocates both the B-tree and the heap
+    (H5Gstab.c:132, :136), so requiring them cannot cost a conforming file.
+
+    MEASURED: a corpus specimen with exactly this shape.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    body = _stab_message_body(raw)
+    if struct.unpack_from("<Q", raw, body + 8)[0] == 0xFFFFFFFFFFFFFFFF:
+        raise RuntimeError("the base file's name-heap address is already "
+                           "undefined; the fixture would prove nothing")
+    struct.pack_into("<Q", raw, body + 8, 0xFFFFFFFFFFFFFFFF)
+    _patch(path, bytes(raw))
+
+
+def _make_stab_btree_addr_undefined(path):
+    """Same shape as the name-heap case, but the symbol-table message's B-tree
+    address is undefined.  Separate fixture because the two are reported by
+    distinct emit sites with distinct messages; libhdf5 reaches the heap first
+    (H5Gstab.c:488) and the B-tree immediately after.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    body = _stab_message_body(raw)
+    if struct.unpack_from("<Q", raw, body)[0] == 0xFFFFFFFFFFFFFFFF:
+        raise RuntimeError("the base file's B-tree address is already undefined; "
+                           "the fixture would prove nothing")
+    struct.pack_into("<Q", raw, body, 0xFFFFFFFFFFFFFFFF)
+    _patch(path, bytes(raw))
+
+
+def _make_softlink_value_offset_oob(path):
+    """Symbol table whose SOFT LINK entry names a TARGET PATH past the local
+    heap data segment.
+
+    A soft link's target lives in the same heap as the names, named by a 4-byte
+    little-endian offset at the start of the entry's 16-byte scratch pad
+    (H5Gent.c:155).  libhdf5 resolves it through the same H5HL_offset_into as
+    the name (H5Gent.c:391), whose bound (H5HL.c:391) is a real error return, so
+    an offset past the segment makes the open fail.  h5policy read no part of the
+    scratch pad, so it accepted this outright.
+
+    The offset is past the SEGMENT but still inside the FILE, so the fixture
+    tests the segment bound rather than a trivially out-of-file address.
+    """
+    raw = _base_bytes(_build_snod_softlink, libver="earliest")
+    ent, seg_addr, seg_size = _snod_slink_entry(raw)
+    # 2 * offset size + 8 = cache type (4) and reserved (4) past the two
+    # address-sized fields, i.e. the first scratch-pad word.
+    scratch = ent + 2 * 8 + 8
+    if struct.unpack_from("<I", raw, scratch)[0] >= seg_size:
+        raise RuntimeError("the base file's soft link value offset is already "
+                           "out of bounds; the fixture would prove nothing")
+    off = seg_size + 16
+    if seg_addr + off >= len(raw):
+        raise RuntimeError("chosen offset leaves the file, so the fixture would "
+                           "test the wrong bound")
+    struct.pack_into("<I", raw, scratch, off)
+    _patch(path, bytes(raw))
+
+
 def _make_bad_heap_segment(path):
     """Old-style group whose local heap declares a ~1 TB data-segment size, far
     past the file; libhdf5 rejects the oversized heap segment."""
@@ -5561,6 +6974,736 @@ def _make_heap_free_list_size_wrap(path):
     struct.pack_into("<Q", raw, heap + 16, off)                  # head -> our node
     struct.pack_into("<Q", raw, dblk_addr + off, 1)              # next == H5HL_FREE_NULL
     struct.pack_into("<Q", raw, dblk_addr + off + 8, 0xFFFFFFFFFFFFFFFF)  # size
+    _patch(path, bytes(raw))
+
+
+def _make_lheap_data_segment_alias(path, base_path):
+    """Two local-heap prefixes declaring the SAME data-segment address.
+
+    Each prefix is individually well-formed -- version, reserved bytes, segment
+    size, free-list head and segment address all pass their own bounds gates,
+    and the shared segment deserialises cleanly -- so the violation exists only
+    across the SET of prefixes.  That is why h5policy checks it at the dedupe
+    point (h5policy_check_lheap_segment_owner) rather than per heap, and why
+    libhdf5 cannot catch it at all: a local-heap data segment carries no header,
+    signature or back-pointer to compare against the prefix claiming it.
+
+    libhdf5's metadata cache is keyed by ADDRESS, so the second heap to protect
+    the shared segment gets a cache HIT.  Its deserialize callback never runs,
+    so H5HL__dblk_new -- the only code that sets heap->dblk and
+    heap->dblk_image -- never runs either, and the heap goes live with both
+    fields NULL.  h5dump -H, h5ls -vr and h5stat all SIGSEGV on this file.
+
+    THREE TRAPS, each of which produces a file that proves nothing:
+      * The shared segment must be adjacent to NEITHER prefix.  H5HLcache.c:438
+        sets single_cache_obj from `prfx_addr + prfx_size == dblk_addr`, and a
+        heap on that path never creates a separate data-block cache entry -- so
+        there is no shared entry to collide on.  Appending a copy of a valid
+        segment at EOF is what guarantees non-adjacency for both prefixes; just
+        pointing one prefix at the other's (adjacent) segment does not.
+      * BOTH group prefixes must be patched, not just one.  Aliasing a victim
+        onto a donor that is itself on the single-cache-object path is the same
+        dead end.
+      * The two prefixes must AGREE on segment size and free-list head.  They do
+        so for free here because both groups are built identically, but a
+        hand-tuned variant that disagrees dies earlier and elsewhere, in
+        H5HL__fl_deserialize (H5HLcache.c:241, "bad heap free list"), without
+        ever reaching the aliasing hole.
+
+    The local-heap prefix carries no checksum and the address edit is
+    size-neutral, so no repair step is needed -- only the superblock's
+    end-of-address field has to grow to cover the appended segment.
+
+    See registry/cases/local-heap-dblk-address-aliased-across-heaps.yml.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    # sizeof_lengths is superblock byte 14 in a VERSION 0 superblock, and the
+    # end-of-address field sits at byte 40 (base 24, free-space 32, EOA 40 with
+    # 8-byte offsets).  Assert the shape so a future libver change fails loudly
+    # rather than silently patching the wrong bytes.
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    if raw[13] != 8 or raw[14] != 8:
+        raise RuntimeError(
+            f"expected 8-byte offsets and lengths, got {raw[13]}/{raw[14]}")
+
+    prefixes = []
+    at = raw.find(b"HEAP")
+    while at >= 0:
+        prefixes.append(at)
+        at = raw.find(b"HEAP", at + 4)
+    # Root group plus the two sibling groups.
+    if len(prefixes) != 3:
+        raise RuntimeError(f"expected 3 local heaps, found {len(prefixes)}")
+
+    def seg_addr(prfx):
+        return struct.unpack_from("<Q", raw, prfx + 24)[0]
+
+    donor = prefixes[1]                        # /g1's heap
+    size = struct.unpack_from("<Q", raw, donor + 8)[0]
+    start = seg_addr(donor)
+    if start + size > len(raw):
+        raise RuntimeError("donor data segment runs past end of file")
+    image = bytes(raw[start:start + size])
+
+    shared = len(raw)                          # adjacent to no prefix
+    raw += image
+    struct.pack_into("<Q", raw, 40, len(raw))  # EOA must cover the copy
+
+    for prfx in prefixes[1:]:                  # both GROUP heaps, not the root
+        if prfx + 32 == shared:
+            raise RuntimeError("appended segment is adjacent to a prefix")
+        struct.pack_into("<Q", raw, prfx + 24, shared)
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_zero_stored_size(path, base_path):
+    """A v1 B-tree chunk record whose stored size is zero while its address is
+    defined -- the shape that wraps the fletcher32 filter's fixed-overhead
+    subtraction.
+
+    libhdf5 hands the record's stored size to the filter pipeline as `nbytes`.
+    H5Zfletcher32.c:73 then does an unguarded `src_nbytes -= FLETCHER_LEN` on a
+    size_t, so a stored size of 0 becomes SIZE_MAX-3: the code reads a checksum
+    at `src + (2**64-4)` and then checksums 2**64-4 bytes.  Measured on the
+    selected build: a hard SIGSEGV in H5_checksum_fletcher32 from an ordinary
+    H5Dread, while the file OPENS cleanly -- h5dump -H, h5ls and h5stat all
+    succeed, which is why the header-only differential probe cannot see it and
+    the data-forcing probe is what supplies the A+ evidence.
+
+    fletcher32 is the filter that makes this reachable, and the reason is that
+    its overhead is FIXED: it always subtracts 4 before looking at the data.  A
+    variable-overhead filter (deflate) fails its own decode first and returns an
+    error instead of wrapping, so a specimen built over deflate proves nothing.
+
+    THE KEY LAYOUT, because it is easy to patch the wrong four bytes.  A v1
+    B-tree node is a 24-byte header (signature, type, level, entries-used, left
+    and right sibling addresses) followed by an alternating sequence
+    key[0], addr[0], key[1], addr[1], ... key[n] -- note n+1 KEYS for n
+    children.  Each chunked-storage key is
+        chunk size (4) | filter mask (4) | offsets (ndims * 8)
+    where `ndims` is the LAYOUT message's dimensionality, which is the dataset
+    rank PLUS ONE (it carries a trailing element-size dimension).  So for the
+    rank-2 base file each key is 4 + 4 + 3*8 = 32 bytes.
+    The trailing key[n] is a boundary sentinel whose size is legitimately zero,
+    so patching it would produce a file that changes nothing -- the record to
+    patch is key[0], which has a real address after it.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    at = raw.find(b"TREE")
+    while at >= 0:
+        # type 1 is chunked storage; type 0 is a group node.
+        if raw[at + 4] == 1:
+            break
+        at = raw.find(b"TREE", at + 4)
+    if at < 0:
+        raise RuntimeError("could not locate a type-1 (chunk) v1 B-tree node")
+    entries = struct.unpack_from("<H", raw, at + 6)[0]
+    if entries < 1:
+        raise RuntimeError(f"chunk B-tree node holds {entries} entries")
+    ndims = 3                                    # rank 2 + the element dimension
+    key0 = at + 24
+    addr0 = key0 + 8 + 8 * ndims
+    size0 = struct.unpack_from("<I", raw, key0)[0]
+    addr = struct.unpack_from("<Q", raw, addr0)[0]
+    # Assert the parse before trusting it: a real first record has a nonzero
+    # size and an address inside the file.  Getting ndims wrong lands on an
+    # offset word instead and both of these fail.
+    if size0 == 0 or not (0 < addr < len(raw)):
+        raise RuntimeError(
+            f"key[0] parse looks wrong: size={size0} addr={addr} (file {len(raw)} bytes)")
+    struct.pack_into("<I", raw, key0, 0)         # stored size -> 0, address kept
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_stored_size_below_framing(path, base_path):
+    """A chunk record whose stored size is NONZERO but smaller than the fixed
+    framing its own filter pipeline consumes.
+
+    The sibling fixture chunk_zero_stored_size.h5 uses 0, which is invalid
+    against any pipeline and is caught at the record.  This one uses 3, which is
+    only invalid *given* fletcher32's four-byte overhead -- so it exercises the
+    other half of chunk.stored_size: the cross-message check in
+    h5policy_finalize_ohdr_dataset, which compares the smallest stored size seen
+    during the chunk walk against the framing recorded from the pipeline message.
+    Two fixtures because they are two code paths, and the inline one cannot see
+    this file.
+
+    WHY 3 AND NOT 1: any of 1, 2, 3 reaches the same wrap, and all three were
+    measured to SIGSEGV the shipped build (as does 0).  Three is the boundary
+    value -- one below the framing -- so it also pins the comparison as
+    `< framing` rather than `<= framing`.  A stored size of exactly 4 must stay
+    ACCEPTED: the subtraction yields 0, which is a legal empty payload, and
+    libhdf5 then rejects it cleanly on the checksum rather than faulting.  That
+    boundary was measured in both directions.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    at = raw.find(b"TREE")
+    while at >= 0 and raw[at + 4] != 1:
+        at = raw.find(b"TREE", at + 4)
+    if at < 0:
+        raise RuntimeError("could not locate a type-1 (chunk) v1 B-tree node")
+    key0 = at + 24
+    ndims = 3                                    # rank 2 + the element dimension
+    addr0 = key0 + 8 + 8 * ndims
+    size0 = struct.unpack_from("<I", raw, key0)[0]
+    addr = struct.unpack_from("<Q", raw, addr0)[0]
+    if size0 <= 4 or not (0 < addr < len(raw)):
+        raise RuntimeError(
+            f"key[0] parse looks wrong: size={size0} addr={addr} (file {len(raw)} bytes)")
+    struct.pack_into("<I", raw, key0, 3)         # one below fletcher32's framing
+    _patch(path, bytes(raw))
+
+
+def _build_nbit(h):
+    """A chunked n-bit dataset.  h5py has no high-level spelling for n-bit (it
+    exposes set_scaleoffset but not set_nbit), so the filter is set by ID through
+    the property-list API -- the same route _build_dynamic_filter takes.  n-bit
+    is a CORE filter, so libhdf5's own set_local callback computes the parameter
+    tree and writes the real cd_values; only the descriptor's declared count is
+    patched afterwards."""
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_chunk((5, 5))
+    dcpl.set_filter(5, 0, ())                    # 5 == H5Z_FILTER_NBIT
+    sid = h5py.h5s.create_simple((10, 10))
+    d = h5py.h5d.create(h.id, b"d", h5py.h5t.NATIVE_INT32, sid, dcpl=dcpl)
+    d.write(h5py.h5s.ALL, h5py.h5s.ALL,
+            np.arange(100, dtype="i4").reshape(10, 10))
+
+
+def _pipeline_cd_nelmts_offset(raw, filter_id):
+    """File offset of the 2-byte cd_nelmts field of FILTER_ID's descriptor.
+
+    A version-1 filter-pipeline message descriptor is
+        filter id (2) | name length (2) | flags (2) | cd_nelmts (2) | name | cd
+    and libver="earliest" writes version 1, which always carries the name-length
+    field -- so cd_nelmts sits at descriptor + 6.  The message payload begins
+    after the pipeline header (version, nfilters, 6 reserved bytes), and the
+    descriptor is located by scanning for the filter id rather than by walking
+    the message, because the preceding descriptors' name padding makes the
+    offset layout-dependent.  Asserting the located count against what the
+    filter requires is what keeps a wrong hit from producing a silent no-op.
+    """
+    want = struct.pack("<H", filter_id)
+    at = 0
+    while True:
+        at = raw.find(want, at)
+        if at < 0:
+            raise RuntimeError(f"filter id {filter_id} not found in the file")
+        # A plausible descriptor: name length and cd_nelmts both small.
+        name_len = struct.unpack_from("<H", raw, at + 2)[0]
+        nelmts = struct.unpack_from("<H", raw, at + 6)[0]
+        if name_len % 8 == 0 and name_len <= 64 and 0 < nelmts <= 64:
+            return at + 6
+        at += 2
+
+
+def _make_chunk_data_over_metadata(path, base_path):
+    """A chunk record whose data address points at the superblock.
+
+    libhdf5 serves it: the chunk's bytes come back as dataset VALUES with no
+    error and rc=0.  Measured on this fixture's shape -- the first two int32
+    values read 1178880137 and 169478669, which are 0x46444889 and 0x0A1A0A0D,
+    the file's own "\x89HDF\r\n\x1a\n" signature.  Pointing the same record
+    at a v1 B-tree node yields 0x45455254, "TREE".  So the primitive is an
+    arbitrary in-file read, silently returned as data.
+
+    THE BASE MUST BE UNFILTERED, and that is the point of using
+    chunked_v1_btree.h5 rather than the fletcher32 control: with a checksum
+    filter in the pipeline libhdf5 notices the substituted bytes and fails the
+    read, which hides the defect behind a clean error.  Without one there is
+    nothing to check the bytes against and they are simply returned.
+
+    Address 0 is chosen because it is the one offset guaranteed to be metadata in
+    every file, but the invariant is not "addr != 0" -- it is that chunk data and
+    metadata occupy disjoint bytes.  h5policy enforces it from both directions
+    against a registry of accounted metadata extents.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    at = raw.find(b"TREE")
+    while at >= 0 and raw[at + 4] != 1:
+        at = raw.find(b"TREE", at + 4)
+    if at < 0:
+        raise RuntimeError("could not locate a type-1 (chunk) v1 B-tree node")
+    ndims = 3                                    # rank 2 + the element dimension
+    key0 = at + 24
+    addr0 = key0 + 8 + 8 * ndims
+    size0 = struct.unpack_from("<I", raw, key0)[0]
+    addr = struct.unpack_from("<Q", raw, addr0)[0]
+    if size0 == 0 or not (0 < addr < len(raw)):
+        raise RuntimeError(
+            f"key[0] parse looks wrong: size={size0} addr={addr} (file {len(raw)} bytes)")
+    # RELATIVE address, not physical: every stored HDF5 address is relative to
+    # the superblock's base, so 0 means "the superblock" at base 0 and at base
+    # 512 alike.  Writing a physical offset here would silently miss the
+    # superblock on a user-block file -- the exact base-relative-vs-physical
+    # confusion this fixture pair exists to catch.
+    struct.pack_into("<Q", raw, addr0, 0)        # chunk data -> the superblock
+    _patch(path, bytes(raw))
+
+
+def _make_scaleoffset_param_count(path):
+    """A scale-offset filter descriptor declaring the wrong parameter count.
+
+    H5Z__filter_scaleoffset's first act is `if (cd_nelmts !=
+    H5Z_SCALEOFFSET_TOTAL_NPARMS)` -- exactly 20 (H5Zscaleoffset.c:104, checked
+    at :1122) -- so libhdf5 refuses the read outright.  h5policy accepted it,
+    which is the gap: a file no reader can use was passing the preflight.
+
+    The count is dropped by one rather than to something wild, so the descriptor
+    still parses and stays inside the message; only the required-total rule is
+    broken.  The client-data words are left in place, so the descriptor extent is
+    unchanged and no checksum needs repairing (v1 pipeline messages carry none).
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(100, dtype="i4").reshape(10, 10),
+                                   chunks=(5, 5), scaleoffset=3),
+        libver="earliest")
+    off = _pipeline_cd_nelmts_offset(raw, 6)
+    have = struct.unpack_from("<H", raw, off)[0]
+    if have != 20:
+        raise RuntimeError(f"expected 20 scale-offset parameters, found {have}")
+    struct.pack_into("<H", raw, off, 19)
+    _patch(path, bytes(raw))
+
+
+def _make_nbit_param_count(path):
+    """An n-bit filter descriptor whose cd_nelmts disagrees with its own
+    cd_values[0].
+
+    n-bit is self-describing: H5Znbit.c:897 writes the actual parameter count
+    into cd_values[0], and :935 refuses the read when `cd_nelmts !=
+    cd_values[0]`.  Patching the DESCRIPTOR count leaves cd_values[0] saying
+    something else, which is the disagreement libhdf5 rejects and h5policy
+    accepted.
+
+    Patched down by one for the same reason as the scale-offset sibling: the
+    descriptor still parses and stays in range, so the only broken rule is the
+    self-consistency one.  Note this is a DIFFERENT defect from
+    H5_CORRUPT_NBIT_PARAMS_OVERRUN, which is about a parameter TREE that walks
+    past cd_nelmts; here the tree is fine and the count is the lie.
+    """
+    raw = _base_bytes(_build_nbit, libver="earliest")
+    off = _pipeline_cd_nelmts_offset(raw, 5)
+    have = struct.unpack_from("<H", raw, off)[0]
+    if have < 2:
+        raise RuntimeError(f"expected an n-bit parameter tree, found {have} values")
+    struct.pack_into("<H", raw, off, have - 1)
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_duplicate_key_offset(path, base_path):
+    """Two v1 B-tree chunk keys declaring the same chunk offset.
+
+    The key order is not decoration: libhdf5 locates a chunk by searching the
+    tree on it, so a duplicate makes one chunk UNREACHABLE and serves the other
+    in its place.  Measured on this fixture's shape -- h5dump exits 0 and returns
+    chunk (0,5)'s bytes at logical position (0,0), while the region whose record
+    was displaced comes back as the dataset's FILL VALUE.  Silent wrong data, no
+    error, same character as chunk_data_over_metadata.h5.
+
+    key[1]'s offset words are copied from key[0] rather than being zeroed or
+    randomised, so the node stays otherwise well-formed: both records keep valid
+    addresses and sizes, and the only broken rule is the strict ordering.  A
+    v1 B-tree node carries no checksum and the edit is size-neutral.
+
+    The offsets are copied from the PREVIOUS key, which makes the pair an
+    equality rather than an inversion -- the duplicate arm of the rule.  An
+    inversion (a later key with a smaller offset) is the other arm and is not
+    separately fixtured; both emit the same code from the same comparison.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    at = raw.find(b"TREE")
+    while at >= 0 and raw[at + 4] != 1:
+        at = raw.find(b"TREE", at + 4)
+    if at < 0:
+        raise RuntimeError("could not locate a type-1 (chunk) v1 B-tree node")
+    entries = struct.unpack_from("<H", raw, at + 6)[0]
+    if entries < 2:
+        raise RuntimeError(f"need at least two entries to duplicate, found {entries}")
+    ndims = 3                                    # rank 2 + the element dimension
+    stride = 8 + 8 * ndims + 8                   # key + child address
+    k0 = at + 24
+    k1 = k0 + stride
+    first = struct.unpack_from("<" + "Q" * ndims, raw, k0 + 8)
+    second = struct.unpack_from("<" + "Q" * ndims, raw, k1 + 8)
+    if not first < second:
+        raise RuntimeError(
+            f"key parse looks wrong: offsets {first} then {second} are not increasing")
+    for w in range(ndims):                       # key[1] offset := key[0] offset
+        struct.pack_into("<Q", raw, k1 + 8 + 8 * w, first[w])
+    _patch(path, bytes(raw))
+
+
+def _make_contiguous_data_over_metadata(path):
+    """A contiguous layout whose data address points at the superblock.
+
+    The same invariant as malformed/chunk_data_over_metadata.h5 through a
+    different layout, and the plainest instance of the primitive: a contiguous
+    dataset has no filter and no checksum, so there is nothing to notice the
+    substitution.  libhdf5 seeks to whatever address the layout message gives and
+    returns those bytes as dataset values.  MEASURED: with the address set to 0,
+    h5dump exits 0 and the first two int32 values are 1178880137 and 169478669,
+    i.e. 0x46444889 and 0x0A1A0A0D -- the file's own "\x89HDF\r\n\x1a\n".
+
+    COMPACT layout has no sibling fixture and needs none: its data is embedded in
+    the layout message payload and bounded against msg_size, so it declares no
+    independent extent and cannot collide with anything.
+
+    LOCATING THE ADDRESS FIELD.  The v3/v4/v5 contiguous layout message stores
+    the data address then the data size, right after the 1-byte version and
+    1-byte class.  Rather than walk the object header to find the message, the
+    generator finds the raw data payload, then scans for the 8-byte word equal to
+    that offset whose SUCCESSOR equals the payload length -- the address/size
+    pair can only be the layout message.  Requiring both halves to match is what
+    keeps it from patching one of the other words that happen to hold the same
+    offset (there were two such decoys in the base file).
+    """
+    # Self-contained rather than derived from another fixture: this generator
+    # locates the layout message by matching the data payload, so it must know
+    # that payload exactly, and coupling to a shared control's shape would break
+    # silently the day that control changes.
+    values = np.arange(25, dtype="i4")
+    raw = _base_bytes(lambda h: h.create_dataset("d", data=values),
+                      libver="earliest")
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    payload = values.tobytes()
+    doff = raw.find(payload)
+    if doff < 0:
+        raise RuntimeError("could not locate the contiguous data payload")
+    addr_off = -1
+    for i in range(len(raw) - 16):
+        if (struct.unpack_from("<Q", raw, i)[0] == doff
+                and struct.unpack_from("<Q", raw, i + 8)[0] == len(payload)):
+            addr_off = i
+            break
+    if addr_off < 0:
+        raise RuntimeError(
+            f"no address/size pair for data at {doff} length {len(payload)}")
+    struct.pack_into("<Q", raw, addr_off, 0)     # relative 0 -> the superblock
+    _patch(path, bytes(raw))
+
+
+def _make_fixed_array_paged_element_over_metadata(path):
+    """A PAGED fixed-array chunk element pointing at the superblock, with the
+    page checksum repaired so the file's only defect is the address.
+
+    REGRESSION GUARD for a silent coverage hole.  h5policy read the page-init
+    bitmap LSB-first; libhdf5 writes it MSB-first (H5VM_bit_set_g = {0x80, 0x40,
+    ...}, H5VMprivate.h:453, whose own note says "bit offset 0 in the first
+    byte's high-bit position").  So page 0 of every conforming file looked
+    UNINITIALIZED, its elements were skipped, and every per-element check --
+    chunk address in file, chunk stored size, raw-data/metadata disjointness --
+    did nothing at all while emitting no finding to say so.  Before the fix this
+    file was `accept`.
+
+    It has to be PAGED to exercise that path, which needs more than one page:
+    h5py writes 1024-element pages, so 1200 elements gives two.  A small fixed
+    array is unpaged and takes the other branch entirely, which is why every
+    pre-existing control missed this.
+
+    The page checksum is recomputed after the edit so the fixture reports the
+    overlap ALONE.  Without that repair it also raises
+    H5_CORRUPT_BAD_CHECKSUM, and a fixture that trips two rules cannot show
+    which one it was built for.
+    """
+    values = np.arange(1200, dtype="i4")
+    def _build(h):
+        d = h.create_dataset("d", shape=(1200,), chunks=(1,), dtype="i4")
+        d[:] = values
+    raw = _base_bytes(_build, libver="latest")
+
+    fahd = raw.find(b"FAHD")
+    if fahd < 0:
+        raise RuntimeError("no fixed-array header")
+    o = 8
+    page_bits = raw[fahd + 7]
+    if page_bits == 0:
+        raise RuntimeError("fixed array is not paged; the bitmap path is untested")
+    nelmts = struct.unpack_from("<Q", raw, fahd + 8)[0]
+    dblk = struct.unpack_from("<Q", raw, fahd + 16)[0]
+    if raw[dblk:dblk + 4] != b"FADB":
+        raise RuntimeError(f"no FADB at {dblk}")
+
+    page_nelmts = 1 << page_bits
+    npages = (nelmts + page_nelmts - 1) // page_nelmts
+    if npages < 2:
+        raise RuntimeError(f"need a multi-page block, got {npages}")
+    elmt_size = raw[fahd + 6]
+    db_prefix = 6 + o + (npages + 7) // 8 + 4
+    full_page = page_nelmts * elmt_size + 4
+
+    page0 = dblk + db_prefix
+    before = struct.unpack_from("<Q", raw, page0)[0]
+    if not (0 < before < len(raw)):
+        raise RuntimeError(f"page 0 element[0] parse looks wrong: {before}")
+    struct.pack_into("<Q", raw, page0, 0)        # relative 0 -> the superblock
+
+    # Repair this page's trailing checksum over its element bytes.
+    body_end = page0 + page_nelmts * elmt_size
+    raw[body_end:body_end + 4] = _jenkins_lookup3()(
+        bytes(raw[page0:body_end])).to_bytes(4, "little")
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_data_over_other_dataset(path):
+    """One dataset's chunk pointed at ANOTHER dataset's chunk.
+
+    Two datasets sharing raw bytes is not a feature HDF5 has -- the allocator
+    gives every chunk its own space -- so an overlap means one dataset serves the
+    other's values.  MEASURED: /a is written as all 111s and /b as all 222s;
+    after crossing /a's first chunk onto /b's, h5dump prints
+    "222, 222, 222, 222, 222" for the first five elements of /a and exits 0.
+    A cross-DATASET read, silently, and h5policy accepted it before this check.
+
+    Both datasets are UNFILTERED so nothing can notice the substitution, and
+    they are given distinct constant fill patterns rather than aranges so the
+    wrong answer is unmistakable in the dump rather than a plausible-looking
+    sequence.
+
+    Located by scanning for the two type-1 (chunked storage) v1 B-tree nodes and
+    copying the second node's first chunk address over the first node's.  The
+    key stride is 4 + 4 + ndims*8 with ndims the LAYOUT dimensionality -- rank
+    plus one -- so a rank-1 dataset has 24-byte keys; the generator asserts the
+    two addresses differ before crossing them.
+    """
+    def _build(h):
+        h.create_dataset("a", data=np.full(25, 111, dtype="i4"), chunks=(5,))
+        h.create_dataset("b", data=np.full(25, 222, dtype="i4"), chunks=(5,))
+    raw = _base_bytes(_build, libver="earliest")
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+
+    nodes = []
+    at = raw.find(b"TREE")
+    while at >= 0:
+        if raw[at + 4] == 1:
+            nodes.append(at)
+        at = raw.find(b"TREE", at + 4)
+    if len(nodes) != 2:
+        raise RuntimeError(f"expected two chunk B-trees, found {len(nodes)}")
+
+    ndims = 2                                    # rank 1 + the element dimension
+    def key0_addr_off(node):
+        return node + 24 + 8 + 8 * ndims
+    dst, src = key0_addr_off(nodes[0]), key0_addr_off(nodes[1])
+    a_addr = struct.unpack_from("<Q", raw, dst)[0]
+    b_addr = struct.unpack_from("<Q", raw, src)[0]
+    if not (0 < a_addr < len(raw)) or not (0 < b_addr < len(raw)) or a_addr == b_addr:
+        raise RuntimeError(
+            f"chunk address parse looks wrong: {a_addr} and {b_addr}")
+    struct.pack_into("<Q", raw, dst, b_addr)     # a's chunk[0] -> b's chunk[0]
+    _patch(path, bytes(raw))
+
+
+def _make_fsm_section_relative_addr(path):
+    """A free-space section whose extent runs past EOF only once its BASE is
+    added -- the specimen that proves free-space section addresses are
+    base-relative and must be translated before the range check.
+
+    REGRESSION GUARD for a one-directional soundness gap.  h5policy read the
+    section address raw and compared it against the PHYSICAL ceiling.  A relative
+    address is smaller than its physical location, so the bound passed too easily
+    and a section running past EOF was accepted -- by up to the user block's
+    size.  It is invisible at base 0, which is where every other fixture sits,
+    and the userblock audit's grep cannot find it either: that grep looks for an
+    unwrapped `bytes_to_u64_le`, while this site reads via
+    `h5policy_msg_u64_at`.
+
+    THE PROOF THAT THESE ADDRESSES ARE RELATIVE is inside the same structure and
+    needs no external authority: the FSHD's own sect_addr field reads N while the
+    FSSE it points at sits at physical N + base.  The generator asserts exactly
+    that below, so a future h5py layout change cannot quietly invalidate the
+    premise.
+
+    CONTRAST h5_frhp_fspace.pk, whose section records are logical HEAP offsets
+    and correctly are NOT translated.  Two walkers that look alike, in different
+    address spaces.
+
+    The patched address is chosen so the check passes UNTRANSLATED and fails
+    TRANSLATED -- that window is
+        (eof - base - sect_size, eof - sect_size]
+    -- which is what makes the fixture prove the translation rather than merely
+    prove an out-of-file section.
+    """
+    values = np.full(50, 111, dtype="i4")
+    fd, base_path = tempfile.mkstemp(suffix=".h5")
+    os.close(fd)
+    try:
+        with h5py.File(base_path, "w", libver="latest", userblock_size=512,
+                       fs_strategy="fsm", fs_persist=True, fs_threshold=1) as h:
+            h.create_dataset("keep", data=values, chunks=(10,))
+            h.create_dataset("gone", data=np.full(200, 222, dtype="i4"),
+                             chunks=(8,))
+        with h5py.File(base_path, "a") as h:
+            del h["gone"]                     # persists a free-space section
+        raw = bytearray(open(base_path, "rb").read())
+    finally:
+        os.unlink(base_path)
+
+    sb = raw.find(b"\x89HDF\r\n\x1a\n")
+    if sb < 0 or raw[sb + 8] != 3:
+        raise RuntimeError("expected a version-3 superblock behind a user block")
+    o = raw[sb + 9]
+    base = int.from_bytes(raw[sb + 12:sb + 12 + o], "little")
+    eof = int.from_bytes(raw[sb + 12 + 2 * o:sb + 12 + 3 * o], "little")
+    if base != 512 or eof != len(raw):
+        raise RuntimeError(f"unexpected geometry: base={base} eof={eof} size={len(raw)}")
+
+    fshd = raw.find(b"FSHD")
+    if fshd < 0:
+        raise RuntimeError("no persisted free-space manager")
+    p = fshd + 6                              # signature, version, client
+    tot = int.from_bytes(raw[p:p + 8], "little"); p += 8
+    p += 8                                    # total section count
+    serial = int.from_bytes(raw[p:p + 8], "little"); p += 8
+    p += 8                                    # ghost count
+    p += 2 + 2 + 2                            # nclasses, shrink, expand
+    addr_bits = int.from_bytes(raw[p:p + 2], "little"); p += 2
+    max_sect = int.from_bytes(raw[p:p + 8], "little"); p += 8
+    sect_rel = int.from_bytes(raw[p:p + o], "little"); p += o
+    used = int.from_bytes(raw[p:p + 8], "little")
+
+    fsse = sect_rel + base
+    if raw[fsse:fsse + 4] != b"FSSE":
+        raise RuntimeError(
+            f"FSHD sect_addr {sect_rel} + base {base} is not an FSSE -- the "
+            f"base-relative premise no longer holds")
+
+    def bytes_for_limit(limit):
+        n, mx = 1, 0xFF
+        while n < 8 and limit > mx:
+            n += 1
+            mx = (mx << 8) | 0xFF
+        return n
+    cnt_w = bytes_for_limit(serial)
+    len_w = bytes_for_limit(max_sect)
+    off_w = (addr_bits + 7) // 8
+
+    cur = fsse + 5 + o                        # signature, version, back-pointer
+    count = int.from_bytes(raw[cur:cur + cnt_w], "little")
+    sect_size = int.from_bytes(raw[cur + cnt_w:cur + cnt_w + len_w], "little")
+    addr_off = cur + cnt_w + len_w
+    if count < 1 or sect_size != tot:
+        raise RuntimeError(f"section node parse looks wrong: count={count} size={sect_size} tot={tot}")
+
+    lo = eof - base - sect_size               # exclusive
+    hi = eof - sect_size                      # inclusive
+    if hi <= lo:
+        raise RuntimeError("no address satisfies passes-untranslated/fails-translated")
+    new_addr = lo + (hi - lo + 1) // 2
+    struct.pack_into("<Q", raw, addr_off, new_addr)
+
+    end = fsse + used - 4                     # the FSSE checksum trails used_size
+    raw[end:end + 4] = _jenkins_lookup3()(
+        bytes(raw[fsse:end])).to_bytes(4, "little")
+    _patch(path, bytes(raw))
+
+
+def _make_chunk_internal_separator_order(path, base_path):
+    """A v1 B-tree INTERNAL node whose separator keys are out of order.
+
+    Separator keys carry the same ordering obligation as leaf keys, and breaking
+    it costs more: a duplicate leaf key loses one chunk, while a bad separator
+    makes an entire SUBTREE unreachable.  MEASURED on this base file -- 130
+    one-element chunks over a two-level index -- duplicating the root's second
+    separator makes libhdf5 return the FILL VALUE for elements 0..56 while 57..129
+    stay correct, at h5dump rc=0.  57 of 130 values silently replaced, no error.
+    h5policy accepted it until the ordering check was extended past leaves.
+
+    IT MUST BE A MULTI-LEVEL INDEX, which is why the base is
+    chunked_v1_btree_deep.h5 (130 chunks over 64-entry nodes) rather than the
+    small chunked_v1_btree.h5: a single-node tree has no separators at all, so
+    every small fixture is blind to this by construction -- the same shape as the
+    paged-array bug, where small controls could not reach the paged branch.
+    The generator asserts the root node's level is nonzero for that reason.
+
+    The DUPLICATE arm is used (key[1] offsets copied from key[0]) rather than an
+    inversion.  Both emit the same code from the same comparison; the duplicate
+    is chosen because its damage is the cleaner demonstration -- a contiguous
+    leading run of fill values.
+    A v1 B-tree node carries no checksum and the edit is size-neutral.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    root = raw.find(b"TREE")
+    while root >= 0 and raw[root + 4] != 1:
+        root = raw.find(b"TREE", root + 4)
+    if root < 0:
+        raise RuntimeError("could not locate a type-1 (chunk) v1 B-tree node")
+    level = raw[root + 5]
+    entries = struct.unpack_from("<H", raw, root + 6)[0]
+    if level == 0:
+        raise RuntimeError(
+            "root chunk B-tree node is a leaf; this fixture needs separators")
+    if entries < 2:
+        raise RuntimeError(f"need at least two separators, found {entries}")
+
+    ndims = 2                                    # rank 1 + the element dimension
+    stride = 8 + 8 * ndims + 8                   # key + child address
+    k0 = root + 24
+    k1 = k0 + stride
+    first = struct.unpack_from("<" + "Q" * ndims, raw, k0 + 8)
+    second = struct.unpack_from("<" + "Q" * ndims, raw, k1 + 8)
+    if not first < second:
+        raise RuntimeError(
+            f"separator parse looks wrong: {first} then {second} not increasing")
+    for w in range(ndims):
+        struct.pack_into("<Q", raw, k1 + 8 + 8 * w, first[w])
+    _patch(path, bytes(raw))
+
+
+def _make_compound_member_overlap(path):
+    """Two compound members whose byte extents overlap.
+
+    Members must occupy disjoint bytes of the parent element.  libhdf5 tests this
+    pairwise while decoding the datatype and refuses outright -- its own comment
+    says an overlap "probably indicates that the file is corrupt"
+    (H5Odtype.c:594-610) -- so a file failing it is one no reader can open the
+    dataset from.  h5policy accepted such files until
+    datatype.compound_members_disjoint landed; this fixture came out of triaging
+    corpus files libhdf5 refused to read while h5policy said accept.
+
+    The second member's OFFSET is moved back onto the first, rather than its size
+    being grown.  That keeps both members inside the parent element, so the
+    pre-existing datatype.compound_member_bounds rule stays satisfied and the
+    only broken rule is disjointness -- otherwise the fixture would be caught by
+    the older check and prove nothing about the new one.
+
+    The offset field's width is version-dependent: a version-1 compound stores it
+    in 4 bytes, and later versions shrink it to the smallest width that holds the
+    parent size.  The generator asserts it read the expected original offset
+    before patching, so a datatype-version change fails loudly instead of
+    silently writing into a neighbouring field.
+    """
+    values = np.zeros(4, dtype=[("a", "i4"), ("b", "i4")])
+    values["a"] = np.arange(4)
+    values["b"] = np.arange(4) + 100
+    raw = _base_bytes(lambda h: h.create_dataset("d", data=values),
+                      libver="earliest")
+
+    # Locate the compound's second member by its NUL-terminated name, then the
+    # 4-byte offset field that follows the name padding in a version-1 compound.
+    at = raw.find(b"b\x00")
+    if at < 0:
+        raise RuntimeError("could not locate member 'b' in the datatype message")
+    # v1 pads each member name to an 8-byte boundary; the offset follows.
+    name_end = at + 8
+    off = struct.unpack_from("<I", raw, name_end)[0]
+    if off != 4:
+        raise RuntimeError(
+            f"expected member 'b' at offset 4, read {off} -- datatype layout changed")
+    struct.pack_into("<I", raw, name_end, 2)     # overlap 'a' at [0,4)
     _patch(path, bytes(raw))
 
 
