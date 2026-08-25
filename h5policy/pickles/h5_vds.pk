@@ -481,18 +481,51 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
         return available >= 16UL ? 16UL : 0UL;
     if ((st == 1UL || st == 2UL) && ver == 1UL)
         {
-            if (available < 16UL) return 0UL;
-            /* Version 1 has no flags and no encoded size: libhdf5 skips eight
-               bytes after the version and pins enc_size to 4, so the only
-               header field left to check is the rank, which sits just past the
-               skipped remainder.  */
-            if (available >= 20UL
-                && !h5policy_selection_rank_ok(
-                        h5policy_msg_u64_at(ios, profile, off + 16#B, 4UL),
-                        off + 16#B, object))
+            /* THE SAME MISTAKE THE VERSION-2 ARM BELOW CARRIED, in the arm next
+               to it.  Version 1 has no flags byte and no encoded size: libhdf5
+               skips EIGHT bytes after the version and pins enc_size to 4 --
+               `pp += 8; enc_size = H5S_SELECT_INFO_ENC_SIZE_4;` in the
+               `version >= 2` else arm of BOTH H5S__hyper_deserialize
+               (src/H5Shyper.c) and H5S__point_deserialize (src/H5Spoint.c).
+
+               So the header is type(4) + version(4) + 8 skipped + rank(4) = 20
+               bytes, and the element count that follows is a 4-byte field at
+               +20.  This arm used to read the u32 at +12 -- INSIDE the skipped
+               span, which libhdf5 never looks at -- and return 16 + it.  The
+               size therefore came out wrong by the whole payload, the mapping
+               cursor desynchronised, and the NEXT selection in the block was
+               reported as malformed: a false positive on a valid file, the
+               mechanism recorded in
+               registry/cases/vds-selection-rank-oracle-false-positive.yml.  That
+               record fixed the version-2 arm and flagged this one as probably
+               wrong in the same way.  It was.
+
+               The rank is not optional here.  It was previously checked only
+               `if (available >= 20)`, which let a truncated selection past the
+               rank gate; libhdf5 always decodes it, so too short to hold it is
+               too short to size.  */
+            if (available < 24UL) return 0UL;
+            var rank1 = h5policy_msg_u64_at(ios, profile, off + 16#B, 4UL);
+            if (!h5policy_selection_rank_ok(rank1, off + 16#B, object))
                 return 0UL;
-            var len1 = h5policy_msg_u64_at(ios, profile, off + 12#B, 4UL);
-            return len1 <= available - 16UL ? 16UL + len1 : 0UL;
+            var count1 = h5policy_msg_u64_at(ios, profile, off + 20#B, 4UL);
+            /* A hyperslab BLOCK carries a start and an end coordinate per
+               dimension; a POINT carries one.  Version 1 has no flags byte, so
+               H5S_HYPER_REGULAR can never be set and a version-1 hyperslab is
+               always the block-list form -- the regular form does not exist at
+               this version.  */
+            var per1 = st == 2UL ? 2UL * rank1 : rank1;
+            var unit1 = h5policy_checked_mul_u64(per1, 4UL,
+                                                 0xffffffffffffffffUL,
+                                                 "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                 "corrupt", off, object,
+                                                 "VDS version-1 selection size overflow");
+            var bytes1 = h5policy_checked_mul_u64(unit1, count1,
+                                                  0xffffffffffffffffUL,
+                                                  "H5_CORRUPT_LENGTH_OVERFLOW",
+                                                  "corrupt", off, object,
+                                                  "VDS version-1 selection size overflow");
+            return bytes1 <= available - 24UL ? 24UL + bytes1 : 0UL;
         }
     if (st == 2UL && ver == 2UL)
         {

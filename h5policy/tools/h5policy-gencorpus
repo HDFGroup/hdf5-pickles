@@ -527,6 +527,9 @@ def _gen_policy(root):
     _make_vds_selection_v2(
         f"{root}/policy/vds_selection_v2.h5",
         f"{root}/policy/vds_hyperslab.h5")
+    _vds_rewrite_virtual_selection(
+        f"{root}/policy/vds_selection_v1.h5",
+        f"{root}/policy/vds_hyperslab.h5", _vds_selection_v3_to_v1)
     _make_vds_selection_v2_rank_zero(
         f"{root}/malformed/vds_selection_v2_rank_zero.h5",
         f"{root}/policy/vds_hyperslab.h5")
@@ -1622,6 +1625,9 @@ def _gen_malformed(root):
     _make_oversize_v2_btree_node_size(
         f"{root}/malformed/oversize_v2_btree_node_size.h5",
         f"{root}/valid/dense_links.h5")
+    _make_v2_btree_leaf_capacity_zero(
+        f"{root}/malformed/v2_btree_leaf_capacity_zero.h5",
+        f"{root}/valid/dense_links.h5")
     # One fixture per reader that used to compare the used-byte count only
     # against file_size: the dense-LINK name index (type 5, depth 0 -> the root
     # is a LEAF) and the dense-ATTRIBUTE name index (type 8, depth 1 -> the root
@@ -1663,6 +1669,8 @@ def _gen_malformed(root):
         f"{root}/malformed/attr_gheap_object_size_wrap.h5")
     _make_attr_gheap_dedup_many_refs(
         f"{root}/malformed/attr_gheap_dedup_many_refs.h5")
+    _make_attr_gheap_free_undersized(
+        f"{root}/malformed/attr_gheap_free_undersized.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -3162,6 +3170,65 @@ def _vds_selection_v3_to_v2(sel):
             + struct.pack("<I", rank) + payload)
 
 
+def _vds_selection_v3_to_v1(sel):
+    """Re-encode one version-3 REGULAR hyperslab selection as version 1.
+
+    The version-1 sibling of _vds_selection_v3_to_v2, and the arm that case
+    record left unverified.  Version 1 has NO flags byte and NO encoded size:
+    libhdf5 writes four bytes of un-used padding and a four-byte length, then
+    skips both on read -- `pp += 8; enc_size = H5S_SELECT_INFO_ENC_SIZE_4` in
+    the `version >= 2` else arm of H5S__hyper_deserialize.  So:
+
+      v3  [type:4][version:4][flags:1][enc:1][rank:4] then 4*rank fields of enc
+      v1  [type:4][version:4][pad:4  ][len:4][rank:4][blocks:4] then the blocks
+
+    Version 1 has no flags byte, so H5S_HYPER_REGULAR can never be set: a v1
+    hyperslab is ALWAYS the block-list form.  A regular v3 selection therefore
+    has to be expanded into explicit blocks, which is only well defined when
+    every dimension has count 1 -- one block.  Anything else raises rather than
+    guessing.
+
+    THE LENGTH FIELD IS DELIBERATELY LEFT STALE.  libhdf5's serializer writes
+    `4 (rank) + 4 (block_count) + 8 * rank * blocks` there, and for a conforming
+    writer the oracle's old formula -- 16 plus that field -- happens to equal the
+    true size exactly.  The bug only shows when the field does NOT hold that
+    value, and real specimens carrying a stale 4 are exactly what exposed the
+    version-2 arm.  Writing 4 here is what makes the fixture discriminate: with
+    it, the old sizer returns 20 against a true size of 40, under-sizing the
+    selection by the whole payload.  libhdf5 never reads the field, so the file
+    stays valid -- measured, h5py opens it and reports the vds shape.
+    """
+    sel_type, version = struct.unpack_from("<II", sel, 0)
+    flags, enc = sel[8], sel[9]
+    rank = struct.unpack_from("<I", sel, 10)[0]
+    if (sel_type, version) != (2, 3):
+        raise RuntimeError(f"expected hyperslab v3, got type={sel_type} "
+                           f"version={version}")
+    if not flags & 0x01:
+        raise RuntimeError("only REGULAR hyperslabs are re-encoded to v1")
+    if len(sel) != 14 + 4 * rank * enc:
+        raise RuntimeError(f"v3 selection is {len(sel)} bytes, expected "
+                           f"{14 + 4 * rank * enc}")
+    starts, ends = [], []
+    for d in range(rank):
+        start, _stride, count, block = (
+            int.from_bytes(sel[14 + (d * 4 + k) * enc:14 + (d * 4 + k + 1) * enc],
+                           "little") for k in range(4))
+        if count != 1:
+            raise RuntimeError(f"dimension {d} has count {count}; only a "
+                               f"single-block selection converts to v1")
+        starts.append(start)
+        ends.append(start + block - 1)
+    payload = b"".join(struct.pack("<I", v) for v in starts + ends)
+    STALE_LENGTH = 4
+    return (struct.pack("<II", 2, 1)
+            + struct.pack("<I", 0)               # un-used padding
+            + struct.pack("<I", STALE_LENGTH)    # length -- never read back
+            + struct.pack("<I", rank)
+            + struct.pack("<I", 1)               # one block
+            + payload)
+
+
 def _vds_rewrite_virtual_selection(path, base_path, rewrite):
     """Replace a VDS mapping's virtual selection with bytes of a DIFFERENT
     length, repairing everything the length change invalidates.
@@ -4599,6 +4666,46 @@ def _make_zero_v2_btree_record_size(path, base_path):
     _patch(path, bytes(raw))
 
 
+def _make_v2_btree_leaf_capacity_zero(path, base_path):
+    """A v2 B-tree whose record width leaves a leaf holding ZERO records.
+
+    The minimum-capacity half of chunk.record_size / dense.btree_record_size.
+    h5policy enforces `record_size > node_size - 10` and nothing exercised it;
+    registry/cases/v2-btree-record-size-zero-assert-only.yml called this "the
+    more interesting untested case, because a zero max_nrec sizes the native
+    record factory", and recorded libhdf5's behaviour there as unmeasured.
+
+    MEASURED 2026-08-24, and the rejection is CORRECT -- this is not a false
+    positive, despite a shallow listing succeeding:
+
+      h5ls -r          rc=0, lists the groups (never traverses the tree)
+      h5dump -H        rc=1, "internal error"
+      assert build     abort -- `assert(size > 0)` in H5FL_fac_init, reached
+                       because H5B2__hdr_init passes nrec_size * max_nrec with
+                       max_nrec == 0 (H5B2hdr.c:147)
+      h5py / 1.14.5    intermittent heap corruption on a real traversal
+                       ("free(): invalid size", "double free or corruption")
+
+    So "libhdf5 opens it" is the assert-only pattern: the guard exists, is
+    compiled out of every shipped build, and what follows is a zero-sized block
+    factory.  The shallow open is not acceptance.
+
+    record_size is set to node_size - 9, one byte past what a leaf can hold, so
+    the fixture pins the BOUNDARY rather than an implausible width -- capacity
+    goes to exactly zero and no further.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    bt = _dense_bthd_info(raw)
+    node_size = struct.unpack_from("<I", raw, bt["bthd"] + 6)[0]
+    if node_size < 20 or node_size - 9 > 0xFFFF:
+        raise RuntimeError(f"base node_size {node_size} cannot express the "
+                           f"zero-capacity boundary in a 2-byte record size")
+    struct.pack_into("<H", raw, bt["bthd"] + 10, node_size - 9)
+    struct.pack_into("<I", raw, bt["checksum"],
+                     _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]])))
+    _patch(path, bytes(raw))
+
+
 def _make_oversize_v2_btree_node_size(path, base_path):
     """Dense-link name index whose node_size (0xFFFFFFFF) exceeds the file.
 
@@ -5671,6 +5778,52 @@ def _make_attr_compound_vlen_member_idx(path):
         raise RuntimeError(f"compound element stride is {hits[1] - hits[0]}, "
                            f"expected {stride}; the compound layout changed")
     struct.pack_into("<I", raw, hits[1] + 4 + _sizeof_offsets(raw), 222)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_gheap_free_undersized(path):
+    """A global-heap free-space sentinel sized BELOW the object-header size.
+
+    The "middle band" registry/cases/global-heap-zero-progress-sentinel.yml
+    recorded as unexercised, with the open question of whether it "under-advances
+    (mis-parsing subsequent objects) or is harmless".  MEASURED 2026-08-24: it is
+    not harmless -- libhdf5 does not terminate.
+
+    The walk is short and worth recording, because the middle band turns out to be
+    a ROUTE INTO the zero-progress sentinel rather than a separate defect.  For
+    index 0 the advance IS the declared size, so a sentinel of 8 steps 8 bytes
+    into its own zeroed payload; those bytes parse as idx 8 / size 0 and advance
+    16; the next 16 are zeros, which parse as idx 0 / size 0 -- and for index 0 a
+    zero size is a zero advance.  Three steps from a plausible-looking header to a
+    loop that never ends.
+
+    h5policy already refuses it (H5_CORRUPT_GLOBAL_HEAP_OBJECT), so this is a
+    regression guard rather than a new rule -- nothing pinned the behaviour
+    before.  Sizes 1 and 15 hang the same way; 8 is used because it is 8-aligned,
+    so the fixture cannot be dismissed as failing an alignment rule instead.
+
+    Reached through an ATTRIBUTE rather than a VDS layout deliberately: opening
+    the file does not read an attribute value, so the differential harness's
+    structural open cannot hang on it, while the defect is still reachable by any
+    consumer that reads the attribute.
+    """
+    raw = _attr_vlen_heap_base()
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError("gheap free undersized: no GCOL in the base file")
+    coll = struct.unpack_from("<Q", raw, gcol + 8)[0]
+    p = gcol + 16
+    while p + 16 <= gcol + coll:
+        idx = struct.unpack_from("<H", raw, p)[0]
+        size = struct.unpack_from("<Q", raw, p + 8)[0]
+        if idx == 0:
+            break
+        p += 16 + ((size + 7) // 8) * 8
+    else:
+        raise RuntimeError("gheap free undersized: no free-space object found")
+    if struct.unpack_from("<H", raw, p)[0] != 0:
+        raise RuntimeError("gheap free undersized: expected the index-0 sentinel")
+    struct.pack_into("<Q", raw, p + 8, 8)
     _patch(path, bytes(raw))
 
 

@@ -27,6 +27,16 @@ controlled outcome; a change that alters any decision is surfaced for review.
   carries a comment saying why, and the reason is recorded in
   `../../registry/cases/`.
 
+  **A reasoned exception belongs in the policy, not here.** `h5cve matrix` reads
+  an expectation's own `allowed_statuses` in *preference* to the
+  `fixture_overrides` entry in `../../registry/h5cve-matrix-policy.yml`, so a
+  value left in the expectation silently shadows the reasoned one — including a
+  value copied from a neighbouring fixture. When a fixture legitimately reports
+  `violation` (libhdf5 crashes on it, or never returns), OMIT `allowed_statuses`
+  from the expectation and put it in the policy with its reason. See
+  `malformed-bad_vds_gheap_free_zero_length.yml`, whose comment records the same
+  correction being made once before.
+
   A fixture may name more than one exercised family with `families:` instead of
   `family:`. This is required when one valid file is evidence for more than one
   semantic boundary.
