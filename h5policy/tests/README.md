@@ -27,15 +27,27 @@ controlled outcome; a change that alters any decision is surfaced for review.
   carries a comment saying why, and the reason is recorded in
   `../../registry/cases/`.
 
-  **A reasoned exception belongs in the policy, not here.** `h5cve matrix` reads
-  an expectation's own `allowed_statuses` in *preference* to the
-  `fixture_overrides` entry in `../../registry/h5cve-matrix-policy.yml`, so a
-  value left in the expectation silently shadows the reasoned one — including a
-  value copied from a neighbouring fixture. When a fixture legitimately reports
-  `violation` (libhdf5 crashes on it, or never returns), OMIT `allowed_statuses`
-  from the expectation and put it in the policy with its reason. See
-  `malformed-bad_vds_gheap_free_zero_length.yml`, whose comment records the same
-  correction being made once before.
+  **Where a `violation` is declared depends on why it happens.** Two cases, and
+  they go in different files:
+
+  - *Normal for the family* — declare it inline. Every external-link fixture
+    reports `violation` because the canary's forbidden activations include
+    `external_open` and traversing an external link necessarily attempts one.
+    That is the family's ordinary signature, so the four `external_link`
+    expectations each carry `allowed_statuses: [violation]` directly.
+  - *A reasoned exception to a libhdf5 defect on one file* — crash, or
+    non-termination — belongs in `fixture_overrides` in
+    `../../registry/h5cve-matrix-policy.yml`, with its reason, and the
+    expectation must then OMIT `allowed_statuses` entirely. `h5cve matrix` reads
+    an expectation's own value in *preference* to the override, so a value left
+    here silently shadows the reasoned one — including a value copied from a
+    neighbouring fixture.
+
+  `malformed-bad_vds_gheap_free_zero_length.yml` records that correction being
+  made once before, and `malformed-attr_gheap_free_undersized.yml` a second time.
+  Either way the status is MEASURED first: the probe's own `--forbid` set is
+  narrower than the matrix's, so `h5policy-probe --forbid crash` can report no
+  violations on a file the matrix scores as one.
 
   A fixture may name more than one exercised family with `families:` instead of
   `family:`. This is required when one valid file is evidence for more than one
