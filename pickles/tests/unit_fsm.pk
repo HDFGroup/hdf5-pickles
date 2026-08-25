@@ -1,0 +1,87 @@
+/* Regression coverage for free-space section address translation: client 0
+ * (Fractal Heap) section addresses are heap-local offsets and must not be
+ * rebased by the superblock's base_addr, while client 1 (File) section
+ * addresses are real file addresses and must be. */
+load "common.pk";
+load "fsm.pk";
+
+var failures = 0;
+fun expect_fsm = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else {
+        printf("FAIL %s\n", name);
+        failures = failures + 1;
+    }
+}
+
+fun seal = (byte[] prefix) byte[]:
+{
+    return prefix + hdf5_u32_le_bytes(lookup3_hashlittle(prefix, 0U));
+}
+
+/* Builds an FSHD header (50 bytes with O=L=4) whose sect_addr_raw points at
+ * an FSSE block holding exactly one client-typed section with raw address 4,
+ * and returns the byte-relative FSSE bytes to write alongside it. */
+fun fsse_bytes = byte[]:
+{
+    return ['F', 'S', 'S', 'E', 0UB,       /* signature, version */
+            0UB, 0UB, 0UB, 0UB,            /* fspace_hdr_addr (O=4) */
+            1UB,                           /* node_count (cnt_size=1) */
+            50UB, 0UB,                     /* sect_size_val (len_size=2) */
+            4UB, 0UB, 0UB, 0UB,            /* sect_addr (off_size=4) == 4 */
+            0UB,                           /* sect_type */
+            0UB, 0UB, 0UB, 0UB];           /* chksum (unvalidated) */
+}
+
+set_global_sizeof_offsets(4UB);
+set_global_sizeof_lengths(4UB);
+set_global_hdf5_base_addr([0UB, 2UB, 0UB, 0UB]);          /* base_addr=512 */
+set_global_hdf5_declared_eof([0UB, 16UB, 0UB, 0UB]);      /* exclusive offset 4608 */
+
+var ios = open("*unit-fsm*");
+
+/* Test A: client 0 (Fractal Heap) -- FSHD at 2000, FSSE at 2100.
+ * sect_addr_raw (base-relative) = 2100 - 512 = 1588. */
+var fshd_a = seal(['F', 'S', 'H', 'D', 0UB, 0UB]           /* sig, version, client_id=0 */
+                  + byte[8]()                               /* tot_space + tot_sect_count = 0 */
+                  + [1UB, 0UB, 0UB, 0UB]                    /* serial_sect_count = 1 */
+                  + byte[4]()                                /* ghost_sect_count = 0 */
+                  + byte[6]()                                /* nclasses/shrink/expand = 0 */
+                  + [32UB, 0UB]                              /* max_sect_addr = 32 */
+                  + [255UB, 255UB, 0UB, 0UB]                /* max_sect_size = 65535 */
+                  + [52UB, 6UB, 0UB, 0UB]                    /* sect_addr_raw = 1588 */
+                  + [21UB, 0UB, 0UB, 0UB]                    /* sect_size = 21 */
+                  + [21UB, 0UB, 0UB, 0UB]);                  /* alloc_sect_size = 21 */
+byte[fshd_a'length] @ ios : 2000#B = fshd_a;
+byte[21] @ ios : 2100#B = fsse_bytes;
+print_fsm(2000#B);
+
+expect_fsm("fheap_client_section_addr_is_not_rebased",
+           global_fsm_last_section_addr == 4UL);
+
+/* Test B: client 1 (File) -- FSHD at 3000, FSSE at 3100.
+ * sect_addr_raw (base-relative) = 3100 - 512 = 2588. */
+var fshd_b = seal(['F', 'S', 'H', 'D', 0UB, 1UB]           /* sig, version, client_id=1 */
+                  + byte[8]()
+                  + [1UB, 0UB, 0UB, 0UB]
+                  + byte[4]()
+                  + byte[6]()
+                  + [32UB, 0UB]
+                  + [255UB, 255UB, 0UB, 0UB]
+                  + [28UB, 10UB, 0UB, 0UB]                  /* sect_addr_raw = 2588 */
+                  + [21UB, 0UB, 0UB, 0UB]
+                  + [21UB, 0UB, 0UB, 0UB]);
+byte[fshd_b'length] @ ios : 3000#B = fshd_b;
+byte[21] @ ios : 3100#B = fsse_bytes;
+print_fsm(3000#B);
+expect_fsm("file_client_section_addr_is_rebased",
+           global_fsm_last_section_addr == 512UL + 4UL);
+
+close(ios);
+if (failures != 0) {
+    printf("UNIT FSM: %i32d failure(s)\n", failures);
+    exit(1);
+}
+printf("UNIT FSM: all passed\n");

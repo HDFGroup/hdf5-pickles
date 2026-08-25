@@ -39,8 +39,9 @@
  *        var hdr = fs_hdr @ <addr>#B;
  *        hdr._print;
  *
- *   2. Map the section info (uses globals from step 1):
- *        var si = fs_sinfo @ (global_fshd_sect_addr#B);
+ *   2. Map the section info (uses globals from step 1; global_fshd_sect_addr
+ *      is base-relative, so translate it before mapping):
+ *        var si = fs_sinfo @ (hdf5_addr_to_file_u64(global_fshd_sect_addr)#B);
  *        si._print;
  *
  * Free-space Manager structure overview:
@@ -106,6 +107,10 @@ var global_fshd_sect_size         = 0UL;  /* Total byte size of FSSE            
 var global_fshd_sect_off_size     = 0UL;  /* (max_sect_addr+7)/8                 */
 var global_fshd_sect_len_size     = 0UL;  /* limit_enc_size(max_sect_size)       */
 var global_fshd_sect_cnt_size     = 0UL;  /* limit_enc_size(serial_sect_count)   */
+
+/* Set by fs_sinfo._print to the most recently decoded section address, for
+ * regression coverage of client-dependent address translation. */
+var global_fsm_last_section_addr  = 0UL;
 
 /* ----------------------------------------------------------------------- *
  * Helper: H5VM_limit_enc_size(limit) = floor(log2(limit)) / 8 + 1
@@ -241,7 +246,7 @@ type fs_hdr = struct {
         printf("  expand_percent=%u16d\n",      expand_percent);
         printf("  max_sect_addr=%u16d\n",       max_sect_addr);
         printf("  max_sect_size=%u64d\n",       bytes_to_u64_le(max_sect_size_raw));
-        printf("  sect_addr=%u64d\n",           bytes_to_u64_le(sect_addr_raw));
+        printf("  sect_addr=%u64d\n",           hdf5_addr_to_file_u64(bytes_to_u64_le(sect_addr_raw)));
         printf("  sect_size=%u64d\n",           bytes_to_u64_le(sect_size_raw));
         printf("  alloc_sect_size=%u64d\n",     bytes_to_u64_le(alloc_sect_size_raw));
         printf("  chksum=%u32d\n",              chksum);
@@ -290,7 +295,7 @@ type fs_sinfo = struct {
         }
 
         var off_sz      = global_sizeof_offsets  as uint<64>;
-        var fhdr_addr   = bytes_to_u64_le_at(data, 5UL, off_sz);
+        var fhdr_addr   = hdf5_addr_to_file_u64(bytes_to_u64_le_at(data, 5UL, off_sz));
         var prefix_size = 5UL + off_sz;
         var end_pos     = global_fshd_sect_size - 4UL;  /* checksum at last 4 bytes */
         var pos         = prefix_size;
@@ -322,7 +327,14 @@ type fs_sinfo = struct {
                 while (k < node_count
                        && sections_read < nsects
                        && pos + off_size + 1UL <= end_pos) {
-                    var sa = bytes_to_u64_le_at(data, pos, off_size);
+                    /* For client 0 (Fractal Heap) sect_addr is a heap-local
+                     * offset, not a file address -- see h5_frhp_fspace.pk's
+                     * heap_off handling of the identical field.  Only client 1
+                     * (File) sections carry an actual base-relative file
+                     * address that needs hdf5_addr_to_file_u64(). */
+                    var sa_raw = bytes_to_u64_le_at(data, pos, off_size);
+                    var sa     = client == 1UB ? hdf5_addr_to_file_u64(sa_raw) : sa_raw;
+                    global_fsm_last_section_addr = sa;
                     pos    = pos + off_size;
                     var st = data[pos] as uint<64>;
                     pos    = pos + 1UL;
@@ -381,9 +393,10 @@ fun print_fs_hdr = (offset<uint<64>,B> off) void:
  * Usage:
  *   print_fsm(<fshd_addr>#B);
  *
- * Common call from the fractal heap layer:
+ * Common call from the fractal heap layer (off must already be a physical
+ * address, so translate the raw bytes before calling):
  *   var hdr = fheap_hdr @ <fheap_addr>#B;
- *   print_fsm(bytes_to_u64_le(hdr.free_space_mgr_addr_raw)#B);
+ *   print_fsm(bytes_to_off(hdr.free_space_mgr_addr_raw));
  * ----------------------------------------------------------------------- */
 
 fun print_fsm = (offset<uint<64>,B> off) void:
@@ -397,8 +410,9 @@ fun print_fsm = (offset<uint<64>,B> off) void:
         return;
     }
 
+    var sect_addr = hdf5_addr_to_file_u64(global_fshd_sect_addr);
     printf("--- fs_sinfo (addr=%u64d size=%u64d) ---\n",
-           global_fshd_sect_addr, global_fshd_sect_size);
-    var sinfo = fs_sinfo @ (global_fshd_sect_addr#B);
+           sect_addr, global_fshd_sect_size);
+    var sinfo = fs_sinfo @ (sect_addr#B);
     sinfo._print;
 };
