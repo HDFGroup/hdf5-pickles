@@ -183,6 +183,39 @@ def test_userblock_files_translate_metadata_addresses():
         assert "did not decode" not in out, (name, out)
 
 
+def shmesg_table_ohdr_offset(name):
+    """Offset of the object header carrying the Shared Message Table.
+
+    Every OHDR in the fixture is a candidate; the one that decodes an
+    oh_msg_shmesg_table message is the superblock extension.
+    """
+    _, offsets = signature_offsets(name, b"OHDR")
+    for off in offsets:
+        if "oh_msg_shmesg_table" in explain(name, 'gos ("%d")' % off, "msgs"):
+            return off
+    raise AssertionError(f"{name} has no Shared Message Table object header")
+
+
+def test_userblock_sohm_heap_messages_translate_addresses():
+    """A userblock file's SOHM-shared messages must resolve, not just print.
+
+    userblock_sohm.h5's second dataset ("values2") shares its dataspace and
+    datatype messages through the SOHM heap (see make_fixtures.py); decoding
+    them requires translating sohm.pk's base-relative heap address by the
+    superblock's base_addr (issue #77).  Walking the Shared Message Table
+    first is required so h5explain knows the file has one at all.
+    """
+    name = "userblock_sohm.h5"
+    ext_off = shmesg_table_ohdr_offset(name)
+    out = explain(name, 'gos ("%d")' % ext_off, "msgs",
+                  "root", 'cd ("group_a/values2")', "msgs")
+    assert "unhandled" not in out, out
+    assert "did not decode" not in out, out
+    assert "resolved payload" in out, out
+    assert "oh_msg_sdspace" in out, out
+    assert "oh_msg_dtype" in out, out
+
+
 def test_cd_unknown_link_reports_and_stays_put():
     out = explain("latest.h5", "root", 'cd ("no_such_link")', "pwd")
     assert 'no hard link named "no_such_link"' in out, out
