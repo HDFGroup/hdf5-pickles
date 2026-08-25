@@ -379,11 +379,11 @@ fun h5policy_find_gheap_object = (int ios, H5PolicyProfile profile,
    (src/H5Shyper.c) and H5S__point_deserialize (src/H5Spoint.c).
 
    Set when this sizer has already emitted a SPECIFIC finding, so the caller
-   does not follow it with the generic H5_CORRUPT_VDS_SELECTION.  Each
+   does not follow it with the generic H5_CORRUPT_SELECTION.  Each
    selection is sized exactly once per call site and never speculatively, so
    the flag cannot leak into an unrelated decode; the caller clears it before
    each call.  */
-var h5policy_vds_selection_reported = 0;
+var h5policy_selection_reported = 0;
 
 /* enc_size legality.  libhdf5 filters it TWICE and the two filters disagree,
    which is why this is set membership rather than the mask or the range it
@@ -405,16 +405,6 @@ fun h5policy_selection_enc_ok = (uint<64> enc) int:
     return (enc == 2UL || enc == 4UL || enc == 8UL) ? 1 : 0;
 }
 
-/* Report and reject one bad selection header field.  Always returns 0 so the
-   sizer's callers keep their existing "0 means malformed" contract.  */
-fun h5policy_selection_reject = (string code, off64 loc, string object,
-                                 string message, H5Evidence ev) uint<64>:
-{
-    h5policy_vds_selection_reported = 1;
-    h5policy_emit_error_ev(code, "corrupt", loc, object, message, ev);
-    return 0UL;
-}
-
 /* Unknown flag bits.  H5S_SELECT_FLAG_BITS is H5S_HYPER_REGULAR alone
    (0x01, src/H5Spkg.h), and libhdf5 refuses anything outside it:
      if (flags & ~H5S_SELECT_FLAG_BITS) HGOTO_ERROR(... "unknown flag ...")
@@ -423,23 +413,9 @@ fun h5policy_selection_reject = (string code, off64 loc, string object,
    selects between the regular and the block-list payload encodings, so an
    unknown neighbour riding alongside it is a signal that the byte is not what
    the writer thought it was.  */
-fun h5policy_selection_flags_ok = (uint<64> flags, off64 loc,
-                                   string object) int:
+fun h5policy_selection_flags_ok = (uint<64> flags) int:
 {
-    if ((flags & 0xfeUL) == 0UL)
-        return 1;
-    var ignored = h5policy_selection_reject(
-        "H5_CORRUPT_VDS_SELECTION_FLAGS", loc, object,
-        "serialized selection sets unknown flag bits",
-        H5Evidence {
-            field = "vds.selection_flags",
-            actual = flags,
-            expected = 1UL,
-            comparison = "at_most",
-            has_loc1 = 1, loc1_role = "actual",
-            loc1 = loc, loc1_len = 1UL
-        });
-    return 0;
+    return (flags & 0xfeUL) == 0UL ? 1 : 0;
 }
 
 /* rank must be 1..H5S_MAX_RANK.  libhdf5 states it once per deserializer, in
@@ -449,29 +425,16 @@ fun h5policy_selection_flags_ok = (uint<64> flags, off64 loc,
    The zero case is the half h5policy used to miss entirely: a rank-0 regular
    hyperslab sizes its payload as 4 * 0 * enc == 0, so it passed as a
    well-formed 14-byte selection.  */
-fun h5policy_selection_rank_ok = (uint<64> rank, off64 loc,
-                                  string object) int:
+fun h5policy_selection_rank_ok = (uint<64> rank) int:
 {
-    if (rank != 0UL && rank <= H5S_MAX_RANK)
-        return 1;
-    var ignored = h5policy_selection_reject(
-        "H5_CORRUPT_VDS_SELECTION_RANK", loc, object,
-        "serialized selection rank is outside 1..H5S_MAX_RANK",
-        H5Evidence {
-            field = "vds.selection_rank",
-            actual = rank,
-            expected = H5S_MAX_RANK,
-            comparison = "at_most",
-            has_loc1 = 1, loc1_role = "actual",
-            loc1 = loc, loc1_len = 4UL
-        });
-    return 0;
+    return (rank != 0UL && rank <= H5S_MAX_RANK) ? 1 : 0;
 }
 
 /* Size one serialized H5S selection using only bounded scalar reads. */
-fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
-                                    off64 off, uint<64> available,
-                                    string object) uint<64>:
+fun h5policy_selection_size = (int ios, H5PolicyProfile profile,
+                               off64 off, uint<64> available,
+                               string object, string role,
+                               string field_ns) uint<64>:
 {
     if (available < 8UL)
         return 0UL;
@@ -506,8 +469,22 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
                too short to size.  */
             if (available < 24UL) return 0UL;
             var rank1 = h5policy_msg_u64_at(ios, profile, off + 16#B, 4UL);
-            if (!h5policy_selection_rank_ok(rank1, off + 16#B, object))
-                return 0UL;
+            if (!h5policy_selection_rank_ok(rank1))
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_SELECTION_RANK", "corrupt", off + 16#B,
+                        object,
+                        role + " serialized selection rank is outside 1..H5S_MAX_RANK",
+                        H5Evidence {
+                            field = field_ns + ".selection_rank",
+                            actual = rank1, expected = H5S_MAX_RANK,
+                            comparison = "at_most",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = off + 16#B, loc1_len = 4UL
+                        });
+                    h5policy_selection_reported = 1;
+                    return 0UL;
+                }
             var count1 = h5policy_msg_u64_at(ios, profile, off + 20#B, 4UL);
             /* A hyperslab BLOCK carries a start and an end coordinate per
                dimension; a POINT carries one.  Version 1 has no flags byte, so
@@ -519,12 +496,12 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
                                                  0xffffffffffffffffUL,
                                                  "H5_CORRUPT_LENGTH_OVERFLOW",
                                                  "corrupt", off, object,
-                                                 "VDS version-1 selection size overflow");
+                                                 role + " version-1 selection size overflow");
             var bytes1 = h5policy_checked_mul_u64(unit1, count1,
                                                   0xffffffffffffffffUL,
                                                   "H5_CORRUPT_LENGTH_OVERFLOW",
                                                   "corrupt", off, object,
-                                                  "VDS version-1 selection size overflow");
+                                                  role + " version-1 selection size overflow");
             return bytes1 <= available - 24UL ? 24UL + bytes1 : 0UL;
         }
     if (st == 2UL && ver == 2UL)
@@ -544,17 +521,45 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
             if (available < 17UL) return 0UL;
             var flags2 = h5policy_msg_u64_at(ios, profile, off + 8#B, 1UL);
             var rank2 = h5policy_msg_u64_at(ios, profile, off + 13#B, 4UL);
-            if (!h5policy_selection_flags_ok(flags2, off + 8#B, object))
-                return 0UL;
-            if (!h5policy_selection_rank_ok(rank2, off + 13#B, object))
-                return 0UL;
+            if (!h5policy_selection_flags_ok(flags2))
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_SELECTION_FLAGS", "corrupt", off + 8#B,
+                        object,
+                        role + " serialized selection sets unknown flag bits",
+                        H5Evidence {
+                            field = field_ns + ".selection_flags",
+                            actual = flags2, expected = 1UL,
+                            comparison = "at_most",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = off + 8#B, loc1_len = 1UL
+                        });
+                    h5policy_selection_reported = 1;
+                    return 0UL;
+                }
+            if (!h5policy_selection_rank_ok(rank2))
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_SELECTION_RANK", "corrupt", off + 13#B,
+                        object,
+                        role + " serialized selection rank is outside 1..H5S_MAX_RANK",
+                        H5Evidence {
+                            field = field_ns + ".selection_rank",
+                            actual = rank2, expected = H5S_MAX_RANK,
+                            comparison = "at_most",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = off + 13#B, loc1_len = 4UL
+                        });
+                    h5policy_selection_reported = 1;
+                    return 0UL;
+                }
             if ((flags2 & 1UL) != 0UL)
                 {
                     var payload2 = h5policy_checked_mul_u64(4UL * rank2, 8UL,
                                                            0xffffffffffffffffUL,
                                                            "H5_CORRUPT_LENGTH_OVERFLOW",
                                                            "corrupt", off, object,
-                                                           "VDS hyperslab selection size overflow");
+                                                           role + " hyperslab selection size overflow");
                     return payload2 <= available - 17UL ? 17UL + payload2 : 0UL;
                 }
             if (available < 25UL) return 0UL;
@@ -563,12 +568,12 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
                                                  0xffffffffffffffffUL,
                                                  "H5_CORRUPT_LENGTH_OVERFLOW",
                                                  "corrupt", off, object,
-                                                 "VDS hyperslab selection size overflow");
+                                                 role + " hyperslab selection size overflow");
             var bytes2 = h5policy_checked_mul_u64(unit2, blocks2,
                                                   0xffffffffffffffffUL,
                                                   "H5_CORRUPT_LENGTH_OVERFLOW",
                                                   "corrupt", off, object,
-                                                  "VDS hyperslab selection size overflow");
+                                                  role + " hyperslab selection size overflow");
             return bytes2 <= available - 25UL ? 25UL + bytes2 : 0UL;
         }
     if (st == 2UL && ver == 3UL)
@@ -580,29 +585,61 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
             /* libhdf5's own order: flags, then enc_size, then rank.  Kept
                because the first failure is what a reader comparing h5policy's
                finding against an HDF5 error stack will see.  */
-            if (!h5policy_selection_flags_ok(flags, off + 8#B, object))
-                return 0UL;
+            if (!h5policy_selection_flags_ok(flags))
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_SELECTION_FLAGS", "corrupt", off + 8#B,
+                        object,
+                        role + " serialized selection sets unknown flag bits",
+                        H5Evidence {
+                            field = field_ns + ".selection_flags",
+                            actual = flags, expected = 1UL,
+                            comparison = "at_most",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = off + 8#B, loc1_len = 1UL
+                        });
+                    h5policy_selection_reported = 1;
+                    return 0UL;
+                }
             if (!h5policy_selection_enc_ok(enc))
-                return h5policy_selection_reject(
-                    "H5_CORRUPT_VDS_SELECTION_ENC_SIZE", off + 9#B, object,
-                    "serialized selection uses an unsupported offset encoding size",
-                    H5Evidence {
-                        field = "vds.selection_enc_size",
-                        actual = enc,
-                        expected = 8UL,
-                        comparison = "at_most",
-                        has_loc1 = 1, loc1_role = "actual",
-                        loc1 = off + 9#B, loc1_len = 1UL
-                    });
-            if (!h5policy_selection_rank_ok(ndims, off + 10#B, object))
-                return 0UL;
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_SELECTION_ENC_SIZE", "corrupt", off + 9#B, object,
+                        role + " serialized selection uses an unsupported offset encoding size",
+                        H5Evidence {
+                            field = field_ns + ".selection_enc_size",
+                            actual = enc,
+                            expected = 8UL,
+                            comparison = "at_most",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = off + 9#B, loc1_len = 1UL
+                        });
+                    h5policy_selection_reported = 1;
+                    return 0UL;
+                }
+            if (!h5policy_selection_rank_ok(ndims))
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_SELECTION_RANK", "corrupt", off + 10#B,
+                        object,
+                        role + " serialized selection rank is outside 1..H5S_MAX_RANK",
+                        H5Evidence {
+                            field = field_ns + ".selection_rank",
+                            actual = ndims, expected = H5S_MAX_RANK,
+                            comparison = "at_most",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = off + 10#B, loc1_len = 4UL
+                        });
+                    h5policy_selection_reported = 1;
+                    return 0UL;
+                }
             if ((flags & 1UL) != 0UL)
                 {
                     var payload = h5policy_checked_mul_u64(4UL * ndims, enc,
                                                            0xffffffffffffffffUL,
                                                            "H5_CORRUPT_LENGTH_OVERFLOW",
                                                            "corrupt", off, object,
-                                                           "VDS hyperslab selection size overflow");
+                                                           role + " hyperslab selection size overflow");
                     return payload <= available - 14UL ? 14UL + payload : 0UL;
                 }
             if (enc > available - 14UL) return 0UL;
@@ -611,12 +648,12 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
                                                 0xffffffffffffffffUL,
                                                 "H5_CORRUPT_LENGTH_OVERFLOW",
                                                 "corrupt", off, object,
-                                                "VDS hyperslab selection size overflow");
+                                                role + " hyperslab selection size overflow");
             var bytes = h5policy_checked_mul_u64(block_unit, blocks,
                                                  0xffffffffffffffffUL,
                                                  "H5_CORRUPT_LENGTH_OVERFLOW",
                                                  "corrupt", off, object,
-                                                 "VDS hyperslab selection size overflow");
+                                                 role + " hyperslab selection size overflow");
             return bytes <= available - 14UL - enc ? 14UL + enc + bytes : 0UL;
         }
     if (st == 1UL && ver == 2UL)
@@ -628,31 +665,49 @@ fun h5policy_vds_selection_size = (int ios, H5PolicyProfile profile,
                header fields are the encoding size and the rank, in that
                order.  */
             if (!h5policy_selection_enc_ok(encp))
-                return h5policy_selection_reject(
-                    "H5_CORRUPT_VDS_SELECTION_ENC_SIZE", off + 8#B, object,
-                    "serialized selection uses an unsupported point encoding size",
-                    H5Evidence {
-                        field = "vds.selection_enc_size",
-                        actual = encp,
-                        expected = 8UL,
-                        comparison = "at_most",
-                        has_loc1 = 1, loc1_role = "actual",
-                        loc1 = off + 8#B, loc1_len = 1UL
-                    });
-            if (!h5policy_selection_rank_ok(ndimsp, off + 9#B, object))
-                return 0UL;
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_SELECTION_ENC_SIZE", "corrupt", off + 8#B, object,
+                        role + " serialized selection uses an unsupported point encoding size",
+                        H5Evidence {
+                            field = field_ns + ".selection_enc_size",
+                            actual = encp,
+                            expected = 8UL,
+                            comparison = "at_most",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = off + 8#B, loc1_len = 1UL
+                        });
+                    h5policy_selection_reported = 1;
+                    return 0UL;
+                }
+            if (!h5policy_selection_rank_ok(ndimsp))
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_SELECTION_RANK", "corrupt", off + 9#B,
+                        object,
+                        role + " serialized selection rank is outside 1..H5S_MAX_RANK",
+                        H5Evidence {
+                            field = field_ns + ".selection_rank",
+                            actual = ndimsp, expected = H5S_MAX_RANK,
+                            comparison = "at_most",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = off + 9#B, loc1_len = 4UL
+                        });
+                    h5policy_selection_reported = 1;
+                    return 0UL;
+                }
             if (encp > available - 13UL) return 0UL;
             var points = h5policy_msg_u64_at(ios, profile, off + 13#B, encp);
             var point_unit = h5policy_checked_mul_u64(ndimsp, encp,
                                                  0xffffffffffffffffUL,
                                                  "H5_CORRUPT_LENGTH_OVERFLOW",
                                                  "corrupt", off, object,
-                                                 "VDS point selection size overflow");
+                                                 role + " point selection size overflow");
             var pbytes = h5policy_checked_mul_u64(point_unit, points,
                                                   0xffffffffffffffffUL,
                                                   "H5_CORRUPT_LENGTH_OVERFLOW",
                                                   "corrupt", off, object,
-                                                  "VDS point selection size overflow");
+                                                  role + " point selection size overflow");
             return pbytes <= available - 13UL - encp ? 13UL + encp + pbytes : 0UL;
         }
     return 0UL;
@@ -824,27 +879,29 @@ fun h5policy_validate_vds_layout = (int ios, H5PolicyProfile profile,
                field it has already emitted a specific finding at that field's
                own offset, which is strictly better evidence than a generic one
                anchored at the start of the selection.  */
-            h5policy_vds_selection_reported = 0;
-            var ss = h5policy_vds_selection_size(ios, profile,
-                                                 ref.data_off + cur#B,
-                                                 end - cur, object);
+            h5policy_selection_reported = 0;
+            var ss = h5policy_selection_size(ios, profile,
+                                             ref.data_off + cur#B,
+                                             end - cur, object,
+                                             "VDS", "vds");
             if (ss == 0UL)
                 {
-                    if (!h5policy_vds_selection_reported)
-                        h5policy_emit_error("H5_CORRUPT_VDS_SELECTION", "corrupt",
+                    if (!h5policy_selection_reported)
+                        h5policy_emit_error("H5_CORRUPT_SELECTION", "corrupt",
                                             ref.data_off + cur#B, object,
                                             "VDS source selection is malformed or overruns the mapping block");
                     return;
                 }
             cur = cur + ss;
-            h5policy_vds_selection_reported = 0;
-            var vs = h5policy_vds_selection_size(ios, profile,
-                                                 ref.data_off + cur#B,
-                                                 end - cur, object);
+            h5policy_selection_reported = 0;
+            var vs = h5policy_selection_size(ios, profile,
+                                             ref.data_off + cur#B,
+                                             end - cur, object,
+                                             "VDS", "vds");
             if (vs == 0UL)
                 {
-                    if (!h5policy_vds_selection_reported)
-                        h5policy_emit_error("H5_CORRUPT_VDS_SELECTION", "corrupt",
+                    if (!h5policy_selection_reported)
+                        h5policy_emit_error("H5_CORRUPT_SELECTION", "corrupt",
                                             ref.data_off + cur#B, object,
                                             "VDS virtual selection is malformed or overruns the mapping block");
                     return;

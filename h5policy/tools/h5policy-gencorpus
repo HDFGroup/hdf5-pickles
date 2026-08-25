@@ -1680,6 +1680,30 @@ def _gen_malformed(root):
         f"{root}/malformed/attr_stdref_blob_size_mismatch.h5")
     _make_attr_stdref_heap_idx_missing(
         f"{root}/malformed/attr_stdref_heap_idx_missing.h5")
+    # The serialized SELECTION inside a region reference's heap object -- in an
+    # attribute those bytes are metadata, and the sizer is the one the VDS layout
+    # already used (h5policy_selection_size, one validator and two roles).
+    _make_attr_region_sel_blocks_over(
+        f"{root}/malformed/attr_region_sel_blocks_over.h5",
+        f"{root}/valid/attr_heap_ids.h5")
+    _make_attr_region_sel_rank(
+        f"{root}/malformed/attr_region_sel_rank.h5",
+        f"{root}/valid/attr_heap_ids.h5")
+    _make_attr_region_sel_enc_size(
+        f"{root}/malformed/attr_region_sel_enc_size.h5",
+        f"{root}/valid/attr_heap_ids.h5")
+    _make_attr_region_sel_flags(
+        f"{root}/malformed/attr_region_sel_flags.h5",
+        f"{root}/valid/attr_heap_ids.h5")
+    _make_attr_stdref_sel_blocks_over(
+        f"{root}/malformed/attr_stdref_sel_blocks_over.h5",
+        f"{root}/valid/attr_stdref_region.h5")
+    _make_attr_stdref_blob_token_size(
+        f"{root}/malformed/attr_stdref_blob_token_size.h5",
+        f"{root}/valid/attr_stdref_region.h5")
+    _make_attr_stdref_blob_sel_bytes(
+        f"{root}/malformed/attr_stdref_blob_sel_bytes.h5",
+        f"{root}/valid/attr_stdref_region.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -6129,6 +6153,205 @@ def _make_attr_stdref_region(path):
     raw = _stdref_attr_base()
     _find_revised_refs(raw, "revised reference control")
     _patch(path, bytes(raw))
+
+
+def _attr_region_selection(raw, what, expect):
+    """(selection offset, blob offset, token width) of the FIRST region-reference
+    heap object in an attribute-bearing file.
+
+    Two blob layouts, distinguished by their own bytes rather than by a caller's
+    claim, because the fixtures below patch both:
+
+      LEGACY  (H5R_DATASET_REGION1)  [addr:sizeof_offsets][selection]
+      REVISED (H5R_DATASET_REGION2)  [token_size:1][token][bytes:4][rank:4][sel]
+
+    A serialized selection begins with a type in 0..3 and a version in 1..3, so
+    both candidates are confirmed against that before being accepted, and the
+    COUNT is required to match ``expect`` -- a base-file layout change then fails
+    loudly instead of patching whatever happens to sit at the old offset.
+    ``expect`` is 1 for the legacy base and 2 for the revised one, which carries
+    two references on purpose so that patching the first leaves the second as an
+    in-file control.
+    """
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError(f"{what}: no GCOL collection in the base file")
+    o = _sizeof_offsets(raw)
+    size = struct.unpack_from("<Q", raw, gcol + 8)[0]
+
+    def is_selection(at):
+        if at + 8 > len(raw):
+            return False
+        st = struct.unpack_from("<I", raw, at)[0]
+        ver = struct.unpack_from("<I", raw, at + 4)[0]
+        return st <= 3 and 1 <= ver <= 3
+
+    hits = []
+    p = gcol + 16
+    while p < gcol + size - 16:
+        idx = struct.unpack_from("<H", raw, p)[0]
+        osz = struct.unpack_from("<Q", raw, p + 8)[0]
+        if idx == 0:
+            break
+        body = p + 16
+        if is_selection(body + o):                       # legacy
+            hits.append((body + o, body, 0))
+        tsz = raw[body]
+        if tsz == o and is_selection(body + 1 + tsz + 8):  # revised
+            hits.append((body + 1 + tsz + 8, body, tsz))
+        p = body + ((osz + 7) // 8) * 8
+    if len(hits) != expect:
+        raise RuntimeError(f"{what}: expected {expect} region-reference heap "
+                           f"object(s), found {len(hits)}")
+    return hits[0]
+
+
+def _attr_selection_variant(path, base_path, mutate, what, expect):
+    """Patch the serialized selection (or blob header) of a region reference.
+
+    No checksum repair is needed and none is done: the bytes live in a global
+    heap collection, which carries no checksum, not in the object header that
+    holds the attribute message.
+    """
+    with open(base_path, "rb") as f:
+        raw = bytearray(f.read())
+    sel, blob, tsz = _attr_region_selection(raw, what, expect)
+    mutate(raw, sel, blob, tsz)
+    _patch(path, bytes(raw))
+
+
+# A version-1 serialized selection is type(4) version(4) 8-skipped rank(4)
+# count(4): libhdf5 pins enc_size to 4 and steps over the eight bytes after the
+# version without reading them (the `version >= 2` else arm of both
+# H5S__hyper_deserialize and H5S__point_deserialize).
+_SEL_V1_RANK = 16
+_SEL_V1_COUNT = 20
+
+
+def _make_attr_region_sel_blocks_over(path, base_path):
+    """An attribute region reference whose selection declares 2**32-1 blocks.
+
+    THE REGIME THIS OPENS: a region reference's heap object is not opaque.  It
+    ends in a serialized H5S selection, and libhdf5 deserializes it -- sizing a
+    coordinate buffer from a count the file supplies (H5S__hyper_deserialize,
+    H5S__point_deserialize).  In an ATTRIBUTE those bytes are METADATA, the same
+    jurisdiction argument that made the heap ID itself checkable, and until this
+    fixture nothing looked inside the object at all.
+
+    MEASURED divergence before the check landed: libhdf5 refuses this file at the
+    dereference ("buffer overflow while decoding selection coordinates") while
+    the control dereferences to 4 elements -- and h5policy accepted it.
+
+    The count is bounded by the bytes that actually follow it, which is exactly
+    what libhdf5 bounds it by (`p_end`), so no threshold is invented here.
+    """
+    def mutate(raw, sel, blob, tsz):
+        struct.pack_into("<I", raw, sel + _SEL_V1_COUNT, 0xFFFFFFFF)
+    _attr_selection_variant(path, base_path, mutate,
+                            "attribute selection blocks", 1)
+
+
+def _make_attr_region_sel_rank(path, base_path):
+    """An attribute region reference whose selection declares rank 2**32-1.
+
+    The rank gate on the attribute side of the shared sizer.  libhdf5 states it
+    once per deserializer, immediately after decoding the rank and before any
+    rank-dependent work: `0 == rank || rank > H5S_MAX_RANK`.  Measured -- libhdf5
+    refuses with "rank of serialized selection does not match dataspace".
+    """
+    def mutate(raw, sel, blob, tsz):
+        struct.pack_into("<I", raw, sel + _SEL_V1_RANK, 0xFFFFFFFF)
+    _attr_selection_variant(path, base_path, mutate,
+                            "attribute selection rank", 1)
+
+
+def _make_attr_region_sel_enc_size(path, base_path):
+    """An attribute region reference whose POINT selection encodes at 3 bytes.
+
+    Rewritten to a version-2 POINT selection so the encoded-size byte exists at
+    all: version 1 has no such field (libhdf5 pins it to 4), so the invariant is
+    unreachable at the version the base file was written with.  Legal values are
+    2, 4 and 8; 3 is refused as "unknown size of point/offset info for
+    selection" -- measured on the exact build.
+    """
+    def mutate(raw, sel, blob, tsz):
+        struct.pack_into("<I", raw, sel, 1)          # H5S_SEL_POINTS
+        struct.pack_into("<I", raw, sel + 4, 2)      # version 2 carries enc_size
+        raw[sel + 8] = 3                             # not 2, 4 or 8
+    _attr_selection_variant(path, base_path, mutate,
+                            "attribute selection enc", 1)
+
+
+def _make_attr_region_sel_flags(path, base_path):
+    """An attribute region reference whose selection sets an unknown flag bit.
+
+    Rewritten to a version-3 HYPERSLAB, the version that carries a flags byte at
+    all -- version 1 has none and point selections have none at any version.
+    H5S_SELECT_FLAG_BITS is H5S_HYPER_REGULAR alone (0x01), and libhdf5 refuses
+    anything outside it: measured, "unknown flag for selection".  The bit matters
+    beyond hygiene -- 0x01 selects between the regular and block-list payload
+    encodings, so an unknown neighbour says the byte is not what the writer
+    thought it was.
+    """
+    def mutate(raw, sel, blob, tsz):
+        struct.pack_into("<I", raw, sel + 4, 3)      # hyperslab version 3
+        raw[sel + 8] = 0x02                          # unknown bit beside REGULAR
+        raw[sel + 9] = 8                             # a legal encoded size
+        struct.pack_into("<I", raw, sel + 10, 1)     # rank 1
+    _attr_selection_variant(path, base_path, mutate,
+                            "attribute selection flags", 1)
+
+
+def _make_attr_stdref_sel_blocks_over(path, base_path):
+    """The REVISED-reference sibling of attr_region_sel_blocks_over.
+
+    Its point is the OFFSET, not the count: a revised reference's selection does
+    not start where a legacy one's does.  H5R__encode_region writes a token width
+    byte, the token, then a selection-size and a rank word ahead of the
+    selection, so the walker has to skip 1 + token_size + 8 bytes.  Getting that
+    arithmetic wrong reads coordinate bytes as a selection header, which is a
+    false positive on every valid file -- so this fixture exists to pin the
+    derivation, and valid/attr_stdref_region.h5 is the control that proves it.
+    """
+    def mutate(raw, sel, blob, tsz):
+        if tsz == 0:
+            raise RuntimeError("expected a REVISED region reference base file")
+        struct.pack_into("<I", raw, sel + _SEL_V1_COUNT, 0xFFFFFFFF)
+    _attr_selection_variant(path, base_path, mutate,
+                            "revised selection blocks", 2)
+
+
+def _make_attr_stdref_blob_token_size(path, base_path):
+    """A revised reference declaring a token wider than its whole heap object.
+
+    The blob's own framing rather than the selection inside it, and the field
+    that was SILENTLY SKIPPED when this check first landed: the bound was taken
+    (`token_size > data_size - 1`) but nothing was reported, so the file came back
+    accepted while libhdf5 refused it -- an accept-versus-reject divergence
+    created exactly where the bound was being applied.  Measured: H5Aread fails
+    cleanly with the width raised to 255 in a 49-byte object.
+    """
+    def mutate(raw, sel, blob, tsz):
+        if tsz == 0:
+            raise RuntimeError("expected a REVISED region reference base file")
+        raw[blob] = 0xFF
+    _attr_selection_variant(path, base_path, mutate,
+                            "revised token width", 2)
+
+
+def _make_attr_stdref_blob_sel_bytes(path, base_path):
+    """A revised reference declaring more selection bytes than its blob holds.
+
+    libhdf5's own safety check, and it is an exact one: H5R__decode_region adds
+    the two u32 header words to the stored size and refuses on
+    `*nbytes < buf_size`.  So the rule here is that equality, not a heuristic.
+    """
+    def mutate(raw, sel, blob, tsz):
+        if tsz == 0:
+            raise RuntimeError("expected a REVISED region reference base file")
+        struct.pack_into("<I", raw, blob + 1 + tsz, 0xFFFFFFFF)
+    _attr_selection_variant(path, base_path, mutate,
+                            "revised selection bytes", 2)
 
 
 def _find_attr_heap_id(raw, what):

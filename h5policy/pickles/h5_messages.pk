@@ -301,6 +301,11 @@ fun h5policy_validate_attr_heap_ids = (int ios,
                        settle it in the datatype walk.  */
                     var revised = 0;
                     var declared = 0UL;
+                    /* Declared out here because the selection check below needs
+                       it: for a revised reference the ELEMENT's type byte, not
+                       the datatype's sub-type, says whether this is a region
+                       reference and therefore whether a selection follows.  */
+                    var etype = 0UL;
                     if (kind == 7UL && subtype >= H5_DTYPE_REF_TYPE_OBJECT2
                         && subtype <= H5_DTYPE_REF_TYPE_ATTR)
                         {
@@ -310,9 +315,9 @@ fun h5policy_validate_attr_heap_ids = (int ios,
                                     s = s + 1UL;
                                     continue;
                                 }
-                            var etype = h5policy_msg_u64_at(ios, profile,
-                                                            value_off + (elem + slot)#B,
-                                                            1UL);
+                            etype = h5policy_msg_u64_at(ios, profile,
+                                                        value_off + (elem + slot)#B,
+                                                        1UL);
                             var eflags = h5policy_msg_u64_at(ios, profile,
                                                              value_off + (elem + slot + 1UL)#B,
                                                              1UL);
@@ -474,6 +479,154 @@ fun h5policy_validate_attr_heap_ids = (int ios,
                                         loc1 = value_off + (elem + slot)#B,
                                         loc1_len = 4UL,
                                     });
+                        }
+
+                    /* THE SERIALIZED SELECTION INSIDE A REGION REFERENCE.
+                       A region reference's heap object is not opaque: it ends in
+                       an H5S selection that libhdf5 deserializes with
+                       H5S__point_deserialize / H5S__hyper_deserialize, sizing a
+                       coordinate buffer from a count the file supplies.  In an
+                       attribute those bytes are METADATA -- the same jurisdiction
+                       argument that made the heap ID itself checkable -- and they
+                       were unvalidated.  MEASURED divergence on three variants of
+                       valid/attr_heap_ids.h5 (nblocks 0xffffffff, nblocks 2**31,
+                       rank 0xffffffff): libhdf5 refuses each one at the
+                       dereference ("buffer overflow while decoding selection
+                       coordinates", "rank of serialized selection does not match
+                       dataspace") while the control dereferences to 4 elements,
+                       and h5policy accepted all three.
+
+                       The blob layout differs by reference generation, so the
+                       offset is derived per kind rather than guessed:
+                         LEGACY  (H5R_DATASET_REGION1) -- [addr][selection]
+                         REVISED (H5R_DATASET_REGION2) --
+                             [token_size:1][token][sel bytes:4][rank:4][selection]
+                       H5R__encode_region writes those two u32 words and
+                       H5R__decode_region requires the declared size plus them to
+                       fit the blob, so that equality is checked here too.
+
+                       The sizer is the SAME one the VDS layout uses: a selection
+                       is the same record wherever it is stored, and its rank,
+                       flags and encoded size have the same legal ranges.  Only
+                       the role differs, which is what names the finding's
+                       family.  */
+                    /* `kind == 7` is not redundant: h5policy_dtype_slot_base
+                       carries the reference SUB-TYPE for a reference slot and the
+                       BASE TYPE SIZE for a vlen slot, so without it every vlen of
+                       a 1- or 3-byte base type would be read as a region
+                       reference.  Measured -- omitting it rejected
+                       valid/attr_heap_ids.h5 and valid/attr_vlen_array_heap_ids.h5,
+                       whose vlen base size is 1.  */
+                    var sel_kind = revised != 0 ? etype : subtype;
+                    if (ref.found != 0UB && kind == 7UL
+                        && (sel_kind == H5_DTYPE_REF_TYPE_REGION
+                            || sel_kind == H5_DTYPE_REF_TYPE_REGION2))
+                        {
+                            var sel_rel = o;
+                            var ok = 1;
+                            if (sel_kind == H5_DTYPE_REF_TYPE_REGION2)
+                                {
+                                    /* The token width is file-supplied, so bound
+                                       it before it is added to anything. */
+                                    if (ref.data_size < 1UL)
+                                        ok = 0;
+                                    else
+                                        {
+                                            var tsz = h5policy_msg_u64_at(
+                                                ios, profile, ref.data_off, 1UL);
+                                            /* The token width is one file-supplied
+                                               byte and the region header must fit
+                                               behind it.  REPORTED, not skipped:
+                                               libhdf5 refuses such a blob
+                                               (measured -- H5Aread fails cleanly
+                                               with the width raised to 255 in a
+                                               49-byte object), so staying silent
+                                               here left an accept-versus-reject
+                                               divergence exactly where the bound
+                                               was being taken.  */
+                                            if (tsz > ref.data_size - 1UL
+                                                || H5_DTYPE_REF_REGION2_SEL_HEADER
+                                                   > ref.data_size - 1UL - tsz)
+                                                {
+                                                    h5policy_emit_error_ev(
+                                                        "H5_CORRUPT_REFERENCE_BLOB_EXTENT",
+                                                        "corrupt", ref.data_off,
+                                                        object,
+                                                        "attribute region reference header does not fit its heap object",
+                                                        H5Evidence {
+                                                            field = "attribute.reference_token_size",
+                                                            actual = tsz,
+                                                            expected = ref.data_size
+                                                                       > 1UL + H5_DTYPE_REF_REGION2_SEL_HEADER
+                                                                       ? ref.data_size - 1UL
+                                                                         - H5_DTYPE_REF_REGION2_SEL_HEADER
+                                                                       : 0UL,
+                                                            comparison = "at_most",
+                                                            has_loc1 = 1,
+                                                            loc1_role = "actual",
+                                                            loc1 = ref.data_off,
+                                                            loc1_len = 1UL,
+                                                        });
+                                                    ok = 0;
+                                                }
+                                            else
+                                                {
+                                                    var shdr = ref.data_off
+                                                               + 1#B + tsz#B;
+                                                    var declared_sel =
+                                                        h5policy_msg_u64_at(
+                                                            ios, profile,
+                                                            shdr, 4UL);
+                                                    /* H5R__decode_region:
+                                                       buf_size += 2*sizeof(u32)
+                                                       then `*nbytes < buf_size`
+                                                       is the refusal. */
+                                                    if (declared_sel
+                                                        > ref.data_size - 1UL
+                                                          - tsz
+                                                          - H5_DTYPE_REF_REGION2_SEL_HEADER)
+                                                        {
+                                                            h5policy_emit_error_ev(
+                                                                "H5_CORRUPT_REFERENCE_BLOB_EXTENT",
+                                                                "corrupt", shdr,
+                                                                object,
+                                                                "attribute region reference declares more selection bytes than its heap object holds",
+                                                                H5Evidence {
+                                                                    field = "attribute.selection_bytes",
+                                                                    actual = declared_sel,
+                                                                    expected = ref.data_size
+                                                                               - 1UL - tsz
+                                                                               - H5_DTYPE_REF_REGION2_SEL_HEADER,
+                                                                    comparison = "at_most",
+                                                                    has_loc1 = 1,
+                                                                    loc1_role = "actual",
+                                                                    loc1 = shdr,
+                                                                    loc1_len = 4UL,
+                                                                });
+                                                            ok = 0;
+                                                        }
+                                                    sel_rel = 1UL + tsz
+                                                        + H5_DTYPE_REF_REGION2_SEL_HEADER;
+                                                }
+                                        }
+                                }
+                            else if (sel_rel > ref.data_size)
+                                ok = 0;
+                            if (ok != 0 && sel_rel < ref.data_size)
+                                {
+                                    h5policy_selection_reported = 0;
+                                    var sz = h5policy_selection_size(
+                                        ios, profile,
+                                        ref.data_off + sel_rel#B,
+                                        ref.data_size - sel_rel, object,
+                                        "attribute", "attribute");
+                                    if (sz == 0UL
+                                        && !h5policy_selection_reported)
+                                        h5policy_emit_error(
+                                            "H5_CORRUPT_SELECTION", "corrupt",
+                                            ref.data_off + sel_rel#B, object,
+                                            "attribute region reference selection is malformed or overruns its heap object");
+                                }
                         }
                     s = s + 1UL;
                 }

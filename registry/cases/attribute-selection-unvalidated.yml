@@ -1,0 +1,149 @@
+# A region reference's global-heap object is NOT OPAQUE.  It ends in a serialized
+# H5S selection, and libhdf5 deserializes it -- sizing a coordinate buffer from a
+# rank, a flags byte, an encoded size and an element count that all come from the
+# file (H5S__point_deserialize, H5S__hyper_deserialize).  When the reference is
+# held by an ATTRIBUTE those bytes are METADATA, by the same argument that made
+# the heap ID itself checkable, and none of those fields was examined.
+#
+# The previous round of work stopped one layer short.  It validated the heap ID
+# -- collection address, object index, declared length -- and then treated the
+# object's CONTENTS as out of scope.  For a vlen that is right: the bytes are the
+# application's value.  For a region reference it is wrong: the bytes are a
+# dataspace selection, a structure libhdf5 parses and allocates from.
+#
+# Found by triaging a corpus specimen whose own bytes were OUT of jurisdiction.
+# The specimen's references live in DATASET raw data, so accepting it is correct;
+# what it named was the DECODER, and the same decoder is reachable from metadata.
+# A specimen can be a correct accept and still point at a real gap.
+schema_version: 1
+
+id: attribute-selection-unvalidated
+title: the serialized dataspace selection inside an attribute's region reference
+  was unvalidated -- rank, flag bits, encoded size, element count and the blob's
+  own framing
+status: oracle-hardened          # h5policy now rejects; libhdf5 already refuses
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The upstream corpus
+  entry that led here is cited as provenance, not as classification.
+
+record: message_envelope
+versions: [1, 2, 3]
+root_cause_classification: local_decode
+violated_invariant:
+  - attribute.selection_extent
+  - attribute.selection_rank
+  - attribute.selection_flags
+  - attribute.selection_enc_size
+  - attribute.reference_blob_extent
+
+validation_closure: >-
+  the attribute message payload to locate the value region; the resolved datatype
+  for the reference sub-type and the file-determined stride; the heap ID to
+  resolve one global-heap object; and then, inside that object, the reference
+  blob's framing and one serialized selection header sized against the bytes that
+  remain.
+activation_before_validation:
+  - public_id                    # H5Aread hands the value to the caller
+entry_points:
+  - h5policy (oracle) -- untrusted-strict and forensic both accepted every case
+  - "libhdf5 H5S__hyper_deserialize / H5S__point_deserialize via H5Rget_region"
+  - "libhdf5 H5R__decode_region (the blob's own two safety words)"
+
+defect: >-
+  ORACLE SIDE (this repository, now fixed).  h5policy_validate_attr_heap_ids
+  resolved the heap object and checked its SIZE, never its contents.  Every field
+  of the selection was therefore free, and so was the revised blob's framing: a
+  token width byte and a declared-selection-size word that libhdf5 both bound.
+  LIBHDF5 SIDE: nothing.  Current libhdf5 refuses all seven fixtures cleanly, and
+  every guard is a real error rather than an assert.  This is a pure
+  oracle-versus-library differential -- the class of gap that is invisible to any
+  check that only asks whether libhdf5 survived the specimen.
+
+fix: >-
+  The selection sizer is SHARED, not duplicated.  h5policy already had one for
+  the VDS layout message, and a serialized selection is the same record wherever
+  it is stored: the same versions, the same rank and flag-bit ranges, the same
+  legal encoded sizes.  h5policy_vds_selection_size was generalized to
+  h5policy_selection_size with role and evidence-namespace parameters and
+  declared in tools/message_routing.py ROLE_PARAMS, exactly as the global-heap
+  walker was in the previous round; the four findings it can emit were renamed
+  from H5_CORRUPT_VDS_SELECTION* to H5_CORRUPT_SELECTION* and given route shards
+  that name the family from the role prefix.  One new finding,
+  H5_CORRUPT_REFERENCE_BLOB_EXTENT, covers the revised blob's framing, which is
+  not a selection field at all.
+  The blob layouts were pinned FROM SOURCE before any check was written, because
+  a guessed offset would have read coordinate bytes as a selection header and
+  rejected valid files:
+    LEGACY  (H5R_DATASET_REGION1)  [addr:sizeof_offsets][selection]
+    REVISED (H5R_DATASET_REGION2)  [token_size:1][token][bytes:4][rank:4][sel]
+  H5R__encode_region writes those two u32 words and H5R__decode_region refuses on
+  `*nbytes < buf_size`, so that equality is checked rather than approximated.
+
+oracle_before: accept, zero findings, in untrusted-strict and forensic alike
+oracle_after: reject_corrupt on all seven fixtures; both controls still accept
+
+libhdf5_behaviour: >-
+  Refuses every case.  MEASURED on the 2.3.0 baseline -- the legacy variants
+  through an h5py dereference of the attribute's region reference ("buffer
+  overflow while decoding selection coordinates", "rank of serialized selection
+  does not match dataspace", "unknown size of point/offset info for selection",
+  "unknown flag for selection"), the revised variants through an exact-build C
+  harness because h5py cannot decode H5R_ref_t at all.  The control dereferences
+  to 4 elements and the revised control to two 5-point regions, so the harness is
+  known to reach the path rather than merely to fail everywhere.
+
+control_is_non_vacuous: >-
+  valid/attr_heap_ids.h5 and valid/attr_stdref_region.h5 both still accept, and
+  the revised control is what distinguishes a correct offset derivation from a
+  walker that rejects everything.  Two false positives were introduced and caught
+  by exactly these controls while the check was being written; see
+  surfaced_false_positive.
+
+surfaced_false_positive: >-
+  TWO, BOTH CAUGHT BY THE VALID CONTROLS BEFORE LANDING.
+  FIRST: the region branch was entered for VLEN slots.
+  h5policy_dtype_slot_base carries the reference SUB-TYPE for a reference slot
+  and the BASE TYPE SIZE for a vlen slot, so without a `kind == 7` gate every
+  vlen of a 1- or 3-byte base type was read as a region reference and its value
+  bytes parsed as a selection.  Measured -- it rejected valid/attr_heap_ids.h5 and
+  valid/attr_vlen_array_heap_ids.h5, whose vlen base size is 1.  One array
+  serving two meanings is the hazard; the gate is now commented as load-bearing.
+  SECOND, and worse because it was silent: bracing.  Rewriting the encoded-size
+  check to emit in place left its `return 0` OUTSIDE the `if`, so
+  h5policy_selection_size returned "malformed" for EVERY version-3 hyperslab and
+  version-2 point selection -- with the reported flag set, which suppressed the
+  caller's own finding.  The net effect was not a false rejection but a silent
+  ACCEPT: malformed/vds_selection_rank_zero.h5 went from reject_corrupt to
+  accept_with_warnings.  It was caught only by running the existing VDS fixtures
+  under their OWN declared profile (legacy), not the profile the new work used.
+  A spot check under the wrong profile had shown the finding still firing.
+
+coverage_gaps:
+  - >-
+    ONE SELECTION, NOT THE WHOLE CHAIN.  The sizer bounds the selection header and
+    the bytes it claims; it does not check that the COORDINATES inside a point
+    selection lie within the referenced dataset's extent, nor that a hyperslab's
+    start precedes its end.  libhdf5 validates those in H5S_select_elements and
+    H5S_select_hyperslab, so files that violate them are refused by the library
+    and accepted here.  Reaching them needs the referenced dataset's dataspace,
+    which is a second object-header walk from inside an attribute value -- a
+    reference-graph edge this validator does not currently follow.
+  - >-
+    ATTRIBUTE REFERENCES (H5R_ATTR, type 4) carry a name after the region, and it
+    is not bounded here.  The type is accepted as blob-backed and its heap ID is
+    checked, but the trailing name length is not.
+  - >-
+    THE SELECTION IS ONLY REACHED WHERE A HEAP ID IS.  Both budgets from the
+    previous round still apply -- 64 IDs per attribute and 64 collection walks per
+    analysis -- so a reference past either bound has its selection unexamined too.
+
+provenance: >-
+  Triage of an upstream CVE corpus specimen naming H5S__point_deserialize.  The
+  specimen itself is a CORRECT ACCEPT: its references are dataset raw data, and
+  its mutation is the selection's encoded-size byte raised from 2 to 8, which
+  makes the element count decode as a 64-bit 2**63.  Current libhdf5 catches that
+  through its own overflow check and then through the buffer bound, so the
+  specimen is refused by the library and correctly ignored by this oracle.  What
+  it contributed was the DECODER, and the observation that the same decoder is
+  reachable from metadata.

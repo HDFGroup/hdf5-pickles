@@ -1,0 +1,96 @@
+# A NEGATIVE RESULT for this oracle and a REAL weakness in libhdf5, recorded
+# together because the two conclusions depend on the same measurement.
+#
+# A global-heap collection's object index is a 16-bit file field, and libhdf5
+# sizes heap->obj from it: H5HG__cache_heap_deserialize grows the array to
+# MAX(nalloc * 2, idx + 1) entries of 24 bytes each (H5HGcache.c).  A 4096-byte
+# collection declaring index 65535 therefore forces a ~1.5 MB allocation -- and
+# the metadata cache accounts that entry at the COLLECTION's size, so its own
+# limit can neither see the array nor evict against it.
+#
+# The reason this is NOT an h5policy check: an index far above what the
+# collection could hold is written by libhdf5 ITSELF, routinely.
+schema_version: 1
+
+id: global-heap-index-allocation-off-book
+title: a global-heap object index sizes libhdf5's slot array and is invisible to
+  the metadata cache's own budget -- but an out-of-range index is legitimate, so
+  there is no sound oracle rule
+status: no-oracle-change         # measured, triaged, deliberately not enforced
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The upstream corpus
+  entry that led here is cited as provenance, not as classification.
+
+record: message_envelope
+root_cause_classification: resource
+violated_invariant: []           # none: no sound invariant was found
+
+# -- Why the obvious rule is wrong ------------------------------------------
+rejected_rule: >-
+  THE RULE THAT LOOKED RIGHT AND IS NOT: `idx < H5HG_NOBJS(f, collection size)`.
+  H5HG_NOBJS is (size - hdr) / objhdr + 2, which is 257 for a 4 KiB collection --
+  the most objects such a collection could hold if every one were empty.  An index
+  above it therefore looks structurally impossible.
+  IT IS NOT.  H5HG__alloc assigns `idx = heap->nused++` for every insert while
+  nused stays under H5HG_MAXIDX, and H5HG_remove NEVER lowers nused -- it recycles
+  the SPACE and leaves the counter alone.  So a collection that is written to,
+  freed and written to again inside one session hands out indices past NOBJS while
+  still having room.  MEASURED with plain h5py: a vlen dataset of 100 elements
+  rewritten three times in one open session produces a 4096-byte collection
+  (NOBJS = 257) holding an object at index 400.
+  And libhdf5 READS such a file correctly -- measured on a hand-built file whose
+  every collection carries index 65535: H5Dread returns all 96 elements, rc 0.
+  So rejecting on this field would be an invariant-A false positive on ordinary
+  churned files, which is why nothing was added.
+  The counter resets on reload (nused is recomputed as max_idx + 1 at deserialize),
+  so how high a legitimate index climbs is bounded only by how long the collection
+  stays cache-resident -- there is no format-level ceiling to check against.
+
+# -- The libhdf5 weakness, measured ----------------------------------------
+libhdf5_behaviour: >-
+  Accepts and reads these files.  The cost is memory, and it is OFF THE CACHE'S
+  BOOKS.  MEASURED on the 2.3.0 baseline with an uncapped reader (RLIMIT_AS masks
+  amplification, so none was set) over two files identical except for the object
+  indices in their six collections:
+    baseline   H5Fget_mdc_size -> max 2097152, current 20971, 12 entries;
+               VmHWM delta +3264 kB
+    amplified  H5Fget_mdc_size -> max 2097152, current 20971, 12 entries;
+               VmHWM delta +12088 kB
+  The cache reports the SAME size and the SAME entry count for both while the
+  amplified file holds 8.8 MB more resident memory -- H5HG__cache_heap_image_len
+  returns heap->size, so the slot array is not part of what the cache measures or
+  evicts.  Per collection the ceiling is the 16-bit index: 65536 * 24 bytes from a
+  4096-byte minimum collection, about 384x, and it is reached with the file still
+  fully readable.  A single specimen from the upstream corpus (index 61442 in one
+  4 KiB collection) measured +1.5 MB against its unmodified base.
+  NO memory-safety claim.  Nothing overruns and nothing faults; the growth path is
+  guarded (`idx >= new_alloc` errors) and the slots are calloc'd.  This is
+  amplification and accounting, not corruption.
+
+oracle_before: accept
+oracle_after: accept -- unchanged, deliberately
+
+coverage_gaps:
+  - >-
+    NO FIXTURE IS TRACKED for this, on purpose: there is nothing to assert.  A
+    fixture whose expectation is "accept" would pin the absence of a rule that was
+    never written, and the two files the measurement used are reconstructible from
+    the recipe above in less time than reviewing a stored blob.
+  - >-
+    IF A RULE IS EVER WANTED it has to be a RESOURCE budget on the forced
+    allocation, not a format invariant on the index -- and it needs a profile knob,
+    because the legitimate and hostile cases differ only in magnitude (measured 3x
+    for ordinary churn versus 360x for the corpus specimen) and the legitimate
+    ceiling is set by session behaviour rather than by the format.
+
+provenance: >-
+  Triage of an upstream CVE corpus specimen naming H5FL_arr_malloc.  Its base file
+  was recovered by size match and confirmed by diff -- 10 changed bytes, of which
+  five are in unreferenced file space before the first dataset's data, two are in
+  the collection's free-space body, and two are the live mutation: one heap
+  object's index raised from 2 to 61442 and its reference count from 0 to 255.
+  libhdf5 refuses the file, but for a reason OUTSIDE this oracle's jurisdiction --
+  the reference naming the now-absent index 2 lives in DATASET raw data.  So the
+  specimen is a correct accept twice over, and what it contributed is the
+  measurement above.
