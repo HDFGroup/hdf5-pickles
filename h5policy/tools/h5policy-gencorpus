@@ -209,6 +209,7 @@ def _gen_valid(root):
         f"{root}/valid/contig_unalloc_size_mismatch.h5")
     _make_attr_vlen_array_heap_ids(f"{root}/valid/attr_vlen_array_heap_ids.h5")
     _make_attr_empty_vlen_heap_id(f"{root}/valid/attr_empty_vlen_heap_id.h5")
+    _make_attr_stdref_region(f"{root}/valid/attr_stdref_region.h5")
     # The control for the attribute heap-ID invariants: a vlen string attribute
     # and a legacy dataset-region-reference attribute, both of which store a
     # global-heap ID in the object-header message.  Their whole point is to be
@@ -1341,6 +1342,8 @@ def _gen_malformed(root):
         f"{root}/malformed/multifault_scaleoffset.h5")
     _make_bad_reference_datatype_version(
         f"{root}/malformed/bad_reference_datatype_version.h5")
+    _make_bad_datatype_version(
+        f"{root}/malformed/bad_datatype_version.h5")
     _make_bad_offset(f"{root}/malformed/bad_offset.h5")
     _make_bad_unused_bits(f"{root}/malformed/bad_unused_bits.h5")
     # Structure-aware fuzzer finds (h5policy-fuzz), each a distinct soundness
@@ -1673,6 +1676,10 @@ def _gen_malformed(root):
         f"{root}/malformed/attr_gheap_dedup_many_refs.h5")
     _make_attr_gheap_free_undersized(
         f"{root}/malformed/attr_gheap_free_undersized.h5")
+    _make_attr_stdref_blob_size_mismatch(
+        f"{root}/malformed/attr_stdref_blob_size_mismatch.h5")
+    _make_attr_stdref_heap_idx_missing(
+        f"{root}/malformed/attr_stdref_heap_idx_missing.h5")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -2849,6 +2856,39 @@ def _make_bad_reference_datatype_version(path):
             break
     else:
         raise RuntimeError("could not locate the compound datatype header")
+    _patch(path, bytes(raw))
+
+
+def _make_bad_datatype_version(path):
+    """A fixed-point datatype message at version 6 -- past the latest defined.
+
+    The positive fixture for datatype.version_supported.  It exists because that
+    invariant lost its only one: malformed/bad_reference_datatype_version.h5 used
+    to trip it through a gate that rejected `class 7 && version != 1`, and that
+    gate was a false positive -- H5T_STD_REF is class 7 at version 4 by
+    construction (H5T_INIT_TYPE_REF_COMMON, src/H5T.c), so it refused every file
+    using a modern reference.  With the gate gone that fixture asserts
+    datatype.reference_encode_version instead, and the version rule needs a
+    fixture that trips it on its own terms.
+
+    Version 6 rather than 0: libhdf5 bounds the version at both ends
+    (H5Odtype.c, `version < H5O_DTYPE_VERSION_1 || version > ...LATEST`), and an
+    over-range version is the direction that keeps working as new versions are
+    defined -- the file simply has to be regenerated with a higher number, which
+    is a visible edit, whereas 0 would silently keep passing forever.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4"),
+                                   track_times=False),
+        libver="earliest")
+    # Datatype message body: byte 0 is (version << 4) | class, bytes 4-7 the
+    # element size.  Version 1, class 0 (fixed-point), size 4.
+    hits = [i for i in range(len(raw) - 8)
+            if raw[i] == 0x10 and struct.unpack_from("<I", raw, i + 4)[0] == 4]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one version-1 fixed-point datatype "
+                           f"message of size 4, found {len(hits)}")
+    raw[hits[0]] = (6 << 4) | 0
     _patch(path, bytes(raw))
 
 
@@ -5951,6 +5991,143 @@ def _make_attr_vlen_len_under(path):
     if true_len < 2:
         raise RuntimeError("base vlen attribute is too short to under-declare")
     struct.pack_into("<I", raw, d, true_len - 1)
+    _patch(path, bytes(raw))
+
+
+def _stdref_attr_base():
+    """Raw bytes of a file whose attribute holds two revised region references.
+
+    Built through the C helper, not h5py: the local h5py links libhdf5 1.14.5
+    and cannot write `H5T_STD_REF`.  See h5policy/tools/probe/make_stdref_attr.c
+    for why the references must be REGION references to carry a heap ID at all.
+    """
+    source = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                          "probe", "make_stdref_attr.c")
+    with tempfile.TemporaryDirectory() as build:
+        helper = os.path.join(build, "make_stdref_attr")
+        out = os.path.join(build, "stdref.h5")
+        _build_and_run_h5cc_helper(source, helper, [out])
+        with open(out, "rb") as f:
+            return bytearray(f.read())
+
+
+# H5R_DATASET_REGION2, the only revised reference variety that is always
+# blob-backed; H5R_OBJECT2 without H5R_IS_EXTERNAL is direct-copied and
+# carries no global-heap ID (H5R__encode_heap).
+H5R_DATASET_REGION2 = 3
+
+
+def _find_revised_refs(raw, what):
+    """Offsets of the two revised-reference elements in the `regs` attribute.
+
+    A revised reference encodes as
+
+        [type:1][flags:1][blob_size:4][heap addr:sizeof_offsets][heap idx:4]
+
+    and the heap ID begins at offset 6 -- `H5R_ENCODE_HEADER_SIZE` plus the
+    blob-size word (H5R__decode_heap).  The pair is anchored on the collection
+    address libhdf5 actually wrote and required to be exactly two elements one
+    element-size apart, so a library layout change fails loudly rather than
+    patching unrelated bytes.
+    """
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError(f"{what}: no GCOL collection in the base file")
+    o = _sizeof_offsets(raw)
+    stride = 6 + o + 4
+    hits = []
+    for i in range(len(raw) - stride):
+        if raw[i] != H5R_DATASET_REGION2 or raw[i + 1] not in (0, 1):
+            continue
+        if int.from_bytes(raw[i + 6:i + 6 + o], "little") != gcol:
+            continue
+        idx = int.from_bytes(raw[i + 6 + o:i + 10 + o], "little")
+        blob = struct.unpack_from("<I", raw, i + 2)[0]
+        if 1 <= idx <= 255 and 0 < blob <= len(raw):
+            hits.append(i)
+    if len(hits) != 2 or hits[1] - hits[0] != stride:
+        raise RuntimeError(f"{what}: expected two adjacent revised references "
+                           f"naming the collection at {gcol}, found {hits}")
+    return hits
+
+
+def _stdref_attr_variant(path, mutate):
+    """Patch the SECOND revised reference and repair the object header.
+
+    The first element is left intact deliberately: it is an in-file control, so
+    a finding that fires on both elements is visibly a walker bug rather than
+    the intended detection.  The attribute lives in a version-2 object header,
+    whose trailing checksum must be recomputed or the file is rejected before
+    any message is decoded and the fixture proves nothing.
+    """
+    raw = _stdref_attr_base()
+    second = _find_revised_refs(raw, "revised reference")[1]
+    mutate(raw, second, _sizeof_offsets(raw))
+    _fix_v2_ohdr_checksum(raw, _enclosing_v2_ohdr(raw, second))
+    _patch(path, bytes(raw))
+
+
+def _enclosing_v2_ohdr(raw, off):
+    """Offset of the version-2 object header whose chunk 0 contains ``off``."""
+    for o in range(off, -1, -1):
+        if raw[o:o + 4] != b"OHDR" or raw[o + 4] != 2:
+            continue
+        flags = raw[o + 5]
+        cur = o + 6 + (16 if flags & (1 << 5) else 0) + (4 if flags & (1 << 4) else 0)
+        size_w = 1 << (flags & 3)
+        chunk0 = int.from_bytes(raw[cur:cur + size_w], "little")
+        if cur + size_w <= off < cur + size_w + chunk0:
+            return o
+    raise RuntimeError(f"no version-2 object header encloses offset {off}")
+
+
+def _make_attr_stdref_blob_size_mismatch(path):
+    """A revised reference whose declared blob size is not the heap object's.
+
+    The revised-reference regime of the attribute heap-ID invariant.  Everything
+    the vlen fixtures cover reaches the heap through a `length | addr | idx`
+    descriptor; a revised reference reaches it through a different encoding
+    entirely -- type and flags first, the ID at offset 6 -- and until this fixture
+    nothing exercised that decode.
+
+    libhdf5 requires EQUALITY here, not a bound: `H5VL__native_blob_get` fails
+    when `hobj_size != size` (H5VLnative_blob.c), so 49 -> 50 is refused.
+    Measured on the exact build: `H5Aread` fails cleanly with the size raised or
+    lowered by one, and succeeds on the untouched file.  h5dump is useless as an
+    oracle for this family -- it prints an EMPTY `DATA {}` block and exits 0.
+    """
+    def mutate(raw, off, o):
+        declared = struct.unpack_from("<I", raw, off + 2)[0]
+        struct.pack_into("<I", raw, off + 2, declared + 1)
+    _stdref_attr_variant(path, mutate)
+
+
+def _make_attr_stdref_heap_idx_missing(path):
+    """A revised reference naming a global-heap object the collection lacks.
+
+    The sibling of attr_vlen_heap_idx_missing in the revised-reference encoding:
+    the same defect, reached through the other decode path, which is the point
+    of having both.  The index is raised to 200 -- past the objects present but
+    inside the obj[] array libhdf5 sizes from the collection SIZE -- so the file
+    occupies the missing-object regime rather than the out-of-bounds one.
+    """
+    def mutate(raw, off, o):
+        struct.pack_into("<I", raw, off + 6 + o, 200)
+    _stdref_attr_variant(path, mutate)
+
+
+def _make_attr_stdref_region(path):
+    """A VALID attribute of revised region references -- the control.
+
+    Without it the two malformed revised-reference fixtures prove only that the
+    new decode rejects something; this proves it accepts the shape libhdf5
+    writes.  It is also the only corpus file carrying a datatype message of
+    class 7 at version 4, which is what `H5T_STD_REF` is by construction
+    (H5T_INIT_TYPE_REF_COMMON, src/H5T.c) -- the corpus previously had none, and
+    a version gate that rejected every one of them went unnoticed as a result.
+    """
+    raw = _stdref_attr_base()
+    _find_revised_refs(raw, "revised reference control")
     _patch(path, bytes(raw))
 
 

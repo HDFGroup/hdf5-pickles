@@ -466,17 +466,70 @@ coverage_gaps:
     name index (record type 8), which link listing never reaches; only an
     attribute-enumerating consumer gets there.  A measurement that had stopped at
     `h5ls -r` would have recorded the internal case as clean.
-    THE DECODE CONSUMER CANNOT BE REACHED THROUGH nrec.  H5C__load_entry runs
-    verify_chksum BEFORE deserialize and, on failure after all retries, errors
-    with "incorrect metadata checksum after all read attempts"
-    (H5Centry.c:1215-1223) -- deserialize never runs.  Both consumers read the
-    SAME nrec, so any count that over-runs the decode also moves the checksum
-    offset past the node image; the four bytes compared there lie beyond the
-    allocation and are not file-controllable, so the verify cannot be made to
-    pass.  A specimen for the decode path is therefore not merely absent, it does
-    not exist -- which is why this entry is closed by argument rather than by a
-    fixture.  Should a future libhdf5 drop or reorder verify_chksum for these
-    clients, the decode consumer becomes reachable and this reasoning expires.
+    THE DECODE CONSUMER IS UNREACHABLE THROUGH nrec ON LP64 -- AND THE ILP32 CASE
+    IS OPEN.  This paragraph first said "cannot be reached", flatly; the width
+    qualifier was missing and the claim was wrong as written.
+    ON LP64 the argument holds.  H5C__load_entry runs verify_chksum BEFORE
+    deserialize and, on failure after all retries, errors with "incorrect
+    metadata checksum after all read attempts" (H5Centry.c:1215-1223).  Both
+    consumers span exactly the same bytes: verify computes
+      chk_size = H5B2_INT_PREFIX_SIZE + nrec * rrec_size
+                 + (nrec + 1) * H5B2_INT_POINTER_SIZE(hdr, depth)
+    (H5B2cache.c) and deserialize walks the same prefix, records and child
+    pointers.  So any count that would over-run the decode moves the checksum
+    offset past the node image too; the four bytes compared there lie beyond the
+    allocation and are not file-controllable, so verify cannot be made to pass.
+    ON ILP32 THAT REASONING FAILS, because chk_size is a size_t.  Both inputs are
+    2-byte on-disk fields, and at their maxima
+      10 + 65535 * 65535 + 65536 * ptr_size
+    is 4295229451 for ptr_size 6 -- past 2**32-1 by ~262 KB, and larger still for
+    wider pointers.  A wrapped chk_size lands INSIDE the node image, where the
+    stored checksum IS file-controllable; verify would then pass and deserialize
+    would run with the full nrec.  That matters because
+    H5B2__cache_int_deserialize takes its image length as
+    `size_t H5_ATTR_UNUSED len` and bounds nothing by it, so a decode reached this
+    way over-reads without limit rather than by the small overshoot the checksum
+    consumer produces.
+    MEASURED 2026-08-24 -- THE DECODE CONSUMER IS REACHABLE ON ILP32, and the
+    specimen exists.  Solving the congruence over the two 2-byte on-disk fields
+    gives three pairs that wrap chk_size into the node image; the one used is
+    record_size 65528 with nrec 65535, which for a depth-1 root with
+    H5B2_INT_POINTER_SIZE 9 gives chk_size 4294967314 -- 18 after the 32-bit
+    wrap.  The stored checksum then sits at node+14 over the first 14 bytes,
+    which the FILE controls, so verify passes.
+    The two widths crash in different functions, which is the proof:
+      LP64   H5F_get_checksums with buf_size=4294967314, called from
+             H5B2__cache_int_verify_chksum (H5B2cache.c:573).  No wrap, verify
+             never passes, deserialize never runs -- the argument above, observed.
+      ILP32  H5A__dense_btree2_name_decode (H5Abtree2.c:319) called from
+             H5B2__cache_int_DESERIALIZE (H5B2cache.c:659) with len=512, reading
+             an unmapped address.  H5C__load_entry reached deserialize at
+             H5Centry.c:1241 because verify returned true.
+    So the checksum is not merely "not a barrier" in the sense already recorded
+    here -- at 32 bits it can be turned into a PASS, and what follows is the
+    decode consumer with nrec 65535 against a 512-byte image.  That is a far
+    larger over-read than the checksum consumer's, because
+    H5B2__cache_int_deserialize takes its length as `size_t H5_ATTR_UNUSED len`
+    and bounds nothing by it.
+    h5policy rejects the specimen (H5_CORRUPT_V2_BTREE_NODE_SIZE), so this
+    VALIDATES the existing rule rather than exposing an oracle gap: the bound on
+    record_size against node capacity is what stops the file, at both widths, for
+    the same reason.
+    Both builds are HDF5 2.3.0 from the same source; the 32-bit one is the
+    separate ILP32 install.  The unmodified base file reads cleanly on the 32-bit
+    build, so the crash is the specimen and not the build.
+    NO TRACKED FIXTURE, deliberately.  The specimen guards the same oracle rule
+    that malformed/v2_btree_leaf_capacity_zero.h5 already guards -- record_size
+    against node capacity -- and its one distinctive property, the ILP32 wrap, is
+    invisible to a suite that runs 64-bit.  Adding it would carry a file that
+    segfaults libhdf5 at both widths through the differential harness for no
+    coverage the corpus can observe.  The construction is recorded above in full
+    (base valid/adjacent_null_messages.h5, record_size 65528, nrec 65535, BTHD
+    checksum repaired, then the node checksum written at root+14 over the first
+    14 bytes), which is enough to rebuild it on demand.
+    Also expiring this reasoning: should a future libhdf5 drop or reorder
+    verify_chksum for these clients, the decode consumer becomes reachable at any
+    width.
   - >-
     No 32-bit measurement on either specimen (see measured.width).
   - >-
