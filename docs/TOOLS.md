@@ -54,7 +54,9 @@ h5cve-corpus --corpus DIR --hdf5 DIR \
 ```
 
 It **exits 0 when the corpus is absent**, so it is skip-not-fail by
-construction.
+construction. `run.sh` runs it as the `cvecorpus` phase when a sibling checkout
+is present (about 90 seconds for 140 specimens); set `H5POLICY_CVE_CORPUS` to
+point elsewhere, or to the **empty string** to disable it.
 
 **It guards the accepts, not the rejections.** Triage of that corpus is
 finished. Its remaining value is that roughly a dozen specimens accept *on
