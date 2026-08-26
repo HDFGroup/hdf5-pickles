@@ -1291,6 +1291,8 @@ def _gen_malformed(root):
         f"{root}/malformed/compound_member_offset_oob.h5")
     _make_compound_member_array_off12_oob(
         f"{root}/malformed/compound_member_array_off12_oob.h5")
+    _make_compound_member_array_nested_oob(
+        f"{root}/malformed/compound_member_array_nested_oob.h5")
     _make_scaleoffset_nelmts_mismatch(
         f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
     _make_scaleoffset_size_mismatch(
@@ -2170,6 +2172,62 @@ def _make_compound_member_array_off12_oob(path):
     # sits at datatype byte 16 (8-byte header + 8-byte padded name "a").
     struct.pack_into("<I", dt, 16, 12)
     _splice_compact_datatype(path, bytes(dt), 16)
+
+
+def _v1_compound_wrapping_member(elem_size, member_off, inner_dt):
+    """Bytes of a version-1 compound with a single *plain* member "a" at byte
+    offset `member_off` whose type is the already-encoded datatype `inner_dt`.
+
+    The sibling helpers hardwire an integer base type; this one takes the member
+    type as bytes so a compound can be nested inside a compound.  The member
+    itself declares rank 0, so it is never promoted -- only whatever `inner_dt`
+    describes is."""
+    dt = bytes([0x16]) + b"\x01\x00\x00" + struct.pack("<I", elem_size)  # compound v1, 1 member
+    name = b"a\x00"
+    name += b"\x00" * ((8 - len(name) % 8) % 8)                          # name padded to 8
+    dt += name + struct.pack("<I", member_off)                           # member name + byte offset
+    dt += bytes([0]) + b"\x00" * 3                                       # rank 0 + reserved
+    dt += struct.pack("<I", 0) + struct.pack("<I", 0)                    # permutation + reserved
+    dt += struct.pack("<I", 0) * 4                                       # 4 dimension-size slots
+    dt += inner_dt                                                       # member type, verbatim
+    return dt
+
+
+def _make_compound_member_array_nested_oob(path):
+    """The v1 embedded-array promotion defect ONE LEVEL DOWN: the member that
+    overruns its parent is inside a nested compound, not in the dataset's own
+    datatype.
+
+    Its three siblings all put the oversized member in the top-level compound.
+    That leaves the depth question open, and the depth question is the one a fix
+    has to answer: H5O__dtype_decode_helper recurses into a nested compound and
+    applies the SAME :507/:509-before-:542 ordering at every level, so a guard
+    added only where the dataset's own datatype is decoded would close the
+    siblings and leave this file accepted.
+
+    Geometry -- deliberately the off12 geometry moved down one level, so the two
+    fixtures differ in depth and in nothing else.  The outer element is 16 bytes
+    and its single member "a" sits at offset 0 with a nested compound behind it,
+    declared 8 bytes, which passes the outer bound 0 + 8 <= 16 honestly.  Inside
+    that nested compound the single member "a" sits at offset 4 with a [2] array
+    of H5T_STD_U32LE: the 4-byte BASE type passes the inner bound 4 + 4 <= 8,
+    and H5T__array_create then promotes it to 8 bytes ending at 12 -- past the
+    8-byte compound that contains it, with neither guard re-running.
+
+    Width-INDEPENDENT for the same reason as compound_member_array_off12_oob:
+    dims [2] give 8 bytes at 32-bit and 64-bit alike, so this isolates the
+    guard-ordering half of the defect from the arithmetic half.
+
+    Modelled on a fuzzed copy of the HDF5 test file tnestedcomp.h5 that reached
+    triage, where the nested carrier was `struct {char; float[62978];}` inside a
+    12-byte compound and libhdf5 2.3.0 accepted it on x86-64 and i386 alike.
+    See registry/cases/compound-member-array-promotion-unguarded.yml."""
+    inner = bytearray(_v1_compound_array_member(8, (2, 0, 0, 0), 4, 32))
+    # _v1_compound_array_member hardwires the member byte offset to 0; the field
+    # sits at datatype byte 16 (8-byte header + 8-byte padded name "a").
+    struct.pack_into("<I", inner, 16, 4)
+    _splice_compact_datatype(
+        path, _v1_compound_wrapping_member(16, 0, bytes(inner)), 16)
 
 
 def _v1_compound_plain_member(elem_size, member_off, base_size, base_precision):
