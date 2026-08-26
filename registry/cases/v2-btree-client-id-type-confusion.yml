@@ -1,0 +1,119 @@
+# A v2 B-tree header's CLIENT ID is chosen by the FILE, and libhdf5 never checks
+# it against the client the caller opened the tree as.
+# H5B2__cache_hdr_deserialize (src/H5B2cache.c) range checks it only against the
+# number of B-tree types --
+#     id = (H5B2_subid_t)*image++;
+#     if (id >= H5B2_NUM_BTREE_ID) HGOTO_ERROR(... "incorrect B-tree type");
+#     cparam.cls = H5B2_client_class_g[id];
+# -- and H5B2__hdr_init then runs `(*hdr->cls->crt_context)(ctx_udata)` with the
+# CALLER's user data.  A dense-attribute index opened as a chunk index, or as a
+# fractal-heap huge-object index, decodes the caller's struct as the wrong type.
+#
+# The oracle side of this was NOT an accept, which is worth stating plainly
+# because the first reading of it was wrong: h5policy already refused every one
+# of these files under every profile.  It refused them as
+# H5_UNSUPPORTED_PICKLE_COVERAGE_GAP -- "this oracle does not decode this
+# shape" -- for files that crash the reference library.  The defect fixed here is
+# the CLASSIFICATION, and the missing fixtures behind a rule that existed.
+schema_version: 1
+
+id: v2-btree-client-id-type-confusion
+title: a v2 B-tree header's client id was reported as an unsupported layout
+  rather than as corruption, and the rule that catches it had no fixture at all
+status: oracle-hardened          # h5policy now rejects as corrupt; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The third-party report
+  that prompted this triage is embargoed; nothing from it is reproduced here
+  beyond what was independently re-derived from the HDF5 source tree and
+  measured locally.
+
+record: dense_index
+versions: [0]                    # v2 B-tree header version
+root_cause_classification: local_decode
+violated_invariant:
+  - dense.btree_record_type
+validation_closure: >-
+  the object header's link-info or attribute-info message to learn which index
+  is being opened and therefore which client the tree must be, and the v2 B-tree
+  header's own version, client id and geometry.
+activation_before_validation:
+  - native_construction          # the wrong class's crt_context runs on the caller's udata
+entry_points:
+  - h5policy (oracle) -- refused as unsupported_coverage_gap under every profile
+  - "libhdf5 H5B2__cache_hdr_deserialize (src/H5B2cache.c) via H5B2__hdr_init"
+  - "direct consumers: h5dump -A, an h5py attribute listing, a by-name link lookup"
+
+defect: >-
+  ORACLE SIDE (this repository, now fixed).  Two of the five v2-B-tree header
+  decode sites conflated a wrong client id with an EMPTY index in a single test
+  -- `record_type != 8 || addr_is_undef` in the dense-attribute walker and
+  `record_type != 5 || addr_is_undef` in the dense-link name-index walker.  A
+  wrong client fell out with no finding, and the caller then emitted one clean
+  H5_UNSUPPORTED_PICKLE_COVERAGE_GAP for the whole layout.  The two conditions
+  are now separate: a type mismatch is reported as
+  H5_CORRUPT_V2_BTREE_RECORD_TYPE and claims the layout as handled, while an
+  undefined root address still returns silently because an empty index is
+  legitimate.
+  The other three sites already reported it -- the shared dense name/creation
+  order validator, the SOHM index, and the chunk index (which accepts either 10
+  or 11) -- so this was an inconsistency among siblings, not a missing idea.
+  LIBHDF5 SIDE: unfixed, and it is not a clean refusal.  See measurements.
+
+fix: >-
+  Split the combined condition at both sites and emit the existing finding.  No
+  new finding code and no new invariant were needed: dense.btree_record_type was
+  already declared, in two families, with H5_CORRUPT_V2_BTREE_RECORD_TYPE mapped
+  to it.  What was missing was any fixture at all.
+
+oracle_before: unsupported_coverage_gap under untrusted-strict, forensic, legacy
+  and trusted-fast alike -- refused, but as an undecoded shape
+oracle_after: reject_corrupt with H5_CORRUPT_V2_BTREE_RECORD_TYPE
+
+libhdf5_behaviour: >-
+  MEASURED on the 2.3.0 baseline by patching the client id of a dense ATTRIBUTE
+  name index (valid client 8) and reading the attributes:
+    id 0  (test class)          SEGFAULT -- h5dump and h5py both exit 139
+    id 5  (group dense name)    clean error, "incorrect B-tree type"
+    id 7  (SOHM index)          SEGFAULT
+    id 9  (attr dense corder)   clean error
+    id 10 (chunked dataset)     SEGFAULT
+  and by patching a dense LINK name index (valid client 5) to 6, 8 or 9:
+    every id aborts with glibc `free(): invalid size` -- heap corruption rather
+    than a clean error -- but ONLY once the index is genuinely consulted.
+  The last point is the important one for anyone re-measuring this.  `h5ls -r`
+  and an h5py `list(group.keys())` both return 0 on the link specimens because
+  neither touches the name B-tree; the abort needs a by-name LOOKUP inside the
+  dense group.  An exit code from an iterating consumer is not evidence here.
+  h5py links libhdf5 1.14.5 and crashes the same way, so this is not new in
+  2.3.0.
+
+control_is_non_vacuous: >-
+  valid/dense_attribute.h5, valid/dense_attribute_corder.h5, valid/dense_links.h5,
+  valid/dense_links_corder.h5 and valid/dense_links_deep.h5 all still accept, and
+  the corder fixtures matter specifically: they carry a SECOND B-tree whose
+  client id legitimately differs from the name index's (9 beside 8, 6 beside 5),
+  so a check that compared the two headers to each other rather than each to its
+  own context would fail on them.
+
+coverage_gaps:
+  - >-
+    THE CRASHING IDS ARE NOT SHIPPED AS FIXTURES, deliberately.  A specimen that
+    segfaults in-process is a hazard for every consumer this corpus is swept by,
+    and h5policy-diff opens each file with h5py in the HARNESS process rather
+    than a subprocess.  The tracked fixtures therefore use ids that error
+    cleanly, and they pin the oracle rule -- which is the same rule for every id.
+    The crash evidence lives in this record.  Regenerating it needs nothing but
+    the recipe in `libhdf5_behaviour`.
+  - >-
+    THE CHUNK-INDEX SITE ACCEPTS EITHER CLIENT 10 OR 11 without pinning which one
+    the layout message declared -- filtered versus unfiltered chunk storage.  The
+    record sizes differ and are validated separately, which probably intercepts a
+    swap in practice, but "probably" is not a measurement and this was not
+    tested.  The remaining three sites cross-check exactly.
+  - >-
+    NOT AN INVARIANT-A GAP AND NEVER WAS.  Every profile already refused these
+    files; only the label was wrong.  Recorded because the first triage of this
+    read the combined condition as a silent ACCEPT, and the measurement said
+    otherwise -- a reminder that "returns without a finding" and "is accepted"
+    are different claims, and only one of them can be read off the source.

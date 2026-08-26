@@ -536,6 +536,17 @@ static herr_t external_link_cb(hid_t root, const char *name,
 
 /* Resolve a concrete link selected by H5Lvisit2.  Unlike a generic object
  * walk, this makes the dense-link index answer a name lookup. */
+/* THE DENSE-INDEX FAMILY OWNS DENSE ATTRIBUTES AS WELL AS DENSE LINKS, so this
+ * callback reads each resolved object's attributes rather than only opening it.
+ *
+ * Without that the exercise drove H5Fopen, H5Lvisit2 and H5Oopen and nothing
+ * else, so a defect in a dense ATTRIBUTE index was structurally unreachable:
+ * measured, malformed/dense_attr_btree_wrong_client.h5 came back
+ * `accepted` from this exercise and `rejected_in_traversal` from the generic
+ * one, and the matrix scored the difference as an invariant-A divergence
+ * against h5policy.  The canary cannot judge half of its own family from a link
+ * walk alone.
+ */
 static herr_t dense_link_cb(hid_t root, const char *name,
                             const H5L_info2_t *info, void *op)
 {
@@ -546,6 +557,7 @@ static herr_t dense_link_cb(hid_t root, const char *name,
         st->call_errors++;
     else {
         st->family_completed++;
+        probe_attributes(obj, st);
         H5Oclose(obj);
     }
     return 0;

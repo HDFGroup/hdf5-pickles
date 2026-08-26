@@ -1650,6 +1650,8 @@ def _gen_malformed(root):
         f"{root}/malformed/fill_value_size_mismatch.h5")
     _make_fill_value_size_mismatch_v2(
         f"{root}/malformed/fill_value_size_mismatch_v2.h5")
+    _make_nbit_atomic_offset_wrap(
+        f"{root}/malformed/nbit_atomic_offset_wrap.h5")
     _make_nbit_member_offset_wrap(
         f"{root}/malformed/nbit_member_offset_wrap.h5")
     _make_attr_reference_size_under(
@@ -1704,6 +1706,14 @@ def _gen_malformed(root):
     _make_attr_stdref_blob_sel_bytes(
         f"{root}/malformed/attr_stdref_blob_sel_bytes.h5",
         f"{root}/valid/attr_stdref_region.h5")
+    # A v2 B-tree header whose client id is not the client the caller opened
+    # the tree as -- the type confusion libhdf5 does not check for.
+    _make_btree_wrong_client(
+        f"{root}/malformed/dense_attr_btree_wrong_client.h5",
+        f"{root}/valid/dense_attribute.h5", 8, 9, "dense attribute name index")
+    _make_btree_wrong_client(
+        f"{root}/malformed/dense_link_btree_wrong_client.h5",
+        f"{root}/valid/dense_links.h5", 5, 6, "dense link name index")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -3771,6 +3781,44 @@ def _bthd_info_for_type(raw, wanted_type):
                         checksum=bthd + 22 + off_size + len_size - 4)
         bthd = raw.find(b"BTHD", bthd + 4)
     raise RuntimeError(f"could not locate v2 B-tree record type {wanted_type}")
+
+
+def _make_btree_wrong_client(path, base_path, was, becomes, what):
+    """Patch a v2 B-tree header's CLIENT ID to a different, still-valid one.
+
+    THE DEFECT THIS EXPRESSES.  libhdf5 range checks the client id against the
+    NUMBER of B-tree types and never against the client the caller opened the
+    tree as: H5B2__cache_hdr_deserialize (src/H5B2cache.c) does
+    `if (id >= H5B2_NUM_BTREE_ID)` and then `cparam.cls = H5B2_client_class_g[id]`,
+    so the FILE chooses the class and H5B2__hdr_init runs that class's
+    crt_context on the CALLER's user data.  The result is a type confusion.
+
+    MEASURED on the 2.3.0 baseline, patching a dense ATTRIBUTE name index
+    (client 8): ids 0, 7 and 10 SEGFAULT h5dump and h5py alike, while 5 and 9
+    error cleanly.  Patching a dense LINK name index (client 5) aborts with
+    glibc `free(): invalid size` -- heap corruption, not a clean error -- but
+    only once the index is genuinely consulted: iterating the group or running
+    `h5ls -r` never touches the name B-tree and returns 0, which is why the
+    fixture's own evidence is a by-name LOOKUP.
+
+    THE ID IS CHOSEN TO ERROR RATHER THAN CRASH where there is a choice.  A
+    fixture that segfaults in-process would be a hazard for any consumer this
+    corpus is swept by, and h5policy-diff opens every file with h5py in the
+    harness process; the crashing ids are recorded in the case record instead.
+    """
+    with open(base_path, "rb") as f:
+        raw = bytearray(f.read())
+    bt = _bthd_info_for_type(raw, was)
+    jenkins = _jenkins_lookup3()
+    stored = struct.unpack_from("<I", raw, bt["checksum"])[0]
+    body = bytes(raw[bt["bthd"]:bt["checksum"]])
+    if jenkins(body) != stored:
+        raise RuntimeError(f"{what}: base header checksum does not verify, so "
+                           f"the geometry is wrong before anything is patched")
+    raw[bt["bthd"] + 5] = becomes
+    struct.pack_into("<I", raw, bt["checksum"],
+                     jenkins(bytes(raw[bt["bthd"]:bt["checksum"]])))
+    _patch(path, bytes(raw))
 
 
 def _sohm_bt2_root_info(raw):
@@ -6458,6 +6506,60 @@ def _make_attr_vlen_heap_seq_len_over(path):
     raw = _attr_vlen_heap_base()
     d = _find_attr_heap_id(raw, "vlen attribute sequence length")
     struct.pack_into("<I", raw, d, 0xFFFFFFFF)
+    _patch(path, bytes(raw))
+
+
+def _make_nbit_atomic_offset_wrap(path):
+    """An n-bit ATOMIC node whose precision + offset wraps a 32-bit sum.
+
+    THE BOUND libhdf5 STATES AND CANNOT ENFORCE.  H5Znbit.c guards the unpacker
+    with `p.precision > p.size * 8 || (p.precision + p.offset) > p.size * 8`,
+    and every field of parms_atomic is `unsigned`, so the sum is evaluated in 32
+    bits and wraps.  Here precision is 16, size 4 and offset 0xfffffff0: the sum
+    is 0 modulo 2**32, the guard passes, and the decoder proceeds with an offset
+    of four billion.  The same three lines appear in the COMPRESS path with no
+    guard at all.
+
+    THE BYTE ORDER DECIDES WHETHER MEMORY OR ONLY DATA IS CORRUPTED, which is why
+    this fixture is BIG endian.  H5Z__nbit_decompress_one_atomic computes, for
+    little endian, `end_i = p->offset / 8` from the UNWRAPPED offset, so its
+    descending loop never executes and the dataset merely decodes to zeros.  The
+    big-endian arm computes both bounds by SUBTRACTING the offset from the
+    datatype length, so both underflow into range and the loop walks off the
+    element.  MEASURED on the 2.3.0 ASan build: heap-buffer-overflow WRITE of
+    size 1 in H5Z__nbit_decompress_one_byte, reached through
+    H5Z__nbit_decompress_one_atomic and H5Z__filter_nbit.  The stock build
+    returns 0 and prints values either way.
+
+    Written with a REAL 16-bit precision datatype rather than by patching the
+    precision, because at precision == size * 8 libhdf5 sets its own
+    need_not_compress flag and stores the chunk verbatim -- the decompressor then
+    never reads precision or offset at all and the fixture would prove nothing.
+    Only the byte-order word and the offset word are patched afterwards.
+    """
+    def build(h):
+        tid = h5py.h5t.NATIVE_INT32.copy()
+        tid.set_precision(16)
+        tid.set_offset(0)
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_chunk((5, 5))
+        dcpl.set_filter(5, 0, ())                  # 5 == H5Z_FILTER_NBIT
+        dcpl.set_obj_track_times(False)
+        sid = h5py.h5s.create_simple((10, 10))
+        d = h5py.h5d.create(h.id, b"d", tid, sid, dcpl=dcpl)
+        d.write(h5py.h5s.ALL, h5py.h5s.ALL,
+                np.arange(100, dtype="i4").reshape(10, 10))
+
+    raw = _base_bytes(build, libver="earliest")
+    # cd_values for a top-level atomic node:
+    #   [nparms, 0, chunk elements, class(1), size, order, precision, offset]
+    want = struct.pack("<8I", 8, 0, 25, 1, 4, 0, 16, 0)
+    i = raw.find(want)
+    if i < 0 or raw.find(want, i + 1) >= 0:
+        raise RuntimeError("expected exactly one n-bit atomic parameter tree "
+                           "with precision 16 in cd_values")
+    struct.pack_into("<I", raw, i + 5 * 4, 1)              # H5Z_NBIT_ORDER_BE
+    struct.pack_into("<I", raw, i + 7 * 4, 0xFFFFFFF0)     # offset; sum wraps
     _patch(path, bytes(raw))
 
 
