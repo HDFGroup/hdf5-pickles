@@ -1,4 +1,10 @@
-# Priority list for developing pickles of file format primitives
+# Archived priority list for developing file-format pickles
+
+> **Historical archive.** This was the project's initial implementation plan.
+> It is retained for provenance, not as a current roadmap or coverage report.
+> Current status lives in [`docs/generated/README.md`](../docs/generated/README.md)
+> and [`registry/validation-coverage.yml`](../registry/validation-coverage.yml).
+
 An HDF5 file is made up of the following objects:
 - A superblock
 - Object headers (prefix + messages)
@@ -8,10 +14,10 @@ An HDF5 file is made up of the following objects:
 - Heap blocks
 - Free space
 
-Development will be based on format specification version 3 
-(https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t3.html) but excluding the changes for HDF5 library v2.0 as listed in section I.B.
-Pickles developed for the specification will be pushed to the
-repository https://github.com/HDFGroup/hdf5-pickles/.  
+The original development plan targeted format specification version 3
+(https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t3.html), excluding
+the HDF5 library v2.0 changes listed in section I.B. This repository was its
+intended destination.
 
 The following primitives are identified and will be tackled in the following order. Each pickle needs to be verified for correctness with an HDF5 file containing the respective messages.
 1. Superblock: there are 4 versions of the superblock
@@ -55,13 +61,10 @@ Then the remaining primitives will be handled as below:
 5. Free-space manager
 6. Shared object header message table
 
-I anticipate work for the following areas:
+The plan anticipated work in the following areas:
 * Refactor/comments as needed for the pickles while development is in progress
 * Instruction guide for download/build/install Poke
 * Instruction guide on how to load pickles/using associated methods/functions for mapping primitives to an HDF5 file via poke editor
 * Resolve discrepancies between coding and the format specification that are noted during development
 * Add Metadata Cache Message to the format specification
 * Incorporate info for handling shared messages that are implemented in the library
-~
-~
-~

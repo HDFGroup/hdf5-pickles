@@ -1298,13 +1298,13 @@ File space info message (type 0x0017). Describes the file space management strat
 | Large Free-space Address | `large_fs_addr` | Version 1 only, present when `persist` is non-zero. Array of 6 file addresses for large-allocation free-space managers, one per allocation type. |
 
 
-<a id="h5lens_metadata_cache_image_message"></a>
+<a id="subsubsec_fmt4_dataobject_hdr_msg_mdci"></a>
 
 ## Metadata Cache Image Message
 
 Pickle type: `oh_msg_mdci`.
 
-Metadata cache image message (type 0x0018). Points to a serialized snapshot of the metadata cache written at file close to accelerate the next file open. Not described in the public format specification.
+Metadata cache image message (type 0x0018). Points to a serialized snapshot of the metadata cache written at file close to accelerate the next file open.
 
 **Fields: Metadata Cache Image Message**
 

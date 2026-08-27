@@ -5,7 +5,7 @@ H5Lens GNU poke pickles. Its hierarchy and terminology follow the upstream
 HDF5 File Format Specification Version 4.0, while its coverage statements
 describe the executable definitions that are actually present in H5Lens.
 
-Canonical organization: [HDF5 File Format Specification Version 4.0](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) (reviewed 2026-08-01).
+Canonical organization: [HDF5 File Format Specification Version 4.0](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) (reviewed 2026-08-27).
 
 Coverage labels describe H5Lens, not the upstream specification:
 
@@ -66,6 +66,7 @@ Coverage labels describe H5Lens, not the upstream specification:
       - [IV.A.3.v. The Attribute Info Message](ohdr_msgs.md#subsubsec_fmt4_dataobject_hdr_msg_attrinfo) — Covered
       - [IV.A.3.w. The Object Reference Count Message](ohdr_msgs.md#subsubsec_fmt4_dataobject_hdr_msg_refcount) — Covered
       - [IV.A.3.x. The File Space Info Message](ohdr_msgs.md#subsubsec_fmt4_dataobject_hdr_msg_fsinfo) — Covered
+      - [IV.A.3.y. The Metadata Cache Image Message](ohdr_msgs.md#subsubsec_fmt4_dataobject_hdr_msg_mdci) — Covered
   - [IV.B. Disk Format: Level 2B - Data Object Data Storage](ohdr_msgs.md#subsubsec_fmt4_dataobject_hdr_msg_layout) — Partial
 - V. Appendix A: Definitions — Not Covered
 - VI. Appendix B: File Space Allocation Types — Not Covered
@@ -80,10 +81,6 @@ Coverage labels describe H5Lens, not the upstream specification:
   - [VIII.B. Datatype Encoding](dtype_enc.md#subsec_fmt4_appendixd_encodet) — Covered
   - [VIII.C. Reference Encoding (Revised)](ref_enc.md#subsec_fmt4_appendixd_encoderv) — Covered
   - [VIII.D. Reference Encoding (Backward Compatibility)](ref_enc.md#subsec_fmt4_appendixd_encodedp) — Covered
-
-## H5Lens extensions
-
-- [Metadata Cache Image Message](ohdr_msgs.md#h5lens_metadata_cache_image_message)
 
 ## Reading and maintaining the reference
 

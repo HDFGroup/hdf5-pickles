@@ -12,8 +12,8 @@ open the repository in a Codespace; locally, use **Dev Containers: Reopen in
 Container**. It installs GNU poke, HDF5 tools, Python dependencies, and the
 repository's command-line tools together.
 
-For a local installation, provide GNU poke, Python with PyYAML, CMake, and the
-HDF5 command tools, then configure the project:
+For a local installation, provide GNU poke, a C++17 compiler, Python with
+PyYAML, CMake, and the HDF5 command tools, then configure the project:
 
 ```sh
 cmake -S . -B build

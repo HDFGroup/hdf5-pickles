@@ -1,5 +1,9 @@
 # Mapping HDF5 Binary Primitives onto an Object Store
 
+> **Status: design proposal.** This repository does not currently implement the
+> importer, exporter, or object-store representation described below. The
+> document defines a prospective preservation and reconstruction contract.
+
 ## Design goal
 
 This design maps a reachable HDF5 object graph into a key/value store without

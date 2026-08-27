@@ -55,6 +55,13 @@ controlled outcome; a change that alters any decision is surfaced for review.
   current `H5PolicyProfile` boundaries, complete built-in preset values,
   saturation, finding classes, profile validation, deterministic walk budgets,
   compound rules, feature switches, and run-mode defaults.
+- `unit_consumer.pk` — synthetic consumer-boundary checks for activation and
+  deny-by-default behavior.
+- `unit_fsinfo.pk` — file-space-info message validation and version checks.
+- `unit_reached.pk` — reached-structure accounting and completeness checks.
+- `unit_seam.pk` — direct in-process analysis seam checks.
+- `_check.py` — shared report and expectation assertions used by the corpus
+  runner.
 - `unit_report_wrapper.sh` — a deterministic hard-timeout simulation that
   validates the shell-generated partial report, its nullable geometry, and its
   byte-path encoding.
@@ -68,6 +75,8 @@ controlled outcome; a change that alters any decision is surfaced for review.
 - `check_workflow_docs.py` — ties the operator assessment workflow's profiles
   and decisions to the CLI, and derives its finding, message-routing,
   invariant-family, verification, and exact-build counts from the registries.
+- `check_profile_docs.py` — compares all 30 numeric, feature, and analysis
+  defaults in the four documented profile tables with `h5_profiles.pk`.
 - `check_lazy_docs.py` — derives the documented lazy-validation growth ratios
   from the tracked artifact and reproduces its deterministic ladder fields.
 - `valid/ malformed/ policy/ resource/ coverage/ integration/ cve/` — generated
