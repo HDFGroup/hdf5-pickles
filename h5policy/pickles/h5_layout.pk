@@ -1165,6 +1165,54 @@ fun h5policy_nbit_walk_params = (int ios, H5PolicyProfile profile,
                                         "n-bit filter parameter tree reads past the client-data array");
                     return poison;
                 }
+            /* THE BOUND libhdf5 STATES AND CANNOT ENFORCE.  H5Znbit.c guards the
+               unpacker with
+
+                   if (p.precision > p.size * 8 || (p.precision + p.offset) > p.size * 8)
+
+               and every field of parms_atomic is `unsigned`, so the SUM is
+               evaluated in 32 bits and wraps.  An offset near 2**32 therefore
+               passes a guard written to reject it.  Restated here without the
+               wrap: subtract instead of adding, so nothing can carry.
+
+               The same three lines appear in the COMPRESS path at H5Znbit.c
+               with no guard at all, which is why this is checked on the
+               parameters rather than on any one direction of travel.
+
+               MEASURED on the 2.3.0 ASan build with precision 16, size 4 and
+               offset 0xfffffff0 on a BIG-ENDIAN atomic node: heap-buffer-overflow
+               WRITE of size 1 in H5Z__nbit_decompress_one_byte, reached from
+               H5Z__nbit_decompress_one_atomic.  The little-endian arm of the same
+               function computes `end_i = offset / 8` from the UNWRAPPED offset, so
+               its loop never runs and the file merely decodes to zeros -- the
+               byte order decides whether the identical parameters corrupt memory
+               or only the data, which is why neither is treated as benign.  The
+               stock build returns 0 either way.  */
+            var a_size = h5policy_msg_u64_at(ios, profile, cd_base + ((idx + 1UL) * 4UL)#B, 4UL);
+            var a_prec = h5policy_msg_u64_at(ios, profile, cd_base + ((idx + 3UL) * 4UL)#B, 4UL);
+            var a_off = h5policy_msg_u64_at(ios, profile, cd_base + ((idx + 4UL) * 4UL)#B, 4UL);
+            /* size is a 32-bit file field, so size * 8 cannot overflow 64 bits. */
+            var a_bits = a_size * 8UL;
+            if (a_prec > a_bits || a_off > a_bits - a_prec)
+                {
+                    h5policy_emit_error_ev("H5_CORRUPT_NBIT_ATOMIC_BOUNDS", "corrupt",
+                                           loc, object,
+                                           "n-bit atomic precision and offset exceed the element width",
+                                           H5Evidence {
+                                               field = "layout.nbit_atomic_bits",
+                                               actual = a_prec > a_bits
+                                                        ? a_prec : a_off,
+                                               expected = a_prec > a_bits
+                                                          ? a_bits : a_bits - a_prec,
+                                               comparison = "at_most",
+                                               has_loc1 = 1, loc1_role = "actual",
+                                               loc1 = cd_base + ((a_prec > a_bits
+                                                                  ? idx + 3UL
+                                                                  : idx + 4UL) * 4UL)#B,
+                                               loc1_len = 4UL,
+                                           });
+                    return poison;
+                }
             return idx + 5UL;
         }
     if (cls == 4UL)          /* NOOPTYPE: class, size */

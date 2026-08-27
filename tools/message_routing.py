@@ -195,6 +195,13 @@ ROLE_PARAMS = {
     # families, because `record` selects the exact-build canary and those differ
     # (a VDS source open vs. an attribute read).
     "h5policy_find_gheap_object": 6,
+    # h5_vds.pk: a serialized H5S selection is the same record wherever it is
+    # stored -- a VDS mapping block and the tail of a region reference's
+    # global-heap blob -- and its rank, flag bits and encoded size have the same
+    # legal ranges in both.  One sizer serves both; the role prefix names the
+    # family, because `record` selects different exact-build canaries (a VDS
+    # source open vs. an attribute dereference).
+    "h5policy_selection_size": 5,
 }
 
 

@@ -38,7 +38,7 @@ violated_invariant:
   - attribute.global_heap_header
   - attribute.global_heap_object
   - attribute.heap_object_present
-  - attribute.heap_sequence_length
+  - attribute.heap_object_length
 validation_closure: >-
   the attribute message payload -- name, datatype and dataspace sizes -- to
   locate the value region and bound it; the resolved datatype for the descriptor
@@ -126,7 +126,8 @@ false_positive_surface: >-
 
 # -- Evidence -----------------------------------------------------------------
 oracle_before: accept, zero findings, in untrusted-strict, forensic and legacy
-oracle_after: reject_corrupt on all four fixtures
+oracle_after: reject_corrupt on every malformed fixture, accept on every
+  control -- twelve malformed and five valid as of 2026-08-24
 libhdf5_behaviour: >-
   Rejects every case cleanly on both local 2.3.0 builds -- Release baseline and
   the AddressSanitizer candidate -- h5dump -A exiting 1 with no sanitizer report
@@ -197,17 +198,111 @@ exposed_defect: >-
   registry/cases/global-heap-zero-progress-sentinel.yml, which is the same
   function and the same branch asymmetry read the other way round.
 
+# -- Follow-up that landed the same day ---------------------------------------
+followup_2026_08_24: >-
+  Two of this record's own coverage gaps were closed after it was written, and
+  both are recorded above rather than deleted, because the shape of the miss is
+  the reusable part.  NESTED REGIMES: slot offsets are now collected during the
+  datatype walk, so a vlen member of a compound attribute and an array of vlen are
+  both validated -- an unmodified prior build accepts both malformed fixtures.
+  EQUALITY: the length rule now matches libhdf5 exactly instead of bounding one
+  direction.  Together they added two malformed fixtures and changed the evidence
+  on an existing one (comparison at_most -> equal), which is why that fixture's
+  expectation moved in the same change.
+  Cost of the capability: one parameter on h5policy_dtype_check (7 call sites,
+  including one in tests/unit_datatype.pk -- grep the test pickles, not only
+  pickles/*.pk, when changing a shared signature) plus a slot cap of 64 per
+  datatype.  Slots past the cap are not validated and the truncation is recorded
+  on a flag rather than reported, which is a cost trade like the walk budget.
+
+# -- A false positive surfaced while building the dedup guard ------------------
+surfaced_false_positive: >-
+  NONZERO RESERVED BYTES IN A GLOBAL-HEAP OBJECT HEADER ARE REJECTED AS CORRUPT,
+  AND LIBHDF5 IGNORES THEM.  h5policy's collection walker tests
+  `reserved != 0` and reports H5_CORRUPT_GLOBAL_HEAP_OBJECT; libhdf5 reads the
+  four bytes past without looking at them -- H5HGcache.c does a bounds check and
+  then `p += 4` under a comment that says only "Reserved bytes".
+  MEASURED: a twelve-element vlen attribute whose collection differs from a valid
+  one ONLY in those four bytes is read normally by libhdf5 (h5py returns all
+  twelve strings) while h5policy reports reject_corrupt.  "libhdf5 opens" must
+  imply "not reject_corrupt", so this is an invariant-A false positive.
+  It is PRE-EXISTING and LATENT: no fixture exercised nonzero reserved bytes on a
+  collection the library actually loads, so the differential harness never had a
+  case to fail on.  Found only because the first version of the dedup fixture
+  used that corruption for its convenience, and checking the fixture against
+  libhdf5 -- rather than assuming a spec violation is a defect -- showed the
+  library disagreeing.  The fixture now uses the object-size wrap instead.
+  NOT FIXED HERE.  The precedent for the fix is the contiguous stored size:
+  a condition the read path ignores belongs at warning severity, not corruption.
+  Demoting it is a severity change to an existing finding and is left as a
+  decision rather than folded into this work.
+
+  SECOND FALSE POSITIVE, FOUND AND FIXED 2026-08-24 WHILE BUILDING THE
+  REVISED-REFERENCE CONTROL: h5policy rejected EVERY file using a modern
+  reference.  h5_datatype.pk carried `ctype == 7 && version != 1 ->
+  H5_CORRUPT_UNSUPPORTED_DATATYPE_VERSION`, and H5T_STD_REF is class 7 at
+  datatype message version 4 BY CONSTRUCTION (H5T_INIT_TYPE_REF_COMMON,
+  src/H5T.c) -- libhdf5 imposes no class-7 version constraint at all
+  (H5Odtype.c:637).  MEASURED: a plain dataset of H5T_STD_REF object references
+  written by the 2.3.0 library came back reject_corrupt while h5dump read it
+  with rc=0.
+  IT SURVIVED BECAUSE THE CORPUS HAD NO SUCH FILE.  Every reference fixture was
+  written by h5py, which links libhdf5 1.14.5 and writes only old-style
+  references, so nothing in the corpus was class 7 above version 1 -- and the
+  one fixture that tripped the gate,
+  malformed/bad_reference_datatype_version.h5, tripped it for the wrong reason:
+  what is actually wrong with that file is its reference ENCODE-VERSION nibble,
+  which libhdf5 requires to equal H5R_ENCODE_VERSION.  A rule with one fixture
+  that passes for an unrelated reason is not guarded.
+  Removing the gate left datatype.version_supported with no positive fixture, so
+  malformed/bad_datatype_version.h5 was added to trip it on its own terms, and
+  valid/attr_stdref_region.h5 now guards the negative side.
+
 # -- Open items ---------------------------------------------------------------
 coverage_gaps:
   - >-
-    REVISED REFERENCES (types 2, 3, 4) ARE NOT COVERED.  Their encoded blob is
-    not a bare heap ID, and no fixture expresses one in an attribute.
+    REVISED REFERENCES (types 2, 3, 4): CLOSED 2026-08-24.  A legacy region
+    reference (sub-type 1) is a BARE heap ID; a revised one is
+    [type:1][flags:1][blob_size:4][addr][idx:4], so the ID begins at offset 6 --
+    H5R_ENCODE_HEADER_SIZE plus the size word (H5R__decode_heap).  The encoding
+    was pinned from the source before any fixture was built, because guessing the
+    offset would have produced a checker that rejected valid files.
+    Two rules, both matching libhdf5: the ID resolves to an object the collection
+    holds, and the declared blob size EQUALS that object's size --
+    H5T__ref_disk_read hands the declared size to H5VL_blob_get and
+    H5VL__native_blob_get refuses on `hobj_size != size`.
+    THE EXCEPTION THAT MATTERS: a type-2 (H5R_OBJECT2) reference WITHOUT
+    H5R_IS_EXTERNAL is direct-copied and carries no heap ID at all
+    (H5R__encode_heap), so the walker must skip it.  Treating every class-7
+    element as blob-backed would have read the object's own bytes as an address.
+    Fixtures: malformed/attr_stdref_blob_size_mismatch.h5 (the equality) and
+    malformed/attr_stdref_heap_idx_missing.h5 (the object), against
+    valid/attr_stdref_region.h5 as the control -- only the SECOND of the two
+    elements is patched in each, so the first is an in-file control and
+    `expected_finding_counts` pins one finding rather than two.
+    The corpus had no revised-reference file at all before this, which is how a
+    gate rejecting `class 7 && version != 1` survived; see
+    `surfaced_false_positive`.
   - >-
-    NESTED REGIMES ARE NOT COVERED: a vlen or region reference inside a compound
-    or an array datatype puts descriptors at member offsets this validator does
-    not compute.  A compound attribute with a vlen member is therefore still
-    accepted with an arbitrary heap ID, and that is the most likely place the
-    next instance of this gap lives.
+    NESTED REGIMES: CLOSED 2026-08-24, and this entry is kept because the
+    prediction it made was right.  It said a compound attribute with a vlen member
+    was "still accepted with an arbitrary heap ID, and that is the most likely
+    place the next instance of this gap lives" -- it was, and it was.
+    Heap-ID slot offsets are now collected DURING the datatype validation walk
+    (h5policy_dtype_slot_* in h5_datatype.pk, threaded as a base_off parameter
+    through h5policy_dtype_check), covering compound members at their byte
+    offsets, class-10 arrays replicated per element, and version-1 compound
+    members using the legacy embedded-array encoding.  Collected during the
+    existing walk rather than by a second parser, because advancing from one
+    compound member to the next needs each child's consumed size and only that
+    walker computes it -- a second copy of that computation is how the two drift.
+    STILL NOT COVERED, deliberately: a vlen whose BASE type is itself a vlen or a
+    reference.  Those inner ids live in the heap object's bytes, at no element
+    offset, so they are not metadata; the collector suppresses recording across a
+    vlen's base type rather than fabricating slots for them.
+    Revised references (types 2-4) are covered as of 2026-08-24; see the entry
+    above.  A revised reference nested inside a compound or array member rides
+    on the same slot collector and needs no separate rule.
   - >-
     THE SWEEP IS BOUNDED TWICE, and both bounds mean real descriptors go
     unchecked: 64 IDs per attribute (H5_ATTR_HEAP_ID_SWEEP_LIMIT) and 64
@@ -227,7 +322,24 @@ coverage_gaps:
     memo plus the walk budget, accepting.  So the walk is the cost unit and the
     budget counts walks.
   - >-
-    NO TEST GUARDS THE DUPLICATE-REPORT DEDUP.  A malformed collection referenced
+    THE DUPLICATE-REPORT DEDUP: GUARDED 2026-08-24, and it needed no report-schema
+    change after all.  The findings array already carried the answer; what was
+    missing was a way for the harness to ASK, so `expected_finding_counts:
+    {CODE: n}` was added to h5policy/tests/_check.py.  `required_findings` is a
+    SET test, which is precisely why the regression was invisible: twelve copies
+    of a code satisfy it exactly as well as one.
+    Guard: malformed/attr_gheap_dedup_many_refs.h5 -- one corrupt collection
+    reached by twelve attribute descriptors.  Measured both ways: with the
+    bad-collection record removed it yields TWELVE identical findings, with it
+    exactly one, and the new assertion reports "reported 12 time(s), expected 1".
+    A metric in the report was considered and rejected as unnecessary: nothing
+    enumerates `metrics` (both consumers read by key, and the wrapper's timeout
+    path already emits an empty object), so a new key would have been additive and
+    needed no version bump -- but it would still have been a JSON change for a
+    property the harness could assert without one.
+  - >-
+    SUPERSEDED NOTE, kept for the reasoning: NO TEST GUARDS THE DUPLICATE-REPORT
+    DEDUP.  A malformed collection referenced
     by many descriptors must be reported ONCE; before the failed-walk record it
     was reported once per element (measured: 4 copies of
     H5_CORRUPT_GLOBAL_HEAP_OBJECT at one offset under untrusted-strict, 7 under
@@ -248,18 +360,19 @@ coverage_gaps:
     constant plus the measurement above; a regression to per-descriptor walking
     would be caught only by re-measuring.
   - >-
-    THE VLEN LENGTH BOUND IS INCOMPLETE for base types wider than one byte, by
-    construction -- see false_positive_surface.  Sound, not tight.
-    MEASURED HOW MUCH WEAKER, 2026-08-24: libhdf5 requires EQUALITY, not a bound.
-    H5VL__native_blob_get calls H5HG_get_obj_size and refuses on
-    `hobj_size != size` ("Expected global heap object size does not match"), which
-    is what closes the revised-reference specimen described in
-    corpus_specimens_closed.  So the oracle admits every under-declared length
-    that libhdf5 refuses.  Tightening to equality needs the vlen base type's size,
-    which lives in a nested datatype message this validator does not decode -- so
-    it is a real gap with a known price, not an oversight.  An under-declaring
-    attribute fixture would be the case to add if that is ever done; the existing
-    fixture over-declares.
+    THE VLEN LENGTH BOUND: TIGHTENED TO EQUALITY 2026-08-24.  It began as
+    `length > object bytes`, which was sound but strictly weaker than libhdf5 in
+    BOTH directions -- it admitted every under-declaration, and for a base type
+    wider than one byte it admitted over-declarations too.  libhdf5 requires
+    equality: H5VL__native_blob_get calls H5HG_get_obj_size and refuses on
+    `hobj_size != size`, where size is the sequence length scaled by the base
+    type's storage size.  The base size now travels on the datatype slot, so the
+    exact rule is stateable and is stated.  Fixture pair:
+    malformed/attr_vlen_heap_seq_len_{over,under}.h5 -- both directions, because a
+    one-directional bound would still pass one of them.  Verified against libhdf5:
+    h5py raises OSError on both and reads both valid controls.
+    Residual: the product is bounded before comparison, so a length whose scaled
+    value overflows 64 bits is not compared rather than being reported.
   - >-
     NO PRE-FIX LIBHDF5 BUILD WAS CONSTRUCTED.  The two-regime analysis above is
     read out of the source, not measured, and neither fixture has been shown to
@@ -268,14 +381,32 @@ coverage_gaps:
     No 32-bit measurement.  The index is a 4-byte field and every collection
     advance is bounded, so no width dependence is expected, but none was run.
   - >-
-    OUT OF SCOPE, NOTED WHILE HERE: the walker's own `align8(data_size)` can wrap
-    in uint<64>.  A declared length in [2^64-7, 2^64-1] makes (n + 7) wrap, so
-    align8 returns 0, the checked add of hdr_size + 0 does not trip, and the
-    object is accepted with a bogus enormous declared size.  This is the same
-    arithmetic the forensic sweep models at multiple widths via
-    h5policy_gcol_advance (see registry/cases/global-heap-zero-progress-sentinel.yml)
-    and the VDS/attribute walker does NOT.  Not touched here: it predates this
-    change, is unrelated to the attribute path, and deserves its own fixture.
+    THE align8 WRAP: INVESTIGATED AND BOUNDED 2026-08-24, and the investigation
+    changed the conclusion.  A declared size in [2^64-7, 2^64-1] makes (n + 7)
+    wrap, align8 returns 0, the checked add of hdr_size + 0 does not trip, and the
+    object was admitted with a nonsense size while the cursor advanced only 16
+    bytes.
+    IT IS NOT A DIVERGENCE, which is the part worth recording.  libhdf5's
+    H5HG_ALIGN is the same formula (8 * ((X + 7) / 8)), so it desynchronizes
+    identically.  Measured on three shapes: h5py refuses the region-reference
+    dereference with "ran off end of input buffer while decoding", and on a
+    crafted collection whose following bytes keep the desynchronized parse
+    self-consistent it refuses with "bad heap index" -- the same conclusion
+    h5policy reached by the same route.  So the oracle was faithfully modelling
+    the library, and no specimen was accepted that libhdf5 reads.
+    Bounded anyway, for two reasons that are not soundness: the wrapped size was
+    handed to callers through the collection memo, so a consumer sizing anything
+    from it would inherit the wrap; and the finding it produced was the wrong one
+    -- a length mismatch reported by whatever later read the object, instead of the
+    overrun that is actually wrong.  The new bound (`data_size > coll_size - pos`,
+    tested BEFORE aligning) is strictly weaker than the span test that follows, so
+    it cannot add a false positive: for any object libhdf5 accepts,
+    data_size <= align8(data_size) < span <= remaining.  Zero valid files gain it.
+    Fixture: malformed/attr_gheap_object_size_wrap.h5.  A METHOD NOTE worth
+    keeping: the first read of this said libhdf5 ACCEPTED the crafted file,
+    because h5py returns a region-reference attribute as an opaque object without
+    touching the heap at all.  Reading the attribute is not exercising the heap;
+    DEREFERENCING it is.  Same shape as h5dump printing nothing and exiting 0.
 open_questions:
   - >-
     Do the other inlined-value regimes have the same gap?  A fill value and a

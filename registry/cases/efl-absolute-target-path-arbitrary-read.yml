@@ -1,0 +1,217 @@
+# A dataset's external-file-list slot names the file its raw data lives in, and
+# the name is decoded from the object header's local heap -- attacker-controlled
+# bytes.  An ABSOLUTE name is used verbatim:
+#
+#   src/H5Defl.c:318   H5_combine_path(dset->shared->extfile_prefix,
+#                                      efl->slot[u].name, &full_name)
+#   src/H5Defl.c:320   fd = HDopen(full_name, O_RDONLY)
+#
+# and inside H5_combine_path (src/H5system.c:787):
+#
+#   if (path1 == NULL || *path1 == '\0' || H5_CHECK_ABSOLUTE(path2))
+#       *full_name = H5MM_strdup(path2);      /* the prefix is DISCARDED */
+#
+# THE POINT WORTH CARRYING is that second excerpt, not the first.  libhdf5 does
+# have a containment mechanism for external targets -- H5Pset_efile_prefix on the
+# DAPL, HDF5_EXTFILE_PREFIX in the environment, with ${ORIGIN} expansion
+# (src/H5Dint.c:230 and H5D__build_file_prefix) -- and an absolute stored name
+# steps around it entirely, because the branch that honours the prefix is the
+# `else` of a test on the attacker's own first byte.  So the obvious mitigation
+# ("resolve external targets under a configured directory") is already present in
+# the library and does not hold.  MEASURED, not inferred: with
+# HDF5_EXTFILE_PREFIX set to a nonexistent directory, h5dump still prints the
+# contents of the absolute target.
+#
+# Nothing here is malformed.  H5Pset_external is documented public API and the
+# specimen is a valid HDF5 file that libhdf5's own writer could have produced;
+# there is no corrupt encoding for an oracle to reject.  That is why this record
+# exists as a POLICY case and closes with no oracle change.
+schema_version: 1
+
+id: efl-absolute-target-path-arbitrary-read
+title: an external-file-list slot naming an absolute path makes a read-only
+  consumer disclose that file as dataset element values, and the efile-prefix
+  containment is discarded for exactly the names that need it
+status: oracle-covered           # pre-existing policy denial and path classification; libhdf5 unfixed by design
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The third-party report
+  that prompted this triage is embargoed; everything recorded here was
+  re-derived from the HDF5 source tree and measured locally.
+
+record: external_file_list
+versions: [1]                    # EFL message version
+root_cause_classification: premature_activation
+violated_invariant:
+  - efl.no_external_open
+  - efl.target_path_classified
+validation_closure: >-
+  the external file list message, its slot array, and each slot's name decoded
+  out of the referenced local heap -- classified as a path, never resolved and
+  never opened.
+activation_before_validation:
+  - external_open              # HDopen of the attacker-named path, src/H5Defl.c:320
+  - data_read                  # its bytes are returned to the caller as element values
+entry_points:
+  - "h5policy (oracle) -- reject_policy under untrusted-strict and forensic; accept_with_warnings with the absolute-path advisory under trusted-fast and legacy.  Opens nothing under any profile."
+  - "libhdf5 -- H5Dread -> H5D__efl_read -> H5_combine_path -> HDopen (src/H5Defl.c:318-320)"
+  - "direct consumer: h5dump -d, or any application that reads the dataset"
+
+defect: >-
+  LIBHDF5 SIDE, and it is a design decision rather than a coding error: the EFL
+  slot name is an unconstrained path, resolved at read time against the reading
+  process's filesystem and its credentials.  An absolute name defeats the only
+  containment the library offers.  The first incorrect security decision is the
+  open itself -- a read-only traversal performing attacker-directed filesystem
+  access -- which is why this is classified premature_activation and not a
+  decode fault.  There is no malformed byte anywhere in the specimen, so the
+  bug cannot be found by any amount of encoding validation; it is reachable
+  only as a feature gate.
+  ORACLE SIDE: no defect, and no change made.  h5policy already denies the EFL
+  feature outright under the untrusted profiles (efl.no_external_open) and, where
+  a profile permits external storage, classifies the decoded name as absolute,
+  parent-relative or relative without resolving it (efl.target_path_classified).
+  The declared boundary does the rest: `external_file_opens: false` in every
+  report.
+
+containment:
+  libhdf5: >-
+    H5Pset_efile_prefix / HDF5_EXTFILE_PREFIX exist and are inert against an
+    absolute name (see the header comment).  No property disables EFL
+    resolution, so a consumer that wants the file's metadata but not its
+    attacker-directed I/O has no supported way to ask for that; declining to
+    read the dataset is the only option, and nothing in the file's metadata
+    marks which datasets need declining.
+  h5policy: >-
+    The feature gate.  untrusted-strict and forensic both reject_policy on the
+    EFL message itself before any name is even classified, which is the correct
+    order: the decision is about the feature, not about how convincing the path
+    looks.  A path allow-list is deliberately NOT modelled -- the oracle has no
+    notion of the consumer's filesystem, and a rule that "absolute is bad,
+    relative is fine" would license the relative names that traverse just as far.
+
+measured: >-
+  PROFILE MATRIX on the specimen (h5policy, 2026-08-26):
+  untrusted-strict reject_policy H5_POLICY_EXTERNAL_STORAGE;
+  forensic reject_policy H5_POLICY_EXTERNAL_STORAGE;
+  trusted-fast and legacy accept_with_warnings with
+  H5_ADVISORY_EXTERNAL_STORAGE_ABSOLUTE_PATH at offset 285, object "/data".
+  boundary.external_file_opens is false in all four.
+  LIBHDF5, exact-build probe (2.3.0 baseline, --exercise external_file_list):
+  activation external_open count 1, path "/etc/passwd"; H5Fopen, H5Ovisit3,
+  H5Oopen, H5Dopen2 and H5Dread all succeed.  So the answer to the sibling
+  record's open question is that the descriptor is not merely opened -- the read
+  completes and the bytes reach the caller.  The specimen is 535 bytes and holds
+  none of the disclosed content.
+  PREFIX EXPERIMENT: HDF5_EXTFILE_PREFIX=<nonexistent directory> with h5dump -d
+  still prints the target's bytes, confirming the H5_CHECK_ABSOLUTE branch is
+  taken and the prefix never reaches the open.
+  PROBE OUTCOME IS MISLEADING HERE and the reason is worth recording: the probe
+  reports outcome rejected_in_traversal, which reads as a libhdf5 refusal and is
+  not one.  It is the probe's own H5Dwrite being refused by the filesystem
+  because the process cannot write /etc/passwd.  Read `activation` and the
+  per-entry-point successes, not `outcome` -- the same lesson as the SIGXCPU
+  case.
+
+harness_defect: >-
+  FOUND WHILE WRITING THIS RECORD, and it is the reason the record is longer than
+  the oracle change it does not make.  h5probe.c:641 sets exercise_write = efl
+  and :659 opens the file H5F_ACC_RDWR for the external_file_list exercise, then
+  issues an H5Dwrite of zeros through the dataset -- i.e. THROUGH the EFL segment,
+  at the attacker-named path.  h5policy-probe copies the HDF5 file into a private
+  workdir and chmods it 0644 for this exercise, but it does not and cannot copy
+  the EFL TARGET.  A relative slot name resolves inside that workdir, which is
+  the case the code comment describes ("writes only the private copied target").
+  An ABSOLUTE slot name does not: the write lands on the real path.
+  MEASURED with a purpose-built specimen naming a writable absolute file -- one
+  byte of that file changed from 0x41 to 0x00 (the fallback single-element write
+  at the last element).  On this case's specimen the same write was aimed at
+  /etc/passwd and failed only on filesystem permissions.
+  It is invisible to the guard that exists for it: h5policy-probe unconditionally
+  overwrites activation["write"] with {count: 0} when exercise ==
+  external_file_list, and --forbid write tests exactly that counter.  Both EFL
+  expectations (policy-external_storage-trusted_fast,
+  policy-external_storage_parent_unlimited) list `write` in `forbidden`, so both
+  of those entries are vacuous today.
+  Not fixed in this change -- filed here so the fix is scoped rather than
+  improvised.  The fix has two halves that must land together: make the write
+  canary conditional on the resolved target being inside the workdir, and stop
+  zeroing the counter, reporting the workdir-local exercise write under its own
+  key instead of erasing the evidence.
+
+systemic: >-
+  All three external-reference families take the absolute name verbatim, by two
+  different code paths.  EFL goes through H5_combine_path, which discards the
+  prefix in its first branch.  External links and VDS go through
+  H5F_prefix_open_file (src/H5Fint.c), whose H5_CHECK_ABSOLUTE branch TRIES the
+  stored name first and only falls back to basename-plus-prefix if that open
+  fails -- documented behaviour, not an oversight, and the same outcome for a
+  hostile name.  h5policy's shared syntactic classifier already covers all three
+  the same way, which is why this record needed no new machinery.
+
+sibling_audit: >-
+  The other EFL fixtures are unaffected: bad_efl_heap_address, bad_efl_name_empty,
+  bad_efl_name_offset, bad_efl_slot_count and truncated_efl_slots all report
+  external_open 0, because their names never decode to a usable path.  Only a
+  slot whose name decodes cleanly reaches the open, which makes the well-formed
+  specimen the ONLY shape that exercises this and explains why an encoding-focused
+  corpus did not surface it.
+
+coverage_gaps:
+  - >-
+    NO FIXTURE ASSERTS THE ABSOLUTE-PATH ADVISORY.  The corpus pins
+    H5_ADVISORY_EXTERNAL_STORAGE_RELATIVE_PATH (policy/external_storage.h5) and
+    H5_ADVISORY_EXTERNAL_STORAGE_PARENT_PATH
+    (policy/external_storage_parent_unlimited.h5); the absolute arm of the same
+    three-way classification has no
+    expectation behind it, so a regression that reclassified absolute names as
+    relative would pass the suite.  Closing this needs a fixture whose slot name
+    is absolute but harmless -- and, given the harness defect above, one whose
+    target does not exist, until the write canary is bounded.
+  - >-
+    THE ADVISORY DOES NOT CARRY THE DECODED PATH.  The finding names the object
+    and the slot offset but its evidence map is empty, so a report reader learns
+    that a path was absolute and not which path.  h5policy_emit_warning_ev exists
+    for exactly this, and the path is already in hand at the emission site
+    (h5_external.pk).  A consumer triaging a file cannot act on
+    "absolute" alone.
+  - >-
+    THE WRITE DIRECTION OF THE LIBRARY DEFECT IS UNWITNESSED ON THE ORACLE SIDE.
+    src/H5Defl.c:432-434 is the same combine-then-open with O_CREAT | O_RDWR, so
+    an absolute name in a file opened for write CREATES OR TRUNCATES that path.
+    This oracle and its differential are read-only by construction, so there is
+    no fixture for it; the probe's accidental write above is, ironically, the only
+    local observation of that path working.
+
+open_questions:
+  - >-
+    Does efl-external-open-before-segment-validation's wrapped-segment fixture
+    also complete a READ before its rejection, or only the open?  This record
+    answers that question for a WELL-FORMED slot (it does: H5Dread succeeds), which
+    is a different claim -- the wrapped slot may still be caught between the open
+    and the read.  The discriminator that record proposes, an interposer logging
+    read(2) rather than open(2), is still the right experiment.
+  - >-
+    Is there a supported way for a consumer to read a dataset's metadata while
+    refusing EFL resolution?  Nothing in H5Pget/set_efile_prefix or the DAPL
+    suggests one; if there genuinely is none, that is the sharpest thing to say
+    upstream, because it means every reader of untrusted HDF5 needs an
+    out-of-library gate -- which is what this oracle is.
+
+reproducers: >-
+  Embargoed third-party reproduction, case 02, outside this repository: specimen
+  basename evil.h5, sha256
+  53062282280bbe8e9e7ac9c0f2a48615409714cb4e527eeac2a6dd866856f185, 535 bytes,
+  with a generator, a runner carrying an explicit pass criterion, and captured
+  output.  Not promoted into cases/ and not added to the corpus: the specimen
+  names an absolute path on the host that produced it, so it is not portable
+  evidence, and the h5policy behaviour it demonstrates is already pinned by the
+  two policy fixtures named under coverage_gaps.
+
+provenance:
+  found_by: >-
+    an embargoed third-party report, re-derived and measured locally; the
+    harness_defect and the prefix-discard measurement are ours
+  h5policy_commit: "branch updates/20260824, at 404af15"
+  libhdf5_source: {branch: develop, commit: 51b92ccee54ed3f14af3509c9ac5e4f3c82e58ce, version: 2.3.0}
+  baseline_build: {version: 2.3.0, build_mode: RelWithDebInfo, sanitizers: [], settings_sha256: 7ce6203229fbd356cbdbaab0e1b333c4319c0063743003226a9fb8d05f47819c}

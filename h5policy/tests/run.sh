@@ -211,6 +211,34 @@ else
 fi
 rm -rf "$repo_dir/cases/$cve_case"
 
+# External CVE specimen corpus.  The bytes are NOT vendored -- they are megabytes
+# of unregenerable blobs, and the reproducibility phase above guarantees that
+# tracked fixtures reproduce byte for byte, which nobody here can promise for
+# files nobody here can regenerate.  So registry/cve-corpus-manifest.yml travels
+# and the specimens do not.
+#
+# WHAT THIS PHASE DEFENDS is the ACCEPTS, not the rejections.  Triage of that
+# corpus is finished; roughly a dozen specimens accept on purpose, and each of
+# those accepts is a load-bearing negative expectation on genuinely hostile
+# input.  A check that starts rejecting one has produced a suspected invariant-A
+# false positive on a real attacker's file rather than on a fixture written here.
+#
+# Runs when a sibling checkout is present and skips otherwise, like every other
+# optional-tooling phase.  Set H5POLICY_CVE_CORPUS to point elsewhere, or to the
+# EMPTY string to disable it -- `${VAR-default}` and not `${VAR:-default}` on
+# purpose, so "unset" and "explicitly off" stay distinguishable.  Measured at
+# about 90 seconds for 140 specimens.
+echo "== external CVE specimen corpus =="
+cve_corpus_status=0
+cve_corpus_dir="${H5POLICY_CVE_CORPUS-$repo_dir/../cve_hdf5}"
+if [[ -n "$cve_corpus_dir" && -d "$cve_corpus_dir" ]]; then
+    "$repo_dir/tools/h5cve-corpus" --corpus "$cve_corpus_dir" || cve_corpus_status=1
+elif [[ -z "$cve_corpus_dir" ]]; then
+    echo "  skipped: disabled by H5POLICY_CVE_CORPUS="
+else
+    echo "  skipped: no corpus at $cve_corpus_dir"
+fi
+
 # In-process seam self-check.  h5policy_analyze shares interpreter state across
 # analyses, so any work that BATCHES them is gated on this: it compares the seam
 # against the CLI and checks the verdicts are order-independent.  It caught a
@@ -272,6 +300,7 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
       && $matrix_status -eq 0 && $mut_status -eq 0 \
+      && $cve_corpus_status -eq 0 \
       && $mut_heap_status -eq 0 \
       && $trunc_status -eq 0 && $lazy_status -eq 0 \
       && $seam_check_status -eq 0 \
@@ -279,5 +308,5 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status pathunit=$path_unit_status seam=$seam_status report=$report_status pathreport=$path_report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status mut=$mut_status mutheap=$mut_heap_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status pathunit=$path_unit_status seam=$seam_status report=$report_status pathreport=$path_report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status cvecorpus=$cve_corpus_status mut=$mut_status mutheap=$mut_heap_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
 exit 1

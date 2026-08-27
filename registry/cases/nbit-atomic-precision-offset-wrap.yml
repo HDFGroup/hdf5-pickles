@@ -1,0 +1,146 @@
+# The N-bit filter's own bound on an atomic node is evaluated in 32-bit unsigned
+# arithmetic, so it wraps and admits the parameters it was written to reject.
+#
+#   src/H5Znbit.c, in H5Z__nbit_decompress_one_array and its siblings:
+#       if (p.precision > p.size * 8 || (p.precision + p.offset) > p.size * 8)
+#
+# Every field of parms_atomic is `unsigned`.  With precision 16, size 4 and
+# offset 0xfffffff0 the sum is 0 modulo 2**32, the guard passes, and the decoder
+# proceeds with an offset of four billion.
+#
+# The same three lines appear in the COMPRESS path (H5Z__nbit_compress_one_array
+# and its siblings) with NO guard at all, which is why the oracle checks the
+# parameters themselves rather than one direction of travel.
+schema_version: 1
+
+id: nbit-atomic-precision-offset-wrap
+title: an n-bit atomic node's precision plus offset is bounded in 32-bit
+  arithmetic, so a wrapping offset passes libhdf5's own guard and the decoder
+  writes off the end of the element
+status: oracle-hardened          # h5policy now rejects; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The third-party report
+  that prompted this triage is embargoed; everything recorded here was
+  re-derived from the HDF5 source tree and measured locally.
+
+record: dataset_layout_filter_fill
+versions: [2, 3]                 # filter-pipeline message versions
+root_cause_classification: local_decode
+violated_invariant:
+  - layout.nbit_atomic_bounds
+validation_closure: >-
+  the filter-pipeline message's client-data array for the n-bit filter, walked
+  as the self-describing type tree it is, and for each atomic node the three
+  words size, precision and offset.
+activation_before_validation:
+  - decompression
+entry_points:
+  - h5policy (oracle) -- accept_with_warnings before this change
+  - "libhdf5 H5Z__nbit_decompress_one_byte via H5Z__nbit_decompress_one_atomic"
+  - "direct consumer: any dataset read, e.g. h5dump -d"
+
+defect: >-
+  ORACLE SIDE (this repository, now fixed): h5policy walked the n-bit parameter
+  tree for STRUCTURE only -- classes known, indices inside cd_nelmts, compound
+  members inside their parent -- and stepped over an atomic node's precision and
+  offset without reading them (`return idx + 5`).  The semantic bound was
+  therefore unchecked even though the analogous rule already existed one layer
+  away on the DATATYPE message ("numeric datatype bit offset and precision
+  exceed the storage size").  The filter carries its own copy of those fields,
+  and that copy is what libhdf5's wrapping guard reads.
+  LIBHDF5 SIDE: unfixed.  Restated without the wrap the rule is
+  `precision <= size * 8 && offset <= size * 8 - precision`; subtracting instead
+  of adding is all it takes, and that is the form the oracle now enforces.
+
+fix: >-
+  Read size, precision and offset in the ATOMIC arm of the parameter walk and
+  apply the bound in the subtracting form.  New finding
+  H5_CORRUPT_NBIT_ATOMIC_BOUNDS under a NEW invariant, layout.nbit_atomic_bounds,
+  deliberately separate from layout.nbit_parameters: that one is about the tree
+  (classes, indices, member containment) and this is a semantic bound on one
+  node.  Folding them would have made a passing structural walk look like
+  evidence for a property it never tested.
+
+oracle_before: accept_with_warnings (H5_ADVISORY_DECODE_FILTER only)
+oracle_after: reject_corrupt with H5_CORRUPT_NBIT_ATOMIC_BOUNDS
+
+libhdf5_behaviour: >-
+  Opens the file and reads the dataset.  MEASURED on the 2.3.0 baseline: h5dump
+  -d returns 0 and prints values.  On the 2.3.0 AddressSanitizer build the same
+  read is a heap-buffer-overflow WRITE of size 1 in
+  H5Z__nbit_decompress_one_byte, reached through H5Z__nbit_decompress_one_atomic
+  and H5Z__filter_nbit.
+  THE BYTE ORDER SELECTS THE CONSEQUENCE, and this is the part worth carrying
+  forward.  H5Z__nbit_decompress_one_atomic computes, for LITTLE endian,
+  `begin_i` from the WRAPPED sum and `end_i = p->offset / 8` from the UNWRAPPED
+  offset; begin_i is therefore small and end_i astronomically large, the
+  descending loop `for (k = begin_i; k >= end_i; k--)` never executes, and the
+  dataset decodes to all zeros -- silent DATA corruption, no memory unsafety.
+  The BIG-endian arm computes both bounds by SUBTRACTING the offset from the
+  datatype length, both underflow back into a small range (measured: begin_i 4,
+  end_i 5 for a 4-byte element), and the ascending loop walks off the element.
+  Identical parameters, one byte different, and only one of them is a memory
+  defect.
+
+measured_variants: >-
+  precision 16, size 4, order BE, offset 0xfffffff0 -- guard passes, ASan
+  heap-buffer-overflow WRITE (the tracked fixture).
+  Same but order LE -- guard passes, no ASan finding, dataset reads as all zeros
+  instead of 0..99.
+  precision 32 (== size * 8) with any offset -- INERT, and this is the trap that
+  cost the first two attempts: at full precision libhdf5's writer sets
+  need_not_compress and stores the chunk verbatim, so the decompressor never
+  reads precision or offset and no patch to them has any effect.  A fixture must
+  be written with a genuinely reduced precision.
+  precision 32, offset 16 (sum 48 > 32, NO wrap) -- also read cleanly by the
+  stock build, for the same need_not_compress reason, which is why an exit code
+  from that shape is not evidence that the guard works.
+
+control_is_non_vacuous: >-
+  A 16-bit-precision n-bit dataset with offset 0, in both byte orders, still
+  reads correctly and is still accepted (accept_with_warnings, the pre-existing
+  decode-filter advisory).  The corpus's other two n-bit fixtures --
+  nbit_param_count and nbit_member_offset_wrap -- keep their own findings, so the
+  new rule did not swallow the structural ones.
+
+corpus_specimens_closed: >-
+  FOUR, and they were false accepts nobody had noticed.  The external CVE corpus
+  holds four 72368-byte siblings whose /Nbit_float_data_le declares precision
+  65556 for a 4-byte element -- 20 with the high 16 bits set -- while the BE
+  sibling in the same file keeps a legitimate precision 20 and offset 7.
+  libhdf5 refuses to read the patched dataset and reads the untouched one; this
+  check now agrees on both, which is what makes it a bound and not a blanket
+  rejection of n-bit files.
+  They had been triaged as OUT OF JURISDICTION on the strength of the affected
+  function being a filter DECODER.  That was wrong: the n-bit parameters live in
+  the filter-pipeline MESSAGE and are metadata, exactly like the attribute
+  heap IDs that were mis-scoped the same way.  Note the half of the rule these
+  exercise is the one that does NOT wrap -- `precision > size * 8` is true in 32
+  bits too -- so they were reachable without the wrap at all, and the wrap
+  fixture is a separate specimen written here.
+  The three that had a verdict are corrected in
+  registry/cve-corpus-manifest.yml; the fourth was untriaged and moved from
+  reject_policy to reject_corrupt because a corrupt verdict outranks a policy
+  one.  THE MANIFEST SURFACED ALL FOUR on its first run after the check landed,
+  flagged as suspected false positives because they had been deliberate accepts.
+  That is precisely the drift direction it was built for.
+
+coverage_gaps:
+  - >-
+    ONLY THE BIG-ENDIAN SPECIMEN IS TRACKED.  The little-endian sibling has the
+    same parameters and the same finding but a different consequence -- wrong
+    data, not corrupted memory -- so a code-scoped tolerance predicate would
+    excuse two explanations under one claim.  The per-fixture entry in
+    registry/h5policy-diff-tolerances.yml says so explicitly.
+  - >-
+    THE COMPRESS PATH IS NOT EXERCISED BY ANY FIXTURE.  H5Z__nbit_compress_one_array
+    and its siblings read precision and offset with no guard whatsoever, but
+    reaching them needs a WRITE, and this oracle and its differential are
+    read-only by construction.  The parameter check covers both paths because it
+    is on the file's bytes; the missing thing is a witness for the write
+    direction.
+  - >-
+    NON-ATOMIC NODES ARE UNCHANGED.  Only the ATOMIC arm carries precision and
+    offset; ARRAY, COMPOUND and NOOPTYPE nodes have no such fields, so there is
+    nothing analogous to check there.

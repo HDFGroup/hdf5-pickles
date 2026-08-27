@@ -342,11 +342,16 @@ if(POKE_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0)
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5policy/tests/run.sh"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
-    # The suite runs the full corpus, the h5cve exact-build matrix, a 154-file
-    # differential, truncation sweeps, and the mutation family; it sits near
-    # 300s on an unloaded host and exceeds it under parallel CTest load, so the
-    # ceiling is generous rather than tight.
-    set_tests_properties(h5policy_regression PROPERTIES TIMEOUT 600)
+    # The suite runs the full corpus, the h5cve exact-build matrix, a 315-file
+    # differential, the external CVE specimen corpus, truncation sweeps, and the
+    # mutation family.  MEASURED 2026-08-26 on an unloaded host: 946s end to end,
+    # of which the differential is 523s and the corpus cases 219s -- the two
+    # phases that scale with fixture count, and the corpus has roughly doubled
+    # (188 -> 350 expected fixtures) since this ceiling was first set.  It
+    # exceeds the measurement again under parallel CTest load, so keep the
+    # ceiling generous rather than tight; raise it with the corpus, and prefer
+    # splitting the differential into its own test over trimming coverage to fit.
+    set_tests_properties(h5policy_regression PROPERTIES TIMEOUT 1800)
     # cache_image_docs_regression reads h5policy/tests/valid/cache_image.h5,
     # which only exists once h5policy_regression's run.sh has (re)generated the
     # corpus; on a clean checkout, running it in registration order (before

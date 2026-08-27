@@ -11,10 +11,17 @@
 #   ordering route (the guard ran too early)
 #     specimen 1c2fd79f...   promoted footprint escapes the bound
 #     specimen cc54e45c...   member offset outside the parent
+# A FIFTH specimen was added 2026-08-26 from ordinary triage rather than from a
+# promoted bundle: 6facdef0..., a fuzzed HDF5 test file whose oversized member
+# sits inside a NESTED compound.  It is what establishes that the defect is not
+# specific to the dataset's own datatype -- see routes.ordering and
+# sibling_audit.
 # They are recorded together because the two halves are not independently
 # fixable: a checked multiply still leaves a non-wrapping member that overruns
 # its element, and a re-ordered guard still lets the product wrap before the
-# guard sees it.  All four converge on the same consumer, H5T__conv_struct_opt.
+# guard sees it.  The four bundle specimens converge on the same consumer,
+# H5T__conv_struct_opt; the fifth deliberately does not, and measuring why is
+# what bounds a nested carrier's reach (measured.DEPTH_AND_32BIT).
 #
 # This record CLOSES items 2 and 3 of
 # registry/cases/arithmetic-divergences-backlog.yml, which asked "is the member
@@ -25,7 +32,7 @@ id: compound-member-array-promotion-unguarded
 title: a v1 compound member's embedded-array promotion multiplies unchecked and
   happens after the guards that should bound it, so an oversized member is
   published and later read out of bounds
-status: oracle-hardened          # h5policy rejects all four; libhdf5 accepts
+status: oracle-hardened          # h5policy rejects all five; libhdf5 accepts
 disclosure: >-
   n/a -- local analysis only.  No advisory database was consulted, no advisory
   text was retrieved, and no identifier was looked up.  The bundles' supplied
@@ -50,7 +57,7 @@ activation_before_validation:
   - cache_publication
   - public_id
 entry_points:
-  - h5policy (oracle) -- untrusted-strict and forensic reject all four specimens
+  - h5policy (oracle) -- untrusted-strict and forensic reject all five specimens
   - "libhdf5 decode: H5Dopen2 -> H5O__dtype_decode -> H5O__dtype_decode_helper (src/H5Odtype.c) -> H5T__array_create (src/H5Tarray.c)"
   - "libhdf5 use: H5Dread -> H5D__scatgath_read -> H5T_convert -> H5T__conv_struct_opt (src/H5Tconv_compound.c:859-868)"
   - "public API: H5Tarray_create1/2 reach the same unchecked constructor"
@@ -94,6 +101,17 @@ defect: >-
   one branch of one function and not at all in another branch of the same
   function, because the legacy embedded-array path routes through
   H5T__array_create instead.
+  AND THEY WROTE THE MEMBER BOUND TOO, in the constructor.  H5T__insert
+  (src/H5Tcompound.c:420-421) applies exactly the check :509 applies too early:
+    if ((offset + total_size) > parent->shared->size)                   /* :421 */
+        HGOTO_ERROR(... "member extends past end of compound type");
+  and here `total_size = member->shared->size` is the PROMOTED size, because the
+  array type already exists by the time it is inserted.  Measured 2026-08-26:
+  reading a promoted member back out of an accepted file with
+  H5Tget_member_type and handing it to H5Tinsert on the compound it came from is
+  REFUSED with that message.  So the library declines to construct the type it
+  accepts from disk -- the invariant is not merely known elsewhere in the tree,
+  it is enforced on the write side of the very same object.
   THE CONSUMER.  H5T__conv_struct_opt (src/H5Tconv_compound.c:859-868) reads
   each member at its declared offset and promoted size during H5Dread, whenever
   the memory type differs from the file type.  That is what turns a bad decode
@@ -113,7 +131,7 @@ why_one_record: >-
   "two coupled changes" -- and 25420ff5 carries BOTH invariants on a single
   specimen, which is the clearest single argument that this is one surface.
 
-# -- The four specimens -------------------------------------------------------
+# -- The five specimens -------------------------------------------------------
 routes:
   arithmetic:
     - specimen: 535 bytes, input_sha256
@@ -163,9 +181,93 @@ routes:
         H5Ovisit3 both SUCCEED first, and the datatype is only decoded at
         H5Dopen2 (measured, compound-member-conv-probe.txt).  So a preflight
         that only opens and walks a file will not see this.
+    - specimen: 2072 bytes, input_sha256
+        6facdef00d299e992ff65cc9a64a9a47c8274c67059af6f585c905a6dd409dd0
+      added: 2026-08-26
+      how: >-
+        THE DEPTH CASE, and the only route entry not reached from a purpose-built
+        specimen.  A fuzzed copy of the HDF5 test file tnestedcomp.h5 -- 136
+        single bytes rewritten, same length -- arrived for triage.  libhdf5 2.3.0
+        rejects it at H5Fopen on an unrelated driver-info address (see
+        registry/cases/driver-info-block-fields-unbounded.yml), which hides
+        everything behind it, so each of the 136 differences was applied ALONE to
+        the pristine base and both sides re-measured.  Exactly one live
+        divergence fell out, at base offset 0x7f5: the v1 embedded-array
+        dimension of member `array_name` goes 2 -> 62978.
+        WHAT MAKES IT NEW is where the member sits.  The four entries above all
+        put the oversized member in the dataset's OWN compound.  Here it is one
+        level down: `struct {char char_name; float array_name[62978];}` declared
+        12 bytes, itself a member of the dataset's 32-byte compound.  The outer
+        bound 16 + 12 <= 32 passes honestly; the inner member passes its own
+        bound as a 4-byte base type and is then promoted to 251912 bytes ending
+        at 251916 inside 12.  H5O__dtype_decode_helper applies the same
+        :507/:509-before-:542 ordering at every recursion level, so a guard added
+        only where the dataset's datatype is decoded would close all four
+        siblings and leave this accepted.
+      tracked_fixture: malformed/compound_member_array_nested_oob.h5
+      note: >-
+        The tracked fixture is NOT this specimen.  It is the off12 geometry moved
+        down one level -- outer 16, nested compound 8, inner member at offset 4
+        with a [2] u32 array promoting to 8 and ending at 12 -- so the two
+        fixtures differ in DEPTH and in nothing else, and both stay
+        width-independent.  Built by _make_compound_member_array_nested_oob.
 
 # -- Measured behaviour -------------------------------------------------------
 measured:
+  DEPTH_AND_32BIT: >-
+    2026-08-26, HDF5 2.3.0, source commit 51b92ccee54ed3f14af3509c9ac5e4f3c82e5
+    8ce.  Three builds, all workstation-local, paths not recorded:
+      baseline   RelWithDebInfo, asserts off, no sanitizers, x86-64,
+                 settings_sha256 7ce6203229fbd356cbdbaab0e1b333c4319c006374300
+                 3226a9fb8d05f47819c
+      candidate  RelWithDebInfo, asserts off, -fsanitize=address, x86-64,
+                 settings_sha256 970f83354e89722436502d348e12c8a33ec783724c3f4
+                 8adf2d7dd9ae081d219
+      i386       RelWithDebInfo, asserts off, no sanitizers, external filters
+                 off, settings_sha256 ef807c88281cc8210e658e3ad02c169ddc9297852
+                 6d58dc1cf4f126aa48c7e62
+    THE 32-BIT GAP IS CLOSED FOR THE ORDERING ROUTE.  It read "libhdf5 itself is
+    unmeasured at 32 bits (the arithmetic is measured; the library is not)".  The
+    library is now measured: i386 libhdf5 ACCEPTS the ordering route exactly as
+    x86-64 does, on both the fuzzed-tnestedcomp carrier and the new tracked
+    fixture, publishing the same promoted member size.  On the carrier the only
+    difference between the widths is native struct padding in the
+    H5Tget_native_type result -- 251936 on x86-64 against 251932 on i386.  The
+    arithmetic route remains unmeasured at 32 bits, and that is the whole of what
+    the gap item now covers; see coverage_gaps.
+    AMPLIFICATION, a second consequence of the same defect and reachable with no
+    sanitizer build, no crafted memory type and no buffer tuning.  On the
+    fuzzed-tnestedcomp carrier H5Tget_native_type turns a 32-byte on-disk element
+    into a 251936-byte in-memory element -- 7873x -- and H5Dread into a buffer of
+    that size returns rc=0.  A reader that sizes its buffer from
+    H5Tget_size(H5Tget_native_type(...)), which is the documented idiom,
+    allocates 2.5 MB for a 320-byte dataset.  The upper bound is UNMEASURED: only
+    62978 was run, and the v1 encoding carries four 32-bit dimensions.
+    THE CONSTRUCTOR ENFORCES WHAT THE DECODER SKIPS, a second in-tree contrast
+    alongside the standalone array decoder already argued in `defect`.
+    H5T__insert (src/H5Tcompound.c:420-421) tests
+    `(offset + total_size) > parent->shared->size` with total_size the member's
+    PROMOTED size.  Measured: handing the decoder's own array_name type -- read
+    straight back out of the file with H5Tget_member_type -- to H5Tinsert on the
+    12-byte compound it came from is refused, "member extends past end of
+    compound type".  The library will not let a program construct the type it
+    just accepted from disk.
+    NEGATIVE RESULT, and it belongs in the record because it bounds what a
+    nested carrier can demonstrate.  The H5T__conv_struct_opt over-read was NOT
+    reproduced from either nested specimen.  Four memory-type shapes were driven
+    against the ASan build and none produced a report; the probe's datatype
+    exercise completes and reports outcome=accepted on both builds.  The reason
+    is structural: the top-level strided copy runs at the nested compound's
+    honest declared size, and making the INNER copy overrun needs a memory-side
+    compound SMALLER than the promoted member -- which H5T__insert refuses to
+    build, per the paragraph above -- while every memory type the API will build
+    is at least as large as the promoted member and the per-element conversion
+    buffer is sized max(src, dst).  This does not weaken the four specimens
+    above, which put the oversized member directly in the dataset's compound
+    where the copy does overrun.  It does mean the depth fixture carries the
+    ACCEPTANCE divergence and the depth argument, while
+    compound_member_array_off12_oob.h5 remains the family's memory-safety
+    carrier.
   REMEASURED: >-
     2026-08-15, at HEAD (2.3.0), on all four bundles.  THE VERSION SKEW IS
     CLOSED: the bundles measured 2.2.0 while the source lines in `defect` were
@@ -326,6 +428,7 @@ reproducers:
     - h5policy/tests/malformed/compound_member_array_bounds.h5
     - h5policy/tests/malformed/compound_member_offset_oob.h5
     - h5policy/tests/malformed/compound_member_array_off12_oob.h5
+    - h5policy/tests/malformed/compound_member_array_nested_oob.h5
   direct_fixtures:
     - h5policy/tests/malformed/compound_member_array_nelem_overflow.h5
     - h5policy/tests/malformed/compound_member_array_bounds.h5
@@ -335,9 +438,18 @@ reproducers:
     # 12 of a 16-byte element, width-independent, and the only fixture here
     # whose libhdf5 consequence is a measured ASan over-read.
     - h5policy/tests/malformed/compound_member_array_off12_oob.h5
+    # Added 2026-08-26.  The off12 geometry moved down one nesting level, so the
+    # two differ in DEPTH and in nothing else: outer element 16, nested compound
+    # 8, inner member at offset 4 with a [2] u32 array promoting to 8 and ending
+    # at 12.  Also width-independent.  It carries the ACCEPTANCE divergence and
+    # the depth argument, not a memory-safety event -- see
+    # measured.DEPTH_AND_32BIT for why a nested carrier cannot reach the
+    # consumer.
+    - h5policy/tests/malformed/compound_member_array_nested_oob.h5
   expectations:
     - h5policy/tests/expected/malformed-compound_member_array_nelem_overflow.yml
     - h5policy/tests/expected/malformed-compound_member_array_off12_oob.yml
+    - h5policy/tests/expected/malformed-compound_member_array_nested_oob.yml
   control_fixture: >-
     variant_fit.h5 in the 40f5826c bundle -- a valid embedded-array compound the
     oracle ACCEPTS.  Essential here: the containment's half (2) newly rejects a
@@ -353,8 +465,14 @@ reproducers:
     syscalls).  Executed arithmetic, not a uint32_t model.  Reusable for any
     future width question in this repo.
   generators: >-
-    The three tracked fixtures are generator-produced and reproducible from this
-    repo.  40f5826c's specimen differs from its tracked fixture in only 32 bytes
+    All tracked fixtures here are generator-produced and reproducible from this
+    repo; the nested one is _make_compound_member_array_nested_oob in
+    h5policy/tools/h5policy-gencorpus.  The 2026-08-26 specimen has NO tracked
+    copy by design -- it is a fuzzed HDF5 test file, and what the corpus needs
+    from it is the shape, not the bytes.  It is reconstructible from
+    tools/test/testfiles/tnestedcomp.h5 (sha256 439042f49c82096ef94dc46fd43ad78
+    29355212faa5fe839f621d5837fc45861) by setting byte 0x7f5 to 0xf6.
+    40f5826c's specimen differs from its tracked fixture in only 32 bytes
     -- object-header timestamps and the chunk-0 checksums over them -- with the
     datatype message byte-identical (corpus-identity.json).  So the tracked
     fixture is a faithful stand-in for that specimen, which is NOT true of the
@@ -397,6 +515,22 @@ sibling_audit: >-
   it is the contrast that makes this record's argument.  The :507/:509 guards
   were audited only for the v1 embedded-array ordering; whether other member
   classes are promoted or transformed after those guards run was not checked.
+  NESTING DEPTH, added 2026-08-26 and now the sharpest constraint on where a fix
+  may go.  H5O__dtype_decode_helper recurses into a nested compound and runs the
+  same :507/:509-before-:542 ordering at every level.  MEASURED at depth two
+  (the ordering route's fifth specimen and the tracked fixture
+  malformed/compound_member_array_nested_oob.h5): libhdf5 accepts an inner
+  member that overruns the compound containing it while the outer member passes
+  its own bound honestly.  A guard placed only where the dataset's own datatype
+  is decoded would therefore close all four earlier specimens and leave this
+  one accepted -- which is the argument for fixing at H5T__array_create or
+  immediately after :542, not at the dataset-datatype boundary.  Depth three,
+  and an array-OF-compound carrier, are INFERRED from the shared recursion and
+  not measured.
+  A second in-tree contrast, measured the same day: H5T__insert
+  (src/H5Tcompound.c:421) already enforces this bound against the promoted size,
+  so the constructor and the standalone array decoder both have what the
+  embedded decode path lacks.  See measured.DEPTH_AND_32BIT.
   Within h5policy: the promoted-footprint bound at h5_datatype.pk:628 is shared,
   so v1 embedded arrays and ordinary members go through one expression.  Whether
   the same compound shape arriving as an ATTRIBUTE datatype rather than a
@@ -412,6 +546,10 @@ version_range:
     the missing guards and the :507/:509-before-:542 ordering were verified
     directly in the 2.3.0 tree at promotion.  No archaeology was run to find
     when the legacy embedded-array path diverged from the standalone one.
+    2026-08-26: acceptance is now MEASURED, not only source-derived, on 2.3.0
+    (source 51b92ccee54) -- on x86-64 baseline, x86-64 ASan and i386, for the
+    ordering route.  So both ends of the stated span are measurements now.  The
+    lower bound is still "measured from", not "introduced in".
   note: >-
     The shape suggests the standalone-array guards were added in response to a
     specific report and the legacy embedded path was never revisited -- the
@@ -450,10 +588,16 @@ coverage_gaps:
     exercise does drive a converting read, the off12 fixture's canary is very
     likely `violation`.
   - >-
-    libhdf5 itself is unmeasured at 32 bits (the arithmetic is measured; the
-    library is not).  Needs libc6-dev-i386 and a 32-bit libhdf5 build.  This
-    matters more here than in most records because variant_wrap32_one decodes
-    as a VALID file at 32 bits.
+    NARROWED 2026-08-26 -- see measured.DEPTH_AND_32BIT.  It read "libhdf5
+    itself is unmeasured at 32 bits (the arithmetic is measured; the library is
+    not)".  An i386 libhdf5 2.3.0 build now exists here and the ORDERING route
+    is measured on it: i386 accepts the same files as x86-64 and publishes the
+    same promoted member size, differing only in native struct padding.
+    RESIDUAL, and it is the half that mattered most: the ARITHMETIC route is
+    still unmeasured against a 32-bit LIBRARY.  variant_wrap32_one decodes as a
+    VALID file at 32 bits, so what an i386 libhdf5 does with it is the open
+    question -- the freestanding i386 witness measures the arithmetic, not the
+    library.  The build to use is the one pinned in measured.DEPTH_AND_32BIT.
   - >-
     The public H5Tarray_create1/2 route into the unchecked constructor has no
     specimen and no test -- it is an API-level entry point, not a file-format
@@ -479,9 +623,26 @@ provenance:
     re-reading established that the arithmetic and ordering halves are one
     surface and that the standalone array decoder already carries the guards
     the embedded path lacks.
+    A fifth specimen (6facdef0...) reached the record 2026-08-26 by ordinary
+    triage of a fuzzed HDF5 test file whose own open-time rejection hid it: the
+    per-mutation isolation sweep that found it is the method worth reusing when
+    a supplied file is rejected before the interesting record is reached.
   hdf5_build: >-
     Measured on HDF5 2.2.0 (source 4d666721f42); baseline Release and candidate
     RelWithDebInfo -fsanitize=address, both accepting.  Source verified against
     the 2.3.0 tree at promotion.  Both are workstation-local installs; paths not
     recorded.  i386 toolchain: gcc 14.2.0, -m32 -nostdlib -static.
+    2026-08-26 additions, HDF5 2.3.0, source 51b92ccee54ed3f14af3509c9ac5e4f3c8
+    2e58ce, all workstation-local, paths not recorded:
+      baseline   RelWithDebInfo, asserts off, no sanitizers, x86-64,
+                 settings_sha256 7ce6203229fbd356cbdbaab0e1b333c4319c006374300
+                 3226a9fb8d05f47819c
+      candidate  RelWithDebInfo, asserts off, -fsanitize=address, x86-64,
+                 settings_sha256 970f83354e89722436502d348e12c8a33ec783724c3f4
+                 8adf2d7dd9ae081d219
+      i386       RelWithDebInfo, asserts off, no sanitizers, external filters
+                 off, settings_sha256 ef807c88281cc8210e658e3ad02c169ddc9297852
+                 6d58dc1cf4f126aa48c7e62
+    The i386 install is a full libhdf5, not a witness harness -- which is what
+    makes the 32-bit LIBRARY measurable here for the first time.
   poke_version: GNU poke 4.3

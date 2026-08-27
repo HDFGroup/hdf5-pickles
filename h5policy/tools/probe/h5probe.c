@@ -77,6 +77,7 @@ enum entry_point_id {
     EP_H5AOPEN_BY_IDX,
     EP_H5AREAD,
     EP_H5AGET_TYPE,
+    EP_H5RGET_REGION,
     EP_H5FGET_INFO2,
     EP_H5GGET_INFO,
     EP_H5FGET_CREATE_PLIST,
@@ -136,6 +137,7 @@ static void init_stats(struct probe_stats *st)
         "H5Tget_nmembers", "H5Tget_member_type", "H5Tget_super",
         "H5Sget_simple_extent_npoints", "H5Dget_create_plist",
         "H5Sselect_elements", "H5Aopen_by_idx", "H5Aread", "H5Aget_type",
+        "H5Rget_region",
         "H5Fget_info2", "H5Gget_info", "H5Fget_create_plist", "H5Pget_userblock",
         "H5Fget_eoa", "H5Fget_filesize", "H5Fget_mdc_image_info",
         "H5Fget_mdc_size", "H5Gget_create_plist", "H5Fget_free_sections"
@@ -370,6 +372,46 @@ done:
     if (dtype >= 0) H5Tclose(dtype);
 }
 
+/* Dereference every LEGACY dataset-region reference in an attribute value.
+ *
+ * Reading the value is not enough for this family and that gap was measurable:
+ * a legacy region reference (H5T_STD_REF_DSETREG) comes back from H5Aread as an
+ * opaque 12-byte blob, and the serialized dataspace selection inside its
+ * global-heap object is not touched until H5Rget_region parses it.  So four
+ * fixtures whose ONLY defect is in that selection -- and which libhdf5 does
+ * refuse on dereference -- were reported `accepted` by this probe, which made
+ * the canary structurally unable to judge the family.
+ *
+ * REVISED references (H5T_STD_REF) need nothing here: H5Aread itself decodes
+ * their blob through H5R__decode_region, so they were already reached.
+ *
+ * Failures are recorded, not treated as fatal: a reference that legitimately
+ * names no region is not a defect, which is why only H5R_DATASET_REGION1 values
+ * are dereferenced at all.
+ */
+static void probe_attr_regions(hid_t obj, hid_t at, hssize_t np, size_t ts,
+                               const void *buf, struct probe_stats *st)
+{
+    if (H5Tget_class(at) != H5T_REFERENCE)
+        return;
+    if (!H5Tequal(at, H5T_STD_REF_DSETREG))
+        return;
+    if (ts != sizeof(hdset_reg_ref_t))
+        return;
+    for (hssize_t i = 0; i < np; i++) {
+        const hdset_reg_ref_t *r =
+            &((const hdset_reg_ref_t *)buf)[i];
+        hid_t sp = H5Rget_region(obj, H5R_DATASET_REGION, r);
+        entry_point_result(st, EP_H5RGET_REGION, sp >= 0);
+        if (sp < 0) {
+            st->call_errors++;
+            continue;
+        }
+        if (st->exercise_heap_structures) st->family_completed++;
+        H5Sclose(sp);
+    }
+}
+
 static void probe_attributes(hid_t obj, struct probe_stats *st)
 {
     H5O_info2_t oi;
@@ -399,6 +441,8 @@ static void probe_attributes(hid_t obj, struct probe_stats *st)
                 entry_point_result(st, EP_H5AREAD, io >= 0);
                 if (io < 0) st->call_errors++;
                 else if (st->exercise_heap_structures) st->family_completed++;
+                if (io >= 0)
+                    probe_attr_regions(obj, at, np, ts, buf, st);
                 free(buf);
             }
         }
@@ -492,6 +536,17 @@ static herr_t external_link_cb(hid_t root, const char *name,
 
 /* Resolve a concrete link selected by H5Lvisit2.  Unlike a generic object
  * walk, this makes the dense-link index answer a name lookup. */
+/* THE DENSE-INDEX FAMILY OWNS DENSE ATTRIBUTES AS WELL AS DENSE LINKS, so this
+ * callback reads each resolved object's attributes rather than only opening it.
+ *
+ * Without that the exercise drove H5Fopen, H5Lvisit2 and H5Oopen and nothing
+ * else, so a defect in a dense ATTRIBUTE index was structurally unreachable:
+ * measured, malformed/dense_attr_btree_wrong_client.h5 came back
+ * `accepted` from this exercise and `rejected_in_traversal` from the generic
+ * one, and the matrix scored the difference as an invariant-A divergence
+ * against h5policy.  The canary cannot judge half of its own family from a link
+ * walk alone.
+ */
 static herr_t dense_link_cb(hid_t root, const char *name,
                             const H5L_info2_t *info, void *op)
 {
@@ -502,6 +557,7 @@ static herr_t dense_link_cb(hid_t root, const char *name,
         st->call_errors++;
     else {
         st->family_completed++;
+        probe_attributes(obj, st);
         H5Oclose(obj);
     }
     return 0;

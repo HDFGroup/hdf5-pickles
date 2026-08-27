@@ -338,6 +338,28 @@ def _object_key(obj):
         return ("py", id(obj))
 
 
+def _unreadable_reference(aid):
+    """Whether this attribute's type is a reference h5py cannot decode.
+
+    A class-7 type that is neither STD_REF_OBJ nor STD_REF_DSETREG is a REVISED
+    reference (H5T_STD_REF).  h5py exposes no constant for it -- `h5py.h5t` has
+    no STD_REF -- which is itself the tell, and reading one raises regardless of
+    whether the file is sound.  Detected from the type rather than from the
+    exception text so it does not depend on an h5py message string.
+    """
+    try:
+        t = aid.get_type()
+        if t.get_class() != h5py.h5t.REFERENCE:
+            return False
+        for known in ("STD_REF_OBJ", "STD_REF_DSETREG"):
+            ref = getattr(h5py.h5t, known, None)
+            if ref is not None and t.equal(ref):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _dataset_logical_bytes(dset):
     n = 1
     for d in dset.shape:
@@ -361,11 +383,69 @@ def eager_probe(path):
     def record(bucket, where, op, exc):
         facts[bucket].append(dict(path=where or "/", op=op, error=_err(exc)))
 
+    def probe_attr_regions(obj, where, name, value):
+        """Dereference a LEGACY dataset-region reference held by an attribute.
+
+        Listing keys, and even reading the value, does not reach this family: a
+        legacy region reference comes back from h5py as an opaque
+        RegionReference and the serialized dataspace selection inside its
+        global-heap object stays unparsed until it is dereferenced.  Measured --
+        four fixtures whose only defect is in that selection were reported as a
+        clean structural open, so invariant A had no deeper evidence to demote
+        with even though libhdf5 does refuse them.
+
+        REVISED references (H5T_STD_REF) cannot be covered here: the bundled
+        libhdf5 is 1.14.5 and h5py raises "Unknown reference type" for them on
+        VALID files too, so the signal would not discriminate.  Those fixtures
+        carry entries in registry/h5policy-diff-tolerances.yml instead.
+        """
+        for r in getattr(value, "flat", [value]):
+            if not isinstance(r, h5py.RegionReference):
+                continue
+            try:
+                # Resolving the reference decodes the blob; indexing the target
+                # with it is what parses the selection.
+                target = obj.file[r]
+                target[r]
+            except Exception as exc:
+                record("attr_errors", where, f"attrs[{name!r}].region", exc)
+                return
+
     def probe_attrs(obj):
         try:
-            list(obj.attrs.keys())
+            names = list(obj.attrs.keys())
         except Exception as exc:
             record("attr_errors", _object_path(obj), "attrs.keys", exc)
+            names = []
+        where = _object_path(obj)
+        for name in names:
+            try:
+                aid = obj.attrs.get_id(name)
+                logical = aid.get_storage_size()
+            except Exception as exc:
+                record("attr_errors", where, f"attrs[{name!r}].info", exc)
+                continue
+            if logical > READ_PROBE_MAX_BYTES:
+                facts["skipped_large_reads"] += 1
+                continue
+            if _unreadable_reference(aid):
+                # NOT an error and deliberately not recorded as one.  The
+                # bundled libhdf5 is 1.14.5 and h5py cannot decode a REVISED
+                # reference at all -- it raises "Unknown reference type" on
+                # VALID files too, so recording it would hand invariant A a
+                # demotion signal that does not discriminate: every
+                # H5T_STD_REF file would demote whether or not anything is
+                # wrong with it.  Skip instead, and let the affected fixtures
+                # carry registry/h5policy-diff-tolerances.yml entries that say
+                # so.
+                facts["skipped_object_reads"] += 1
+                continue
+            try:
+                value = obj.attrs[name]
+            except Exception as exc:
+                record("attr_errors", where, f"attrs[{name!r}]", exc)
+                continue
+            probe_attr_regions(obj, where, name, value)
         try:
             flags = obj.id.get_create_plist().get_attr_creation_order()
             if flags & h5py.h5p.CRT_ORDER_INDEXED:

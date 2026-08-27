@@ -28,8 +28,8 @@ tools/h5mutate           -> ../h5policy/tools/h5mutate
 `tools/pkdoc.py`, `tools/check_tutorial.py`, `tools/check_markdown_links.py`,
 `tools/check_tool_overview.py`,
 `tools/finding_registry.py`, `tools/check_registry.py`,
-`tools/message_routing.py`, and `tools/h5cve` are repository-level helper
-scripts (not symlinks). They generate and test documentation, load and check
+`tools/message_routing.py`, `tools/h5cve`, and `tools/h5cve-corpus` are
+repository-level helper scripts (not symlinks). They generate and test documentation, load and check
 the sharded finding registry and its message routes, and orchestrate the CVE
 case workflow described below.
 
@@ -37,6 +37,43 @@ case workflow described below.
 prose sidecars, and the checked Version 4.0 hierarchy in `docs/spec/index.yml`.
 Its check mode also rejects stale generated Markdown and invalid section,
 coverage, layout, or anchor mappings.
+
+## h5cve-corpus External Specimen Manifest
+
+`tools/h5cve-corpus` checks h5policy against an external CVE specimen corpus
+that this repository does **not** vendor. The bytes are megabytes of
+unregenerable blobs against a smaller repository pack, and `run.sh` guarantees
+that tracked fixtures reproduce byte for byte — a guarantee nobody here can hold
+for files nobody here can regenerate. So `registry/cve-corpus-manifest.yml`
+travels and the specimens do not; point the tool at a sibling checkout.
+
+```
+h5cve-corpus --corpus DIR                      # verify against the manifest
+h5cve-corpus --corpus DIR --hdf5 DIR \
+             --revision REV --regenerate       # rewrite it
+```
+
+It **exits 0 when the corpus is absent**, so it is skip-not-fail by
+construction. `run.sh` runs it as the `cvecorpus` phase when a sibling checkout
+is present (about 90 seconds for 140 specimens); set `H5POLICY_CVE_CORPUS` to
+point elsewhere, or to the **empty string** to disable it.
+
+**It guards the accepts, not the rejections.** Triage of that corpus is
+finished. Its remaining value is that roughly a dozen specimens accept *on
+purpose* — their defects are dataset raw data, filter decode, teardown, or a
+field libhdf5 itself writes out of range — and each such accept is a
+load-bearing negative expectation on genuinely hostile input. A future check
+that starts rejecting one has produced a suspected invariant-A false positive on
+a real attacker's file rather than on a fixture written here.
+
+Only `decision` is a contract. The finding list is informational and regenerated
+wholesale, because a new check firing on an already-rejected file is not drift
+and comparing it would make the manifest churn on every commit. `base` is a
+mechanical same-size, fewest-differing-bytes match against the HDF5 source tree,
+which is what makes an upstream CVE description checkable — a title can name a
+function the specimen's own bytes cannot reach. `triage` is the judgement, is
+carried forward across regeneration, and reads `untriaged` wherever nobody has
+made one: a rejecting specimen is in the safe direction, not an examined one.
 
 ## h5cve Case Orchestrator
 
