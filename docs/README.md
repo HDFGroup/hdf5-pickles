@@ -18,6 +18,13 @@ construction exercises in an explicitly advanced path. For repository-specific
 vocabulary used by the policy corpus and CVE workflow, see the
 [glossary](GLOSSARY.md).
 
+Architecture and provenance references include the [bounded raw-decode
+model](What%20is%20bounded%20raw%20decode.md), the [file-format evolution
+matrix](HDF5%20File%20Format%20Specification%20Evolution.md), and the
+[object-store mapping](Mapping%20HDF5%20Binary%20Primitives%20onto%20an%20Object%20Store.md),
+which is a design proposal rather than an implemented subsystem. Security-case
+work follows the separate [CVE strategy](A%20CVE%20strategy%20for%20the%20HDF5%20library.md).
+
 Each specification page is generated from two sources of truth:
 
 - **`pickles/*.pk`** — the executable format definitions (shared constants,
@@ -64,9 +71,10 @@ checked against the command-line and registry contracts. The first-ten-minutes
 guide runs its inspection and policy commands and checks the canary inventory
 against its source mappings. The lazy-validation ratios are derived from the
 tracked measurement before its deterministic fields are reproduced. The
-Mermaid tool overview and Codespaces configuration retain their own structural
-checks. Relative targets in tracked Markdown links are also checked, without
-fetching external URLs:
+profile tables, command help surfaces, marker inventory, Mermaid tool overview,
+and Codespaces configuration retain their own structural checks. Relative
+targets in tracked Markdown links are also checked, without fetching external
+URLs:
 
 ```sh
 cmake --build build --target docs-check

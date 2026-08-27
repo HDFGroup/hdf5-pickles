@@ -64,6 +64,7 @@ carry-forward · **✝** retained for compatibility but superseded · — not pr
 | Object header v2 (`OHDR`; checksums, times, attr phase-change) | — | — | ● | ○ | ○ | HDF5 1.8 | — |
 | Shared message ad-hoc flag (global heap based) | ● | ◐ | ✝ | ✝ | ✝ | HDF5 1.0 | Original format spec |
 | Shared Object Header Message tables (`SMTB`/`SMLI`, SOHM) | — | — | ● | ○ | ○ | HDF5 1.8 (dedup of datatypes/dataspaces) | [New Features in HDF5 Release 1.8.0 and Format Compatibility Considerations](https://support.hdfgroup.org/archive/support/HDF5/doc1.8/ADGuide/CompatFormat180.html) |
+| Metadata Cache Image message and block (`MDCI`) | — | — | — | ● | ○ | HDF5 1.10 | HDF5 format specification §IV.A.3.y |
 | Attribute message | ● | ◐ | ◐ | ○ | ○ | HDF5 1.0; v2 in 1.6 era, v3 (charset) in 1.8 | — |
 | Attribute Info message + dense attribute storage | — | — | ● | ○ | ○ | HDF5 1.8 (break 64 KB header limit) | — |
 | Fill value message (old) / new versioned fill value | ● | ◐ | ◐ | ○ | ○ | Split specified in 1.1; v3 in 1.8 | — |
