@@ -198,6 +198,18 @@ type oh_msg_linfo =
 /* elm_size in dtype_hdr is used in calculating memb_off for version 3 compound type */
 var global_dt_elm_size = 0;
 
+/* The compound `membs` union's element types (compound_props1/2/3, below) are
+   standalone named types, not anonymous structs nested inside oh_msg_dtype --
+   so unlike oh_msg_fill's guards (see #14/#15), they cannot reference the
+   enclosing type's `ver` lexically. Set right before mapping `membs`, and
+   read by a `byte[0] _guard` at the top of each compound_propsN, so that
+   whichever version poke tries first, a version mismatch aborts before
+   any of that element's fields -- including the recursive, unboundedly
+   expensive memb_props -- are read. */
+var global_compound_ver = 0;
+
+fun set_global_compound_ver = (int v) int: { global_compound_ver = v; return 0; }
+
 /* The datatype message header section */
 type dtype_hdr = 
     struct {
@@ -695,6 +707,21 @@ fun shared_msg_payload_offset = (off64 shared_off, uint<8> wanted_type) off64:
 /* The datatype message properties section for compound class type version 1 */
 type compound_props1 = 
     struct {
+        /* Field-level guard, checked immediately (zero bytes consumed) before
+           any other field.  The `membs` union below (oh_msg_dtype's `compound`
+           arm) evaluates compound_props1[nn]/2[nn]/3[nn] in declaration order,
+           mapping each element in full before its own trailing-label
+           discriminant (`v1: ver == 1`, etc.) is ever consulted -- so a
+           wrong-version compound datatype can still reach the recursive,
+           unboundedly expensive memb_props below before that label fires.
+           This guard re-checks the same condition as the trailing label, but
+           as the very first thing evaluated, aborting before memb_props can
+           be reached regardless of union declaration order. See #14/#15.
+           global_compound_ver is set immediately before `membs` is mapped
+           (oh_msg_dtype's `compound` arm) -- these are standalone named
+           types, not anonymous structs nested in oh_msg_dtype, so they have
+           no lexical access to that arm's `ver`. */
+        byte[0] _guard: global_compound_ver == 1;
         string memb_name;
         byte[round_up_8 (memb_name'size / 1#B) - (memb_name'size / 1#B)] pad;
         byte[4] memb_off;
@@ -747,6 +774,8 @@ type compound_props1 =
 /* The datatype message properties section for compound class type version 2 */
 type compound_props2 =
     struct {
+        /* See compound_props1 above: same field-level guard technique. */
+        byte[0] _guard: global_compound_ver == 2;
         string memb_name;
         byte[round_up_8 (memb_name'size / 1#B) - (memb_name'size / 1#B)] pad;
         byte[4] memb_off;
@@ -776,6 +805,8 @@ type compound_props2 =
 /* The datatype message properties section for compound class type version 3 */
 type compound_props3 =
     struct {
+        /* See compound_props1 above: same field-level guard technique. */
+        byte[0] _guard: global_compound_ver >= 3;
         string memb_name;
         byte[get_v3_cmpd_memb_off_size(global_dt_elm_size)] memb_off;
             dtype_hdr memb_hdr;
@@ -1080,7 +1111,12 @@ type oh_msg_dtype =
 
                 method nmembs = int: { return (t_flags & 0xffff) as int; }
 
-                
+                /* compound_props1/2/3 (below) are standalone named types
+                   without lexical access to `ver` -- publish it through this
+                   global so each one's own field-level guard can check it.
+                   See the comment on compound_props1's `_guard` field. */
+                var _set_compound_ver = set_global_compound_ver(ver);
+
                 union {
                     compound_props1[nn] v1: ver == 1;
                     compound_props2[nn] v2: ver == 2;
@@ -1625,6 +1661,17 @@ type oh_msg_fill =
         byte version: version < 4;
         union {
             struct {
+                /* Field-level guard, checked immediately (zero bytes consumed)
+                   before any other field in this arm.  Poke maps a union
+                   alternative's fields in full before checking a *trailing*
+                   label constraint (the `v1_v2: version < 3` below) -- see
+                   issue #14 for the resulting hazard: a wrong-version message
+                   can still reach fill_value below with a garbage fill_size
+                   before that label is ever consulted. This guard re-checks
+                   the same condition as the trailing label, but as the very
+                   first thing evaluated, so it aborts before fill_value can
+                   be reached regardless of union declaration order. See #15. */
+                byte[0] _guard: version < 3;
                 byte alloc_time;
                 byte fill_time;
                 byte fill_defined;
@@ -1641,6 +1688,10 @@ type oh_msg_fill =
             } v1_v2: version < 3;
 
             struct {
+                /* See the v1_v2 arm above: same field-level guard technique,
+                   protecting fill_value from a garbage-sized read if this arm
+                   is ever tried against a non-v3 message. */
+                byte[0] _guard: version == 3;
                 byte flags;
                 uint<32> fill_size if (flags & 0x020U);
                 if ((flags & 0x020U) && (fill_size > 0))
@@ -1909,6 +1960,18 @@ type oh_msg_pline =
         byte nfilters: nfilters <= 32UB;
         union {
             struct { 
+                /* Field-level guard, checked immediately (zero bytes consumed)
+                   before any other field in this arm.  Poke maps a union
+                   alternative's fields in full before checking a *trailing*
+                   label constraint (the `v1: version == 1` below) -- see
+                   issue #14 for the resulting hazard: a wrong-version pipeline
+                   message can still reach filt_list below -- up to 32 filters,
+                   each with a name up to ~64KB and cd_data up to ~256KB --
+                   before that label is ever consulted. This guard re-checks
+                   the same condition as the trailing label, but as the very
+                   first thing evaluated, so it aborts before filt_list can be
+                   reached regardless of union declaration order. See #15. */
+                byte[0] _guard: version == 1;
                 byte[6] res;
 
                 type filt_descr = 
@@ -1928,6 +1991,10 @@ type oh_msg_pline =
             } v1: version == 1;
             
             struct {
+                /* See the v1 arm above: same field-level guard technique,
+                   protecting filt_list from a wasted parse if this arm is
+                   ever tried against a non-v2 message. */
+                byte[0] _guard: version == 2;
                 type filt_descr =
                     struct {
                         uint<16> id;
