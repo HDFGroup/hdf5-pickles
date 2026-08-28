@@ -1,141 +1,499 @@
 # Mapping HDF5 Binary Primitives onto an Object Store
 
-**Assumption/Decision:** The linear address space is no longer required. Byte identity with any
-ingested `.h5` file is explicitly sacrificed; **format compatibility** *is* retained via a canonical linearization (described below). Attestation moves to a canonical per-object level.
+> **Status: design proposal.** This repository does not currently implement the
+> importer, exporter, or object-store representation described below. The
+> document defines a prospective preservation and reconstruction contract.
+
+## Design goal
+
+This design maps a reachable HDF5 object graph into a key/value store without
+preserving the input file's allocation history. It separates bytes that carry
+content from bytes that provide indexing, addressing, allocation, or other
+linearization machinery.
+
+Import partitions an HDF5 file into three things:
+
+1. **Preserved atoms:** byte strings that carry non-indexing content.
+2. **Relocations:** typed fields inside otherwise preserved atoms whose encoded
+   values depend on file placement or a regenerated container.
+3. **Derived structures:** indexes and allocation structures that can be
+   reproduced from records in the first two classes.
+
+The key/value representation stores preserved atoms and relocation records. It
+stores the semantic fields found in index records, but not the index topology or
+block layout. Export allocates the atoms, resolves the relocations, and rebuilds
+the derived structures under an explicit export profile.
+
+The resulting file is a conforming HDF5 file, but it is not expected to be the
+same byte string as the input. The intended preservation property is defined
+below; this document does not use the ambiguous term "byte-equivalent" without
+that definition.
+
+In this document, **binary compatibility for non-indexing data** means exact
+encoded bytes for `exact` atoms and exact non-patch bytes for
+`relocation-normalized` atoms. It is a file-format preservation claim, not an
+application binary-interface claim.
+
+## Round-trip contract
+
+Let `I` be import, `E_p` be export under profile `p`, and `H` be an input HDF5
+file accepted by that profile:
+
+```text
+K  = I(H)
+H' = E_p(K)
+
+H ≈p H'
+```
+
+`H ≈p H'` means that `H` and `H'` are **relocation-normalized byte
+equivalent** under profile `p`:
+
+1. Every preserved atom has identical bytes outside its declared relocation,
+   other derived, and checksum fields.
+2. Every relocated field in `H'` resolves to the same logical object, heap
+   value, raw-data extent, or external target as it did in `H`.
+3. The reachable object graphs are isomorphic: hard-link identity, link and
+   attribute values, datatypes, dataspaces, dataset values, creation-order
+   values, references, and other modeled content agree.
+4. Every regenerated index is complete, internally consistent, and reachable
+   from its owner.
+5. `H'` is valid for the HDF5 format and reader bounds named by `p`.
+6. Every reachable non-indexing atom is either `exact` or
+   `relocation-normalized`. A `re-encoded` or `pass-through` atom limits the
+   result to logical equivalence with explicit exclusions; it does not receive
+   the whole-file `H ≈p H'` verdict. An `unsupported` atom prevents certified
+   export.
+
+For a canonical profile, the first export must also be a fixed point:
+
+```text
+H' = E_p(I(H))
+E_p(I(H')) = H'
+```
+
+The second equality is byte identity. Storage-local object IDs and ingest
+provenance may differ after re-import, but they must not affect the canonical
+serialization.
+
+This separates four claims that must not be conflated:
+
+- **HDF5 format compatibility:** an ordinary HDF5 reader can read the export.
+- **Logical equivalence:** the reachable HDF5 object graphs have the same
+  modeled meaning.
+- **Relocation-normalized byte equivalence:** non-indexing atom bytes are
+  preserved except at declared patch sites.
+- **Canonical determinism:** the same modeled graph and export profile produce
+  the same exported byte string.
+
+## Byte ownership model
+
+Classification is performed at the field or atom level, not merely by
+structure signature. A B-tree record can contain both a derived child address
+and a semantic chunk filter mask. A fractal heap contains derived allocation
+machinery as well as link or attribute values that must be retained.
+
+| Class | Examples | Import representation | Export treatment |
+| --- | --- | --- | --- |
+| Preserved atom | Address-free datatype and dataspace encodings, link names, attribute values, position-independent raw data | Exact bytes plus type and encoding metadata | Copy byte-for-byte |
+| Relocatable atom | Hard-link targets, data-layout addresses, shared-message references, VL heap IDs, object and region references | Exact bytes plus typed relocation sidecar | Copy, then patch declared fields |
+| Semantic index record | Chunk coordinates and filter mask; link or attribute name and creation order | Logical record independent of node or heap placement | Supply to a deterministic index builder |
+| Derived structure | B-tree topology, array index blocks, heap headers and free lists, object-header continuation layout, free-space indexes, checksums and padding | Not retained as content | Rebuild under the export profile |
+| Pass-through or provenance | User block, driver information, original layout census, unallocated or trailing bytes | Exact bytes or digest plus a declared policy | Preserve, omit, or reject as the profile specifies |
+
+### Byte-ownership manifest
+
+Each import produces a byte-ownership manifest for the source artifact. Every
+input span belongs to exactly one of these classes:
+
+```text
+preserved | relocation | semantic-index-field | derived | padding |
+pass-through | provenance-only | unsupported
+```
+
+The manifest records the source span, owning atom or record, encoding version,
+preservation status, and digest. It is the basis of the round-trip comparator.
+Spans within a relocatable atom are split at patch boundaries, so the atom's
+preserved fragments and relocation fields do not overlap in the manifest.
+Overlapping reachable structures, unbounded records, or unexplained gaps do not
+receive a certified equivalence verdict. Unallocated ranges may be recorded as
+provenance without becoming part of logical equivalence.
+
+Preservation status is one of:
+
+- `exact`: all atom bytes are copied unchanged;
+- `relocation-normalized`: only declared patch fields change;
+- `re-encoded`: content is retained but its byte encoding may change;
+- `pass-through`: bytes are retained without a claim about their meaning;
+- `unsupported`: certified export is refused.
 
 ## Invariants
 
-1. **Token-width preservation.** Size of Offsets stays 8 bytes; `haddr_t` fields are
-reinterpreted as opaque object IDs (OIDs). Every structure encoding remains bit-compatible with the published format; no spec fork. The undefined address (all 1s) is the null key. Addresses identify structure starts only — no address arithmetic.
-2. **Store semantics, derive access paths.** Persist only structures carrying user-visible content; regenerate all container/index structures at linearization time.
-3. **Snapshot commits.** All visibility changes occur via copy-on-write manifest updates and an atomic root swap. This is SWMR's ordered-flush discipline transplanted.
-4. **Canonical linearization.** Deterministic traversal, deterministic offset assignment, token substitution (OID → offset), checksum recomputation, synthesized free-space/EOA. Same graph in → identical `.h5` bytes out. `h5repack` is the existence proof and the compatibility precedent: it already rebuilds all container structures from records.
+1. **No OIDs in preserved encodings.** An HDF5 file address is represented in
+   the store by a typed relocation, not by writing an object ID into the raw
+   field. This retains the original bytes, supports the file's actual field
+   width, and keeps object identity separate from file placement.
+2. **Typed targets.** A relocation names an object, heap value, byte extent,
+   external target, or target-plus-addend as allowed by the source encoding.
+   The design does not assume that every address names only a metadata-structure
+   start.
+3. **Store records, derive access paths.** Index topology, allocator state,
+   cache images, free-space state, and container packing are never authoritative
+   content. Semantic fields carried by those structures are authoritative.
+4. **Stable object identity.** OIDs distinguish HDF5 objects, including
+   distinct objects with equal content. Content hashes identify immutable byte
+   payloads. Hard links refer to OIDs and therefore retain alias identity.
+5. **Snapshot commits.** A committed root names immutable records, payloads,
+   manifest shards, and an export profile. Visibility changes by copy-on-write
+   publication followed by one conditional root swap.
+6. **Profiled linearization.** Offset and length widths, container versions,
+   index-selection rules, allocation order, padding, filter implementations,
+   and every other byte-affecting choice are inputs to export, not ambient
+   library defaults.
 
-## Stored vs. derived
+## Stored records and derived structures
 
-### Stored (semantic content)
+### Stored content
 
-- Object header message bodies
-- Link records (name, target, creation order, charset)
-- Attribute records (incl. creation order)
-- Chunk records: (coords → digest, size, filter mask)
-- VDS mappings (layout v4 virtual entries; user data)
-- Committed datatype bodies
-- External file lists / external link targets
-- Per-dataset original index type (provenance enum)
+- Object-header message type, flags, creation order, encoding version, and raw
+  body, with relocation fields described separately.
+- Link records: raw name, target, link type, creation order, and character set.
+- Attribute records: raw name, datatype, dataspace, value, character set, and
+  creation order.
+- Dataset layout semantics, including dimensions and chunk shape, without a
+  physical data or index address.
+- Chunk records: coordinates, payload digest, and filter mask. Source stored
+  size is retained as provenance and checked against the payload; export derives
+  the encoded size from the output payload.
+- Compact, contiguous, and chunk payload atoms, subject to the VL, reference,
+  and filter rules below.
+- Virtual-dataset mappings, committed datatype bodies, fill values, external
+  file lists, and external-link targets.
+- The semantic payloads extracted from local, global, fractal, and shared
+  message heaps.
+- Profile inputs and source provenance, including original structure versions
+  and index families.
 
-### Derived at linearization (access path)
+### Derived at export
 
-- v1 and v2 B-trees (all record types)
-- Fractal heaps (`FRHP`/`FHDB`/`FHIB`) + heap IDs
-- Fixed / Extensible array index blocks
-- Symbol table nodes (`SNOD`), local heaps
-- SOHM tables (re-deduplication)
-- Free-space manager, aggregators, EOA
-- Global heap collections (regenerated for VL data)
-- Superblock (synthesized; version per profile)
+- Version 1 and version 2 B-tree nodes and child topology.
+- Fixed-array and extensible-array index blocks.
+- Fractal-heap headers, direct and indirect blocks, managed offsets, free lists,
+  and heap IDs.
+- Local-heap headers and free lists; symbol-table nodes and cached scratch-pad
+  values.
+- Global-heap collections, object indexes, packing, and free-space tails.
+- Shared-message indexes and deduplication placement. Dereferenced shared
+  message bodies remain stored content.
+- Object-header chunk packing, NIL messages, continuations, container padding,
+  and container checksums. Semantic header fields such as timestamps and phase
+  change thresholds remain stored content or explicit profile inputs.
+- Metadata cache images, free-space managers, aggregators, allocation gaps, and
+  end-of-address markers.
+- Superblock address fields and checksums. Offset and length widths and other
+  compatibility settings come from the export profile.
 
-**Key subtleties:** (a) Appendix C index-type selection is a deterministic function of dataspace properties (single fixed chunk → Single Chunk; fixed dims, no filters → Implicit; fixed → Fixed Array; one unlimited → Extensible Array; else v2 B-tree), so canonical linearization regenerates the correct index, not merely a valid one. (b) Fractal heap layout depends on insertion history; heap IDs are therefore regenerated (canonical insertion = creation order) and re-embedded in regenerated B-tree records — internally consistent, historically different. Creation-order values are stored record fields for exactly this reason. (c) Chunk filter masks are user-visible state recoverable from nowhere else; they are first-class manifest fields (they are, verbatim, the content of v2 B-tree record types 10/11).
+An index builder consumes semantic records, not previously serialized nodes.
+For example, a chunk index consumes `(coordinates, payload target, stored size,
+filter mask)` records. A dense-group builder consumes link records. Rebuilding a
+heap is permitted to change heap IDs, but every reference to a heap value is a
+declared relocation and is patched consistently.
+
+## Record and relocation representation
+
+A preserved atom is stored with its original bytes. Patch sites live in a
+sidecar rather than being overwritten with OIDs:
+
+```yaml
+oid: object-42
+record_class: object-header-message
+encoding_version: 3
+raw_bytes: <immutable byte string>
+relocations:
+  - offset: 16
+    width: 8
+    kind: object_address
+    target: object-17
+derived_fields:
+  - offset: 60
+    width: 4
+    kind: checksum
+preservation: relocation-normalized
+```
+
+Compound references may have more than one patch component. A global-heap ID,
+for example, can require both a regenerated collection address and a regenerated
+object index. The descriptor records the complete compound encoding rather than
+pretending it is a single `haddr_t`.
+
+Record hashes cover the record class, original bytes with patch fields
+normalized, the typed relocation descriptors and targets, and relevant encoding
+metadata. Payload hashes cover the exact stored payload representation. OIDs are
+storage-local identities and are not embedded into an exported HDF5 file.
 
 ## Keyspace
 
-The keyspace splits along the mutation grain of the format itself:
-
-**Metadata plane:** keyed by OID, overwritten in place. Object headers, B-tree nodes, fractal heap blocks, group symbol-table nodes, local heaps, global heap collections, SOHM tables. These are exactly the structures the library's metadata cache already treats as unit-of-dirty; a PUT per evicted cache entry is the natural write path.
-
-**Payload plane:** keyed by content hash, immutable, deduplicating. Dataset chunks (filtered bytes as-written), contiguous data bodies, and optionally committed-datatype message bodies. Chunk indexes then store the OID of a small chunk stub — or, better, the index record's address field holds an OID that the OID map resolves to a hash key (see below), so the on-disk index encoding is untouched.
+The keyspace separates immutable payload bytes, immutable semantic records, and
+the mutable name of the current snapshot:
 
 ```text
-{c}                                   container (one HDF5 "file"); bucket or prefix
+{c}                                   one logical HDF5 container
 
-{c}/root                              commit pointer: tiny object naming the current
-                                      superblock OID + OID-map generation + Merkle root
+{c}/root                              conditional commit pointer naming the current
+                                      map generation, profile, and Merkle root
 
-{c}/sb/{gen}                          superblock + superblock-extension OH, synthesized superblock
-                                      parameters per generation (profile, K values), versioned
+{c}/profile/{id}                      immutable export profile and compatibility bounds
 
-{c}/map/{shard}/{gen}                 OID map shards: oid → (key, size, class, hash) record 
-                                      manifests, COW-sharded: object-header stubs, link records,
-                                      attribute records, chunk records, dtype bodies (small bodies
-                                      inline, large by digest reference)
+{c}/map/{shard}/{gen}                 immutable COW shard: OID -> current record key,
+                                      class, size, preservation status, and digest
 
-{c}/h/{algo}/{digest}                 payload plane: immutable, content-addressed, deduplicating :
-                                      chunk bytes (post-filter), contiguous data bodies, large
-                                      message bodies
+{c}/o/{oid}/{gen}                     immutable normalized semantic record, raw atom,
+                                      and relocation descriptors
 
-{c}/ext/{name}                        external-reference table: EFL filenames, external
-                                      link targets, VDS source files → container IDs/URIs
+{c}/h/{algo}/{digest}                 immutable content-addressed payload atom or large
+                                      message body
 
-{c}/att/{gen}                         attestation manifest, attestation objects: signed Merkle
-                                      roots; ingest records
+{c}/ext/{oid}/{gen}                   external file, external link, and VDS target records
+
+{c}/att/{gen}                         ingest provenance and optional signed snapshot root
 ```
 
-The payload plane is conflict-free by construction: content-addressed `PUTs` are idempotent, so any number of uncoordinated producers may write it. All coordination concentrates in `{c}/map` and `{c}/root`.
+Derived HDF5 nodes and heaps do not appear in the keyspace. A metadata-cache
+eviction is therefore not automatically a key/value `PUT`; the persistence
+grain is the normalized record or payload atom.
 
-### The OID map is the load-bearing structure
+Content-addressed payload writes are idempotent. Metadata updates create new
+record objects and copy-on-write map shards. No committed record is overwritten
+in place.
 
-Naïvely, OID-keyed mutable objects give us last-write-wins with torn readers. The fix is the same trick the format has used since the superblock extension: one level of indirection. The OID map — sharded by OID range, each shard a small immutable object, each generation copy-on-write — resolves OID → current object key. A commit is: PUT new payload/metadata objects → `PUT` changed map shards at `{gen+1}` → atomically swap `{c}/root`. That's SWMR's ordered-flush discipline transplanted verbatim; readers pin a root and see a consistent snapshot, time travel falls out for free, and GC is "delete objects unreachable from retained roots." Hot-path cost is one extra small `GET` per cold OID, amortized by caching shards — and note the map shard *is* morally a fixed-array index block, so the format already taught us how to build it.
+## Import
 
-For write-hot metadata we can cheat: allow selected classes (v2 B-tree leaves under active append) to bypass the map and be overwritten at their OID key directly, accepting torn-read risk only within an uncommitted epoch. That's a tuning knob, not an architecture change.
+Import proceeds from the superblock and the reachable object graph:
+
+1. Read the format widths, version bounds, driver information, and root object
+   from the source artifact itself.
+2. Traverse links and references in a deterministic order, retaining hard-link
+   identity and detecting cycles. Objects reachable only through references are
+   included. Unreachable allocated bytes are provenance, not logical content.
+3. Parse every supported object-header message, raw-data layout, index, and heap.
+   Extract semantic index records while classifying their physical container
+   bytes as derived.
+4. Store each non-indexing atom in its original encoding. Replace no bytes;
+   describe address-, heap-, size-, and checksum-dependent fields in sidecars.
+5. Store position-independent payloads by content digest. Normalize
+   position-dependent VL and reference payloads as described below.
+6. Emit and validate the byte-ownership manifest, including preservation status
+   and a reason for every non-exact atom.
+7. Publish the records, manifest shards, profile, and ingest provenance with one
+   root commit.
+
+The importer may use source addresses to detect aliasing and cycles while
+reading, but source addresses are not persistent object identities.
+
+## Export and canonical linearization
+
+Export is a deterministic linker and index builder:
+
+1. Validate the snapshot graph, relocation targets, profile, and required
+   codecs before allocating output.
+2. Choose each index family according to the selected profile.
+3. Order objects and semantic records using the profile's canonical traversal
+   and tie-breaking rules. Storage OID values must not affect this order.
+4. Build heap and index structures from sorted semantic records, using pinned
+   node capacities, split rules, heap growth parameters, and padding values.
+5. Assign offsets in the profile's allocation order and with its alignment
+   rules.
+6. Copy preserved atom bytes and patch only declared relocation and derived
+   fields.
+7. Recompute container checksums, free-space state, superblock fields, and EOA.
+8. Reject the export if any relocation remains unresolved or any atom's
+   preservation status violates the requested profile.
+
+Canonical traversal must be specified independently of incidental OID values.
+A root-first graph traversal ordered by raw link-name bytes is sufficient for
+named objects; references are visited in containing-object and logical element
+order. The profile must define deterministic tie breakers for reference-only
+and otherwise anonymous objects.
+
+`h5repack` is an engineering precedent for rebuilding HDF5 container
+structures from decoded records. It is not proof of byte preservation or
+canonical determinism; those properties come from this export contract and its
+verification.
+
+## Export profiles
+
+Index provenance and index policy are distinct:
+
+- A **preservation profile** rebuilds the original index family and retains
+  source encoding widths and versions wherever the format permits.
+- A **canonical profile** applies a pinned index-selection policy and canonical
+  container versions. It still preserves atom bytes except where the profile
+  explicitly classifies a field or atom as re-encoded.
+
+At minimum, a profile pins:
+
+- size of offsets and size of lengths;
+- superblock, object-header, message, heap, and index version policy;
+- dataset chunk-index selection rules;
+- group and attribute compact/dense thresholds;
+- B-tree node sizes, split and merge policy, and record ordering;
+- heap growth, collection sizing, alignment, allocation order, and padding;
+- user-block and driver-info handling;
+- filter identifiers, parameters, implementation identity, and version;
+- external-target policy and minimum/maximum reader bounds.
+
+Changing a profile creates a different serialization contract. A claim that the
+same graph yields the same file bytes is meaningful only when the profile is
+also the same.
+
+## Position-dependent payloads
+
+### Variable-length data
+
+VL data embeds global-heap IDs in otherwise raw dataset storage. Import stores a
+normalized fixed part plus the semantic heap values:
+
+- The fixed element array retains its original encoding except that each global
+  heap ID is a declared compound relocation.
+- Heap element byte strings are stored in logical element scan order. Nested VL
+  values recurse according to the stored datatype encoding.
+- Individually large values may be separate content-addressed payloads without
+  changing their logical order.
+- Export builds global-heap collections, assigns indexes, and patches every
+  compound heap-ID relocation.
+
+The heap collection layout and object indexes are derived. The unpadded heap
+object content is semantic and is preserved according to its own relocation
+status.
+
+### References
+
+Legacy object references, legacy region references, revised references, and
+reference blobs are relocatable atoms. Import resolves each reference to an OID
+or external target while retaining the original non-relocation bytes. Region
+selections and attribute names are semantic content. Export reconstructs any
+required heap blobs and encodes the new address, token, heap address, and heap
+index fields.
+
+Null references remain null and do not acquire targets.
+
+### Filters
+
+An address-free filtered chunk can be stored and reproduced as the exact
+post-filter byte string; export need not invoke the codec. Its filter mask is a
+first-class chunk-record field.
+
+A filtered chunk containing VL or reference relocations must be decoded,
+patched, and re-filtered. Such an atom is `re-encoded`, not `exact` or merely
+`relocation-normalized`. Canonical output requires the profile to pin the filter
+implementation and version as well as its identifier and parameters.
+The exporter recomputes the chunk's stored size from the re-filtered bytes.
+
+If a required filter is unavailable, lossy, nondeterministic, or cannot be
+safely decoded, certified export is refused. The design never treats successful
+opaque copying as sufficient when an embedded relocation must change.
+
+## Other boundary cases
+
+| Case | Handling |
+| --- | --- |
+| Compact data | Treat the inline payload as an atom inside the layout message; patch nested VL or reference fields as needed. |
+| Contiguous data | Store one exact extent or checksum-addressed shards above a profile threshold; regenerate only its layout address and extent placement. |
+| Object-header continuations | Preserve semantic messages and their ordering fields; regenerate continuation blocks, NIL space, lengths, and checksums. |
+| Dense links and attributes | Preserve logical records and raw values; regenerate fractal heaps, heap IDs, and B-tree indexes. |
+| Shared object-header messages | Preserve dereferenced message bodies; regenerate sharing decisions and SOHM indexes under the profile. |
+| Symbol-table scratch pads | Treat cached addresses as derived; preserve the link record they accelerate. |
+| VDS mappings and external links | Preserve target strings, selections, and flags; keep foreign content outside the equivalence claim. |
+| External file lists | Preserve the list and offsets as metadata; external raw bytes are not part of the container snapshot. |
+| User block | Preserve exact bytes by default; omission is an explicit profile choice that prevents whole-artifact relocation equivalence. |
+| Driver information | Preserve only for a compatible driver profile; otherwise retain as provenance or reject. Multi-file physical layouts require a separate profile. |
+| Unknown object-header message | Certified relocation equivalence requires proof that the payload is address-free. Otherwise reject, or retain as `pass-through` without a semantic claim. |
+| Metadata cache image | Treat as derived and omit or regenerate; it is never authoritative content. |
 
 ## Commit model
 
-- **Compatibility bar:** HDF5 defines no concurrent-mutation semantics (SWMR is
-  single-writer; parallel HDF5 is one logical writer). Base profile therefore: **N uncoordinated payload writers, one committer**. Producers stream content-addressed chunks and hand `(coords, digest, size, filter-mask)` tuples to a sequencer, which batches COW manifest-shard updates and swaps `{c}/root`.
-- **Epoch granularity:** is a batching parameter bounded below by root-key churn, GC pressure, and signing cost (practical floor ≈ 1–10 Hz) and above by reader staleness and crash-replay window. SWMR-replacement workloads: 100 ms–1 s. Bulk ingest: seconds–minutes, size-triggered. Adaptive commit-on-max(interval, dirty-shard-count) recommended.
-- **Crash semantics:** uncommitted objects are invisible garbage (GC'd); no torn-file state is observable — strictly better than the linear format's failure modes.
-- **Multi-writer extension (off by default):** optimistic CAS on root with disjoint-shard merge; same-shard conflict → rebase/retry. Explicitly new semantics (`git`-style) not sanctioned by the format; quarantined as an extension profile so the compatibility claim stays crisp.
-- **GC × attestation interaction:** retention must pin all objects reachable from signed roots; otherwise the Merkle history develops holes precisely where an auditor would look.
+The base profile permits any number of uncoordinated payload producers and one
+snapshot committer. Producers write immutable content-addressed payloads and
+submit semantic records such as `(coordinates, digest, stored size, filter
+mask)`. The committer writes new normalized records and map shards, then
+conditionally replaces `{c}/root`.
+
+Readers pin one root and observe a consistent snapshot. Objects written but not
+reachable from a committed root are invisible and eligible for garbage
+collection. Retained or attested roots pin everything reachable from them.
+
+True concurrent mutation of the same logical HDF5 graph requires merge
+semantics that HDF5 does not define. It is outside the base equivalence contract
+and must be a separately named extension profile.
 
 ## Attestation
 
-- Manifest shards carry per-record content hashes; shards hash up to a **Merkle root per commit** stored in `{c}/root` and signed into `{c}/att/{gen}`. Per-object granularity, diff-able between commits; strictly stronger than a whole-file hash.
-- **Ingest record:** because container structures are derived (not stored), the ingested file's layout fingerprint, signature census, per-dataset index types, superblock version, the minimum-writer bound from the matrix above, is captured at ingest as an immutable `{c}/att/` object. Layout history is provenance, not content.
-- **File-level attestation** is recovered via canonical linearization: the stable hash attests the canonical serialization (format-semantic content), not accidental layout history.
+The current OID map and normalized records form a Merkle graph. A record digest
+covers normalized atom bytes, relocation descriptors, semantic index fields,
+and referenced payload digests. Map shards hash into the committed root, which
+may be signed and retained under `{c}/att/{gen}`.
 
-### Attestation and the linearization contract
+The ingest record separately retains the source file digest, byte-ownership
+manifest digest, format census, and tool/build identities. It attests the input
+artifact without pretending that its allocation history is content.
 
-Since we're moving attestation per-object: the natural manifest is the OID map itself, enriched — each entry carries the content hash of the object's **encoded structure bytes with address fields normalized** (OIDs are already stable, so no normalization is even needed within the store; only linearized offsets vary). The map shards hash up to the root pointer, giving us a Merkle root per commit: sign that, and we've attested the entire object graph with per-object granularity — stronger than any whole-file hash, and diff-able between commits, which is precisely the provenance story for our audit framework.
+The canonical exported file has its own whole-file digest. That digest attests
+`E_p(K)`, including profile `p`; it is not the digest of the ingested file.
 
-Format compatibility is then a *canonical linearization*: deterministic traversal (say, ascending OID), deterministic offset assignment, token substitution, checksum recomputation, synthesized free-space/EOA. Same graph in → identical `.h5` bytes out, every time. So we recover a stable file-level hash too - not of the original ingested file, but of the canonical serialization, which is arguably the more defensible attestation object anyway (it's the format-semantic content, not accidental layout history).
+## Verification contract
 
-## Exceptions
+An implementation must make the design claims measurable with fixtures that
+cover legacy and current format versions and every supported storage regime.
+For each fixture, verification must:
 
-| Case | Handling |
-| ------ | ---------- |
-| Contiguous layouts (address + size, arbitrary extent) | Single payload object; shard as `{digest}/{n}` extents above threshold; `(address,size)` regenerated at pack time |
-| v1 object-header continuations (unsignatured extents) | Coalesced into parent record set; valid continuation messages re-emitted at pack time |
-| Symbol-table-entry scratch pads (cached addresses) | Not stored; regenerated or cache-type-zeroed at pack time |
-| External file lists / external links / VDS sources | Quarantined in `{c}/ext/`; inherently foreign byte ranges / URIs |
-| User block, driver-info block | Ingest-side provenance only; re-emitted on request at pack time |
+1. Prove that the byte-ownership manifest covers the input without unexplained
+   overlaps or gaps.
+2. Export and compare every preserved atom outside its declared patch mask.
+3. Resolve each original and exported relocation and compare its logical target.
+4. Compare the reachable graphs through both a structural walker and the public
+   HDF5 API, including hard-link aliasing, creation order, dataset values, VL
+   nesting, and references.
+5. Exercise every regenerated index family and verify all records are reachable
+   exactly once through the owning index.
+6. Open and exercise the export with the newest available libhdf5 build, reading
+   the version from that build's artifact and recording it with the result.
+7. Re-import and re-export the canonical file and require an identical
+   whole-file digest.
+8. Check negative fixtures for unknown messages, missing filters, unresolved
+   external targets, corrupt indexes, overlapping extents, and unsupported
+   driver layouts; none may receive a certified equivalence verdict.
 
-## Variable-length data and embedded addresses
+The corpus must include compact, contiguous, and every chunk-index regime;
+compact and dense groups and attributes; local, global, fractal, and shared
+message heaps; filtered and unfiltered data; nested VL; legacy and revised
+references; nonzero base addresses; user blocks; object-header continuations;
+and reference-only objects. Generators must assert that the intended structural
+regime was actually produced.
 
-The problem. VL data is the format's one violation of raw-data position independence: VL elements are stored in chunks as (length, global heap ID) tuples, where a heap ID = collection `haddr_t` + index. Addresses therefore leak into payload bytes for: VL sequences, VL strings, nested VL (heap IDs inside heap elements), old-style object/region references (embedded OH addresses; region selections via global-heap blobs), and revised (1.12) reference blobs. Naïve content-addressing of such chunks would hash accidental heap layout, break dedup, and be invalidated by heap regeneration at pack time.
+## Non-goals
 
-**Resolution — normalize at ingest, regenerate at pack** (invariant 2, one level deeper: the global heap is an access path; VL element bytes are semantics):
-
-- **Fixed part:** the chunk's element array with each heap ID replaced by a canonical ordinal (element i = i-th VL element in chunk scan order), preserving original tuple field widths.
-- **Sidecar:** length-prefixed concatenation of VL element bytes in scan order. Fixed part + sidecar are packed into one payload object with a header split-offset (single `GET`); individually huge elements spill to their own content-addressed objects (mirrors the format's own oversized-collection rule; enables dedup of large repeated values).
-- Both parts are deterministic functions of semantic content → content-addressable; identical VL data under different heap-packing histories hashes identically. This is an attestation *improvement* over the linear format, whose `GCOL` collections accrete insertion-order noise.
-- **Nested VL** recurses, driven by the stored datatype message; the packer necessarily parses raw data through the type. Precedent: `h5repack` already rebuilds heaps by pushing VL data through type conversion. (The format ecosystem concedes this corner: SWMR excludes VL; parallel HDF5 refuses VL writes.)
-- **References** (class 7, both encodings): embedded addresses rewritten to OIDs at ingest — stable in-store, so reference-bearing chunks are content-stable — substituted OID → offset at pack.
-- **Pack-time synthesis:** real `GCOL` collections regenerated (4 KB minimum, size-doubling, free-space tail), (address, index) pairs assigned, tuples rewritten.
-
-**Filter carve-out.** Post-filter bytes cannot be stored as-written for VL/reference chunks (filtered bytes wrap position-dependent tuples). These chunks are stored normalized + unfiltered and re-filtered at pack. Canonical-linearization determinism therefore requires pinned filter codecs (implementation + version + parameters) in the container profile, an SBOM-shaped requirement worth recording regardless. Loss is minimal: filters over VL chunks only ever compressed the tuple array, never the heap data.
-
-## Commit-epoch granularity under concurrent writers
-
-We don't want to invent a distributed database. The current format has no concurrent-mutation semantics: SWMR is single-writer with ordered visibility; parallel HDF5 is many processes forming one logical writer via collective MPI-IO. So the compatibility bar is single-writer commits — anything beyond that is new semantics we choose to define, and should be quarantined as such.
-
-Within that bar, the derived-index decision does most of the work. The payload plane is content-addressed and immutable, so concurrent chunk *production* is conflict-free by construction: any number of producers can `PUT {c}/h/{algo}/{digest}` objects with no coordination whatsoever, because a content-addressed `PUT` is idempotent. All contention concentrates at exactly two points: manifest-shard updates and the root swap. That gives us the natural deployment shape for your actual workloads (detector/instrument ingest): **N uncoordinated payload writers, one committer**. Producers stream chunks and hand `(coords, digest, size, filter mask)` tuples to a sequencer; the sequencer batches manifest-shard COW updates and swaps the root. No locks, no CAS storms, and HDF5 semantics preserved exactly.
-
-Epoch granularity then becomes a batching parameter, not a correctness question, and it's bounded on both sides by concrete numbers. Lower bound: the root is a single hot key, and object stores throttle per-prefix request rates (S3 on the order of a few thousand `PUT`/s per prefix, but a *single key* with read-after-write consistency wants far less churn than that), plus every epoch generates map-shard garbage for GC and, if you sign roots, an attestation cost. Practical floor: don't swap faster than ~1–10 Hz. Upper bound: epoch length is the reader-staleness window (SWMR VFD...) and the crash-replay window: uncommitted objects after a crash are invisible garbage (a genuinely better failure mode than the linear format's torn-file corruption; there is no "partial epoch" state a reader can observe). For SWMR-replacement use cases, epochs of 100 ms–1 s replicate the flush cadence applications already expect; for bulk ingest, seconds to minutes with size-triggered commits. We can make it adaptive: commit on max(interval, dirty-shard count), and it's a tuning knob per container.
-
-If we later want true multi-writer, the COW shard structure gives us optimistic concurrency almost for free: writers prepare disjoint shard deltas and CAS the root; disjoint-shard commits merge trivially (different datasets → different shards), same-shard conflicts retry with rebase. This is `git` semantics grafted onto HDF5, with merge rules HDF5 never defined (two writers appending to the same unlimited dimension have no format-sanctioned outcome). We need to specify this as an explicit extension profile, off by default, so the base design's compatibility claim stays intact and crisp. Finally: signed roots and GC are in tension. The retention policy must treat attested roots as pinned, or the Merkle history develops holes exactly where an auditor would look.
+- Reproducing the input file's original offsets, allocation gaps, free-space
+  history, B-tree split history, heap packing history, or cache image.
+- Claiming byte identity between the input and first export.
+- Assigning logical meaning to unsupported opaque records.
+- Defining distributed merge semantics for concurrent HDF5 mutations.
+- Attesting the contents of external files merely because their names appear in
+  the container.
 
 ## Summary
 
-The design needs exactly three inventions: the OID map, the root-swap commit, and the canonical pack order. Everything else is the 1998 graph wearing different edge labels.
+The compatibility bridge is not an OID-shaped substitute for every file
+address. It is a relocation-aware object representation:
 
-This design keeps the **binary record encodings** and the HDF5 file format's type system while adopting Zarr's storage economics (content-addressed immutable chunks), `git`'s commit model (COW manifests, root swap, Merkle attestation), and `h5repack`'s regeneration discipline as the compatibility bridge. Net inventions required: the record manifest, the root-swap commit, and the canonical pack order.
+```text
+HDF5 bytes
+    -> preserved atoms + typed relocations + semantic index records
+    -> key/value snapshot
+    -> deterministic allocation + regenerated indexes + relocation patching
+    -> conforming HDF5 bytes
+```
+
+The first and last byte strings may differ. Their non-indexing atoms agree
+byte-for-byte outside declared patch sites, their references resolve to the same
+logical targets, and their reachable HDF5 graphs have the same modeled meaning.
+After the first canonical export, the loop reaches a byte-identical fixed point.

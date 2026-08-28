@@ -49,7 +49,7 @@ FMT4_SECTION_ORDER = (
     "IV.A.3.f", "IV.A.3.g", "IV.A.3.h", "IV.A.3.i", "IV.A.3.j",
     "IV.A.3.k", "IV.A.3.l", "IV.A.3.m", "IV.A.3.n", "IV.A.3.o",
     "IV.A.3.p", "IV.A.3.q", "IV.A.3.r", "IV.A.3.s", "IV.A.3.t",
-    "IV.A.3.u", "IV.A.3.v", "IV.A.3.w", "IV.A.3.x", "IV.B",
+    "IV.A.3.u", "IV.A.3.v", "IV.A.3.w", "IV.A.3.x", "IV.A.3.y", "IV.B",
     "V", "VI",
     "VII", "VII.A", "VII.B", "VII.C", "VII.D", "VII.E",
     "VIII", "VIII.A", "VIII.B", "VIII.C", "VIII.D",

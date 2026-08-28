@@ -18,6 +18,14 @@ Run the examples below from the repository root.
 | [`h5policy-crashfuzz`](../tools/h5policy-crashfuzz) | Mutate HDF5 seeds against the installed HDF5 command-line tools and triage any crashers with h5policy. |
 | [`h5policy-gencorpus`](../tools/h5policy-gencorpus) | Regenerate deterministic valid, malformed, policy, resource, coverage, integration, and CVE fixtures. |
 | [`h5policy-fuzzlib`](../tools/h5policy-fuzzlib) | Provide the shared mutation engine, seed loader, and guided corpus used by both fuzzers; this is a support module, not a normal CLI. |
+| [`h5policy-probe`](../tools/h5policy-probe) | Exercise one file against an exact installed `libhdf5` build while measuring unsafe activation. |
+| [`h5policy-truncate`](../tools/h5policy-truncate) | Sweep bounded file prefixes and record truncation behavior. |
+| [`h5policy-lazy`](../tools/h5policy-lazy) | Measure deterministic validation work as metadata and payload size vary. |
+| [`h5policy-seamcheck`](../tools/h5policy-seamcheck) | Compare the in-process analysis seam with the command-line report. |
+| [`h5mutate`](../tools/h5mutate) | Generate typed, checksum-resealed mutants for named invariant families. |
+
+The repository-wide [tool guide](../../docs/TOOLS.md) documents standalone
+probe, truncation, lazy-validation, seam-check, and mutation workflows.
 
 ## `h5policy`
 
@@ -304,6 +312,7 @@ The principal classifications are:
 | `CRASH` | h5policy returned an unknown exit or unparseable output. | Hard |
 | `FALSE_ACCEPT` | `libhdf5` cleanly rejected a mutant that h5policy accepted. | Hard |
 | `ACCEPT_VS_CRASH` | h5policy accepted, while the reference process crashed or timed out. | Advisory because the crashed oracle is not trustworthy ground truth. |
+| `ACCEPT_VS_OLD_REF` | h5policy accepted a format version newer than the reference library understands. | Informational compatibility distinction; the older reference is not ground truth. |
 | `INTERNAL` | h5policy returned the controlled `internal_error` decision. | Advisory, but saved for investigation. |
 | `FALSE_REJECT` | `libhdf5` opened while h5policy returned `reject_corrupt`. | Advisory |
 | `OK` | Agreement or an otherwise uninteresting mutation. | Discarded |
@@ -373,10 +382,11 @@ the guided `Corpus` input pool, and these shared mutation strategies:
 | `super` | Change a v2/v3 superblock address and repair its checksum so deep validators see the mutated pointer. |
 | `dict` | Splice real HDF5 signatures, versions, and message-type bytes at likely structural offsets. |
 | `struct` | Mutate an interior field of a recognized checksummed block and repair the checksum so validation proceeds past the checksum gate. |
+| `struct_deep` | Apply the same checksum-preserving structural mutation to deeper supported block types. |
 
 The checksum-repairing strategies are important: an ordinary bit flip inside a
-checksummed structure is rejected immediately, while `super` and `struct` let
-the mutant reach the deeper traversal and consistency checks under test.
+checksummed structure is rejected immediately, while `super`, `struct`, and
+`struct_deep` let the mutant reach deeper traversal and consistency checks.
 
 ## Typical workflow
 

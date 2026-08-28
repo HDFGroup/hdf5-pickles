@@ -1,7 +1,7 @@
 # H5Lens: HDF5 Pickles and Policy Workbench
 
 H5Lens describes HDF5 on-disk metadata with
-[GNU poke](https://www.jemarch.net/poke/) pickles. It combines reusable format
+[GNU poke](https://jemarch.net/poke) pickles. It combines reusable format
 definitions with an interactive explorer, an independent preflight oracle for
 untrusted files, a conservative repair planner, and a marker scanner.
 
@@ -50,6 +50,11 @@ Continue with [H5Lens in 10 Minutes](docs/FIRST_10_MINUTES.md), the guided
 [H5Lens tutorial](docs/TUTORIAL.md), or see the
 [`h5policy`](h5policy/README.md), [`h5patch`](h5patch/README.md), and
 [`h5explain`](h5explain/README.md) guides for complete command behavior.
+
+## License
+
+H5Lens is distributed under the GNU General Public License, version 3 or later.
+See [`COPYING`](COPYING) for the full license text.
 
 ## Acknowledgments
 
