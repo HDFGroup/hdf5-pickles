@@ -198,6 +198,27 @@ type oh_msg_linfo =
 /* elm_size in dtype_hdr is used in calculating memb_off for version 3 compound type */
 var global_dt_elm_size = 0;
 
+/* The compound `membs` union's element types (compound_props1/2/3, below) are
+   standalone named types, not anonymous structs nested inside oh_msg_dtype --
+   so unlike oh_msg_fill's guards (see #14/#15), they cannot reference the
+   enclosing type's `ver` lexically. Set right before mapping `membs`, and
+   read by a `byte[0] _guard` at the top of each compound_propsN, so that
+   whichever version poke tries first, a version mismatch aborts before
+   any of that element's fields -- including the recursive, unboundedly
+   expensive memb_props -- are read. */
+var global_compound_ver = 0;
+
+fun set_global_compound_ver = (int v) int: { global_compound_ver = v; return 0; }
+
+/* Same reasoning as global_compound_ver above, for the `memb_names` union's
+   element types (enum_props, enum_name_v3, below) inside oh_msg_dtype's
+   `enumeration` arm -- enum_props is a standalone named type, and the v3
+   alternative uses poke's built-in `string` type directly, which cannot be
+   given a `_guard` field at all, hence the enum_name_v3 wrapper. */
+var global_enum_ver = 0;
+
+fun set_global_enum_ver = (int v) int: { global_enum_ver = v; return 0; }
+
 /* The datatype message header section */
 type dtype_hdr = 
     struct {
@@ -695,6 +716,31 @@ fun shared_msg_payload_offset = (off64 shared_off, uint<8> wanted_type) off64:
 /* The datatype message properties section for compound class type version 1 */
 type compound_props1 = 
     struct {
+        /* Field-level guard, checked immediately (zero bytes consumed) before
+           any other field.  The `membs` union below (oh_msg_dtype's `compound`
+           arm) evaluates compound_props1[nn]/2[nn]/3[nn] in declaration order,
+           mapping each element in full before its own trailing-label
+           discriminant (`v1: ver == 1`, etc.) is ever consulted -- so a
+           wrong-version compound datatype can still reach the recursive,
+           unboundedly expensive memb_props below before that label fires.
+           This guard re-checks the same condition as the trailing label, but
+           as the very first thing evaluated, aborting before memb_props can
+           be reached regardless of union declaration order. See #14/#15.
+           global_compound_ver is set immediately before `membs` is mapped
+           (oh_msg_dtype's `compound` arm) -- these are standalone named
+           types, not anonymous structs nested in oh_msg_dtype, so they have
+           no lexical access to that arm's `ver`.
+
+           This is independent of, not made redundant by, the `compound`
+           arm's own `ctype == 6` guard (PR #90 review, issue #15): that one
+           only confirms the message's *class* is genuinely compound -- it
+           says nothing about *version*, so a real ctype==6 message with
+           ver==3 would still reach here with v1 tried first, same hazard,
+           one layer in. Confirmed directly: removing only this guard (the
+           ctype==6 guard left in place) measurably reintroduces the cost
+           (~2.6x) on a real v3 message crafted so v1's misaligned memb_hdr
+           recurses expensively. */
+        byte[0] _guard: global_compound_ver == 1;
         string memb_name;
         byte[round_up_8 (memb_name'size / 1#B) - (memb_name'size / 1#B)] pad;
         byte[4] memb_off;
@@ -747,6 +793,8 @@ type compound_props1 =
 /* The datatype message properties section for compound class type version 2 */
 type compound_props2 =
     struct {
+        /* See compound_props1 above: same field-level guard technique. */
+        byte[0] _guard: global_compound_ver == 2;
         string memb_name;
         byte[round_up_8 (memb_name'size / 1#B) - (memb_name'size / 1#B)] pad;
         byte[4] memb_off;
@@ -776,6 +824,8 @@ type compound_props2 =
 /* The datatype message properties section for compound class type version 3 */
 type compound_props3 =
     struct {
+        /* See compound_props1 above: same field-level guard technique. */
+        byte[0] _guard: global_compound_ver >= 3;
         string memb_name;
         byte[get_v3_cmpd_memb_off_size(global_dt_elm_size)] memb_off;
             dtype_hdr memb_hdr;
@@ -803,8 +853,29 @@ type compound_props3 =
 /* The datatype message properties section for enumerated class type version 1 & 2 */
 type enum_props =
     struct {
+        /* Field-level guard, same technique and rationale as
+           compound_props1/2/3 above (see #14/#15, PR #90 review): the
+           `memb_names` union below (oh_msg_dtype's `enumeration` arm)
+           evaluates enum_props[nn]/enum_name_v3[nn] in declaration order,
+           mapping each element in full before its own trailing-label
+           discriminant is checked -- so a version-3 enumeration can still
+           have its names misread with this padded (v1/v2) layout before
+           that label fires. global_enum_ver is set immediately before
+           `memb_names` is mapped, for the same standalone-type reason
+           global_compound_ver is. */
+        byte[0] _guard: global_enum_ver <= 2;
         string name;
         byte[round_up_8 (name'size / 1#B) - (name'size / 1#B)] pad;
+    };
+
+/* Wraps poke's built-in `string` so the `memb_names` union's v3 alternative
+   (enumeration/enumeration class, ver>=3) can carry the same field-level
+   guard as enum_props above -- `string` itself is a built-in type and
+   cannot be given a `_guard` field directly. */
+type enum_name_v3 =
+    struct {
+        byte[0] _guard: global_enum_ver >= 3;
+        string name;
     };
 
 /* The datatype message properties section for array class type version 2 */
@@ -837,6 +908,19 @@ type oh_msg_dtype =
 
         union {
             struct {
+                /* Field-level guard, checked immediately (zero bytes
+                   consumed) before any other field in this arm. This outer
+                   `types` union -- one arm per datatype class -- was itself
+                   unaudited for #14/#15: it dispatches on trailing `ctype`
+                   labels alone, so a wrong-class arm can map real,
+                   attacker/format-influenced bytes as its own fields before
+                   its label is ever checked. Most notably the `enumeration`
+                   arm below can attempt a `byte[nn * base_hdr.elm_size]`
+                   read sized from bits that are unconstrained for any other
+                   class. Guards on every arm here (matching each arm's own
+                   existing trailing label exactly) close this regardless of
+                   declaration order. See PR #90 review on issue #15. */
+                byte[0] _guard: ctype == 0;
                 uint<16> bit_offset;
                 uint<16> bit_precision;
 
@@ -876,6 +960,8 @@ type oh_msg_dtype =
             } fixed_point: ctype == 0;
 
             struct {
+                /* See fixed_point's `_guard` above for the rationale. */
+                byte[0] _guard: ctype == 1;
                 uint<16> bit_offset;
                 uint<16> bit_precision;
                 uint<8> eloc;
@@ -945,6 +1031,8 @@ type oh_msg_dtype =
 
             /* Not verified yet for time */
             struct {
+                /* See fixed_point's `_guard` above for the rationale. */
+                byte[0] _guard: ctype == 2;
                 uint<16> bit_precision;
 
                 var tt = hdr.flags;
@@ -974,6 +1062,11 @@ type oh_msg_dtype =
             } time: ctype == 2;
  
             struct {
+                /* See fixed_point's `_guard` above for the rationale. This
+                   arm has no mapped fields at all, so there is nothing to
+                   protect -- kept for consistency/auditability, not because
+                   it is otherwise at risk. */
+                byte[0] _guard: ctype == 3;
                 var tt = hdr.flags;
                 var ss = hdr.elm_size;
                 var ff = tt .>>8;
@@ -1005,6 +1098,8 @@ type oh_msg_dtype =
             } text_string: ctype  == 3;
 
             struct {
+                /* See fixed_point's `_guard` above for the rationale. */
+                byte[0] _guard: ctype == 4;
                 uint<16> bit_offset;
                 uint<16> bit_precision;
 
@@ -1040,6 +1135,10 @@ type oh_msg_dtype =
             } bitfield: ctype == 4;
 
             struct {
+                /* See fixed_point's `_guard` above for the rationale.
+                   `tag` below is an unbounded null-terminated scan when
+                   wrongly entered against another class's bytes. */
+                byte[0] _guard: ctype == 5;
                 string tag;
                 byte[round_up_8 (tag'size / 1#B) - (tag'size / 1#B)] pad;
 
@@ -1070,8 +1169,31 @@ type oh_msg_dtype =
 
             } opaque: ctype == 5;
 
-            /* compound: Not verified yet for v3 */
             struct {
+                /* See fixed_point's `_guard` above for the rationale. This
+                   one matters even with compound_props1/2/3's own guards
+                   (PR #90 review, issue #15): those check *version*, not
+                   *class* -- so if `compound` gets tried for a message that
+                   isn't actually class 6, the inner guards have no way to
+                   detect that, and let the (wrong) attempt through anyway.
+                   Concretely: `ver` covers the whole 1-15 range across the
+                   three of them (`==1`, `==2`, `>=3`), so whatever garbage
+                   `ver` a misread produces, one of those guards is almost
+                   certain to pass regardless of the message's true class,
+                   and `nn` (below, attacker/format-influenced when
+                   ctype != 6) still drives a real compound_propsN[nn]
+                   attempt. This guard is what actually stops that.
+
+                   The two guards are independent, not redundant: this one
+                   rejects the wrong *class* before nn is ever trusted; each
+                   compound_propsN's own guard rejects the wrong *version*
+                   once a class-6 message is confirmed. Removing either one
+                   alone reopens a real gap -- confirmed directly: with only
+                   compound_props1's guard removed (this one left in place),
+                   a genuine v3 message crafted so v1's misaligned memb_hdr
+                   recurses into dtype_props_size_at still cost measurably
+                   more (~2.6x) than with both guards present. */
+                byte[0] _guard: ctype == 6;
                 var ff = hdr.flags;
                 var ss = hdr.elm_size;
 
@@ -1080,7 +1202,12 @@ type oh_msg_dtype =
 
                 method nmembs = int: { return (t_flags & 0xffff) as int; }
 
-                
+                /* compound_props1/2/3 (below) are standalone named types
+                   without lexical access to `ver` -- publish it through this
+                   global so each one's own field-level guard can check it.
+                   See the comment on compound_props1's `_guard` field. */
+                var _set_compound_ver = set_global_compound_ver(ver);
+
                 union {
                     compound_props1[nn] v1: ver == 1;
                     compound_props2[nn] v2: ver == 2;
@@ -1121,6 +1248,10 @@ type oh_msg_dtype =
             } compound: ctype == 6;
 
             struct {
+                /* See fixed_point's `_guard` above for the rationale. This
+                   arm has no mapped fields at all, so there is nothing to
+                   protect -- kept for consistency/auditability. */
+                byte[0] _guard: ctype == 7;
 
                 var tt = hdr.flags;
                 var ss = hdr.elm_size;
@@ -1161,6 +1292,20 @@ type oh_msg_dtype =
             } reference: ctype == 7;
 
             struct {
+                /* See fixed_point's `_guard` above for the rationale. This
+                   is the arm the PR #90 review specifically flagged:
+                   memb_values below (byte[nn*base_hdr.elm_size]) is sized
+                   from bits that are unconstrained for any other class,
+                   so a wrong-class message could otherwise drive an
+                   attacker/format-influenced allocation before ctype == 8
+                   is checked.
+
+                   The inner memb_names union just below has the same
+                   #14/#15 hazard one layer in -- v1_2/v3 selects between
+                   enum_props and the built-in `string` by a trailing `ver`
+                   label -- and is guarded separately: see enum_props and
+                   enum_name_v3 above. */
+                byte[0] _guard: ctype == 8;
                 var ff = hdr.flags;
                 var ss = hdr.elm_size;
 
@@ -1174,11 +1319,13 @@ type oh_msg_dtype =
                 /* Use base_hdr.flags to get class type to determine property size for each class type */
                 //var jj = dtype_props_size(base_hdr.flags);
                 var jj = dtype_props_size_at(base_hdr'offset);
-                byte[jj] base_props; 
+                byte[jj] base_props;
+
+                var _set_enum_ver = set_global_enum_ver(ver);
 
                 union {
                     enum_props[nn] v1_2: ver <= 2;
-                    string[nn] v3: ver >= 3;
+                    enum_name_v3[nn] v3: ver >= 3;
                 } memb_names;
 
                 byte[nn*base_hdr.elm_size] memb_values;
@@ -1208,6 +1355,11 @@ type oh_msg_dtype =
             } enumeration: ctype == 8;
 
             struct {
+                /* See fixed_point's `_guard` above for the rationale.
+                   base_props below is sized via dtype_props_size_at on a
+                   nested header that, if this arm is wrongly entered,
+                   reads bytes belonging to some other class entirely. */
+                byte[0] _guard: ctype == 9;
 
                 var ff = hdr.flags;
                 var ss = hdr.elm_size;
@@ -1248,6 +1400,8 @@ type oh_msg_dtype =
             } variable_length: ctype == 9;
 
             struct {
+                /* See fixed_point's `_guard` above for the rationale. */
+                byte[0] _guard: ctype == 10;
                 var ff = hdr.flags;
                 var ss = hdr.elm_size;
 
@@ -1294,6 +1448,8 @@ type oh_msg_dtype =
             } array: ctype == 10;
 
             struct {
+                /* See fixed_point's `_guard` above for the rationale. */
+                byte[0] _guard: ctype == 11 && hdr.complex_encoding_defined() == 1;
                 var ff = hdr.flags;
                 var ss = hdr.elm_size;
                 /* The class bit math lives in dtype_hdr, so both complex arms
@@ -1345,6 +1501,10 @@ type oh_msg_dtype =
                that is merely truncated still fails to map instead of being
                mislabelled as an undefined encoding. */
             struct {
+                /* See fixed_point's `_guard` above for the rationale. This
+                   arm has no mapped fields at all, so there is nothing to
+                   protect -- kept for consistency/auditability. */
+                byte[0] _guard: ctype == 11;
                 var ff = hdr.flags;
                 var ss = hdr.elm_size;
                 var hh = hdr.complex_homogeneous();
@@ -1535,7 +1695,7 @@ fun print_recurse_dtype = (oh_msg_dtype dt, int depth) void:
                 indent(depth+2); printf("names=%v\n", dt.types.enumeration.memb_names.v1_2[i]);
             } else if (ver >= 3) {
                 indent(depth+1); printf("Member %v:\n", i);
-                indent(depth+2); printf("names=%v\n", dt.types.enumeration.memb_names.v3[i]);
+                indent(depth+2); printf("names=%v\n", dt.types.enumeration.memb_names.v3[i].name);
             }
             i++;
         }
@@ -1625,6 +1785,17 @@ type oh_msg_fill =
         byte version: version < 4;
         union {
             struct {
+                /* Field-level guard, checked immediately (zero bytes consumed)
+                   before any other field in this arm.  Poke maps a union
+                   alternative's fields in full before checking a *trailing*
+                   label constraint (the `v1_v2: version < 3` below) -- see
+                   issue #14 for the resulting hazard: a wrong-version message
+                   can still reach fill_value below with a garbage fill_size
+                   before that label is ever consulted. This guard re-checks
+                   the same condition as the trailing label, but as the very
+                   first thing evaluated, so it aborts before fill_value can
+                   be reached regardless of union declaration order. See #15. */
+                byte[0] _guard: version < 3;
                 byte alloc_time;
                 byte fill_time;
                 byte fill_defined;
@@ -1641,6 +1812,10 @@ type oh_msg_fill =
             } v1_v2: version < 3;
 
             struct {
+                /* See the v1_v2 arm above: same field-level guard technique,
+                   protecting fill_value from a garbage-sized read if this arm
+                   is ever tried against a non-v3 message. */
+                byte[0] _guard: version == 3;
                 byte flags;
                 uint<32> fill_size if (flags & 0x020U);
                 if ((flags & 0x020U) && (fill_size > 0))
@@ -1909,6 +2084,18 @@ type oh_msg_pline =
         byte nfilters: nfilters <= 32UB;
         union {
             struct { 
+                /* Field-level guard, checked immediately (zero bytes consumed)
+                   before any other field in this arm.  Poke maps a union
+                   alternative's fields in full before checking a *trailing*
+                   label constraint (the `v1: version == 1` below) -- see
+                   issue #14 for the resulting hazard: a wrong-version pipeline
+                   message can still reach filt_list below -- up to 32 filters,
+                   each with a name up to ~64KB and cd_data up to ~256KB --
+                   before that label is ever consulted. This guard re-checks
+                   the same condition as the trailing label, but as the very
+                   first thing evaluated, so it aborts before filt_list can be
+                   reached regardless of union declaration order. See #15. */
+                byte[0] _guard: version == 1;
                 byte[6] res;
 
                 type filt_descr = 
@@ -1928,6 +2115,10 @@ type oh_msg_pline =
             } v1: version == 1;
             
             struct {
+                /* See the v1 arm above: same field-level guard technique,
+                   protecting filt_list from a wasted parse if this arm is
+                   ever tried against a non-v2 message. */
+                byte[0] _guard: version == 2;
                 type filt_descr =
                     struct {
                         uint<16> id;
