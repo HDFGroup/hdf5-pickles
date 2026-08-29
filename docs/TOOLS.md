@@ -26,7 +26,7 @@ tools/h5mutate           -> ../h5policy/tools/h5mutate
 ```
 
 `tools/pkdoc.py`, `tools/check_tutorial.py`, `tools/check_markdown_links.py`,
-`tools/check_tool_overview.py`,
+`tools/check_tool_overview.py`, `tools/check_objectstore_example.py`,
 `tools/finding_registry.py`, `tools/check_registry.py`,
 `tools/message_routing.py`, `tools/h5cve`, and `tools/h5cve-corpus` are
 repository-level helper scripts (not symlinks). They generate and test documentation, load and check

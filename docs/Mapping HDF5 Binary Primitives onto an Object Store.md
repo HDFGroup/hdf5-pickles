@@ -4,6 +4,41 @@
 > importer, exporter, or object-store representation described below. The
 > document defines a prospective preservation and reconstruction contract.
 
+## Summary
+
+The compatibility bridge is not an OID-shaped substitute for every file
+address. It is a relocation-aware object representation:
+
+```text
+HDF5 bytes
+    -> preserved atoms + typed relocations + semantic index records
+    -> key/value snapshot
+    -> deterministic allocation + regenerated indexes + relocation patching
+    -> conforming HDF5 bytes
+```
+
+The first and last byte strings may differ. Their non-indexing atoms agree
+byte-for-byte outside declared patch sites, their references resolve to the same
+logical targets, and their reachable HDF5 graphs have the same modeled meaning.
+After the first canonical export, the loop reaches a byte-identical fixed point.
+
+Where to look:
+
+- **What is the claim, exactly?** [Round-trip
+  contract](#round-trip-contract), and [Atom
+  correspondence](#atom-correspondence) for what makes it checkable rather than
+  merely stated.
+- **Which bytes survive, and which are rebuilt?** [Byte ownership
+  model](#byte-ownership-model) and [Stored records and derived
+  structures](#stored-records-and-derived-structures).
+- **What does one file actually look like?** [A worked
+  example](#a-worked-example).
+- **What would it cost to build here?** [Relationship to this
+  repository](#relationship-to-this-repository) and [Staged
+  implementation](#staged-implementation).
+- **What is still unresolved?** [Open questions](#open-questions) and
+  [Non-goals](#non-goals).
+
 ## Why an object store
 
 HDF5's container is a single linear address space with an internal allocator.
@@ -371,90 +406,257 @@ storage-local identities and are not embedded into an exported HDF5 file.
 
 ## A worked example
 
-The classes above are easier to read against one small file. Take `ex.h5`: a
-group `/g`, a chunked deflate-filtered dataset `/g/d` with two allocated chunks
-out of four, and one variable-length string attribute `note` on that dataset.
-The table is schematic — it names structures and classes, not measured offsets
-— but the assignment of each structure to a class is the real one.
+Take `ex.h5`: a group `/g`, a deflate-filtered dataset `/g/d` of shape
+`(4, 4)` with chunk shape `(2, 2)` and only two of its four chunks written, and
+one variable-length string attribute `note` on that dataset.
 
-| Source structure | Class | Status |
-| --- | --- | --- |
-| Superblock, its checksum, and the root-group address | derived | — |
-| Object-header prefix, chunk sizes, gaps, NIL messages, checksums | derived | — |
-| Link message body naming `g`, and the name bytes | preserved | `exact` |
-| Datatype and dataspace message bodies for `/g/d` | preserved | `exact` |
-| Filter-pipeline message body (`deflate`, its `cd_values`) | preserved | `exact` |
-| Layout message body, chunked | preserved | `relocation-normalized` |
-| — the chunk-index address inside that body | relocation | — |
-| Attribute message body for `note`, its name and datatype | preserved | `relocation-normalized` |
-| — the global-heap ID inside the attribute's value | relocation (compound) | — |
-| Fixed-array index header, data block, and element addresses | derived | — |
-| Chunk records `(0,0)` and `(1,0)`: coordinates, filter mask | semantic-index-field | — |
-| Post-filter chunk payloads for `(0,0)` and `(1,0)` | preserved | `exact` |
-| Global-heap collection header, object index, packing, free tail | derived | — |
-| — the heap object body holding `"some note"` | preserved | `exact` |
-| Free-space manager sections, aggregator state, EOA | derived | — |
+Every span, field offset, and digest below was read off such a file rather than
+sketched. They are illustrative, not normative: another writer, or another
+library version, places the same structures elsewhere, which is exactly the
+property this design refuses to preserve. The structural regime — version 2
+object headers, a version 4 chunked layout with a fixed-array index, a
+global-heap-backed variable-length attribute — is what the example is really
+about, and that regime is what a generator must assert it produced.
+
+The file is generated, not hand-built. `tools/h5policy-gencorpus` writes it to
+`h5policy/tests/valid/objectstore_mapping_example.h5` and asserts the regime
+above; `tools/check_objectstore_example.py` reads the spans, values, digests,
+and byte counts below back out of this document and compares them against a
+freshly written copy, so a writer change fails a check here rather than quietly
+making this section fiction. The file is not tracked, and cannot be: its group
+object headers carry wall-clock timestamps, so two runs a second apart differ.
+
+### Import: the byte-ownership manifest
+
+Every span belongs to exactly one class, and spans split at patch boundaries,
+so an atom's preserved fragments never overlap its relocation fields:
+
+| Span | Structure | Class | Status |
+| --- | --- | --- | --- |
+| `0..48` | Superblock v3: 8-byte offsets and lengths, EOA `6182`, root header at `48` | derived | — |
+| `48..195` | Root group object header, version 2 | (classified per message, as below) | — |
+| `195..342` | `/g` object header, version 2 | (classified per message) | — |
+| `342..354` | `/g/d` object-header prefix, chunk 0 | derived | — |
+| `354..390` | Dataspace message body: rank 2, `{4, 4}` | preserved | `exact` |
+| `394..406` | Datatype message body: `H5T_STD_I32LE` | preserved | `exact` |
+| `410..412` | Fill-value message body: incremental allocation, fill-if-set | preserved | `exact` |
+| `416..428` | Filter-pipeline message body: deflate, one `cd_value` of `4` | preserved | `exact` |
+| `432..442` | Layout message body: version 4, chunked, `{2, 2, 4}`, fixed-array | preserved | `relocation-normalized` |
+| `442..450` | — its chunk-index address, value `610` | relocation | — |
+| `454..472` | Attribute-info message body | preserved | `exact` |
+| `476..518` | Attribute message body: name `note`, vlen UTF-8 string, scalar dataspace, and the 4-byte sequence length | preserved | `relocation-normalized` |
+| `518..526` | — global-heap collection address, value `2048` | relocation, component 1 | — |
+| `526..530` | — global-heap object index, value `1` | relocation, component 2 | — |
+| `534..606` | NIL message: 72 bytes of reserved header space | padding | — |
+| `606..610` | Object-header chunk checksum | derived | — |
+| `610..638` | Fixed-array index header, `FAHD` | derived | — |
+| `638..712` | Fixed-array data block, `FADB` | derived | — |
+| `638..712` | — the per-chunk address, stored size, and filter mask inside it | semantic-index-field | — |
+| `712..2048` | Allocation gap, all zero | padding | — |
+| `2048..2080` | Global-heap collection header and object header, `GCOL`, 4096 bytes allocated | derived | — |
+| `2080..2089` | — the heap object body, `"some note"` | preserved | `exact` |
+| `2089..6144` | Remainder of the collection: packing and free tail | derived | — |
+| `6144..6163` | Chunk `(0,0)` post-filter bytes, filter mask `0` | preserved | `exact` |
+| `6163..6182` | Chunk `(2,0)` post-filter bytes, filter mask `0` | preserved | `exact` |
+
+The `FADB` row appears twice on purpose, and it is the one place the "exactly
+one class per span" rule needs care: the block's bytes are derived, while the
+chunk addresses, stored sizes, and filter masks *encoded in* those bytes are
+semantic. The manifest resolves this by classifying the span as derived and
+recording the extracted fields against the chunk records, not by giving one
+span two owners.
 
 Four things in that table carry the whole design:
 
-- The two unallocated chunks have no record, and that absence is content: they
-  read as fill. An index builder that invents records for them changes what a
-  reader sees.
-- The layout message is preserved *and* patched. Its version, dimensions, and
-  chunk shape survive byte-for-byte; only the index address moves.
-- The attribute's heap ID is compound. Export rebuilds the collection, assigns
-  a new object index, and patches both components — the collection address and
-  the index — as one relocation.
+- The two unwritten chunks have no record anywhere, and that absence is
+  content: they read as fill. An index builder that invents records for them
+  changes what a reader sees.
+- The layout message is preserved *and* patched. Its version, dimensions, chunk
+  shape, and index-type byte survive byte-for-byte; ten of its eighteen bytes
+  are copied and the last eight are rewritten.
+- The attribute's heap ID is compound: an 8-byte collection address and a
+  4-byte object index, at `518` and `526`, patched together or not at all.
 - The chunk payloads are post-filter bytes and stay `exact`. The codec is never
   invoked, because nothing inside those chunks needs to change. Had the dataset
   held variable-length or reference data, the same chunks would have to be
   decoded, patched, and re-filtered, and would drop to `re-encoded`.
 
-The dataset's record then looks like this, with the message bodies stored as
-raw atoms and every address in a sidecar:
+A manifest row carries more than the table shows. In full, the layout message's
+two rows are:
+
+```yaml
+- span: [432, 442]
+  owner: object-7/message/layout
+  encoding_version: 4
+  class: preserved
+  preservation: relocation-normalized
+  digest: sha256:...            # of these ten bytes
+- span: [442, 450]
+  owner: object-7/message/layout
+  class: relocation
+  kind: chunk_index_root
+  source_value: 610             # provenance only; never an export input
+  target: index-of(object-7)
+```
+
+### Import: records and keys
+
+The dataset's record stores the message bodies as raw atoms, with every address
+in a sidecar. The offsets are into the message body, not the file:
 
 ```yaml
 oid: object-7                        # /g/d
 record_class: object-header
 census:                              # preservation-profile input
   header_version: 2
+  layout_version: 4
   chunk_index: fixed-array
 messages:
   - type: layout
     encoding_version: 4
-    raw_bytes: <immutable byte string>
+    raw_bytes: 0402000301020204030a6202000000000000
     relocations:
-      - offset: 12
+      - offset: 10
         width: 8
         kind: chunk_index_root
         target: index-of(object-7)
     preservation: relocation-normalized
   - type: attribute
     encoding_version: 3
-    raw_bytes: <immutable byte string>
+    raw_bytes: <54 bytes>
     relocations:
-      - offset: 44
-        width: 12
-        kind: global_heap_id
-        components: [collection_address, object_index]
+      - kind: global_heap_id
         target: heapvalue-9
+        components:
+          - offset: 42
+            width: 8
+            part: collection_address
+          - offset: 50
+            width: 4
+            part: object_index
     preservation: relocation-normalized
 chunks:
   - coordinates: [0, 0]
     filter_mask: 0
-    payload: h/sha256/3f1c...
-  - coordinates: [1, 0]
+    payload: sha256:3b0e6a04066c1b16...
+    source_stored_size: 19           # provenance; export recomputes it
+  - coordinates: [2, 0]
     filter_mask: 0
-    payload: h/sha256/9ab4...
+    payload: sha256:9a8977eaeda1a5f9...
+    source_stored_size: 19
 ```
 
-Exporting it under a canonical profile changes the file offsets, the
-fixed-array block placement, the global-heap collection address and object
-index — and therefore the patched heap ID — the chunk addresses, every
-container checksum, the free-space state, and the EOA. It does not change the
-datatype, dataspace, filter-pipeline, or link-name bytes, the attribute name,
-the heap object body, or either post-filter chunk payload. That split is what
-`H ≈p H'` asserts.
+Note what the raw layout bytes show: `04` version, `02` chunked, `00` flags,
+`03` dimensionality, `01` encoded-length, `02 02 04` the dimensions, `03`
+fixed-array, `0a` page bits — then `6202000000000000`, the little-endian `610`
+that the sidecar owns. Ten bytes of content, eight bytes of placement, in one
+message.
+
+Importing the file writes:
+
+```text
+{c}/h/sha256/3b0e6a04...   chunk (0,0) payload, 19 bytes
+{c}/h/sha256/9a8977ea...   chunk (2,0) payload, 19 bytes
+{c}/h/sha256/052bad54...   heap value "some note", 9 bytes
+{c}/o/object-1/1           root group record
+{c}/o/object-4/1           /g record
+{c}/o/object-7/1           /g/d record, above
+{c}/map/0/1                OID -> record key, class, size, status, digest
+{c}/man/0/1                the manifest shard, and match_p
+{c}/att/1                  source digest, manifest digest, census, tool identities
+{c}/root                   -> generation 1, profile canonical-v1, Merkle root
+```
+
+Nothing in that list corresponds to the superblock, either object-header
+checksum, the `FAHD`, the `FADB`, the collection framing and its 4055 bytes of
+packing, the NIL message, or the 1336-byte allocation gap.
+
+Counting only the spans enumerated above, `/g/d`'s preserved content is 179
+bytes: 141 of metadata and heap value, 38 of chunk payload. The file carrying
+it is 6182 bytes. Do not read a compression ratio into that — this file is
+dominated by one 4096-byte collection and a 1336-byte gap, both of which are
+fixed costs that a real file amortizes over far more content. The number worth
+taking from it is the 179, which is what has to round-trip byte-for-byte.
+
+### Export: the trace
+
+The eight steps of [Export and canonical
+linearization](#export-and-canonical-linearization), against this snapshot:
+
+1. **Validate.** Three payload digests resolve; the layout relocation names an
+   index the builder will create; the attribute relocation names `heapvalue-9`;
+   deflate is available at the pinned implementation and version.
+2. **Choose index families.** The canonical profile's rule — fixed maximum
+   dimensions, filtered, more than one chunk — selects fixed array. The census
+   agrees, but the choice came from the profile; agreement is a coincidence to
+   be verified, not an input.
+3. **Order.** Root, then `/g`, then `/g/d`, by raw link-name bytes. Chunk
+   records sort by coordinates: `(0,0)` before `(2,0)`.
+4. **Build.** A fixed-array header and one data block sized for four elements,
+   two of them undefined; a global-heap collection at the profile's collection
+   size, holding one 9-byte object.
+5. **Allocate.** Superblock, headers, index, heap, and chunk payloads in the
+   profile's allocation order and alignment.
+6. **Copy and patch.** The dataspace, datatype, fill-value, pipeline, and
+   attribute-info bodies are copied verbatim. The layout body is copied and its
+   final eight bytes set to the new `FAHD` address. The attribute body is
+   copied and both heap-ID components set to the new collection address and
+   object index.
+7. **Recompute.** Both object-header checksums, the index and collection
+   checksums, the superblock, and the EOA.
+8. **Reject** on any unresolved relocation or status violation.
+
+If the profile's allocation order happens to match the source writer's, some
+addresses will coincide. Nothing requires it, and a test that depends on it is
+testing the wrong property.
+
+### `match_p` for this file
+
+| Source atom | Atom in `H'` | Kind |
+| --- | --- | --- |
+| Dataspace, datatype, fill-value, pipeline, attribute-info bodies | The same bodies, relocated in the file | same carrier, `exact` |
+| Layout body `432..450` | Layout body, index address rewritten | same carrier, `relocation-normalized` |
+| Attribute body `476..530` | Attribute body, both heap-ID components rewritten | same carrier, `relocation-normalized` |
+| Heap object body `2080..2089` | Heap object body, at a new collection address and possibly a new object index | same carrier, `exact` |
+| Chunk payloads `6144..6182` | The same two payloads | same carrier, `exact` |
+| NIL message `534..606`, gap `712..2048` | none | `dropped` (padding) |
+| Superblock, checksums, `FAHD`, `FADB`, collection framing | none | `dropped` (derived) |
+| — | Rebuilt superblock, index, collection, checksums | not in the image; `derived` |
+
+This file has no re-homed atom: nothing moves carrier. Had the profile's
+shared-message policy shared the datatype, the datatype body would map to
+`re-homed(a')` — body bytes still `exact`, its object-header message framing
+replaced by a shared-message stub and excluded from the comparison. That case
+is why the rule exists, and it is worth a fixture precisely because this
+example does not exercise it.
+
+### Verification
+
+For this fixture, the [verification contract](#verification-contract) reduces
+to something concrete:
+
+1. The manifest covers `0..6182` with no overlap and no unclassified span. The
+   four-byte runs between the message bodies are derived message framing, the
+   collection tail is derived packing, and the only padding is the NIL message
+   and the allocation gap.
+2. Every preserved atom compares equal outside its patch mask — including
+   the ten non-address bytes of the layout message and the 42 non-heap-ID bytes
+   of the attribute message, which are the two comparisons a naive
+   whole-message diff would get wrong in opposite directions.
+3. Three relocations resolve: the index address reaches the dataset's chunk
+   index, and the two heap-ID components together reach the value `"some
+   note"`.
+4. The API-level graph compares equal: `/g`, `/g/d`, its datatype and
+   dataspace, `d[0:2,0:2]` and `d[2:4,0:2]` as written, `d[0:2,2:4]` and
+   `d[2:4,2:4]` as fill, and `note` reading back as `"some note"`.
+5. The fixed array yields exactly two records, each reachable once, and the two
+   unwritten chunks are still absent — a rebuilt index that reports four chunks
+   fails here even though every byte it stored was correct.
+6. `H'` opens under the newest available libhdf5, and the version is read off
+   that build.
+7. Re-import and re-export `H'`; the whole-file digest is identical.
+8. Excluded throughout: every derived span, the NIL message, and the allocation
+   gap.
 
 ## Keyspace
 
@@ -864,21 +1066,3 @@ None of these is resolved by asserting the contract more firmly:
   contract here.
 - Partial, incremental, or subsetting export. The contract is stated for whole
   files.
-
-## Summary
-
-The compatibility bridge is not an OID-shaped substitute for every file
-address. It is a relocation-aware object representation:
-
-```text
-HDF5 bytes
-    -> preserved atoms + typed relocations + semantic index records
-    -> key/value snapshot
-    -> deterministic allocation + regenerated indexes + relocation patching
-    -> conforming HDF5 bytes
-```
-
-The first and last byte strings may differ. Their non-indexing atoms agree
-byte-for-byte outside declared patch sites, their references resolve to the same
-logical targets, and their reachable HDF5 graphs have the same modeled meaning.
-After the first canonical export, the loop reaches a byte-identical fixed point.

@@ -473,6 +473,105 @@ def _gen_valid(root):
                                        data=np.arange(2, dtype="i4"))
                       for i in range(5)])
 
+    # The fixture behind the worked example in
+    # docs/Mapping HDF5 Binary Primitives onto an Object Store.md.  It is a
+    # documentation fixture first and a corpus fixture second: the design doc
+    # quotes its spans, field offsets, and digests, so the file has to be
+    # reproducible from this generator or those numbers rot silently.
+    #
+    # The regime is what matters, and it is chosen, not incidental:
+    #   * chunk shape (2, 2) over a (4, 4) fixed-extent dataspace gives four
+    #     chunks, and writing only the left half leaves two of them
+    #     unallocated -- the example's "a chunk's absence is content" point;
+    #   * fixed maximum dimensions plus a filter select a FIXED-ARRAY chunk
+    #     index, which is the index family the example walks;
+    #   * a variable-length string attribute puts its value in a global heap
+    #     collection, giving the example its compound (collection address,
+    #     object index) relocation.
+    # `_assert_objectstore_mapping_example` below enforces every one of those.
+    write_objectstore_mapping_example(
+        f"{root}/valid/objectstore_mapping_example.h5")
+
+
+def write_objectstore_mapping_example(path):
+    """Write the object-store mapping example and assert its regime.
+
+    Public because `tools/check_objectstore_example.py` calls it to verify the
+    design document against a freshly written file, without regenerating the
+    whole corpus.
+    """
+    def _content(h):
+        d = h.create_group("g").create_dataset(
+            "d", shape=(4, 4), chunks=(2, 2), dtype="i4", compression="gzip")
+        d[0:2, 0:2] = np.arange(4, dtype="i4").reshape(2, 2)
+        d[2:4, 0:2] = np.arange(4, 8, dtype="i4").reshape(2, 2)
+        d.attrs["note"] = "some note"
+    _write(path, _content)
+    _assert_objectstore_mapping_example(path)
+    return path
+
+
+def _assert_objectstore_mapping_example(path):
+    """Assert the structural regime of the object-store mapping example.
+
+    Regime only -- the writer-independent facts the design document reasons
+    about.  The absolute spans, digests, and byte counts the document also
+    quotes are deliberately NOT checked here: they follow the writer, and
+    failing corpus generation for everyone because an h5py bump moved an
+    object header by four bytes would be the wrong trade.
+    `tools/check_objectstore_example.py` owns those, and reports them against
+    the document so the fix is to update the prose, not the corpus.
+    """
+    raw = open(path, "rb").read()
+    assert raw[8] == 3 and raw[9] == 8 and raw[10] == 8, (
+        "expected a v3 superblock with 8-byte offsets and lengths, got "
+        f"version {raw[8]}, offsets {raw[9]}, lengths {raw[10]}")
+    assert raw.count(b"GCOL") == 1, (
+        "expected exactly one global-heap collection; the variable-length "
+        "attribute value is supposed to live in it")
+    assert b"some note" in raw, "attribute value is not stored literally"
+    assert raw.count(b"FAHD") == 1 and raw.count(b"FADB") == 1, (
+        "expected one fixed-array index header and one data block; the chunk "
+        "index family changed, so the example no longer walks what it says")
+
+    with h5py.File(path, "r") as h:
+        assert "g" in h and "d" in h["g"], (
+            "the example names the dataset /g/d; a different path changes "
+            "every object-header address it quotes")
+        d = h["g/d"]
+        assert d.shape == (4, 4) and d.chunks == (2, 2), (d.shape, d.chunks)
+        assert d.maxshape == (4, 4), (
+            f"maximum dimensions must stay fixed, got {d.maxshape}; an "
+            "unlimited dimension would select an extensible array instead")
+        assert d.compression == "gzip", (
+            f"the dataset must stay deflate-filtered, got {d.compression!r}; "
+            "an unfiltered chunk is stored raw, and the example's point that a "
+            "post-filter chunk can stay `exact` without running the codec "
+            "would describe nothing")
+        assert d.id.get_num_chunks() == 2, (
+            f"expected 2 of 4 chunks allocated, got "
+            f"{d.id.get_num_chunks()}; the unallocated pair is the point")
+        for i in range(d.id.get_num_chunks()):
+            info = d.id.get_chunk_info(i)
+            assert info.filter_mask == 0, (
+                f"chunk {info.chunk_offset} has filter mask "
+                f"{info.filter_mask}; the example states every chunk is "
+                "filtered, so a skipped filter would misdescribe it")
+        assert h5py.check_vlen_dtype(d.attrs.get_id("note").dtype) is str, (
+            "the `note` attribute must stay a variable-length string, or its "
+            "value moves out of the global heap and the compound relocation "
+            "the example describes disappears")
+        ohdr = h5py.h5o.get_info(d.id).addr
+    assert raw[ohdr:ohdr + 4] == b"OHDR" and raw[ohdr + 4] == 2, (
+        f"dataset object header at {ohdr} is not a version 2 header")
+    # The layout message must be version 4 chunked with a fixed-array index:
+    # `04 02` version and class, then the index-type byte `03` immediately
+    # before the 8-byte address the example treats as its relocation.
+    assert b"\x04\x02\x00\x03\x01\x02\x02\x04\x03" in raw, (
+        "the version-4 chunked layout message with a fixed-array index and "
+        "{2, 2, 4} dimension sizes is not present; the example's relocation "
+        "offset is measured from exactly this encoding")
+
 
 def _gen_policy(root):
     # ---- policy/ : denied feature, expected `reject_policy` -------------
