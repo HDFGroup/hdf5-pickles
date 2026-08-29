@@ -249,10 +249,10 @@ Counters are bounded by ratio, not equality — decoding a larger stored-size
 field can cost a few operations without any payload being touched, while a
 validator that read payload would grow with `n`. In the current tracked
 measurement, the unfiltered ladder's `metadata_bytes_seen`/`walk_operations`
-remain exactly 447/219 across the 3,031× physical-file increase. The filtered
-ladder remains at 447 metadata bytes while operations move only 247 → 251
+remain exactly 447/225 across the 3,031× physical-file increase. The filtered
+ladder remains at 447 metadata bytes while operations move only 253 → 257
 across 1,061× physical growth. The sensitivity control rises
-410 → 2,012 → 89,312 operations. These ratios are derived from the
+416 → 2,018 → 89,318 operations. These ratios are derived from the
 `physical_bytes` endpoints in
 [`registry/lazy-validation.json`](../registry/lazy-validation.json), not from the
 nominal element-count ratio.
@@ -341,6 +341,13 @@ provenance and prohibited identifiers:
 ```sh
 python3 tools/check_hygiene.py --paths cases/<id>
 ```
+
+The same checker also loads `h5policy-probe` and tests its `portable_asan()`
+emitter, in both modes.  An AddressSanitizer summary names the source tree the
+instrumented build was compiled from in every symbolized frame — a host path the
+probe does not choose and cannot omit — so that emitter is the one place where
+scanning the output after the fact would keep re-finding a leak nobody had
+fixed.
 
 ## Marker Scanner
 

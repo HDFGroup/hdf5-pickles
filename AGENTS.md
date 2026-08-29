@@ -368,6 +368,11 @@ satisfiable at once.
   `h5policy/tools/h5policy-probe` each carry a `portable_path()` applied at
   emission for this reason; the values they hold internally stay absolute,
   because `h5cc` drives the sibling-lib lookup and the probe build-cache key.
+  A generator also emits paths it never chose: an AddressSanitizer summary names
+  the source tree the instrumented build was compiled from, in every symbolized
+  frame. `h5policy-probe`'s `portable_asan()` rewrites those at emission, and
+  `tools/check_hygiene.py` loads the emitter and tests it, so the prevention is
+  checked rather than assumed.
 
 `tools/check_hygiene.py` enforces the portable-path, prohibited-identifier and
 case-bundle-reference rules over tracked files as part of `docs-check`. Its
@@ -376,8 +381,9 @@ regenerated per machine, so a failure there would be unfixable by any commit —
 and for the same reason the case-reference rule never applies to files *inside*
 a bundle, where naming your own artifacts is correct. The explicit per-bundle
 command in [Write and promotion boundary](#write-and-promotion-boundary) closes
-that gap before handoff; `portable_path()` remains the generator-side
-prevention.
+that gap before handoff; `portable_path()` and `portable_asan()` remain the
+generator-side prevention, and the checker exercises the latter directly (it is
+the one emitter whose output embeds paths the tool does not choose).
 
 ## Boundaries
 

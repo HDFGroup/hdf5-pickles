@@ -20,6 +20,8 @@ into the gitignored cases/ tree (AGENTS.md)."""
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
+import importlib.util
 from pathlib import Path
 import re
 import subprocess
@@ -80,6 +82,58 @@ RULES = (
 def fail(message: str) -> None:
     print(f"HYGIENE CHECK FAILED: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+# The generator-side half of the host-path rule. The scan below catches a leak
+# after it lands in a file; this catches the emitter that would put it there
+# again on the next run, which is what AGENTS.md ("If a generator emits a host
+# path, fix the generator") actually asks for. h5policy-probe is checked because
+# it is the only emitter whose output embeds paths it does not choose -- the
+# symbolized frames of an AddressSanitizer report name the source tree the
+# instrumented libhdf5 was compiled from.
+PROBE = ROOT / "h5policy/tools/h5policy-probe"
+
+# Deliberately a real host-shaped path: this file is exempt from HOST_PATH (see
+# ALLOWED) precisely so the rule and its test can spell out what they match.
+_ASAN_SAMPLE = {
+    "error": "heap-buffer-overflow",
+    "access": "READ of size 1 at 0x504000002dce thread T0",
+    "top_frames": [
+        "#0 0x1 in H5Z__filter_fletcher32 /home/someone/hdf5/src/H5Zfletcher32.c:75",
+        "#1 0x2  (/home/someone/install/lib/libhdf5.so.1000.0.0+0x1234)",
+    ],
+}
+
+
+def check_probe_emitter() -> None:
+    """h5policy-probe must strip host paths from an ASan summary at emission."""
+    if not PROBE.is_file():
+        return
+    loader = importlib.machinery.SourceFileLoader("h5policy_probe", str(PROBE))
+    spec = importlib.util.spec_from_loader("h5policy_probe", loader)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        loader.exec_module(module)
+    except Exception as exc:  # pragma: no cover - import failure is the finding
+        fail(f"cannot load {PROBE.relative_to(ROOT)} to check its emitter: {exc}")
+    portable_asan = getattr(module, "portable_asan", None)
+    if portable_asan is None:
+        fail("h5policy-probe no longer defines portable_asan(); an ASan report "
+             "would carry the instrumented build's source-tree paths into every "
+             "case bundle and registry record")
+    emitted = portable_asan(_ASAN_SAMPLE)
+    leaked = [line for line in emitted["top_frames"] + [emitted["access"]]
+              if HOST_PATH.search(line)]
+    if leaked:
+        fail("h5policy-probe's portable_asan() left a host path in "
+             f"{leaked[0]!r}")
+    # Stripping the path must not strip what identifies the frame.
+    if "H5Zfletcher32.c:75" not in emitted["top_frames"][0]:
+        fail("h5policy-probe's portable_asan() dropped the source location; "
+             "the frame no longer says which line faulted")
+    if "libhdf5.so.1000.0.0+0x1234" not in emitted["top_frames"][1]:
+        fail("h5policy-probe's portable_asan() dropped the soname or the module "
+             "offset from an unsymbolized frame")
 
 
 def tracked_files() -> list[Path] | None:
@@ -187,6 +241,7 @@ def main() -> int:
             return 0
         exempt_policy_files = True
 
+    check_probe_emitter()
     scanned, violations = scan(files, exempt_policy_files)
 
     if violations:

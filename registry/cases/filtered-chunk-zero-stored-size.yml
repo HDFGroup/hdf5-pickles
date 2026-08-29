@@ -100,14 +100,29 @@ measured:
     offsets, all size 52.  So the corrupt index carries THREE defects, only one
     of which this record covers -- see coverage_gaps.
   width: >-
-    NOT measured at 32 bits.  The wrap residue is width-dependent (SIZE_MAX-3
-    on LP64, 2**32-4 on ILP32), so an ILP32 build reaches a different length
-    from the same file; whether it faults as reliably is unmeasured.
+    MEASURED at 32 bits on 2026-08-29, on a second specimen carrying stored size
+    2 (see the update block under coverage_gaps).  The residue IS
+    width-dependent -- (size_t)-2 on LP64, 2**32-2 on ILP32 -- but the OUTCOME
+    is not: the i386 build (HDF5 2.3.0, RelWithDebInfo, -m32, asserts off)
+    faults at the same site, H5_checksum_fletcher32 (src/H5checksum.c:115),
+    reached from H5Zfletcher32.c:78 with nbytes=2, rc=139.  Both residues exceed
+    their address space, so neither width is the safer one.
   asan: >-
-    NOT obtained.  The stock build segfaults outright, so there was no
-    accepted-but-unsafe state needing a sanitizer to expose; an ASan run would
-    sharpen read (1) above from "landed on mapped memory" to an exact report,
-    and that is worth doing if this is ever pursued upstream.
+    OBTAINED 2026-08-29, on the stored-size-2 specimen, and it pins read (1)
+    exactly as this entry predicted:
+      ERROR: AddressSanitizer: heap-buffer-overflow
+      READ of size 1 at 0x504000002dce thread T0
+        #0 H5Z__filter_fletcher32  H5Zfletcher32.c:75
+        #1 H5Z_pipeline            H5Z.c:1467
+        #2 H5D__chunk_lock         H5Dchunk.c:4850
+        #3 H5D__chunk_read         H5Dchunk.c:3141
+        #4 H5D__read               H5Dio.c:398
+        #5 H5VL__native_dataset_read H5VLnative_dataset.c:373
+    That is the UINT32DECODE at :75 reading through `src + (2**64-2)`, i.e.
+    two bytes before the allocation -- the read this record could previously only
+    derive from the source.  The stock build still walks past it and faults in
+    read (2).  So both out-of-bounds reads are now measured, on one file, and
+    the ordering note above stands: which of the two faults is allocator luck.
 
 # -- Divergence from the selected build ---------------------------------------
 divergence:
@@ -296,12 +311,22 @@ coverage_gaps:
     NO SZIP FIXTURE for the sibling site (src/H5Zszip.c:298).  See
     sibling_audit; the local build's szip support was not confirmed.
   - >-
-    NO ASAN WITNESS.  The stock build segfaults, so nothing was hidden, but the
-    FIRST of the two out-of-bounds reads (the UINT32DECODE through
-    `src + (2**64-4)`) is only inferred from the source -- the measured fault is
-    the second one.  An ASan run would pin it.
-  - >-
-    No 32-bit measurement; the wrap residue is width-dependent.
+    CLOSED 2026-08-29.  Both gaps this record left open -- "NO ASAN WITNESS" and
+    "No 32-bit measurement" -- were measured on a SECOND specimen, a different
+    be_data.h5 mutant whose stored size is 2 rather than 0, i.e. the
+    BELOW-FRAMING arm of the rule rather than the zero arm.  See measured.asan
+    and measured.width above.  Two things follow that the original measurement
+    could not show:
+      (a) The rule generalises off its synthetic fixtures.  The below-framing
+          comparison at object finalization -- added when the zero-only form was
+          found insufficient (see the answered open question) -- fires on a
+          real-world file built by nobody for this purpose, with evidence
+          chunk.stored_size actual=2 expected=4 comparison=at_least.
+      (b) The defect is not width-dependent in outcome.  A conclusion drawn
+          only on LP64 would have been correct here, but for the wrong reason:
+          the residue differs and both happen to exceed their address space.
+    Still unfixed in libhdf5 on develop 51b92ccee54 (HDF5 2.3.0), and
+    `grep -n 'if (nbytes' src/H5Z*.c` still returns nothing.
   - >-
     METHOD NOTE, recorded because it cost real time and would cost it again.
     The specimen's index was first read by hand-parsing the v1 B-tree node, and
@@ -356,10 +381,33 @@ provenance:
     The other 21, including the fletcher32 little-endian sibling, read cleanly.
     So the specimen must be read per dataset -- a whole-file h5dump crashes on
     the first bad one and hides the rest -- and the two rc=1 datasets are
-    SEPARATE, UNINVESTIGATED faults, not part of this record.  h5policy reports
+    SEPARATE, UNINVESTIGATED faults, not part of this record.
+    PARTLY ANSWERED 2026-08-29 by the second specimen, which carries the same
+    shape: an rc=1 dataset is a filter refusing its own parameters and is the
+    LOUD case.  The dangerous sibling is the one that returns rc=0 WITH WRONG
+    VALUES, which the same sweep found and which is its own record --
+    filter-local-parms-disagree-with-source-messages.  Reading a nonzero rc as
+    "the interesting one" is the wrong instinct here.  h5policy reports
     only H5_ADVISORY_DECODE_FILTER on both, so if either turns out to be a
     metadata defect it is a further false accept; neither was triaged.
+  second_specimen_sha256: b7cf5ce08384f917bf160a2b6334ee8d04f190be68235183e08eb754a8871823
+  second_specimen_note: >-
+    The 2026-08-29 re-measurement.  Also a be_data.h5 mutant, but a different one
+    -- ten independent mutation sites, of which exactly one is this defect, at
+    file offset 0xabc0: the 4-byte stored size of key[0] in the v1 B-tree node at
+    43944, 0x34 -> 0x02, on /Fletcher_float_data_be.  Because the specimen is
+    multi-defect, the site had to be isolated onto a pristine base file before
+    anything measured on it meant anything; a whole-file run reports one
+    rejection and hides the other nine.
   hdf5_build: >-
-    HDF5 2.3.0, source tree at develop f8f0379c7c5ef3cd4939cb9e115d2fd3502e1748;
-    stock Release install.  Workstation-local; paths not recorded.
+    Original measurement: HDF5 2.3.0, source tree at develop
+    f8f0379c7c5ef3cd4939cb9e115d2fd3502e1748; stock Release install.
+    Re-measurement 2026-08-29: HDF5 2.3.0, source tree at develop
+    51b92ccee54ed3f14af3509c9ac5e4f3c82e58ce, three builds -- baseline
+    (RelWithDebInfo, -DNDEBUG, no sanitizers, settings_sha256
+    7ce6203229fbd356cbdbaab0e1b333c4319c0063743003226a9fb8d05f47819c, x86-64),
+    candidate (RelWithDebInfo, asserts live, -fsanitize=address, settings_sha256
+    970f83354e89722436502d348e12c8a33ec783724c3f48adf2d7dd9ae081d219, x86-64),
+    and an i386 arm (RelWithDebInfo, -DNDEBUG, -m32, no sanitizers).
+    Workstation-local; paths not recorded.
   poke_version: GNU poke 4.3
