@@ -1420,6 +1420,12 @@ def _gen_malformed(root):
     _make_contiguous_stored_size_past_eof(
         f"{root}/valid/contiguous_stored_size_past_eof.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
+    # The same declared size, relocated off prefix+32 so the load routes through
+    # the cache class that carries no end-of-address bound.  bad_heap_segment.h5
+    # is ASan-clean; this one is not.
+    _make_lheap_dblk_size_unbounded(
+        f"{root}/malformed/lheap_dblk_size_unbounded.h5")
+    _make_lheap_dblk_relocated(f"{root}/valid/lheap_dblk_relocated.h5")
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_heap_free_list_size_wrap(
         f"{root}/malformed/heap_free_list_size_wrap.h5")
@@ -8112,6 +8118,103 @@ def _make_bad_heap_segment(path):
     if heap < 0:
         raise RuntimeError("could not locate the local heap")
     # HEAP(4) + version(1) + reserved(3) then the data-segment size (a length).
+    struct.pack_into("<Q", raw, heap + 8, 0x0000_0100_0000_0000)
+    _patch(path, bytes(raw))
+
+
+def _relocate_lheap_segment(raw):
+    """Move a local heap's data segment off prefix + 32, contents and all.
+
+    Returns the heap-prefix offset.  A non-contiguous data segment is ORDINARY
+    -- libhdf5 relocates one whenever the heap grows -- so this transform on its
+    own must leave a perfectly valid file, and valid/lheap_dblk_relocated.h5
+    exists to pin that.  Without that control, a future "fix" that simply
+    rejected non-contiguous segments would keep every malformed fixture here
+    passing while breaking real files.
+    """
+    heap = raw.find(b"HEAP")
+    if heap < 0:
+        raise RuntimeError("could not locate the local heap")
+    seg_size = struct.unpack_from("<Q", raw, heap + 8)[0]
+    seg_addr = struct.unpack_from("<Q", raw, heap + 24)[0]
+    if seg_addr != heap + 32:
+        raise RuntimeError(
+            "expected a data segment contiguous with its prefix (addr %d, "
+            "prefix+32 %d); the base file changed and this transform would not "
+            "move it off the flagged load class" % (seg_addr, heap + 32))
+    if not 0 < seg_size <= len(raw) - seg_addr:
+        raise RuntimeError("implausible data-segment size %d" % seg_size)
+
+    segment = bytes(raw[seg_addr:seg_addr + seg_size])
+    new_addr = len(raw)
+    raw += segment                       # the contents move with the address
+    struct.pack_into("<Q", raw, heap + 24, new_addr)
+
+    # The superblock's end-of-address must cover the relocated segment.  In a
+    # version-0 superblock the base address, free-space address and EOA follow
+    # the fixed 24-byte prefix, each sizeof_offsets wide -- derived from byte 13
+    # rather than counted out by hand.
+    if raw[8] != 0:
+        raise RuntimeError("expected a version-0 superblock, found version %d"
+                           % raw[8])
+    eoa_off = 24 + 2 * raw[13]
+    if struct.unpack_from("<Q", raw, eoa_off)[0] != len(raw) - len(segment):
+        raise RuntimeError(
+            "superblock EOA at %d reads %d, expected the pre-append file size "
+            "%d; the layout assumption is wrong and extending it would corrupt "
+            "an unrelated field"
+            % (eoa_off, struct.unpack_from("<Q", raw, eoa_off)[0],
+               len(raw) - len(segment)))
+    struct.pack_into("<Q", raw, eoa_off, len(raw))
+    return heap
+
+
+def _make_lheap_dblk_relocated(path):
+    """VALID CONTROL: a local heap whose data segment is legally not contiguous
+    with its prefix.  Everything about it is well-formed; only the segment's
+    address differs from the shape h5py happens to write.  Pins the regime that
+    malformed/lheap_dblk_size_unbounded.h5 depends on."""
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    _relocate_lheap_segment(raw)
+    _patch(path, bytes(raw))
+
+
+def _make_lheap_dblk_size_unbounded(path):
+    """The same oversized local-heap data segment as bad_heap_segment.h5, but
+    RELOCATED so the load routes through the unchecked cache class.
+
+    WHY A SECOND FIXTURE FOR ONE ORACLE RULE.  H5C__load_entry applies its
+    end-of-address bound only to classes carrying
+    H5AC__CLASS_SPECULATIVE_LOAD_FLAG (H5Centry.c:1050-1052).  A local-heap data
+    segment CONTIGUOUS with its prefix (address == prefix + 32) is part of the
+    flagged prefix load and is bounded; a segment anywhere else is a separate
+    H5AC_LHEAP_DBLK load, which carries no flag and is not.  The file chooses
+    which, through eight bytes of address.
+
+    bad_heap_segment.h5 leaves the address at prefix + 32 and is therefore
+    AddressSanitizer-CLEAN despite declaring ~1 TB.  This fixture moves the
+    segment and nothing else, and the same declared size reaches an unchecked
+    H5MM_malloc.  Two files, one oracle rule, two different libhdf5 paths --
+    which is the point, and why neither covers the other.
+
+    THE SEGMENT IS COPIED, NOT JUST REPOINTED.  Aiming the address at arbitrary
+    bytes leaves the symbol-table entries indexing into non-heap data and the
+    file picks up an unrelated finding (H5_CORRUPT_LINK_NAME_EMPTY measured),
+    so the fixture would then reject for the wrong reason.  The real segment is
+    appended at the end of the file, the EOA is extended to cover it, and only
+    then is the address moved -- so the heap contents stay valid and the ONLY
+    defect is the declared size.
+
+    See registry/cases/cache-load-length-eoa-check-is-class-gated.yml.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    heap = _relocate_lheap_segment(raw)
+
+    # Now the defect: a declared size no file could hold.
     struct.pack_into("<Q", raw, heap + 8, 0x0000_0100_0000_0000)
     _patch(path, bytes(raw))
 
