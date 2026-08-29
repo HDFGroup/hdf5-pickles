@@ -163,7 +163,10 @@ details.
   compatibility behavior, and analysis depth.  The shipped presets are
   `legacy`, `trusted-fast`, `untrusted-strict`, and `forensic`; all retain hard
   safety invariants.  Their HDF5 feature and resource settings are listed in the
-  [`h5policy` profile guide](../h5policy/README.md#profiles).
+  [`h5policy` profile guide](../h5policy/README.md#profiles).  Not to be
+  confused with an *export profile*, which is a different concept belonging to
+  a different document: see the [object-store
+  mapping](Mapping%20HDF5%20Binary%20Primitives%20onto%20an%20Object%20Store.md#export-profiles).
 
 **Forensic profile**
 : The profile intended for bounded investigation: it continues reporting where
@@ -380,3 +383,6 @@ details.
 - [Regression-corpus layout](../h5policy/tests/README.md)
 - [Exact-build probe](../h5policy/tools/probe/README.md)
 - [CVE tools and canary matrix](TOOLS.md)
+- [Object-store mapping terms: atom, relocation, export
+  profile](Mapping%20HDF5%20Binary%20Primitives%20onto%20an%20Object%20Store.md#design-goal)
+  (design proposal, not implemented)

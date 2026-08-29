@@ -4,6 +4,52 @@
 > importer, exporter, or object-store representation described below. The
 > document defines a prospective preservation and reconstruction contract.
 
+## Why an object store
+
+HDF5's container is a single linear address space with an internal allocator.
+That assumes a mutable file with cheap small writes at arbitrary offsets. An
+object store offers the opposite: immutable objects, no in-place update,
+conditional-write and listing primitives instead of an allocator, and a latency
+floor that makes a pointer chase expensive.
+
+The usual responses each give something up:
+
+- **Store the `.h5` file as one object.** Everything about HDF5 keeps working
+  and nothing about the store does — no deduplication, no snapshot, no partial
+  update, and every writer serializes on the whole artifact.
+- **Store a sidecar index into byte ranges of that object.** Reads become
+  cheap; writes, provenance, and any structural change do not, and the file
+  remains the unit of truth.
+- **Convert to a store-native format.** Reads and writes become cheap, and the
+  HDF5 artifact is gone, taking with it the datatype model, the attribute
+  model, and any claim that what comes back is what went in.
+
+This design takes a fourth option: decompose the container so the store holds
+what the HDF5 file *means* — content atoms, typed relocations, and semantic
+index records — and regenerate the linearization machinery on demand. The
+artifact becomes reproducible rather than retained. The store gets immutable
+content-addressed objects, deduplication, snapshot isolation, and many
+uncoordinated producers; an export is still a conforming HDF5 file that
+preserves the original's non-indexing bytes.
+
+The cost is the exporter. Rebuilding indexes correctly is the whole of the
+work, and the [round-trip contract](#round-trip-contract) exists to say
+precisely what a rebuild is allowed to change.
+
+The scope is the round trip: file in, file out. Serving HDF5 reads directly out
+of the store without an export is a plausible extension and is not specified
+here; see [Non-goals](#non-goals).
+
+## Prior art
+
+| Approach | What it does | Why it is not this |
+| --- | --- | --- |
+| HSDS and the `h5pyd` sharded schema | Decomposes an HDF5 domain into per-object metadata and per-chunk objects in a store, served through a REST API. | The closest neighbour, and evidence that the decomposition is practical at scale. Its unit of truth is its own schema rather than the source bytes: no byte-preservation claim, no relocation model, and a round trip back to a file is a re-write, not a reconstruction. |
+| kerchunk and VirtualiZarr reference sets | Record byte ranges of existing HDF5 files so an array client can read chunks directly. | The file stays authoritative and the reference set is a read accelerator over it. Nothing is preserved, rebuilt, or attested, and metadata that is not chunk-addressable is out of scope. |
+| Zarr and comparable store-native array formats | One object per chunk, metadata as store objects. | Solves the storage problem by not being HDF5. There is no object header, link, shared-message, or reference encoding to preserve, so the question this document answers does not arise. |
+| The `ros3` driver, page buffering, paged aggregation | Read an unmodified HDF5 file from object storage, with page-aligned allocation to make the reads coarse. | Byte-preserving by construction, because the file is untouched, and correspondingly without deduplication, snapshots, partial update, or concurrent producers. Complementary rather than alternative: paged aggregation is a good export-profile setting. |
+| `h5repack` | Rebuilds a conforming HDF5 container from decoded records, changing layout, filters, and index families. | Engineering precedent that the rebuild is possible, and an exporter in miniature. It is not evidence of byte preservation or canonical determinism: it preserves no atom bytes by contract, pins nothing, and emits no manifest. Those properties come from this export contract and its verification. |
+
 ## Design goal
 
 This design maps a reachable HDF5 object graph into a key/value store without
@@ -18,6 +64,17 @@ Import partitions an HDF5 file into three things:
    values depend on file placement or a regenerated container.
 3. **Derived structures:** indexes and allocation structures that can be
    reproduced from records in the first two classes.
+
+An **atom** is a contiguous span of source bytes that the design treats as one
+unit of preservation: a message body, a link name, a heap value, a raw-data
+extent. The term is unrelated to libhdf5's historical use of *atom* for an
+`hid_t` identifier.
+
+Throughout this document, **profile** without a qualifier means an *export
+profile* — the pinned set of byte-affecting choices defined under [Export
+profiles](#export-profiles). It is a different thing from the `h5policy`
+validation profiles used elsewhere in this repository; see the
+[glossary](GLOSSARY.md).
 
 The key/value representation stores preserved atoms and relocation records. It
 stores the semantic fields found in index records, but not the index topology or
@@ -36,21 +93,64 @@ application binary-interface claim.
 
 ## Round-trip contract
 
-Let `I` be import, `E_p` be export under profile `p`, and `H` be an input HDF5
-file accepted by that profile:
+Let `I` be import, `E_p` be export under export profile `p`, and `H` be an
+input HDF5 file accepted by that profile:
 
 ```text
 K  = I(H)
 H' = E_p(K)
 
-H ≈p H'
+Certified_p(H -> H')
 ```
 
-`H ≈p H'` means that `H` and `H'` are **relocation-normalized byte
-equivalent** under profile `p`:
+`Certified_p(H -> H')` is a **directed verdict** on an ordered pair, not a
+symmetric relation: it says that `H'` is a certified export of `H` under `p`.
+The only symmetric relation here is logical equivalence, clause 3 below; the
+byte-level clauses and the status gate in clause 6 are one-way obligations on
+the export. `H ≈p H'` is shorthand for that verdict and never denotes an
+equivalence class.
+
+### Atom correspondence
+
+The byte-level clauses compare atoms, so the verdict is meaningful only
+relative to a stated correspondence between the atoms of `H` and those of
+`H'`. Export does not preserve carriers. Regenerated sharing decisions can move
+a message body between an object header and a shared-message heap; the
+profile's compact and dense thresholds can move a link record between a symbol
+table and a fractal heap, or a payload between a compact layout message and a
+contiguous extent. In each case the content survives and the atom does not.
+
+Every export profile therefore defines a total function
+
+```text
+match_p : atoms(H) -> atoms(H') | re-homed(atoms(H')) | dropped
+```
+
+subject to:
+
+- **Injective.** No two source atoms correspond to one exported atom.
+- **Same carrier:** `match_p(a) = a'` where `a` and `a'` sit in the same
+  container class. Clauses 1 and 2 apply to the atom as written.
+- **Re-homed:** `match_p(a) = re-homed(a')` where the profile deliberately
+  changes the carrier. The atom's *body* bytes must still satisfy clause 1; its
+  framing — message header, heap-ID stub, layout class, and the length fields
+  that describe it — is derived and excluded from the comparison. Being
+  re-homed is not by itself a downgrade: a re-homed atom keeps its preservation
+  status.
+- **Dropped:** `match_p(a) = dropped` is permitted only where `a` is classified
+  `derived`, `padding`, or `provenance-only`. Dropping any other atom refuses
+  the verdict.
+
+Every atom of `H'` outside the image of `match_p` must be `derived`. An
+implementation reports `match_p` next to the byte-ownership manifest; a verdict
+quoted without it is not checkable, because the reader cannot tell which
+comparison was performed.
+
+Under `match_p`, the verdict requires:
 
 1. Every preserved atom has identical bytes outside its declared relocation,
-   other derived, and checksum fields.
+   other derived, and checksum fields, and outside the framing excluded for a
+   re-homed atom.
 2. Every relocated field in `H'` resolves to the same logical object, heap
    value, raw-data extent, or external target as it did in `H`.
 3. The reachable object graphs are isomorphic: hard-link identity, link and
@@ -59,22 +159,10 @@ equivalent** under profile `p`:
 4. Every regenerated index is complete, internally consistent, and reachable
    from its owner.
 5. `H'` is valid for the HDF5 format and reader bounds named by `p`.
-6. Every reachable non-indexing atom is either `exact` or
+6. **Status gate.** Every reachable non-indexing atom is either `exact` or
    `relocation-normalized`. A `re-encoded` or `pass-through` atom limits the
    result to logical equivalence with explicit exclusions; it does not receive
-   the whole-file `H ≈p H'` verdict. An `unsupported` atom prevents certified
-   export.
-
-For a canonical profile, the first export must also be a fixed point:
-
-```text
-H' = E_p(I(H))
-E_p(I(H')) = H'
-```
-
-The second equality is byte identity. Storage-local object IDs and ingest
-provenance may differ after re-import, but they must not affect the canonical
-serialization.
+   the whole-file verdict. An `unsupported` atom prevents certified export.
 
 This separates four claims that must not be conflated:
 
@@ -85,6 +173,49 @@ This separates four claims that must not be conflated:
   preserved except at declared patch sites.
 - **Canonical determinism:** the same modeled graph and export profile produce
   the same exported byte string.
+
+For a canonical profile, the first export must also be a fixed point. More
+strongly, export must be idempotent over every snapshot, not only over
+snapshots that were imported from a file:
+
+```text
+H' = E_p(I(H))
+
+E_p(I(H'))     = H'             the first export is a fixed point
+E_p(I(E_p(K))) = E_p(K)         export is idempotent, for every snapshot K
+```
+
+Both equalities are byte identity. Storage-local object IDs and ingest
+provenance may differ after re-import, but they must not affect the canonical
+serialization.
+
+The second form is the one to test. The first is its special case at
+`K = I(H)`, and only the general form rules out an exporter whose output
+depends on how the store was populated — for example one that follows record
+insertion order where the profile's canonical traversal should decide.
+
+### Determinism under a preservation profile
+
+A preservation profile consumes the source format census — original structure
+versions and index families — as an export input (see [Stored
+content](#stored-content)). That is a deliberate exception to "provenance does
+not affect serialization" and must be stated as one: under a preservation
+profile the census is authoritative content, not ingest metadata, and the
+[keyspace](#keyspace) stores it in the record rather than in the attestation.
+
+The determinism claim is correspondingly conditional:
+
+- **Determinism.** Two exports of one snapshot under one preservation profile
+  agree byte-for-byte, given the same census.
+- **Fixed point.** `E_p(I(H')) = H'` holds only where `I(H')` records a census
+  equal to the one `E_p` consumed. An exporter that reproduces the recorded
+  index family satisfies this by construction. One that falls back — because
+  the recorded family is unsupported, or because the profile's reader bounds
+  forbid it — does not.
+- A preservation profile that cannot reproduce the recorded census for an
+  object exports that object under the canonical rules, records the
+  substitution in the manifest, and withholds the fixed-point claim. It must
+  not report a fixed point it did not reach.
 
 ## Byte ownership model
 
@@ -112,7 +243,9 @@ pass-through | provenance-only | unsupported
 ```
 
 The manifest records the source span, owning atom or record, encoding version,
-preservation status, and digest. It is the basis of the round-trip comparator.
+preservation status, and digest. Together with the profile's `match_p` (see
+[Atom correspondence](#atom-correspondence)), which names each source atom's
+counterpart in the export, it is the basis of the round-trip comparator.
 Spans within a relocatable atom are split at patch boundaries, so the atom's
 preserved fragments and relocation fields do not overlap in the manifest.
 Overlapping reachable structures, unbounded records, or unexplained gaps do not
@@ -164,7 +297,12 @@ Preservation status is one of:
   physical data or index address.
 - Chunk records: coordinates, payload digest, and filter mask. Source stored
   size is retained as provenance and checked against the payload; export derives
-  the encoded size from the output payload.
+  the encoded size from the output payload. **A chunk's absence is content.** An
+  unallocated chunk reads as the fill value, so the set of chunk records is
+  itself semantic: an index builder that materializes a record for every chunk
+  in the dataspace changes what a reader sees, under both the fill-value and
+  space-allocation-time settings. Those settings, and the fill value, are stored
+  content.
 - Compact, contiguous, and chunk payload atoms, subject to the VL, reference,
   and filter rules below.
 - Virtual-dataset mappings, committed datatype bodies, fill values, external
@@ -231,6 +369,93 @@ normalized, the typed relocation descriptors and targets, and relevant encoding
 metadata. Payload hashes cover the exact stored payload representation. OIDs are
 storage-local identities and are not embedded into an exported HDF5 file.
 
+## A worked example
+
+The classes above are easier to read against one small file. Take `ex.h5`: a
+group `/g`, a chunked deflate-filtered dataset `/g/d` with two allocated chunks
+out of four, and one variable-length string attribute `note` on that dataset.
+The table is schematic — it names structures and classes, not measured offsets
+— but the assignment of each structure to a class is the real one.
+
+| Source structure | Class | Status |
+| --- | --- | --- |
+| Superblock, its checksum, and the root-group address | derived | — |
+| Object-header prefix, chunk sizes, gaps, NIL messages, checksums | derived | — |
+| Link message body naming `g`, and the name bytes | preserved | `exact` |
+| Datatype and dataspace message bodies for `/g/d` | preserved | `exact` |
+| Filter-pipeline message body (`deflate`, its `cd_values`) | preserved | `exact` |
+| Layout message body, chunked | preserved | `relocation-normalized` |
+| — the chunk-index address inside that body | relocation | — |
+| Attribute message body for `note`, its name and datatype | preserved | `relocation-normalized` |
+| — the global-heap ID inside the attribute's value | relocation (compound) | — |
+| Fixed-array index header, data block, and element addresses | derived | — |
+| Chunk records `(0,0)` and `(1,0)`: coordinates, filter mask | semantic-index-field | — |
+| Post-filter chunk payloads for `(0,0)` and `(1,0)` | preserved | `exact` |
+| Global-heap collection header, object index, packing, free tail | derived | — |
+| — the heap object body holding `"some note"` | preserved | `exact` |
+| Free-space manager sections, aggregator state, EOA | derived | — |
+
+Four things in that table carry the whole design:
+
+- The two unallocated chunks have no record, and that absence is content: they
+  read as fill. An index builder that invents records for them changes what a
+  reader sees.
+- The layout message is preserved *and* patched. Its version, dimensions, and
+  chunk shape survive byte-for-byte; only the index address moves.
+- The attribute's heap ID is compound. Export rebuilds the collection, assigns
+  a new object index, and patches both components — the collection address and
+  the index — as one relocation.
+- The chunk payloads are post-filter bytes and stay `exact`. The codec is never
+  invoked, because nothing inside those chunks needs to change. Had the dataset
+  held variable-length or reference data, the same chunks would have to be
+  decoded, patched, and re-filtered, and would drop to `re-encoded`.
+
+The dataset's record then looks like this, with the message bodies stored as
+raw atoms and every address in a sidecar:
+
+```yaml
+oid: object-7                        # /g/d
+record_class: object-header
+census:                              # preservation-profile input
+  header_version: 2
+  chunk_index: fixed-array
+messages:
+  - type: layout
+    encoding_version: 4
+    raw_bytes: <immutable byte string>
+    relocations:
+      - offset: 12
+        width: 8
+        kind: chunk_index_root
+        target: index-of(object-7)
+    preservation: relocation-normalized
+  - type: attribute
+    encoding_version: 3
+    raw_bytes: <immutable byte string>
+    relocations:
+      - offset: 44
+        width: 12
+        kind: global_heap_id
+        components: [collection_address, object_index]
+        target: heapvalue-9
+    preservation: relocation-normalized
+chunks:
+  - coordinates: [0, 0]
+    filter_mask: 0
+    payload: h/sha256/3f1c...
+  - coordinates: [1, 0]
+    filter_mask: 0
+    payload: h/sha256/9ab4...
+```
+
+Exporting it under a canonical profile changes the file offsets, the
+fixed-array block placement, the global-heap collection address and object
+index — and therefore the patched heap ID — the chunk addresses, every
+container checksum, the free-space state, and the EOA. It does not change the
+datatype, dataspace, filter-pipeline, or link-name bytes, the attribute name,
+the heap object body, or either post-filter chunk payload. That split is what
+`H ≈p H'` asserts.
+
 ## Keyspace
 
 The keyspace separates immutable payload bytes, immutable semantic records, and
@@ -255,6 +480,9 @@ the mutable name of the current snapshot:
 
 {c}/ext/{oid}/{gen}                   external file, external link, and VDS target records
 
+{c}/man/{shard}/{gen}                 immutable byte-ownership manifest shard for one
+                                      ingested artifact, and the export's match_p
+
 {c}/att/{gen}                         ingest provenance and optional signed snapshot root
 ```
 
@@ -265,6 +493,51 @@ grain is the normalized record or payload atom.
 Content-addressed payload writes are idempotent. Metadata updates create new
 record objects and copy-on-write map shards. No committed record is overwritten
 in place.
+
+### Requirements on the object store
+
+The design is portable only to the extent that it names what it needs:
+
+- **Immutable objects.** A committed key is never overwritten, and
+  content-addressed payload writes are idempotent, so a retried `PUT` is
+  harmless.
+- **One conditional write.** Publication is a compare-and-swap on `{c}/root`
+  alone — replace if the current generation is the one the committer read.
+  Every other write creates a fresh key unconditionally. A store may expose
+  this as a conditional `PUT`, as a precondition on a generation number, or
+  through an external lock; the design needs exactly one such primitive and no
+  transactions.
+- **Read-after-write consistency for new keys**, so a reader that has resolved
+  `{c}/root` can read everything that root names.
+- **No dependency on listing.** Reachability comes from the root and the map
+  shards, never from enumerating a prefix. Listing may be eventually consistent
+  without affecting correctness; garbage collection is its only consumer and
+  must tolerate a stale view.
+
+It does not require multi-key transactions, an ordered keyspace, range queries,
+compare-and-swap across more than one key, or object append.
+
+### Scale and cost
+
+The persistence grain is the record or the payload atom, which bounds key count
+at roughly one key per object plus one per allocated chunk. That is
+unremarkable at 10^4 objects and is the design's principal unsolved problem at
+10^8 chunks, where per-chunk keys make ingest a small-object write storm and
+export a wide fan-out read.
+
+Deliberately unspecified, because the equivalence contract does not depend on
+the answers and an implementation may choose them without changing an exported
+byte:
+
+- **Record packing.** Small records — links, attributes, chunk records — should
+  be batched into larger immutable objects with an intra-object offset held in
+  the map. Packing is byte-affecting for the *store*, not for the exported
+  file, so it belongs to a store-side profile and not to the export profile.
+- **Map-shard granularity**, and how a shard splits as a container grows.
+- **Read amplification for export:** how many round trips a full export costs,
+  and how much can be prefetched from the map alone.
+- **Store limits.** Maximum object size, minimum efficient part size, and
+  per-prefix request-rate limits all bear on the packing rule.
 
 ## Import
 
@@ -289,6 +562,29 @@ Import proceeds from the superblock and the reachable object graph:
 
 The importer may use source addresses to detect aliasing and cycles while
 reading, but source addresses are not persistent object identities.
+
+### Import is a hostile-input parser
+
+Import decodes untrusted metadata by definition: an artifact whose structure
+could be trusted would not need a manifest. Every bound that applies to a
+validating reader applies here, and then some, because import eagerly walks
+structures that a reader would touch only lazily or not at all.
+
+- A **certified** import requires a prior accept verdict from a bounded
+  validator at a named validation profile, recorded with the ingest provenance.
+  An import that cannot name one still produces a snapshot; it does not produce
+  a certified one.
+- Import must be bounded in the terms of [bounded raw
+  decode](What%20is%20bounded%20raw%20decode.md): bound every extent before
+  mapping it, bound every count before multiplying by it, cap recursion depth,
+  and size no allocation from an unvalidated field.
+- Overlap detection is not an optimization. The manifest's "exactly one class
+  per span" property is what turns aliasing — two structures claiming one span
+  — into a rejection rather than a silent last-writer-wins, and aliasing is a
+  live corruption class rather than a theoretical one.
+- Rejection is the default for anything unmodeled. `unsupported` is a status
+  the design already carries; reaching for `pass-through` to get past a parse
+  failure converts an unparsed structure into an unfalsifiable claim.
 
 ## Export and canonical linearization
 
@@ -315,12 +611,12 @@ named objects; references are visited in containing-object and logical element
 order. The profile must define deterministic tie breakers for reference-only
 and otherwise anonymous objects.
 
-`h5repack` is an engineering precedent for rebuilding HDF5 container
-structures from decoded records. It is not proof of byte preservation or
-canonical determinism; those properties come from this export contract and its
-verification.
-
 ## Export profiles
+
+An **export profile** is the complete set of byte-affecting choices that export
+consumes. Nothing that affects the output bytes may come from an ambient
+library default; that is invariant 6. A profile is immutable and is named by
+the snapshot root, so a stored file always records which contract produced it.
 
 Index provenance and index policy are distinct:
 
@@ -337,6 +633,15 @@ At minimum, a profile pins:
 - dataset chunk-index selection rules;
 - group and attribute compact/dense thresholds;
 - B-tree node sizes, split and merge policy, and record ordering;
+- object-header message ordering and chunk assignment, which are byte-affecting
+  and have no semantic anchor in the format;
+- file-space strategy, free-space threshold, and page size. The free-space
+  *sections* are derived, but the strategy and page size are creation
+  properties recorded in the superblock extension, and paged aggregation is the
+  single largest determinant of read performance for the exported file;
+- the shard boundary rule and threshold for contiguous payloads (see [Other
+  boundary cases](#other-boundary-cases)), without which two conforming
+  exporters disagree;
 - heap growth, collection sizing, alignment, allocation order, and padding;
 - user-block and driver-info handling;
 - filter identifiers, parameters, implementation identity, and version;
@@ -407,7 +712,7 @@ opaque copying as sufficient when an embedded relocation must change.
 | External file lists | Preserve the list and offsets as metadata; external raw bytes are not part of the container snapshot. |
 | User block | Preserve exact bytes by default; omission is an explicit profile choice that prevents whole-artifact relocation equivalence. |
 | Driver information | Preserve only for a compatible driver profile; otherwise retain as provenance or reject. Multi-file physical layouts require a separate profile. |
-| Unknown object-header message | Certified relocation equivalence requires proof that the payload is address-free. Otherwise reject, or retain as `pass-through` without a semantic claim. |
+| Unknown object-header message | Certified relocation equivalence requires proof that the payload is address-free. Otherwise reject, or retain as `pass-through` without a semantic claim. The message-header flags are part of the decision, not decoration: *fail-if-unknown* (always, and when open for write) determines whether the export is readable at all, *shareable* interacts with regenerated sharing decisions, and the *modified-by-unaware-software* bit records that a writer rewrote the object. An exporter that rebuilds the header must decide, per profile, whether it is such a writer and set that bit accordingly. |
 | Metadata cache image | Treat as derived and omit or regenerate; it is never authoritative content. |
 
 ## Commit model
@@ -440,6 +745,26 @@ artifact without pretending that its allocation history is content.
 The canonical exported file has its own whole-file digest. That digest attests
 `E_p(K)`, including profile `p`; it is not the digest of the ingested file.
 
+## Relationship to this repository
+
+Nothing described here is implemented, but most of it has a starting point in
+this repository, and the design is better read as an extension of that work
+than as a greenfield proposal.
+
+| Design element | Existing starting point |
+| --- | --- |
+| The format model that fixes atom boundaries, field widths, and version rules | `pickles/*.pk`, the executable structure definitions. `docs/spec/index.yml` records which upstream specification sections are `covered`, `partial`, or `not-covered`; the `not-covered` set is the initial `unsupported` set. |
+| Byte-ownership manifest | `h5policy/pickles/h5_walk.pk` already keeps a half-open interval registry over decoded metadata and raw-data extents, and rejects self, alias, and partial overlap. The manifest is an emitter over that bookkeeping plus a gap analysis, not a second parser. |
+| "No unexplained overlaps", verification item 1 | The same registry, reported today as `H5_CORRUPT_RAW_DATA_OVERLAPS_DATA` and `H5_CORRUPT_RAW_DATA_OVERLAPS_METADATA`. |
+| Bounded import | The `h5policy` validation profiles and finding classes, and [bounded raw decode](What%20is%20bounded%20raw%20decode.md). |
+| Verification corpus | `tools/h5policy-gencorpus` already generates the regression corpus under `h5policy/tests`, already follows the "assert that the intended structural regime was produced" rule, and already covers most of the storage regimes listed below. |
+| Clause 5, the export's own validity | Run `H'` back through the validator at the profile's reader bounds. A certified export that its own validator rejects is a contradiction, and the cheapest one to test. |
+| No aliased extents in the export | Two datasets sharing one content-addressed payload must not share an extent in `H'`. That aliasing is already a finding, so the check exists before the exporter does. |
+
+Two consequences are worth stating plainly. The first implementation milestone
+is not an exporter. And the manifest is useful on its own, as a forensic
+artifact for the CVE workflow, whether or not the exporter is ever built.
+
 ## Verification contract
 
 An implementation must make the design claims measurable with fixtures that
@@ -470,6 +795,61 @@ references; nonzero base addresses; user blocks; object-header continuations;
 and reference-only objects. Generators must assert that the intended structural
 regime was actually produced.
 
+## Staged implementation
+
+Each stage produces something checkable on its own, and none of them requires
+the next one to exist.
+
+1. **Manifest only.** Emit a byte-ownership manifest from the existing walk for
+   every corpus fixture. Success is total span coverage with no overlap and an
+   explanation for every gap. This measures how much of the corpus is
+   classifiable today, which nothing currently reports.
+2. **Classification review.** For each class, record which structures reach it
+   and why. The `unsupported` set that falls out is the honest scope statement
+   for every stage after it.
+3. **Import to a local store.** Records, payloads, and relocation sidecars; no
+   export. Verified by re-deriving the manifest from the store and comparing it
+   with the one emitted in stage 1.
+4. **Export, one regime.** One profile, one index family, no filters and no
+   variable-length data — enough to exercise allocation, relocation patching,
+   and a single index builder end to end.
+5. **Export, canonical profile.** The remaining index families, heaps,
+   references, and filters, then the fixed-point and idempotence checks.
+6. **Preservation profile.** The census-driven variant and its conditional
+   determinism claim, which only becomes meaningful once canonical determinism
+   holds.
+
+## Open questions
+
+None of these is resolved by asserting the contract more firmly:
+
+- **Small-record packing and map-shard granularity**, per [Scale and
+  cost](#scale-and-cost). The design is untested above roughly 10^6 keys.
+- **Garbage-collection safety.** Unreachable objects are collectable, but the
+  design does not say how collection races a producer that has written payloads
+  and not yet submitted records. A grace period keyed on ingest generation is
+  the obvious answer and is not specified.
+- **Reading without exporting.** If the store can serve reads directly, the
+  export becomes an archival operation rather than the only access path — which
+  changes which structures are worth deriving eagerly. Deliberately out of
+  scope here, but it is the question that decides whether this is a storage
+  format or a transport format.
+- **Partial and incremental export.** Exporting one group, or re-exporting only
+  what changed since a prior root, is undefined; the fixed-point property is
+  stated for whole files.
+- **Filter implementation identity.** Pinning implementation and version is
+  necessary and may not be sufficient, because a codec's output can depend on
+  build flags and on runtime strategy selection. Whether a canonical profile
+  can pin a codec tightly enough to be reproducible across platforms is an
+  empirical question. The honest fallback is already in the contract: classify
+  a chunk that must be re-filtered as `re-encoded` and exclude it from the byte
+  claim.
+- **Whether the exact-atom bar is the right bar for every deployment.** It is
+  what makes the design auditable and it is expensive. A profile claiming only
+  logical equivalence for raw data may be the more useful default for some
+  users; if so it must be a named profile, never an undocumented relaxation of
+  this one.
+
 ## Non-goals
 
 - Reproducing the input file's original offsets, allocation gaps, free-space
@@ -479,6 +859,11 @@ regime was actually produced.
 - Defining distributed merge semantics for concurrent HDF5 mutations.
 - Attesting the contents of external files merely because their names appear in
   the container.
+- Serving HDF5 reads directly from the store. The specified access path is
+  export; a native reader over the keyspace is a possible extension and has no
+  contract here.
+- Partial, incremental, or subsetting export. The contract is stated for whole
+  files.
 
 ## Summary
 
