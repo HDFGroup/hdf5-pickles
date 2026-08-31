@@ -1,0 +1,223 @@
+# PROPOSAL, not a promotion.  Nothing in the tracked tree was modified.
+#
+# The metadata cache has exactly one implementation of "this load must fit in the
+# file", and it is gated on a per-class behaviour flag rather than applied to
+# every load.  Six classes carry the flag; the rest reach malloc with a length
+# decoded off disk.  The oracle already rejects such files, so this is a
+# libhdf5-side record with no coverage gap attached -- which is precisely why it
+# has no registry entry today and should get one.
+schema_version: 1
+
+id: cache-load-length-eoa-check-is-class-gated
+title: H5C__load_entry applies its end-of-address bound only to classes carrying
+  the speculative-load flag, so most metadata cache clients pass an unchecked
+  on-disk length to malloc
+status: oracle-hardened          # h5policy rejects; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: heap_structures
+versions: [0]                    # local-heap prefix version 0, the only one defined
+root_cause_classification: local_decode
+violated_invariant:
+  - heap.offset_bounds
+# BOTH findings this case produces route to that one invariant, checked against
+# registry/findings/routes/H5_CORRUPT_LENGTH_OVERFLOW.yml with the registry's own
+# loader: the address finding (H5_CORRUPT_OFFSET_OUT_OF_FILE) and the size
+# finding (H5_CORRUPT_LENGTH_OVERFLOW) share the message "local heap data
+# segment outside file", and that message is routed to
+# heap_structures / heap.offset_bounds.  There is no `heap.length_bounds` --
+# an earlier draft of this record invented one.
+validation_closure: >-
+  the local-heap prefix record on its own -- data-segment address, data-segment
+  size and free-list head are all in one 32-byte header, and the contradiction
+  is decidable without following anything.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - "h5policy (oracle) -- REJECTS (H5_CORRUPT_OFFSET_OUT_OF_FILE on the address;
+     H5_CORRUPT_LENGTH_OVERFLOW on the size once the address is repaired)"
+  - "libhdf5 H5Lvisit / H5Ovisit / H5Gopen -> H5G__stab_iterate (src/H5Gstab.c:488)"
+  - "-> H5HL_protect (src/H5HL.c:341) -> H5AC_protect (src/H5AC.c:1302)"
+  - "-> H5C_protect (src/H5Centry.c:3149) -> H5C__load_entry (src/H5Centry.c:1055)"
+  - "shipped consumers: h5dump (any mode), h5ls, h5stat"
+
+# -- The defect ---------------------------------------------------------------
+defect: >-
+  H5C__load_entry obtains the image length from the client class's
+  get_initial_load_size callback (src/H5Centry.c:1045) -- for most clients a
+  field decoded off disk -- and allocates that many bytes at :1055.  The bound
+  that would make this safe, H5C__verify_len_eoa (:949), is applied at :1050-1052
+  only when `type->flags & H5C__CLASS_SPECULATIVE_LOAD_FLAG`.
+  So "is this record's size bounded?" is answered by a per-class behaviour flag,
+  not by the record's decoder.  The flag exists to permit a speculative read past
+  the end and TRIM it; the side effect is that the classes which are not
+  speculative get no check at all -- the opposite of the risk ordering.
+  The local heap makes the split visible because both halves are declared twenty
+  lines apart in one file (src/H5HLcache.c:100 vs :117), and WHICH ONE LOADS IS
+  CHOSEN BY THE FILE: a data segment contiguous with its prefix
+  (address == prefix + 32) is part of the flagged prefix load; any other address
+  is a separate, unflagged data-block load.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  date: 2026-08-29
+  hdf5_build: >-
+    HDF5 2.3.0 from the develop source tree at 51b92ccee54.  baseline:
+    RelWithDebInfo, -DNDEBUG, no sanitizers, settings_sha256
+    7ce6203229fbd356cbdbaab0e1b333c4319c0063743003226a9fb8d05f47819c.
+    candidate: RelWithDebInfo, asserts live, -fsanitize=address, settings_sha256
+    970f83354e89722436502d348e12c8a33ec783724c3f48adf2d7dd9ae081d219.  i386 arm:
+    RelWithDebInfo, -DNDEBUG, -m32.  All x86-64 hosts; paths not recorded.
+  isolation: >-
+    THE PROOF THAT THE VALUE IS NOT THE PROBLEM.  Two files differing only in the
+    eight bytes of the data-segment address, same 4.9 EB size:
+      address == prefix + 32  -> flagged prefix class   -> ASan CLEAN
+      address == 1024         -> unflagged dblk class   -> ASan ABORTS
+  amplification: >-
+    MEASURED with an LD_PRELOAD malloc interposer, all from one 2485-byte file.
+    A gate upstream constrains which sizes are reachable: H5HLcache.c:189 rejects
+    `free_block != H5HL_FREE_NULL && free_block >= dblk_size` before the
+    allocation, so a large free-list head forces the size larger still.  With the
+    head set to H5HL_FREE_NULL (== 1, H5HLpkg.h:54) the gate is gone:
+      64 MiB GRANTED   1 GiB GRANTED   4 GiB GRANTED   47 GB REFUSED   4.9 EB REFUSED
+    PEAK RSS NEVER MOVES off ~8 MB.  H5Fsuper.c forces EOA <= physical size, so
+    the H5F_block_read after the allocation fails and the buffer is never
+    touched.  The cost is ADDRESS SPACE, not resident memory.
+  instrument_note: >-
+    Three instruments give three different answers and only one is right here.
+    ASan reports only the sizes it REFUSES.  Peak RSS reports only pages TOUCHED,
+    of which there are none.  "Did libhdf5 ask for this?" is answerable only by
+    interposing malloc.
+  width: >-
+    The witness specimen DOES NOT REPRODUCE on i386: dblk_size is a size_t
+    (H5HLpkg.h:89), so 0x4448890000000058 truncates to 88 and a different check
+    rejects the file ("Bad value" on i386 vs "Can't allocate space" on x86-64).
+    An ILP32-targeted value would be needed; not attempted.
+  memory_safety: >-
+    NONE.  The buffer is correctly sized for the length requested and nothing is
+    read or written out of bounds.  This is an allocation defect, not a
+    memory-safety one, and must not be written up as the latter.
+
+# -- Divergence ---------------------------------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: opens; fails the link iteration after attempting the allocation
+  libhdf5_version: 2.3.0 (measured)
+  classification: >-
+    Not an A-prime: the oracle rejects and libhdf5 also fails, so the two agree
+    on the decision.  What differs is WHERE -- libhdf5 fails because the
+    allocator refuses, or because a later read runs past EOF, not because it
+    checked.  A grantable size on a host with more address space simply
+    succeeds further.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: oracle_only
+  description: >-
+    h5policy: enforced; both the address and the size are covered.
+    libhdf5: make H5C__verify_len_eoa unconditional at H5Centry.c:1050.
+    THE CAVEAT: for the six speculative classes the function TRIMS len to the
+    EOA rather than refusing it, and a speculative read depends on that.  The fix
+    must keep the trim for those and add a hard refusal for the rest -- not drop
+    the condition, which would extend trimming to clients that should be refused.
+systemic:
+  semantic_boundary: >-
+    the metadata cache's load path.  Every client's decoded length should be
+    bounded by the file before it reaches an allocator, with speculative trimming
+    as an explicit opt-in rather than the bound as an opt-in.
+  status: planned
+  owner: unassigned
+backports: []
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: >-
+    to be generated, not lifted from the case bundle.  H5Fopen +
+    H5Lvisit_by_name2 is the whole PoC.
+  existing_fixture: >-
+    h5policy/tests/malformed/bad_heap_segment.h5 ALREADY pins the oracle rule --
+    a ~1 TB declared data-segment size -- and it is the fixture the route shard
+    cites as evidence.  IT DOES NOT REACH THIS DEFECT: its data-segment address
+    is 712, which is prefix + 32, so the load goes through the flagged,
+    EOA-checked prefix class.  MEASURED: that fixture is AddressSanitizer-CLEAN.
+    Moving only its address off prefix+32, size and free list untouched, makes
+    the same file abort with `requested allocation size 0x10000000000`.
+    So the corpus pins the oracle and never exercises the library's missing
+    bound, which is the fixture gap this record identifies.
+  direct_fixture: >-
+    to be generated by h5policy-gencorpus: the same shape as bad_heap_segment.h5
+    but with the data-segment address OFF prefix+32, so the load routes through
+    the unflagged data-block class.  A promotion must not add a tracked
+    reference to a case artifact, so it must be generated rather than copied.
+    NOTE, measured on an ad-hoc patch of the existing fixture: moving the
+    address also breaks the heap contents and adds a second finding
+    (H5_CORRUPT_LINK_NAME_EMPTY).  The generator must either keep the heap
+    contents consistent or the expectation must declare both findings.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: true
+
+sibling_audit: >-
+  THE FLAG PARTITIONS THE CACHE, so the affected set is enumerable rather than
+  searchable.  Flag holders (checked): superblock and driver info
+  (H5Fsuper_cache.c:89, :107), global heap (H5HGcache.c:75), fractal-heap header
+  (H5HFcache.c:122), local-heap PREFIX (H5HLcache.c:100), object-header prefix
+  (H5Ocache.c:92).
+  Unflagged (unchecked): local-heap DATA BLOCK -- measured here -- object-header
+  CONTINUATION, v1/v2 B-tree nodes, SNOD, extensible- and fixed-array blocks,
+  fractal-heap indirect and direct blocks, free-space header and section info,
+  SOHM table and list.
+  A per-client patch fixes one; the condition at H5Centry.c:1050 fixes all.
+  NOT MEASURED: every unflagged client except the local-heap data block.
+
+fuzz_seed: >-
+  The productive shape is a PAIR of fields in one header: the size, and the
+  free-list head that gates whether the size is reached at all.  Mutating the
+  size alone leaves a large free-list head forcing the size above what any
+  allocator grants -- which is exactly why the supplied specimen requests 4.9 EB
+  and gets refused, a weaker witness than the defect allows.
+
+coverage_manifest_change: >-
+  None for the oracle.  This record exists to carry the libhdf5 side, which is
+  currently described nowhere in registry/.
+
+compatibility_backport_risks: >-
+  None identified for the bound itself: a structure libhdf5 wrote always fits
+  inside the EOA.  The risk is entirely in the speculative-trim caveat above.
+
+coverage_gaps:
+  - >-
+    Only the local-heap data block was measured; the other unflagged clients were
+    not, though the class-flag argument covers them by construction.
+  - >-
+    The amplification is address space, not resident memory, because the read
+    after the allocation fails.  Whether a file can be built whose read SUCCEEDS
+    -- making the pages resident and the DoS real -- was not investigated, and it
+    is the single measurement that would most change the severity.
+  - >-
+    Not reproduced at 32 bits; an ILP32-targeted size would be needed.
+  - >-
+    1.14.x and 1.10.x not audited.
+
+provenance:
+  found_by: >-
+    re-running the §11 process on a supplied specimen whose local-heap prefix
+    declares a 4.9 EB data segment.  The specimen's primary oracle finding names
+    the data-segment ADDRESS; the size defect is only visible once the address is
+    repaired.
+  input_sha256: 27ca938d13af57cbb95d67e93c93b9cf6015220944efcab244f2b2b6a97dd4dd
+  input_note: >-
+    2485 bytes, declared EOA 2088.  BASE FILE NOT RECOVERED -- no local corpus
+    match, closest candidate differs in 216 of ~2066 bytes -- so there is no
+    single-site sweep and no claim about which bytes the original mutation
+    touched.
+  h5policy_commit: 8d7ce9a
+  poke_version: GNU poke 4.3

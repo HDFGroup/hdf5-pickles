@@ -101,6 +101,12 @@ controlled outcome; a change that alters any decision is surfaced for review.
   defaults in the four documented profile tables with `h5_profiles.pk`.
 - `check_lazy_docs.py` — derives the documented lazy-validation growth ratios
   from the tracked artifact and reproduces its deterministic ladder fields.
+- `../../tools/check_objectstore_example.py` — reads the spans, field values,
+  digests, and byte counts quoted by the object-store mapping document's worked
+  example back out of that document and compares them with
+  `valid/objectstore_mapping_example.h5`. It uses the corpus copy when the
+  corpus has been generated and writes its own otherwise, so it runs under
+  `docs-check` without requiring one.
 - `valid/ malformed/ policy/ resource/ coverage/ integration/ cve/` — generated
   fixtures (git-ignored build output; see below).
 

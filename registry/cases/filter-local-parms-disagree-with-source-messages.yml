@@ -1,0 +1,365 @@
+# The parameterised filters -- n-bit and scale-offset -- store "local"
+# parameters that libhdf5 DERIVES from the object's own datatype and fill-value
+# messages when it writes the file, and compares back to nothing when it reads
+# it.  Each such parameter is a COPY whose original is still in the same object
+# header, which is what makes a disagreement decidable with no data decode and
+# impossible in a conforming file.
+#
+# Promoted 2026-08-29 from a supplied multi-defect specimen: one of its ten
+# mutation sites was the only one BOTH h5policy and libhdf5 accepted while the
+# data changed.  A sibling sweep generalised that one byte into this class.
+schema_version: 1
+
+id: filter-local-parms-disagree-with-source-messages
+title: n-bit and scale-offset copy byte order, precision, bit offset and
+  fill-value availability out of the object's own datatype and fill-value
+  messages and never compare them back, so a one-word edit makes libhdf5 return
+  different values with exit code 0
+status: oracle-hardened          # h5policy rejects as of 2026-08-29; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  Deliberately NOT part of
+  the repository-advisory draft written for the same specimen: this is a
+  data-integrity defect, not a memory-safety one, and it needs its own severity
+  discussion and its own compatibility assessment.
+
+# -- Triage -------------------------------------------------------------------
+record: dataset_layout_filter_fill
+versions: [2, 3]                 # layout versions that reach a filtered chunked dataset
+root_cause_classification: aggregate_object
+violated_invariant:
+  - layout.filter_byte_order
+  - layout.filter_precision
+  - layout.filter_bit_offset
+  - layout.filter_fill_availability
+validation_closure: >-
+  the aggregate dataset description -- the datatype message, the fill-value
+  message and the filter-pipeline message of ONE object header.  Not the filter
+  descriptor alone: the values it must agree with live in sibling messages.
+  Object-header messages arrive in any order, so the comparison cannot be an
+  inline gate in the pipeline walker (that would be evadable by reordering) and
+  belongs at object finalization, exactly where the two already-enforced members
+  of this family live.
+activation_before_validation:
+  - none                         # no native construction is reached; the data is
+                                 # simply decoded with parameters the object's
+                                 # own metadata contradicts
+entry_points:
+  - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-08-29 (was: accept_with_warnings, decode-filter advisory only)"
+  - "libhdf5 H5Dread -> H5Z_pipeline -> H5Z__filter_scaleoffset (src/H5Zscaleoffset.c:1146-1151)"
+  - "libhdf5 H5Dread -> H5Z_pipeline -> H5Z__filter_nbit (src/H5Znbit.c:1091, :1105)"
+  - "shipped consumers: h5dump with data, h5ls with data, any H5Dread.  NOT h5dump -H / h5ls -v / h5stat, which never run the pipeline"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+defect: >-
+  WRITE SIDE.  H5Z__set_local_scaleoffset fills the descriptor from the
+  dataset's own type and creation properties:
+    cd_values[PARM_ORDER]    = LE/BE from H5T_get_order(type)   -- :1035, :1039
+    cd_values[PARM_FILAVAIL] = from H5P_fill_value_defined()    -- :1051-1060
+  and H5Z__set_parms_atomic does the same for n-bit (src/H5Znbit.c:440-482):
+    class, size, order, precision, bit offset, all from the same datatype.
+  READ SIDE.  H5Z__filter_scaleoffset copies the words into locals at
+  :1146-1151 and validates only what it needs internally.  scale_type and
+  dtype_class are cross-checked against EACH OTHER at :1161-1168 -- which is why
+  a wrong SCALETYPE or CLASS fails loudly, rc=1.  Nothing compares any word
+  against the MESSAGE it was copied from.
+  Two traps that make this read wrong from the source:
+    * PARM_ORDER *is* read early, at :1128 and :1133 -- but only against
+      H5T_native_order_g, the HOST's order, to decide whether to byte-swap.  The
+      file's own datatype message is never consulted.  cd_nelmts != 20 at :1121
+      is the sole descriptor-level check in the function, and h5policy already
+      covers it (layout.filter_param_count).
+    * PARM_FILAVAIL is only ever tested for equality with FILL_DEFINED (:458 and
+      six further sites), so a value outside its two-member enumeration
+      (:124-125) is not refused -- it silently means "no fill value", exactly as
+      a 0 would.
+  n-bit consumes p->order with an assert for the second arm (H5Znbit.c:1105,
+  :1417), which is a no-op under -DNDEBUG.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  MEASURED: 2026-08-29, libhdf5 2.3.0 (source tree at develop 51b92ccee54).
+  method: >-
+    Each variant is ONE 4-byte store into a pristine base file.  The affected
+    dataset is read with h5dump -d and its printed values digested, then
+    compared against the same dataset read from the unmodified base, with
+    h5dump's file-naming banner normalised out.  rc=0 with a changed digest is
+    silent wrong data.
+  oracle_as_found: >-
+    ACCEPT_WITH_WARNINGS on all fifteen variants -- H5_ADVISORY_DECODE_FILTER
+    and nothing else, under untrusted-strict and forensic alike.  A false accept
+    in the METADATA domain: filter client data is inside the oracle's boundary,
+    not beyond it the way raw chunk data would be.
+  oracle_now: >-
+    REJECT_CORRUPT, H5_CORRUPT_FILTER_PARM_MISMATCH, for a byte order,
+    precision, bit offset or fill-value availability word that contradicts the
+    message it was copied from -- plus the two-member enumeration bound on the
+    availability word.
+  libhdf5: >-
+    OPENS, READS, RETURNS WRONG VALUES, rc=0.  Nine of fifteen variants:
+      scale-offset cd[1] SCALEFACTOR = 100          silent wrong data
+      scale-offset cd[1] SCALEFACTOR = 0xFFFFFFFF   silent wrong data
+      scale-offset cd[6] ORDER  LE -> BE            silent wrong data
+      scale-offset cd[7] FILAVAIL = 0               silent wrong data
+      scale-offset cd[7] FILAVAIL = 169             silent wrong data
+      scale-offset cd[8..] FILVAL -2.2 -> 99.5      silent wrong data
+      n-bit        cd[5] ORDER  LE -> BE            silent wrong data
+      n-bit        cd[6] PRECISION 20 -> 24         silent wrong data
+      n-bit        cd[7] OFFSET 7 -> 0              silent wrong data
+    Four fail loudly (rc=1): scale-offset SCALETYPE (2, 169) and CLASS (0, 2),
+    all caught by the filter's own scale_type/dtype_class cross-check.
+    Two are inert: SIGN (ignored for a float) and ORDER = 169 (matching neither
+    LE nor BE, so the swap decision comes out right by accident).
+    The clearest witness is scale-offset cd[6]: one byte turns all 42 values of
+    a f8 dataset into 1.19453e+103, -4.60704e-30, -8.21912e+68 ... while h5dump
+    exits 0.
+  asan: >-
+    CLEAN on every one of the fifteen, under the ASan candidate build.  THIS IS
+    AN INTEGRITY FINDING, NOT A MEMORY-SAFETY ONE.  Do not let a later edit
+    write it up as a crasher; the argument for checking it is precisely that a
+    crash reports itself and this does not.
+  probe_blind_spot: >-
+    h5policy-probe reports `accepted` for every silent-wrong-data variant,
+    because it reads element (0,...,0) and several of them change only later
+    elements.  Every verdict above comes from the h5dump differential.  A canary
+    status of `verified` on these fixtures is therefore correct and expected:
+    libhdf5 completes the exercise because it accepts the corruption.
+  false_positive_controls: >-
+    THREE conforming shapes of the fill-availability word were built and
+    measured BEFORE the rule was written, and one of them rules out the obvious
+    symmetric version:
+      (a) explicit fill value      -> cd[7] == 1, fill message with value bytes
+      (b) DEFAULT fill value       -> cd[7] == 1, fill message says
+                                      H5D_FILL_VALUE_DEFAULT, NO value bytes
+      (c) explicitly UNDEFINED     -> cd[7] == 0, NO value bytes
+    (b) is what libhdf5 writes when no fill value is given, so a rule of the
+    form "cd[7] == 1 implies an explicit fill value" would reject files the
+    library produces by default.  Hence the asymmetry: only cd[7] == 0 AGAINST
+    an explicit fill value is a rule, plus the enumeration bound.  (c) needed a
+    C reproducer -- h5py has no binding for H5Pset_fill_value with a NULL value.
+  corpus_sweep: >-
+    ZERO false positives over 460 .h5 files in the libhdf5 source tree (every
+    test file the library itself wrote), plus the 60-file valid corpus and the
+    integration and examples trees.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt          # was: accept_with_warnings, until 2026-08-29
+  libhdf5: opens, reads, returns wrong values, rc=0
+  libhdf5_version: 2.3.0 (measured)
+  classification: >-
+    WAS A-prime -- an oracle FALSE ACCEPT.  Closed on the oracle side
+    2026-08-29.  NOT an invariant-A violation in the crash sense: libhdf5 also
+    accepts, so the two agreed on the DECISION and disagreed only on whether the
+    values could be trusted.  Same shape as
+    registry/cases/chunk-data-over-metadata.yml, where a chunk address pointing
+    at metadata returns those bytes as dataset values with rc=0.
+  note: >-
+    libhdf5 opens AND reads these files cleanly, so unlike the filtered-chunk
+    stored-size case there is no "deeper libhdf5 evidence" for the differential
+    harness to demote on -- a data-forcing probe returns rc=0.  That made all
+    six fixtures HARD A FAILURES on the first full run, and the resolution is an
+    A~ PREDICATE, not a per-fixture tolerance: libhdf5 is actively wrong here,
+    which is the condition that justifies one.
+    LANDED: H5_CORRUPT_FILTER_PARM_MISMATCH joins SILENT_WRONG_DATA_CODES in
+    h5policy-diff, alongside the three addressing codes already there.  Worth
+    noting how it differs from them -- those three make libhdf5 read the WRONG
+    BYTES; this one makes it read the right bytes and DECODE them wrongly.  The
+    outcome the harness can observe is identical (rc=0 everywhere, different
+    values), which is what the shared exemption is about.
+    ONE ADJUSTMENT WAS NEEDED and it is worth recording, because the predicate
+    silently did not fire at first: it required `class == "corrupt"` across ALL
+    findings, and every filtered dataset also carries the
+    H5_ADVISORY_DECODE_FILTER warning -- valid ones included.  The exemption was
+    therefore unreachable for any filtered fixture.  It now ignores the
+    `warning` class only; a policy, resource or unsupported finding on the same
+    file still makes it a hard failure.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: oracle_only
+  description: >-
+    h5policy: landed.  The pipeline walker records the derived words in
+    h5_layout.pk; the datatype walker records byte order, bit offset and bit
+    precision in h5_datatype.pk; h5policy_finalize_ohdr_dataset compares them.
+    O(1) per-object state, no message walked twice, and at finalization rather
+    than inline because object-header messages arrive in any order.
+    libhdf5: NOT proposed as a patch here.  The same comparison is available at
+    dataset-open time, where the datatype and fill value are already in hand,
+    but it is a behaviour change in a read path that has tolerated disagreement
+    for a long time -- see compatibility_backport_risks.
+systemic:
+  semantic_boundary: >-
+    the aggregate dataset description.  A filter's "local" parameters are a
+    projection of the object's other messages; the boundary that can enforce
+    that is the object header, not the descriptor.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder) -- landed; libhdf5 read path still open
+  landed_changes:
+    - h5policy/pickles/h5_walk.pk (four sets of pipeline globals, three datatype
+      context fields plus has_datatype_atomic_props)
+    - h5policy/pickles/h5_datatype.pk (records byte order, bit offset and bit
+      precision for the numeric classes 0, 1 and 4)
+    - h5policy/pickles/h5_layout.pk (records the derived words from the
+      scale-offset and n-bit descriptors, gated on an atomic root)
+    - h5policy/pickles/h5_validate.pk (the four comparisons at object
+      finalization, plus the resets)
+    - registry/findings/catalog/dataset_layout_filter_fill.yml
+      (H5_CORRUPT_FILTER_PARM_MISMATCH, ambiguous)
+    - registry/findings/routes/H5_CORRUPT_FILTER_PARM_MISMATCH.yml
+    - registry/validation-coverage.yml (four invariant ids, eight fixture rows)
+    - h5policy/tools/h5policy-gencorpus (six malformed generators, two valid
+      controls, and a `written` knob on _scaleoffset_cd_patch)
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/scaleoffset_byte_order_mismatch.h5
+  direct_fixture: h5policy/tests/malformed/nbit_precision_mismatch.h5
+  expectations:
+    - h5policy/tests/expected/malformed-scaleoffset_byte_order_mismatch.yml
+    - h5policy/tests/expected/malformed-nbit_byte_order_mismatch.yml
+    - h5policy/tests/expected/malformed-nbit_precision_mismatch.yml
+    - h5policy/tests/expected/malformed-nbit_bit_offset_mismatch.yml
+    - h5policy/tests/expected/malformed-scaleoffset_fill_unavailable.yml
+    - h5policy/tests/expected/malformed-scaleoffset_fill_avail_undefined.yml
+    - h5policy/tests/expected/valid-scaleoffset_filter_fillvalue.yml
+    - h5policy/tests/expected/valid-nbit_reduced_precision.yml
+  six_fixtures_why: >-
+    Four invariants, six malformed files, and neither number is padding.
+    BYTE ORDER gets one file per filter because the word sits at a different
+    cd_values index in each -- [5] for n-bit, [6] for scale-offset -- so
+    h5policy records it from two different offsets and one file would leave one
+    constant unexercised.
+    FILL AVAILABILITY gets one file per arm because the rule is two conditions
+    in one if/else: an out-of-enumeration word, and an in-range 0 against an
+    explicit fill value.  Measured: disabling either arm alone leaves the other
+    fixture rejecting, so neither covers the other.
+    Each of the five conditions was disabled ON ITS OWN and the matching fixture
+    measured accepting while the other five kept rejecting.  Reverting the whole
+    change proves less: an earlier check can return before the one under test
+    ever runs.
+  generator: >-
+    h5policy-gencorpus.  Scale-offset goes through _scaleoffset_cd_patch (v2
+    pipeline message, object-header checksum repaired); n-bit through
+    _nbit_cd_patch (v1 pipeline message, no checksum, size-neutral edit).  BOTH
+    ASSERT THE PRE-PATCH VALUE, because both locate the descriptor by scanning
+    and a wrong hit would patch an unrelated word and produce a file that tests
+    nothing.
+  regimes_the_generators_assert: >-
+    Two regimes had to be created deliberately, and both were found by
+    measurement after a first attempt produced a fixture whose finding was right
+    and whose stated consequence was unsupported:
+      * N-BIT MUST ACTUALLY COMPRESS.  A full-precision native int32 leaves
+        need_not_compress set (cd_values[1] == 1) and the pipeline is a
+        pass-through; the precision and bit-offset words are still written but no
+        read path consumes them.  valid/nbit_reduced_precision.h5 uses 20-bit
+        precision at bit offset 4 so the filter does real work.
+      * THE FILL VALUE MUST BE VISIBLE.  It has to sit at an IN-EXTENT element of
+        an ALLOCATED chunk.  A fully written dataset never materialises it (the
+        patch then changes nothing libhdf5 returns), and a dataset whose fill
+        elements fall outside the DATASPACE hides them just as well.  The fixture
+        writes five of six elements; the sixth reads back as -7 before the patch
+        and 5 after it.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true      # h5policy never runs a pipeline
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: true
+
+backports: []                       # nothing landed in libhdf5 to backport
+
+fuzz_seed: >-
+  Filter client data is a productive mutation axis, and the interesting values
+  here are LEGAL-LOOKING ones: an in-range enumerator that contradicts a sibling
+  message.  ORDER = 1 (big-endian) on a little-endian datatype, FILAVAIL = 0
+  with a fill value present, PRECISION = 24 inside a 32-bit storage size -- all
+  ordinary small integers that a mutator pushing toward extremes never
+  generates.  The general shape: mutate a field TOWARD another valid value of
+  its own domain and let a cross-message rule catch it, rather than toward
+  SIZE_MAX and hope for a wrap.
+
+compatibility_backport_risks: >-
+  h5policy side: none identified.  Every covered value is derived by the writer
+  from the message it is compared against, so a conforming file always agrees;
+  measured zero false positives over 460 libhdf5-written test files plus the
+  valid corpus.
+  libhdf5 side: UNMEASURED, and this is why the library-side fix stays a
+  proposal rather than a patch.  Files written by third-party tools that fill
+  these parameters themselves, rather than through H5Z__set_local_*, would
+  suddenly fail to read.  No survey of such files was done, and this repository
+  has no way to do one.
+
+sibling_audit: >-
+  Both parameterised internal filters were swept and both are affected.
+  NOT COVERED, deliberately: scale-offset cd_values[1] (SCALEFACTOR).  It is
+  equally silent and equally damaging -- 100 and 0xFFFFFFFF both return wrong
+  values with rc=0 -- but it is a genuine user parameter derived from no
+  message, so no cross-message rule can reach it.  Stating that is the point;
+  the class is not closed.
+  NOT COVERED, for a different reason: cd_values[8..] (FILVAL), the copy of the
+  fill value itself.  It is derived from the fill-value message, so it looks
+  like the same rule, but H5Z_scaleoffset_save_filval packs it byte-by-byte in a
+  direction that depends on H5T_native_order_g and applies a conditional
+  H5Z__scaleoffset_convert first.  A bounded decoder cannot reconstruct the
+  WRITER's host order from the file, so a byte comparison against the
+  fill-value message would false-positive on files written on the other
+  endianness.  Measured as silent wrong data (fill -2.2 -> 99.5) and left open.
+  NOT SWEPT: n-bit's compound and array parameter subtrees -- only the atomic
+  root was measured.  They carry the same per-member precision/offset/order
+  words, so the same class plausibly extends there.
+  OUT OF SCOPE: deflate, shuffle, szip and fletcher32 carry no derived local
+  parameters; dynamically loaded filters cannot be audited from a metadata
+  oracle.
+
+coverage_gaps:
+  - >-
+    scale-offset cd_values[1] SCALEFACTOR: silent wrong data, no cross-message
+    rule available.  Unclosed and unclosable at this boundary.
+  - >-
+    scale-offset cd_values[8..] FILVAL: silent wrong data; the packing is
+    host-order dependent on the WRITE side, so a comparison against the
+    fill-value message risks a false positive on cross-endian files.  Unclosed.
+  - >-
+    Only the atomic n-bit root is checked.  The compound and array parameter
+    subtrees were neither measured nor covered.
+  - >-
+    No valid FIXTURE for the explicitly-undefined fill value (cd_values[7] == 0
+    with no value bytes), because h5py cannot write one.  The shape WAS measured
+    with a C reproducer and the rule leaves it alone by construction -- rule (b)
+    requires ctx.has_fill_value, which only an explicit value sets -- but the
+    corpus does not pin it.
+  - >-
+    Not measured at 32 bits.  Nothing here is width-dependent on inspection --
+    every comparison is a 4-byte word against a 1-, 2- or 4-byte word -- but
+    that is source-derived, not measured.
+  - >-
+    1.14.x and 1.10.x not audited.
+
+provenance:
+  found_by: >-
+    sweeping the ten mutation sites of a supplied multi-defect specimen one at a
+    time, against both the oracle and a per-dataset libhdf5 read.  Site m03
+    (file offset 0x2784, scale-offset cd_values[7] 1 -> 169) was the ONLY site
+    both the oracle and libhdf5 accepted while the data changed; everything else
+    here came from generalising that byte.  The specimen's headline defect was a
+    fletcher32 length wrap that h5policy already rejected -- this was the finding
+    underneath it.
+  input_sha256: b7cf5ce08384f917bf160a2b6334ee8d04f190be68235183e08eb754a8871823
+  input_note: >-
+    A 10-site mutation of HDF5's own test/testfiles/be_data.h5 (sha256
+    3602ed2a0435f2bfe93c0d89c3615683e46e9717bbe32a02fedcf779bdb406b5), 24
+    datasets over five filters in both byte orders.  Multi-defect, so no
+    measurement on it means anything until each site is isolated onto a pristine
+    base: a whole-file run reports one rejection and hides the other nine.
+  h5policy_commit: e720c570d75314cda3793d6f0b606f9c93b77d16
+  poke_version: GNU poke 4.3
+  hdf5_build: >-
+    HDF5 2.3.0 from the develop source tree at 51b92ccee54.  baseline:
+    RelWithDebInfo, -DNDEBUG, no sanitizers, settings_sha256
+    7ce6203229fbd356cbdbaab0e1b333c4319c0063743003226a9fb8d05f47819c.
+    candidate: RelWithDebInfo, asserts live, -fsanitize=address, settings_sha256
+    970f83354e89722436502d348e12c8a33ec783724c3f48adf2d7dd9ae081d219.
+    Both x86-64.  Workstation-local installs; paths not recorded.

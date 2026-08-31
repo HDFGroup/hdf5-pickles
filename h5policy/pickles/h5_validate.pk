@@ -654,6 +654,124 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
                 loc2 = ctx.datatype_size_offset#B, loc2_len = 4UL,
             });
 
+    /* The parameterised filters copy four more words out of this object's own
+       datatype and fill-value messages when the file is written, and compare
+       none of them back on read (H5Zscaleoffset.c:1146-1151 believes the
+       descriptor outright; H5Znbit.c:1105 and :1417 guard the second byte-order
+       arm with an assert, which is a no-op in a release build).  Each rule below
+       is a strict tightening: the writer DERIVED the value from the message it
+       is being compared against, so a conforming file always agrees.
+
+       MEASURED, HDF5 2.3.0 develop: each of these edits reads back with rc=0 and
+       DIFFERENT VALUES, and none produces a memory-safety error under
+       AddressSanitizer.  That is what makes them worth a check -- a crash is
+       self-reporting, silently wrong data is not.  */
+
+    /* Byte order.  n-bit and scale-offset both take it from H5T_get_order() and
+       both encode LE as 0, BE as 1, so one comparison serves either filter.  */
+    if (h5policy_pipeline_has_decode_order != 0UB
+        && ctx.has_datatype_atomic_props != 0UB
+        && h5policy_pipeline_decode_order != ctx.datatype_byte_order)
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_FILTER_PARM_MISMATCH", "corrupt", loc, object,
+            "n-bit/scale-offset filter byte order does not match the datatype message",
+            H5Evidence {
+                field = "filter.decode_byte_order",
+                actual = h5policy_pipeline_decode_order,
+                expected = ctx.datatype_byte_order,
+                comparison = "equal",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = h5policy_pipeline_decode_order_offset#B, loc1_len = 4UL,
+                has_loc2 = 1, loc2_role = "expected",
+                loc2 = ctx.datatype_byte_order_offset#B, loc2_len = 1UL,
+            });
+
+    /* n-bit's bit precision and bit offset describe the same atomic root the
+       datatype message describes; the decompressor uses them to place each
+       element's bits, so a disagreement silently shifts every value.  */
+    if (h5policy_pipeline_has_decode_precision != 0UB
+        && ctx.has_datatype_atomic_props != 0UB
+        && h5policy_pipeline_decode_precision != ctx.datatype_bit_precision)
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_FILTER_PARM_MISMATCH", "corrupt", loc, object,
+            "n-bit filter precision does not match the datatype message",
+            H5Evidence {
+                field = "filter.decode_precision",
+                actual = h5policy_pipeline_decode_precision,
+                expected = ctx.datatype_bit_precision,
+                comparison = "equal",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = h5policy_pipeline_decode_precision_offset#B, loc1_len = 4UL,
+                has_loc2 = 1, loc2_role = "expected",
+                loc2 = ctx.datatype_bit_precision_offset#B, loc2_len = 2UL,
+            });
+
+    if (h5policy_pipeline_has_decode_bit_offset != 0UB
+        && ctx.has_datatype_atomic_props != 0UB
+        && h5policy_pipeline_decode_bit_offset != ctx.datatype_bit_offset)
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_FILTER_PARM_MISMATCH", "corrupt", loc, object,
+            "n-bit filter bit offset does not match the datatype message",
+            H5Evidence {
+                field = "filter.decode_bit_offset",
+                actual = h5policy_pipeline_decode_bit_offset,
+                expected = ctx.datatype_bit_offset,
+                comparison = "equal",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = h5policy_pipeline_decode_bit_offset_offset#B, loc1_len = 4UL,
+                has_loc2 = 1, loc2_role = "expected",
+                loc2 = ctx.datatype_bit_offset_offset#B, loc2_len = 2UL,
+            });
+
+    /* Scale-offset's fill-value availability word.  Two rules, and the
+       ASYMMETRY between them is the whole point -- the obvious symmetric
+       version is a FALSE POSITIVE on files libhdf5 writes by default.
+
+       (a) The word is an enumeration with exactly two members, 0 and 1
+           (H5Zscaleoffset.c:124-125).  The filter only ever tests it for
+           equality with 1, so any other value silently means "no fill value"
+           instead of being refused.
+       (b) A 0 (FILL_UNDEFINED) contradicts an object header that carries an
+           EXPLICIT fill value, because H5P_fill_value_defined() would then have
+           reported USER_DEFINED and the writer would have stored 1.
+
+       The converse -- a 1 with no explicit fill value in the header -- is NOT a
+       finding, and this is measured, not assumed.  H5P_fill_value_defined()
+       returns DEFAULT as well as USER_DEFINED, and the writer stores 1 for
+       both, so a dataset created without an explicit fill value has
+       cd_values[7] == 1 and a fill-value message that says
+       H5D_FILL_VALUE_DEFAULT with no value bytes.  Verified on files written by
+       libhdf5 in both shapes, plus the third shape -- an explicitly UNDEFINED
+       fill value, which correctly stores 0 and carries no value bytes either,
+       and which rule (b) therefore also leaves alone.  */
+    if (h5policy_pipeline_has_decode_filavail != 0UB
+        && h5policy_pipeline_decode_filavail > 1UL)
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_FILTER_PARM_MISMATCH", "corrupt", loc, object,
+            "scale-offset filter fill-value availability is not a defined value",
+            H5Evidence {
+                field = "filter.decode_fill_available",
+                actual = h5policy_pipeline_decode_filavail,
+                expected = 1UL,
+                comparison = "at_most",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = h5policy_pipeline_decode_filavail_offset#B, loc1_len = 4UL,
+            });
+    else if (h5policy_pipeline_has_decode_filavail != 0UB
+             && h5policy_pipeline_decode_filavail == 0UL
+             && ctx.has_fill_value != 0UB)
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_FILTER_PARM_MISMATCH", "corrupt", loc, object,
+            "scale-offset filter reports no fill value but the object header defines one",
+            H5Evidence {
+                field = "filter.decode_fill_available",
+                actual = h5policy_pipeline_decode_filavail,
+                expected = 1UL,
+                comparison = "equal",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = h5policy_pipeline_decode_filavail_offset#B, loc1_len = 4UL,
+            });
+
     /* A fixed-array chunk index has one, permanent capacity: libhdf5 computes
        prod(ceil(max_dims[i] / chunk_dim[i])) over the data dimensions
        (H5D__chunk_set_info_real, H5Dchunk.c) and stores it in the FAHD header
@@ -835,6 +953,7 @@ fun h5policy_validate_ohdr_raw = (int ios,
     h5policy_object_finding_mark = h5policy_error_finding_count;
     ctx.has_dataspace = 0UB;
     ctx.has_datatype = 0UB;
+    ctx.has_datatype_atomic_props = 0UB;
     ctx.has_dataset_layout = 0UB;
     ctx.has_fill_value = 0UB;
     ctx.has_link_info = 0UB;
@@ -854,6 +973,12 @@ fun h5policy_validate_ohdr_raw = (int ios,
     ctx.datatype_size = 0UL;
     ctx.datatype_size_offset = 0UL;
     ctx.datatype_logical_size = 0UL;
+    ctx.datatype_byte_order = 0UL;
+    ctx.datatype_byte_order_offset = 0UL;
+    ctx.datatype_bit_offset = 0UL;
+    ctx.datatype_bit_offset_offset = 0UL;
+    ctx.datatype_bit_precision = 0UL;
+    ctx.datatype_bit_precision_offset = 0UL;
     ctx.fill_value_size = 0UL;
     ctx.compact_layout_size = 0UL;
     ctx.contiguous_layout_size = 0UL;
@@ -873,6 +998,18 @@ fun h5policy_validate_ohdr_raw = (int ios,
     h5policy_pipeline_decode_size = 0UL;
     h5policy_pipeline_has_decode_size = 0UB;
     h5policy_pipeline_decode_size_offset = 0UL;
+    h5policy_pipeline_decode_order = 0UL;
+    h5policy_pipeline_has_decode_order = 0UB;
+    h5policy_pipeline_decode_order_offset = 0UL;
+    h5policy_pipeline_decode_precision = 0UL;
+    h5policy_pipeline_has_decode_precision = 0UB;
+    h5policy_pipeline_decode_precision_offset = 0UL;
+    h5policy_pipeline_decode_bit_offset = 0UL;
+    h5policy_pipeline_has_decode_bit_offset = 0UB;
+    h5policy_pipeline_decode_bit_offset_offset = 0UL;
+    h5policy_pipeline_decode_filavail = 0UL;
+    h5policy_pipeline_has_decode_filavail = 0UB;
+    h5policy_pipeline_decode_filavail_offset = 0UL;
     h5policy_pipeline_chunk_framing = 0UL;
     h5policy_pipeline_has_framing = 0UB;
     h5policy_pipeline_framing_offset = 0UL;

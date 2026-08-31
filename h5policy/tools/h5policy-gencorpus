@@ -369,6 +369,28 @@ def _gen_valid(root):
            lambda h: h.create_dataset(
                "d", data=np.arange(100, dtype="i4").reshape(10, 10),
                chunks=(5, 5), scaleoffset=0))
+    # The same filter WITH an explicit fill value.  Together the two files pin
+    # both accepting shapes of the fill-availability rule: this one has
+    # cd_values[7] == 1 and an explicit fill value in the header, the one above
+    # has cd_values[7] == 1 and NO explicit value, because
+    # H5P_fill_value_defined() reports DEFAULT as well as USER_DEFINED and the
+    # writer stores 1 for both.  Rejecting the second shape is the false
+    # positive the asymmetric rule exists to avoid, and it is a shape libhdf5
+    # writes by default -- so the control is not hypothetical.
+    # The third shape, an EXPLICITLY UNDEFINED fill value (cd_values[7] == 0
+    # with no value bytes), is also conforming and also accepted, but h5py
+    # cannot write it -- H5Pset_fill_value with a NULL value has no binding.
+    # It was measured with a C reproducer instead; see the case record.
+    _write(f"{root}/valid/scaleoffset_filter_fillvalue.h5",
+           lambda h: h.create_dataset(
+               "d", data=np.arange(100, dtype="i4").reshape(10, 10),
+               chunks=(5, 5), scaleoffset=0, fillvalue=-7))
+    # An n-bit dataset the filter actually compresses (20-bit precision at bit
+    # offset 4), which is the regime its precision and bit-offset parameters
+    # belong to; the full-precision shape leaves need_not_compress set and the
+    # pipeline a pass-through.  Valid control for the three n-bit fixtures.
+    _write_earliest(f"{root}/valid/nbit_reduced_precision.h5",
+                    _build_nbit_reduced)
     # A well-formed version-2 pipeline led by a dynamically registered filter.
     # Version 2 drops the name-length field only for filter IDs below
     # H5Z_FILTER_RESERVED (256); every dynamic filter -- lz4 (32004) here, as
@@ -450,6 +472,105 @@ def _gen_valid(root):
            lambda h: [h.create_dataset("dataset_with_a_long_name_%02d" % i,
                                        data=np.arange(2, dtype="i4"))
                       for i in range(5)])
+
+    # The fixture behind the worked example in
+    # docs/Mapping HDF5 Binary Primitives onto an Object Store.md.  It is a
+    # documentation fixture first and a corpus fixture second: the design doc
+    # quotes its spans, field offsets, and digests, so the file has to be
+    # reproducible from this generator or those numbers rot silently.
+    #
+    # The regime is what matters, and it is chosen, not incidental:
+    #   * chunk shape (2, 2) over a (4, 4) fixed-extent dataspace gives four
+    #     chunks, and writing only the left half leaves two of them
+    #     unallocated -- the example's "a chunk's absence is content" point;
+    #   * fixed maximum dimensions plus a filter select a FIXED-ARRAY chunk
+    #     index, which is the index family the example walks;
+    #   * a variable-length string attribute puts its value in a global heap
+    #     collection, giving the example its compound (collection address,
+    #     object index) relocation.
+    # `_assert_objectstore_mapping_example` below enforces every one of those.
+    write_objectstore_mapping_example(
+        f"{root}/valid/objectstore_mapping_example.h5")
+
+
+def write_objectstore_mapping_example(path):
+    """Write the object-store mapping example and assert its regime.
+
+    Public because `tools/check_objectstore_example.py` calls it to verify the
+    design document against a freshly written file, without regenerating the
+    whole corpus.
+    """
+    def _content(h):
+        d = h.create_group("g").create_dataset(
+            "d", shape=(4, 4), chunks=(2, 2), dtype="i4", compression="gzip")
+        d[0:2, 0:2] = np.arange(4, dtype="i4").reshape(2, 2)
+        d[2:4, 0:2] = np.arange(4, 8, dtype="i4").reshape(2, 2)
+        d.attrs["note"] = "some note"
+    _write(path, _content)
+    _assert_objectstore_mapping_example(path)
+    return path
+
+
+def _assert_objectstore_mapping_example(path):
+    """Assert the structural regime of the object-store mapping example.
+
+    Regime only -- the writer-independent facts the design document reasons
+    about.  The absolute spans, digests, and byte counts the document also
+    quotes are deliberately NOT checked here: they follow the writer, and
+    failing corpus generation for everyone because an h5py bump moved an
+    object header by four bytes would be the wrong trade.
+    `tools/check_objectstore_example.py` owns those, and reports them against
+    the document so the fix is to update the prose, not the corpus.
+    """
+    raw = open(path, "rb").read()
+    assert raw[8] == 3 and raw[9] == 8 and raw[10] == 8, (
+        "expected a v3 superblock with 8-byte offsets and lengths, got "
+        f"version {raw[8]}, offsets {raw[9]}, lengths {raw[10]}")
+    assert raw.count(b"GCOL") == 1, (
+        "expected exactly one global-heap collection; the variable-length "
+        "attribute value is supposed to live in it")
+    assert b"some note" in raw, "attribute value is not stored literally"
+    assert raw.count(b"FAHD") == 1 and raw.count(b"FADB") == 1, (
+        "expected one fixed-array index header and one data block; the chunk "
+        "index family changed, so the example no longer walks what it says")
+
+    with h5py.File(path, "r") as h:
+        assert "g" in h and "d" in h["g"], (
+            "the example names the dataset /g/d; a different path changes "
+            "every object-header address it quotes")
+        d = h["g/d"]
+        assert d.shape == (4, 4) and d.chunks == (2, 2), (d.shape, d.chunks)
+        assert d.maxshape == (4, 4), (
+            f"maximum dimensions must stay fixed, got {d.maxshape}; an "
+            "unlimited dimension would select an extensible array instead")
+        assert d.compression == "gzip", (
+            f"the dataset must stay deflate-filtered, got {d.compression!r}; "
+            "an unfiltered chunk is stored raw, and the example's point that a "
+            "post-filter chunk can stay `exact` without running the codec "
+            "would describe nothing")
+        assert d.id.get_num_chunks() == 2, (
+            f"expected 2 of 4 chunks allocated, got "
+            f"{d.id.get_num_chunks()}; the unallocated pair is the point")
+        for i in range(d.id.get_num_chunks()):
+            info = d.id.get_chunk_info(i)
+            assert info.filter_mask == 0, (
+                f"chunk {info.chunk_offset} has filter mask "
+                f"{info.filter_mask}; the example states every chunk is "
+                "filtered, so a skipped filter would misdescribe it")
+        assert h5py.check_vlen_dtype(d.attrs.get_id("note").dtype) is str, (
+            "the `note` attribute must stay a variable-length string, or its "
+            "value moves out of the global heap and the compound relocation "
+            "the example describes disappears")
+        ohdr = h5py.h5o.get_info(d.id).addr
+    assert raw[ohdr:ohdr + 4] == b"OHDR" and raw[ohdr + 4] == 2, (
+        f"dataset object header at {ohdr} is not a version 2 header")
+    # The layout message must be version 4 chunked with a fixed-array index:
+    # `04 02` version and class, then the index-type byte `03` immediately
+    # before the 8-byte address the example treats as its relocation.
+    assert b"\x04\x02\x00\x03\x01\x02\x02\x04\x03" in raw, (
+        "the version-4 chunked layout message with a fixed-array index and "
+        "{2, 2, 4} dimension sizes is not present; the example's relocation "
+        "offset is measured from exactly this encoding")
 
 
 def _gen_policy(root):
@@ -1298,6 +1419,23 @@ def _gen_malformed(root):
         f"{root}/malformed/scaleoffset_nelmts_mismatch.h5")
     _make_scaleoffset_size_mismatch(
         f"{root}/malformed/scaleoffset_size_mismatch.h5")
+    # The filter local parameters libhdf5 copies out of the object's own
+    # datatype and fill-value messages and never compares back.  Six files, four
+    # invariants: byte order gets one fixture per filter because the two keep
+    # the word at different cd_values indices, and fill availability gets one
+    # per arm because the rule is deliberately asymmetric.
+    _make_scaleoffset_byte_order_mismatch(
+        f"{root}/malformed/scaleoffset_byte_order_mismatch.h5")
+    _make_scaleoffset_fill_unavailable(
+        f"{root}/malformed/scaleoffset_fill_unavailable.h5")
+    _make_scaleoffset_fill_avail_undefined(
+        f"{root}/malformed/scaleoffset_fill_avail_undefined.h5")
+    _make_nbit_byte_order_mismatch(
+        f"{root}/malformed/nbit_byte_order_mismatch.h5")
+    _make_nbit_precision_mismatch(
+        f"{root}/malformed/nbit_precision_mismatch.h5")
+    _make_nbit_bit_offset_mismatch(
+        f"{root}/malformed/nbit_bit_offset_mismatch.h5")
     # The chunk-size matrix.  A chunk above 4 GiB is format-legal and, since
     # libhdf5 2.0.0, writable, so what it means depends on the layout version
     # and the chunk index type -- and the arithmetic fault that actually
@@ -1381,6 +1519,12 @@ def _gen_malformed(root):
     _make_contiguous_stored_size_past_eof(
         f"{root}/valid/contiguous_stored_size_past_eof.h5")
     _make_bad_heap_segment(f"{root}/malformed/bad_heap_segment.h5")
+    # The same declared size, relocated off prefix+32 so the load routes through
+    # the cache class that carries no end-of-address bound.  bad_heap_segment.h5
+    # is ASan-clean; this one is not.
+    _make_lheap_dblk_size_unbounded(
+        f"{root}/malformed/lheap_dblk_size_unbounded.h5")
+    _make_lheap_dblk_relocated(f"{root}/valid/lheap_dblk_relocated.h5")
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_heap_free_list_size_wrap(
         f"{root}/malformed/heap_free_list_size_wrap.h5")
@@ -2268,10 +2412,42 @@ def _make_compound_member_offset_oob(path):
     _splice_compact_datatype(path, dt, 16)
 
 
-def _scaleoffset_cd_patch(path, cd_index, value):
+def _scaleoffset_cd_patch(path, cd_index, value, fillvalue=None, expect=None,
+                          nelmts=8, written=None):
     """Build a chunked scale-offset dataset (4-element chunk of i4) and overwrite
     cd_values[cd_index] in its v2 filter pipeline message, repairing the object-
-    header checksum.  Shared by the element-count and element-size fixtures.
+    header checksum.  Shared by the element-count, element-size and
+    local-parameter fixtures.
+
+    `fillvalue` gives the dataset an EXPLICIT fill value, which the object header
+    then carries as a fill-value message with value bytes.  That distinction is
+    load-bearing for the availability fixture and nowhere else: without it
+    libhdf5 still stores cd_values[7] == 1, because H5P_fill_value_defined()
+    reports DEFAULT as well as USER_DEFINED, and the resulting file is
+    CONFORMING -- see valid/scaleoffset_filter.h5, which is that shape.
+
+    `nelmts` sizes the dataset and `written` how much of it is filled in; the
+    default writes all of it.  Leaving the tail unwritten puts the FILL VALUE
+    at an IN-EXTENT element of an ALLOCATED chunk, which is the only regime in
+    which the fill value is both encoded by the filter and visible to a reader.
+
+    That regime was arrived at by measurement, and two nearby shapes do not
+    work -- which is the whole reason it is a parameter rather than a constant:
+      * a fully written dataset never materialises the fill value, so patching
+        cd_values[7] changes the h5policy verdict and NOTHING libhdf5 returns;
+      * a dataset whose fill elements fall outside the DATASPACE (six elements
+        in 4-element chunks, say) hides them just as well -- they are in the
+        chunk, but no reader ever asks for them.
+    Both produce a fixture whose finding is correct and whose stated consequence
+    is unsupported.  Measured on the shape used here (six elements, five
+    written): the sixth reads back as the fill value -7 before the patch and as
+    5 after it, rc=0 either way.
+
+    `expect` is the value cd_values[cd_index] must hold before the patch.  These
+    fixtures target parameters libhdf5 fills in from the object's own datatype
+    and fill-value messages, so patching one whose base value is not what the
+    fixture assumes would produce a file that tests nothing: an assertion is the
+    difference between a guard fixture and a decoration.
 
     The pipeline payload is: version(1) nfilters(1); then the descriptor id(2)
     flags(2) cd_nelmts(2), followed by the 32-bit client-data words, so
@@ -2282,8 +2458,17 @@ def _scaleoffset_cd_patch(path, cd_index, value):
     bound, but h5patch's matching repair fixture wants the plain version-4
     form this filter pipeline has always needed."""
     def _build(h):
-        h.create_dataset("d", data=np.arange(8, dtype="i4"),
-                         chunks=(4,), scaleoffset=0, track_times=False)
+        kw = {} if fillvalue is None else {"fillvalue": fillvalue}
+        if written is None:
+            # The original one-shot form, kept byte-for-byte: the element-count
+            # and element-size fixtures are tracked files and must not drift
+            # because a sibling fixture needed a different shape.
+            h.create_dataset("d", data=np.arange(nelmts, dtype="i4"),
+                             chunks=(4,), scaleoffset=0, track_times=False, **kw)
+        else:
+            d = h.create_dataset("d", shape=(nelmts,), dtype="i4", chunks=(4,),
+                                 scaleoffset=0, track_times=False, **kw)
+            d[0:written] = np.arange(written, dtype="i4")
     raw = _base_bytes(_build, libver=("v110", "v110"))
 
     for o in range(len(raw) - 4):
@@ -2301,7 +2486,15 @@ def _scaleoffset_cd_patch(path, cd_index, value):
             mbody = p + 4 + (2 if flags & 0x04 else 0)
             if (mtype == 0x0b and raw[mbody] == 2 and raw[mbody + 1] == 1
                     and struct.unpack_from("<H", raw, mbody + 2)[0] == 6):
-                struct.pack_into("<I", raw, mbody + 8 + 4 * cd_index, value)
+                at = mbody + 8 + 4 * cd_index
+                if expect is not None:
+                    have = struct.unpack_from("<I", raw, at)[0]
+                    if have != expect:
+                        raise RuntimeError(
+                            f"scale-offset cd_values[{cd_index}] is {have}, "
+                            f"expected {expect}: the base file changed and this "
+                            f"fixture would patch a value it was not written for")
+                struct.pack_into("<I", raw, at, value)
                 _fix_v2_ohdr_checksum(raw, o)
                 _patch(path, bytes(raw))
                 return
@@ -2335,6 +2528,154 @@ def _make_scaleoffset_size_mismatch(path):
     driving the same out-of-bounds write.  h5policy rejects it because the
     declared element size disagrees with the dataset's datatype size."""
     _scaleoffset_cd_patch(path, 4, 131073)
+
+
+# The filter "local" parameters libhdf5 DERIVES from the object's own datatype
+# and fill-value messages (H5Z__set_local_scaleoffset, H5Z__set_parms_atomic)
+# and never compares back on read.  Each fixture below edits exactly one of
+# them, leaving the descriptor well-formed and in range, so the ONLY broken rule
+# is the agreement with the sibling message.
+#
+# These are integrity fixtures, not memory-safety ones.  MEASURED on HDF5 2.3.0:
+# an edited parameter of this kind makes libhdf5 read the dataset with rc=0 and
+# return different values, with a clean AddressSanitizer run.  Do not annotate
+# them as crashers.
+
+
+def _make_scaleoffset_byte_order_mismatch(path):
+    """A scale-offset descriptor claiming big-endian for a little-endian type.
+
+    cd_values[6] (H5Z_SCALEOFFSET_PARM_ORDER) is written from H5T_get_order() of
+    the dataset's own datatype (H5Zscaleoffset.c:1035, :1039).  On read the
+    filter compares it only against H5T_native_order_g, to decide whether to
+    byte-swap (:1128, :1133) -- never against the datatype message that produced
+    it.  Flipping LE (0) to BE (1) therefore inverts every element's byte order
+    silently.  Measured on a f8 dataset: all 42 values came back as unrelated
+    magnitudes (1.19453e+103, -4.60704e-30, ...) with h5dump exiting 0."""
+    _scaleoffset_cd_patch(path, 6, 1, expect=0)
+
+
+def _make_scaleoffset_fill_unavailable(path):
+    """A scale-offset descriptor reporting no fill value on a dataset that
+    defines one.
+
+    cd_values[7] (H5Z_SCALEOFFSET_PARM_FILAVAIL) is written from
+    H5P_fill_value_defined() (H5Zscaleoffset.c:1051-1060).  The decompressor
+    tests it for equality with H5Z_SCALEOFFSET_FILL_DEFINED and takes the
+    "no fill value" path otherwise, so the fill sentinels in the encoded chunk
+    decode as ordinary numbers.
+
+    THE EXPLICIT FILL VALUE IS THE FIXTURE.  Without it the file would be
+    conforming: libhdf5 stores 1 for a DEFAULT fill value too, and h5policy must
+    not reject that -- valid/scaleoffset_filter.h5 pins exactly that shape.
+
+    THE UNWRITTEN ELEMENT IS THE WITNESS.  Six elements, five written, so the
+    sixth is the fill value, in extent, inside a chunk the filter really encoded.
+    MEASURED: it reads back as -7 before the patch and as 5 after it, both rc=0.
+    See _scaleoffset_cd_patch for the two nearby shapes that produce no witness
+    at all."""
+    _scaleoffset_cd_patch(path, 7, 0, fillvalue=-7, expect=1, nelmts=6, written=5)
+
+
+def _make_scaleoffset_fill_avail_undefined(path):
+    """A scale-offset descriptor whose fill-value availability word is outside
+    its two-member enumeration.
+
+    H5Z_SCALEOFFSET_FILL_UNDEFINED is 0 and FILL_DEFINED is 1
+    (H5Zscaleoffset.c:124-125); nothing else has a meaning.  Because the filter
+    only ever tests for equality with 1, an out-of-range word is not refused --
+    it silently means "no fill value", exactly as a 0 would.  169 is used rather
+    than a near-miss to make the intent unmistakable in a hex dump.
+
+    Unlike the sibling above this needs no explicit fill value: a word outside
+    the enumeration is wrong against any object header."""
+    _scaleoffset_cd_patch(path, 7, 169, expect=1)
+
+
+def _build_nbit_reduced(h):
+    """A chunked n-bit dataset that n-bit actually COMPRESSES.
+
+    _build_nbit uses a full-precision native int32, for which
+    H5Z__set_parms_atomic leaves need_not_compress set (cd_values[1] == 1) and
+    the pipeline is a pass-through.  The precision and bit-offset parameters are
+    still written, but a fixture built on that base would exercise a parameter no
+    read path consumes.  A 20-bit precision at bit offset 4 makes the filter do
+    real work (1.587:1 on this shape), which is the regime the parameters belong
+    to.  h5py has no high-level spelling for either n-bit or a reduced-precision
+    datatype, so both go through the low-level API."""
+    dtype = h5py.h5t.STD_I32LE.copy()
+    dtype.set_precision(20)
+    dtype.set_offset(4)
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_chunk((5, 5))
+    dcpl.set_filter(5, 0, ())                    # 5 == H5Z_FILTER_NBIT
+    sid = h5py.h5s.create_simple((10, 10))
+    d = h5py.h5d.create(h.id, b"d", dtype, sid, dcpl=dcpl)
+    d.write(h5py.h5s.ALL, h5py.h5s.ALL,
+            np.arange(100, dtype="i4").reshape(10, 10))
+
+
+def _nbit_cd_patch(path, cd_index, value, expect):
+    """Overwrite cd_values[cd_index] of the n-bit descriptor in a v1 filter
+    pipeline message, on the reduced-precision base above.
+
+    libver="earliest" writes a VERSION 1 pipeline message, whose descriptor is
+        filter id (2) | name length (2) | flags (2) | cd_nelmts (2) | name | cd
+    so the client data starts at cd_nelmts + 2 + name_length; the name length is
+    already padded to a multiple of 8.  _pipeline_cd_nelmts_offset locates the
+    descriptor by scanning for the filter id, which is why `expect` matters: a
+    wrong hit would patch an unrelated word and produce a fixture that tests
+    nothing.  A v1 message carries no checksum, and the edit is size-neutral, so
+    no header repair is needed -- unlike the v2 scale-offset path."""
+    raw = _base_bytes(_build_nbit_reduced, libver="earliest")
+    off = _pipeline_cd_nelmts_offset(raw, 5)
+    nelmts = struct.unpack_from("<H", raw, off)[0]
+    name_len = struct.unpack_from("<H", raw, off - 4)[0]
+    if cd_index >= nelmts:
+        raise RuntimeError(
+            f"n-bit descriptor holds {nelmts} values, cannot patch [{cd_index}]")
+    at = off + 2 + name_len + 4 * cd_index
+    have = struct.unpack_from("<I", raw, at)[0]
+    if have != expect:
+        raise RuntimeError(
+            f"n-bit cd_values[{cd_index}] is {have}, expected {expect}: the base "
+            f"file changed and this fixture would patch a value it was not "
+            f"written for")
+    struct.pack_into("<I", raw, at, value)
+    _patch(path, bytes(raw))
+
+
+def _make_nbit_byte_order_mismatch(path):
+    """An n-bit descriptor claiming big-endian for a little-endian type.
+
+    Same invariant as the scale-offset sibling and a separate fixture on
+    purpose: n-bit keeps the order word at cd_values[5] and scale-offset at
+    cd_values[6], so the two recording branches are different code and a wrong
+    constant in either would go untested with only one file.  On read n-bit
+    branches on it at H5Znbit.c:1091 and asserts the other arm at :1105 -- a
+    no-op in a release build."""
+    _nbit_cd_patch(path, 5, 1, expect=0)
+
+
+def _make_nbit_precision_mismatch(path):
+    """An n-bit descriptor whose bit precision contradicts the datatype message.
+
+    cd_values[6] comes from H5T_get_precision() of the same datatype the object
+    header describes (H5Znbit.c:479).  The decompressor uses it to place each
+    element's bits, so a disagreement shifts every value silently.  24 against a
+    20-bit datatype: still inside the 32-bit storage size, so the datatype-level
+    precision bounds are untouched and only the agreement rule is broken."""
+    _nbit_cd_patch(path, 6, 24, expect=20)
+
+
+def _make_nbit_bit_offset_mismatch(path):
+    """An n-bit descriptor whose bit offset contradicts the datatype message.
+
+    cd_values[7] comes from H5T_get_offset() (H5Znbit.c:482).  Patched 4 -> 0,
+    which is the value a full-width type would legitimately carry -- the point
+    being that the word is individually plausible and only wrong RELATIVE to the
+    datatype message, which is the whole class of defect this rule covers."""
+    _nbit_cd_patch(path, 7, 0, expect=4)
 
 
 def _v1_object_header(raw, want_type):
@@ -7876,6 +8217,103 @@ def _make_bad_heap_segment(path):
     if heap < 0:
         raise RuntimeError("could not locate the local heap")
     # HEAP(4) + version(1) + reserved(3) then the data-segment size (a length).
+    struct.pack_into("<Q", raw, heap + 8, 0x0000_0100_0000_0000)
+    _patch(path, bytes(raw))
+
+
+def _relocate_lheap_segment(raw):
+    """Move a local heap's data segment off prefix + 32, contents and all.
+
+    Returns the heap-prefix offset.  A non-contiguous data segment is ORDINARY
+    -- libhdf5 relocates one whenever the heap grows -- so this transform on its
+    own must leave a perfectly valid file, and valid/lheap_dblk_relocated.h5
+    exists to pin that.  Without that control, a future "fix" that simply
+    rejected non-contiguous segments would keep every malformed fixture here
+    passing while breaking real files.
+    """
+    heap = raw.find(b"HEAP")
+    if heap < 0:
+        raise RuntimeError("could not locate the local heap")
+    seg_size = struct.unpack_from("<Q", raw, heap + 8)[0]
+    seg_addr = struct.unpack_from("<Q", raw, heap + 24)[0]
+    if seg_addr != heap + 32:
+        raise RuntimeError(
+            "expected a data segment contiguous with its prefix (addr %d, "
+            "prefix+32 %d); the base file changed and this transform would not "
+            "move it off the flagged load class" % (seg_addr, heap + 32))
+    if not 0 < seg_size <= len(raw) - seg_addr:
+        raise RuntimeError("implausible data-segment size %d" % seg_size)
+
+    segment = bytes(raw[seg_addr:seg_addr + seg_size])
+    new_addr = len(raw)
+    raw += segment                       # the contents move with the address
+    struct.pack_into("<Q", raw, heap + 24, new_addr)
+
+    # The superblock's end-of-address must cover the relocated segment.  In a
+    # version-0 superblock the base address, free-space address and EOA follow
+    # the fixed 24-byte prefix, each sizeof_offsets wide -- derived from byte 13
+    # rather than counted out by hand.
+    if raw[8] != 0:
+        raise RuntimeError("expected a version-0 superblock, found version %d"
+                           % raw[8])
+    eoa_off = 24 + 2 * raw[13]
+    if struct.unpack_from("<Q", raw, eoa_off)[0] != len(raw) - len(segment):
+        raise RuntimeError(
+            "superblock EOA at %d reads %d, expected the pre-append file size "
+            "%d; the layout assumption is wrong and extending it would corrupt "
+            "an unrelated field"
+            % (eoa_off, struct.unpack_from("<Q", raw, eoa_off)[0],
+               len(raw) - len(segment)))
+    struct.pack_into("<Q", raw, eoa_off, len(raw))
+    return heap
+
+
+def _make_lheap_dblk_relocated(path):
+    """VALID CONTROL: a local heap whose data segment is legally not contiguous
+    with its prefix.  Everything about it is well-formed; only the segment's
+    address differs from the shape h5py happens to write.  Pins the regime that
+    malformed/lheap_dblk_size_unbounded.h5 depends on."""
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    _relocate_lheap_segment(raw)
+    _patch(path, bytes(raw))
+
+
+def _make_lheap_dblk_size_unbounded(path):
+    """The same oversized local-heap data segment as bad_heap_segment.h5, but
+    RELOCATED so the load routes through the unchecked cache class.
+
+    WHY A SECOND FIXTURE FOR ONE ORACLE RULE.  H5C__load_entry applies its
+    end-of-address bound only to classes carrying
+    H5AC__CLASS_SPECULATIVE_LOAD_FLAG (H5Centry.c:1050-1052).  A local-heap data
+    segment CONTIGUOUS with its prefix (address == prefix + 32) is part of the
+    flagged prefix load and is bounded; a segment anywhere else is a separate
+    H5AC_LHEAP_DBLK load, which carries no flag and is not.  The file chooses
+    which, through eight bytes of address.
+
+    bad_heap_segment.h5 leaves the address at prefix + 32 and is therefore
+    AddressSanitizer-CLEAN despite declaring ~1 TB.  This fixture moves the
+    segment and nothing else, and the same declared size reaches an unchecked
+    H5MM_malloc.  Two files, one oracle rule, two different libhdf5 paths --
+    which is the point, and why neither covers the other.
+
+    THE SEGMENT IS COPIED, NOT JUST REPOINTED.  Aiming the address at arbitrary
+    bytes leaves the symbol-table entries indexing into non-heap data and the
+    file picks up an unrelated finding (H5_CORRUPT_LINK_NAME_EMPTY measured),
+    so the fixture would then reject for the wrong reason.  The real segment is
+    appended at the end of the file, the EOA is extended to cover it, and only
+    then is the address moved -- so the heap contents stay valid and the ONLY
+    defect is the declared size.
+
+    See registry/cases/cache-load-length-eoa-check-is-class-gated.yml.
+    """
+    raw = _base_bytes(
+        lambda h: h.create_dataset("d", data=np.arange(4, dtype="i4")),
+        libver="earliest")
+    heap = _relocate_lheap_segment(raw)
+
+    # Now the defect: a declared size no file could hold.
     struct.pack_into("<Q", raw, heap + 8, 0x0000_0100_0000_0000)
     _patch(path, bytes(raw))
 
