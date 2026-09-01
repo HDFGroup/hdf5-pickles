@@ -1,0 +1,142 @@
+/* family_vfd.pk - HDF5 "family" VFD virtual-file assembler.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   - The HDF5 "family" VFD (H5FD_FAMILY): one logical HDF5 address space
+ *     split across a sequence of equal-sized physical member files, named
+ *     by applying an HDF5-style printf pattern (e.g. "fam-%06d.h5") to a
+ *     0-based member index. Unlike "multi" (whose member names are a real
+ *     H5Pset_fapl_multi() parameter), family's pattern is not a property --
+ *     H5Pset_fapl_family()/H5Pget_fapl_family() only carry memb_size and
+ *     memb_fapl_id. The pattern is the filename itself, passed straight to
+ *     H5Fcreate()/H5Fopen() (H5FD__family_get_default_printf_filename() in
+ *     H5FDfamily.c auto-inserts "-%06d" before ".h5" if the caller's
+ *     filename doesn't already contain a "%d" conversion).
+ *
+ *   family_member_name() parses that pattern (a literal "%d", or "%0Nd"
+ *   for zero-padded fixed width N) and renders it for one index.
+ *
+ *   assemble_family() concatenates member files in index order -- stopping
+ *   at the first index whose member file does not exist -- into a single
+ *   physical file at output_path, via poke's ios_copy_bytes (no bytes pass
+ *   through poke's own value stack).  The result decodes with
+ *   superblock.pk / ohdr_msgs.pk completely unmodified: the family driver
+ *   writes its *global* logical eof into the superblock's eof_addr on every
+ *   member (confirmed against real v0/v1 and v2/v3 family fixtures), so
+ *   unlike "multi" (see drv_info.pk), no further address-space patching is
+ *   needed before decoding the assembled file.
+ *
+ *   output_path is caller-supplied and never removed by this pickle --
+ *   assemble_family only ever writes an ordinary file at a path the caller
+ *   already chose, so the caller always knows where it landed.
+ *
+ * Load order:
+ *   (poke) .load pickles/family_vfd.pk
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk   <- and whatever else you need to
+ *                                            explore the assembled file
+ *                                            (ohdr_msgs.pk, stab.pk, ...)
+ *
+ * Quick start:
+ *   pattern is exactly the filename the file was created/opened with (e.g.
+ *   what h5py.File(pattern, driver="family", ...) was called with) -- not a
+ *   separate property; H5Pset_fapl_family() has no naming parameter at all.
+ *   family_member_name() resolves member paths relative to poke's current
+ *   working directory, so either cd there first or fold the directory into
+ *   pattern itself (e.g. "/data/run-%05d.h5").
+ *
+ *     var total = assemble_family("fam-%05d.h5", "/tmp/assembled.h5");
+ *     printf("assembled %v bytes\n", total);
+ *
+ *     var f = open("/tmp/assembled.h5");
+ *     set_ios(f);
+ *     var sb = superblock @ 0#B;
+ *     printf("super_vers=%v\n", sb.super_vers);
+ *     close(f);
+ *
+ *   From there the assembled file decodes like any ordinary HDF5 file --
+ *   load ohdr_msgs.pk / stab.pk / etc. and navigate it exactly as usual.
+ */
+
+fun family_member_name = (string pattern, int i) string:
+{
+    var pct = -1;
+    var j = 0;
+    while (j < pattern'length) {
+        if (pattern[j] == '%') {
+            pct = j;
+            break;
+        }
+        j = j + 1;
+    }
+    if (pct == -1) {
+        printf("family_member_name: no '%%d' specifier in pattern: %s\n", pattern);
+        raise E_inval;
+    }
+
+    var k = pct + 1;
+    var zero_padded = 0;
+    if (k < pattern'length && pattern[k] == '0') {
+        zero_padded = 1;
+        k = k + 1;
+    }
+    var width = 0;
+    while (k < pattern'length && pattern[k] >= '0' && pattern[k] <= '9') {
+        width = width * 10 + ((pattern[k] - '0') as int);
+        k = k + 1;
+    }
+    if (k >= pattern'length || pattern[k] != 'd') {
+        printf("family_member_name: malformed '%%d' specifier in pattern: %s\n", pattern);
+        raise E_inval;
+    }
+
+    var prefix = pattern[0:pct];
+    var suffix = pattern[k + 1:pattern'length];
+
+    var num = format("%v", i);
+    if (zero_padded)
+        while (num'length < width)
+            num = "0" + num;
+
+    return prefix + num + suffix;
+}
+
+fun assemble_family = (string pattern, string output_path) uint<64>:
+{
+    var out = open(output_path, IOS_F_CREATE | IOS_F_TRUNCATE | IOS_F_WRITE | IOS_F_READ);
+    var total = 0UL;
+    var i = 0;
+    var done = 0;
+
+    while (!done) {
+        var member_name = family_member_name(pattern, i);
+        try {
+            var mf = open(member_name, IOS_F_READ);
+            var msize = iosize(mf) /#B;
+            ios_copy_bytes(mf, out, 0#B, total#B, msize#B);
+            total = total + msize;
+            close(mf);
+            i = i + 1;
+        } catch (Exception e) {
+            done = 1;
+        }
+    }
+    close(out);
+    return total;
+}

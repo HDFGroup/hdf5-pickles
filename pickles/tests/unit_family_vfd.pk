@@ -1,0 +1,112 @@
+/* Regression coverage for the "family" VFD member-name pattern parser and
+ * assemble_family()'s real file-copying behavior. */
+load "family_vfd.pk";
+
+var failures = 0;
+fun expect_family = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else {
+        printf("FAIL %s\n", name);
+        failures = failures + 1;
+    }
+}
+
+expect_family("zero_padded_first_member",
+              family_member_name("fam-%05d.h5", 0) == "fam-00000.h5");
+expect_family("zero_padded_multi_digit_member",
+              family_member_name("fam-%05d.h5", 42) == "fam-00042.h5");
+expect_family("zero_padded_overflows_width_without_truncating",
+              family_member_name("fam-%02d.h5", 12345) == "fam-12345.h5");
+expect_family("plain_no_padding",
+              family_member_name("fam-%d.h5", 7) == "fam-7.h5");
+expect_family("prefix_and_suffix_preserved_verbatim",
+              family_member_name("/data/run-%03d.member.h5", 5)
+              == "/data/run-005.member.h5");
+
+var rejected = 0;
+try {
+    var ignored = family_member_name("no-percent-d.h5", 0);
+} catch (Exception e) {
+    rejected = 1;
+}
+expect_family("pattern_without_percent_d_is_rejected", rejected);
+
+var rejected_bad_spec = 0;
+try {
+    var ignored = family_member_name("fam-%05s.h5", 0);
+} catch (Exception e) {
+    rejected_bad_spec = 1;
+}
+expect_family("percent_specifier_other_than_d_is_rejected", rejected_bad_spec);
+
+/* --- assemble_family(): real file-copying regression ---
+ * Runs against real on-disk member files (not the in-memory "*name*" IOS
+ * used elsewhere in pickles/tests/ -- that backend pads iosize() up to a
+ * fixed 4096-byte buffer, which would silently break assemble_family's
+ * "copy exactly iosize(member) bytes" accounting). WORKING_DIRECTORY for
+ * this test is the CMake build directory (see CMakeLists.txt), not the
+ * source tree, so these scratch files never touch tracked/source paths.
+ */
+
+fun make_member = (string path, byte pattern, int count) void:
+{
+    var ios = open(path, IOS_F_CREATE | IOS_F_TRUNCATE | IOS_F_WRITE | IOS_F_READ);
+    var data = byte[count]();
+    var i = 0;
+    while (i < count) {
+        data[i] = pattern;
+        i = i + 1;
+    }
+    byte[count] @ ios : 0#B = data;
+    close(ios);
+}
+
+fun bytes_all_equal = (byte[] b, byte v) int:
+{
+    var ok = 1;
+    var i = 0;
+    while (i < b'length) {
+        if (b[i] != v) ok = 0;
+        i = i + 1;
+    }
+    return ok;
+}
+
+make_member("family_vfd_regress-00000.h5", 0xAAUB, 10);
+make_member("family_vfd_regress-00001.h5", 0xBBUB, 6);
+make_member("family_vfd_regress-00002.h5", 0xCCUB, 14);
+
+var assembled_total = assemble_family("family_vfd_regress-%05d.h5",
+                                       "family_vfd_regress_out.h5");
+expect_family("assemble_family_total_matches_sum_of_members",
+              assembled_total == 30UL);
+
+/* Comparisons run while the IOS is still open: a mapped byte[] is a lazy
+ * proxy into its IOS, not a detached copy -- indexing it after close()
+ * re-reads from a closed IOS and raises "no IOS" instead of comparing
+ * already-fetched bytes. */
+var out_ios = open("family_vfd_regress_out.h5", IOS_F_READ);
+var out_size = iosize(out_ios) /#B;
+var member0_intact = bytes_all_equal(byte[10] @ out_ios : 0#B, 0xAAUB);
+var member1_intact = bytes_all_equal(byte[6]  @ out_ios : 10#B, 0xBBUB);
+var member2_intact = bytes_all_equal(byte[14] @ out_ios : 16#B, 0xCCUB);
+close(out_ios);
+
+expect_family("assemble_family_stops_at_first_missing_member",
+              out_size == 30UL);
+expect_family("assemble_family_preserves_first_member_bytes", member0_intact);
+expect_family("assemble_family_preserves_second_member_bytes", member1_intact);
+expect_family("assemble_family_preserves_third_member_bytes", member2_intact);
+
+var no_members_total = assemble_family("family_vfd_regress_nomatch-%05d.h5",
+                                        "family_vfd_regress_empty.h5");
+expect_family("assemble_family_returns_zero_when_first_member_is_missing",
+              no_members_total == 0UL);
+
+if (failures != 0) {
+    printf("UNIT FAMILY_VFD: %i32d failure(s)\n", failures);
+    exit(1);
+}
+printf("UNIT FAMILY_VFD: all passed\n");
