@@ -45,6 +45,31 @@ retraction narrative belongs. Nothing has to be remembered at rename time. A dea
 name too generic to word-match safely is skipped and reported by name, so the gap
 is visible; outside a git checkout the whole rule reports that it is unchecked.
 
+A separate checker, `tools/check_source_citations.py`, gates the other kind of
+citation that rots silently: **a line number into one of our own pickles**. A
+renamed field leaves a name to compare against, so history can catch it; a line
+number leaves nothing, and stays syntactically valid while the code moves under
+it. Measured when that checker was written, **all six** such citations in the
+tracked tree were stale — two by more than five hundred lines, two landing on
+unrelated code.
+
+So the citation has to say what it points at, and the checker holds it to that:
+
+```
+h5_datatype.pk:1180 (member_off > elm_size)
+h5_walk.pk:806 (H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS)
+h5_group.pk:194-262 (h5policy_local_heap_data_addr, data_seg_addr)
+```
+
+Every substantial token in the parenthesised anchor must appear at the cited line
+(±3 lines, or anywhere inside a declared range). Prose may wrap between the
+citation and its anchor, including after a `#` comment marker, but nothing else
+may come between them — so a citation with no anchor cannot quietly adopt the
+next parenthetical in the sentence. When a citation does break, the error names
+the missing token, which turns the repair into a grep. Citations into the libhdf5
+tree are deliberately **not** covered: that tree is not in this repo and those
+citations are pinned to a stated upstream version instead.
+
 ## Vocabulary (from the strategy doc)
 
 `scope` — where the invariant is checked (§3, §11.2):
