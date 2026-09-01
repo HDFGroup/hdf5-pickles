@@ -606,6 +606,9 @@ def _gen_policy(root):
     _make_vds_nentries_overcount(
         f"{root}/malformed/vds_nentries_overcount.h5",
         f"{root}/policy/vds_absolute_source.h5")
+    _make_vds_nentries_cleanup_overrun(
+        f"{root}/cve/vds_nentries_cleanup_overrun.h5",
+        f"{root}/policy/vds_absolute_source.h5")
     # A second VDS base, because vds_absolute_source maps a whole extent and so
     # serializes H5S_SEL_ALL for BOTH selections -- a 16-byte header with no
     # flags, no encoding size and no rank.  Selection-header fixtures need a
@@ -3518,6 +3521,55 @@ def _make_vds_nentries_overcount(path, base_path):
     if nentries != 1:
         raise RuntimeError(f"expected a single-mapping VDS base, got {nentries}")
     struct.pack_into("<Q", raw, data + 1, nentries + 1)
+    checksum = data + obj_size - 4
+    struct.pack_into("<I", raw, checksum,
+                     _jenkins_lookup3()(bytes(raw[data:checksum])))
+    _patch(path, raw)
+
+
+def _make_vds_nentries_cleanup_overrun(path, base_path):
+    """VDS mapping count whose wrap leaves a USABLE allocation, so the failure
+    CLEANUP is what runs off the end rather than the decode loop.
+
+    The sibling cve/vds_nentries_mult_overflow.h5 picks 2^61, whose product with
+    sizeof(H5O_storage_virtual_ent_t) wraps to ZERO.  That faults on entry 0's
+    own write, inside the decode loop, and so never reaches
+    H5D__virtual_free_layout_mappings -- which is the failure path
+    registry/cases/vds-mapping-count-overflows-entry-allocation.yml identifies as
+    the more serious half, because it iterates the UNWRAPPED count over the
+    wrapped buffer and hands each out-of-bounds entry to H5D_close and H5MM_xfree.
+
+    Reaching it needs a product that is at least one entry wide, so entry 0
+    decodes and the ordinary payload bound is what fails.  On a 64-bit build
+    sizeof(H5O_storage_virtual_ent_t) is 352 == 2**5 * 11, so
+    ``count * 352 mod 2**64`` depends only on ``count mod 2**59``: writing
+    ``count = k * 2**59 + m`` gives a product of exactly ``m * 352`` bytes while
+    list_nused stays astronomically large.  m == 1 is the tightest isolation
+    (the allocation covers exactly the one mapping the base encodes); m == 2 is
+    used here so a base that ever grows a second mapping still reaches the
+    cleanup rather than faulting in the decode loop.
+
+    WIDTH: the amplification is 64-bit only, and provably so.  The narrowing to
+    size_t happens before the multiply, and requiring the low 59 bits to be small
+    forces the low 32 bits small too -- so no single count can leave list_nused
+    huge on both ABIs.  On i386 this count narrows to 2, the product is 416
+    bytes, and libhdf5 rejects the file with an ordinary H5Dopen2 error.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    # create_virtual_dataset can't set track_times=False; pin the timestamps so
+    # this fixture stays byte-reproducible.
+    _pin_ohdr_times(raw)
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError("generated VDS fixture has no global heap")
+    data = gcol + 32
+    obj_size = struct.unpack_from("<Q", raw, gcol + 24)[0]
+    if obj_size < 13 or data + obj_size > len(raw):
+        raise RuntimeError("generated VDS heap object geometry changed")
+    nentries = struct.unpack_from("<Q", raw, data + 1)[0]
+    if nentries != 1:
+        raise RuntimeError(f"expected a single-mapping VDS base, got {nentries}")
+    struct.pack_into("<Q", raw, data + 1, (1 << 59) + 2)
     checksum = data + obj_size - 4
     struct.pack_into("<I", raw, checksum,
                      _jenkins_lookup3()(bytes(raw[data:checksum])))

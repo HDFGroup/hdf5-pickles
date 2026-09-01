@@ -33,6 +33,18 @@ invariant referenced by a finding or route rule exists in its record, every
 required fixture finding is catalogued, every generated fixture is owned by an
 expectation, and no YAML key or finding code is defined twice.
 
+It also gates **stale citations of retired case-record fields**. When a record
+renames one of its own fields, every citation of the old name elsewhere is left
+dangling — and worse, may keep asserting whatever the rename retracted. That has
+happened: `registry_reading_note` was renamed from an earlier heading in two
+records, and three files went on citing the dead name. So the deny-list is
+*derived from git history* rather than declared: every top-level field name a
+record has ever carried, minus the names any record carries now, is a dead name,
+and a dead name may appear only in a record that once had it — which is where the
+retraction narrative belongs. Nothing has to be remembered at rename time. A dead
+name too generic to word-match safely is skipped and reported by name, so the gap
+is visible; outside a git checkout the whole rule reports that it is unchecked.
+
 ## Vocabulary (from the strategy doc)
 
 `scope` — where the invariant is checked (§3, §11.2):
