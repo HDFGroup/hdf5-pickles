@@ -1,0 +1,382 @@
+# The datatype decoder descends one C stack frame per nesting level with no
+# depth limit, so the depth is whatever the input says.  One VLen level costs an
+# attacker 8 bytes and libhdf5 ~448 bytes of stack -- a 56x amplification from
+# input bytes to stack bytes.
+#
+# READ THIS FIRST, because the obvious measurement says the opposite.  Both
+# exact-build probes report `accepted` on the tracked fixture, and h5dump -pH
+# prints all 5,000 levels and exits 0.  That is a DEFAULT-CONFIGURATION false
+# negative: the probe runs on a main thread with an 8 MiB stack, which is exactly
+# where the file is harmless.  This is a two-axis defect -- depth CROSSED WITH
+# stack size -- and sweeping only the depth proves nothing.
+#
+# The exposure then splits, and the halves deserve different severities:
+#   * a datatype inside an OBJECT HEADER is capped at 8187 levels by the
+#     container, not by the code, so it crashes only on a stack under ~3.5 MiB;
+#   * H5Tdecode on an application buffer has NO ceiling, and the default 8 MiB
+#     stack dies at depth 19437 from a 152 KiB buffer.
+# Keeping those apart is the whole point of this record.
+schema_version: 1
+
+id: datatype-nesting-depth-uncapped
+title: the datatype decoder recurses once per nesting level with no depth limit --
+  bounded to 8187 levels inside an object header by the two-byte message size, and
+  unbounded via H5Tdecode, where a 152 KiB buffer exhausts a default 8 MiB stack
+status: oracle-hardened          # h5policy rejects on resource grounds; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+  RELATED AND WORTH CHECKING BEFORE ANY FILING: a SIBLING stack-exhaustion defect
+  at a different site -- unbounded recursion in H5O__shared_read -- is recorded in
+  registry/cases/shared-message-self-reference-recursion.yml and came from a
+  private disclosure held outside this repository.  Datatype nesting depth appears
+  in neither.  If that reporter's scope is "recursive decoders" rather than that
+  one function, this case may fall inside it.
+
+# -- Triage -------------------------------------------------------------------
+record: datatypes
+versions: [1, 3]                 # datatype message versions carrying the nested classes
+root_cause_classification: resource
+violated_invariant:
+  - datatype.recursion_depth
+validation_closure: >-
+  the datatype message alone: the chain of nested class headers, counted before
+  any of them is materialised.  No other record is needed -- the depth is a
+  property of the message, which is why h5policy can decide it in a preflight
+  without descending.
+activation_before_validation:
+  - native_construction         # one H5T_t is allocated per level as it descends
+entry_points:
+  - "h5policy (oracle) -- reject_resource at the datatype preflight, without descending the chain"
+  - "libhdf5 H5Fopen then H5Dopen2, or any traversal reaching the object.  H5Fopen ALONE IS SAFE: the datatype is decoded lazily"
+  - "libhdf5 H5O__dtype_decode_helper (src/H5Odtype.c) -- six self-recursive sites, no depth parameter, no cap"
+  - "libhdf5 H5Tdecode2 -> H5T_decode -> H5O_msg_decode -> the same helper, with NO object-header message-size ceiling (src/H5T.c)"
+  - "shipped tools: h5dump and h5ls reach it; on the default main-thread stack both exit 0"
+
+# -- The defect, read out of the source tree -----------------------------------
+defect: >-
+  H5O__dtype_decode_helper (src/H5Odtype.c) descends a nested datatype by calling
+  itself, and its signature carries no depth:
+    H5O__dtype_decode_helper(unsigned *ioflags, const uint8_t **pp, H5T_t *dt,
+                             bool skip, const uint8_t *p_end)
+  The VLen branch recurses unconditionally:
+    if (NULL == (dt->shared->parent = H5T__alloc()))
+        HGOTO_ERROR(H5E_DATATYPE, H5E_NOSPACE, FAIL, "memory allocation failed");
+    if (H5O__dtype_decode_helper(ioflags, pp, dt->shared->parent, skip, p_end) < 0)
+        HGOTO_ERROR(H5E_DATATYPE, H5E_CANTDECODE, FAIL, "unable to decode VL parent type");
+  There are SIX such sites at head -- compound member, enum parent, VLen parent,
+  array parent, and the complex class added at 2.0.0 -- and the file contains no
+  depth counter, no depth parameter and no mention of a recursion or nesting
+  limit at any tag examined.
+  Nothing the decoder reads is out of range: the H5_IS_KNOWN_BUFFER_OVERFLOW
+  guards are present and correct.  The wrong decision is descending an
+  attacker-chosen depth on the C stack at all, before anything has established
+  that the depth is affordable -- which is why this is classified `resource` and
+  why no amount of encoding validation finds it.  The encoding is valid.
+
+the_container_caps_one_path_and_not_the_other: >-
+  THE MOST LOAD-BEARING FIELD IN THIS RECORD, because it is what makes the
+  default-configuration probe result honest rather than wrong.
+  A v2 object-header message body is length-prefixed with TWO bytes, and the
+  fixture's header flags select a two-byte chunk-0 size:
+    datatype message body = 8*D + 12   ->  D <= 8190
+    OH chunk-0 size       = 8*D + 38   ->  D <= 8187
+  So one datatype message holds at most 8187 VLen levels, needing about 3.5 MiB
+  of stack -- comfortably inside the default 8 MiB.  Three ways to exceed that
+  were considered and rejected: a v1 object header also uses a two-byte message
+  size; a message cannot span continuation chunks; and chaining across objects is
+  the shared-message path, which is the sibling defect named under `disclosure`.
+  The VLen wrapper is also the cheapest linear nesting the format offers -- a
+  single-member compound or an array level costs more bytes per frame -- so 8
+  bytes per level is the attacker's best case and 8187 is a real ceiling.
+  H5T_decode HAS NO SUCH CEILING.  It takes an application-supplied buffer and
+  size and reaches the same helper with no object header:
+    H5T_decode(size_t buf_size, const unsigned char *buf)
+    ...
+    H5O_msg_decode(f, NULL, H5O_DTYPE_ID, buf_size, buf)
+  The depth is then bounded only by the buffer the application passes, and
+  H5Tencode/H5Tdecode exist precisely so a type can be shipped between files and
+  processes -- so such a buffer is routinely attacker-reachable data rather than
+  a local constant.
+
+the_teardown_recurses_too: >-
+  H5T__free (src/H5T.c) releases the chain by recursion, on the success and the
+  failure path alike:
+    assert(dt->shared->parent != dt);
+    if (dt->shared->parent && H5T_close_real(dt->shared->parent) < 0)
+        HDONE_ERROR(H5E_DATATYPE, H5E_CANTCLOSEOBJ, FAIL, "unable to close parent data type");
+  with the same shape for compound members.  Decode and teardown are sequential
+  rather than nested, so the peak is max(decode, teardown) and the measured
+  thresholds already include it.  It matters for the FIX: a depth cap still has
+  to unwind whatever was already built, and if that unwinding recurses to the
+  rejected depth then the cap has moved the crash rather than removed it.  Same
+  shape as registry/cases/mdci-reconstruct-cleanup-unsafe.yml and the cleanup half
+  of registry/cases/vds-mapping-count-overflows-entry-allocation.yml.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  date_and_build: >-
+    2026-09-01, libhdf5 develop 51b92ccee54ed3f14af3509c9ac5e4f3c82e58ce
+    (H5_VERS 2.3.0).  baseline Release/RelWithDebInfo no sanitizers; candidate
+    RelWithDebInfo -fsanitize=address; plus an i386 -m32 variant and, for the
+    consumer arm, h5py 3.13.0 with its bundled libhdf5 1.14.5.
+    Workstation-local installs; paths not recorded.
+  oracle: >-
+    reject_resource under untrusted-strict and forensic, one finding,
+    H5_RESOURCE_DATATYPE_RECURSION_DEPTH.  The offsets DIFFER between profiles --
+    588 and 1100 -- because the profiles carry different depth caps and 8 bytes
+    per level puts strict at roughly nesting level 65 and forensic at roughly
+    129.  Both are one to two orders of magnitude below any measured stack
+    threshold, and neither descends the chain.
+  probe_false_negative: >-
+    baseline `accepted`, candidate `accepted`, no violations, on the tracked
+    fixture.  Read alone that says "no defect".  It says "the default
+    configuration is safe", which is a different and much narrower claim.  The
+    probe runs on a main thread with an 8 MiB stack.
+  stack_cost: >-
+    Bisected at 256 KiB granularity on the stock build, object-header path:
+    depth 5000 needs >= 2304 KiB (~472 B/frame); depth 7000 >= 3072 KiB (~449);
+    depth 8187 (the format maximum) >= 3584 KiB (~448).  Linear and consistent at
+    ~448 bytes of stack per recursion frame.
+  small_stack_thresholds: >-
+    At 512 KiB -- the default stack for a non-main thread on macOS, and a common
+    worker-pool and threaded-server setting -- depth 600 survives, depth 1200
+    SIGSEGVs, depth 5000 SIGSEGVs.  The depth-1200 file is 9757 BYTES.  At the
+    default 8192 KiB all three survive.
+  realistic_consumer: >-
+    h5py 3.13.0 with bundled libhdf5 1.14.5, reading the dataset on a
+    threading.Thread with an explicit stack size: 8192 KiB -> the datatype
+    decodes and the interpreter survives, rc 0; 512 KiB -> rc 139 (SIGSEGV),
+    killing the whole interpreter with no catchable Python exception.
+  h5tdecode_path: >-
+    H5Tdecode2 called correctly with the true buffer size, at the DEFAULT 8 MiB
+    stack: survives depth 19375, SIGSEGVs at depth 19437.  The buffer at the
+    crash depth is 155510 bytes (152 KiB).  Implied 432 bytes per frame,
+    consistent with the 448 measured on the object-header path.  No small-stack
+    precondition of any kind.
+  asan_scope: >-
+    READ THE PATH BEFORE READING THE SANITIZER.  On the OBJECT-HEADER path ASan
+    reports nothing at depth 5000 or 8187, because the format cap holds the depth
+    below the threshold -- so "ASan clean" there is a statement about the cap, not
+    about safety.  On the H5Tdecode2 path ASan reports
+    "ERROR: AddressSanitizer: stack-overflow" directly.
+  trigger_scope: >-
+    H5Fopen ALONE IS SAFE, measured: at a 512 KiB stack the depth-5000 file opens
+    and closes cleanly, because the datatype is decoded lazily.  The trigger is
+    opening the OBJECT -- H5Dopen2, or any traversal reaching it, which includes
+    h5dump and h5ls.
+  width: >-
+    i386 behaves identically to x86-64 on the object-header path: survives the
+    default 8 MiB stack, SIGSEGVs at 512 KiB.  Per-frame cost was not
+    re-bisected at 32 bits.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_resource
+  libhdf5: >-
+    accepted on the default main-thread stack; SIGSEGV below ~2.3 MiB (fixture
+    depth) or ~3.5 MiB (format maximum); SIGSEGV on the default stack via
+    H5Tdecode
+  libhdf5_version: 2.3.0 (develop); consumer arm 1.14.5
+  classification: disagreement-conditional-on-configuration
+  note: >-
+    h5policy refuses the resource shape; libhdf5 accepts it in the configuration
+    the differential harness runs in.  That is a real invariant-A' divergence, but
+    it is NOT a soundness gap in the oracle: the oracle is the conservative side,
+    and the tracked expectation already pins its refusal.  No entry in
+    registry/h5policy-diff-tolerances.yml is warranted, and none is present --
+    both sides refuse the file, for different reasons and at different depths.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    Three parts, and the second is the one a depth cap alone would miss.
+    (1) CAP THE DEPTH: thread a counter through H5O__dtype_decode_helper and
+    reject beyond a documented maximum.  The format's own ceiling for the cheapest
+    shape (8187) bounds what any object-header-resident type can need, so a limit
+    one or two orders of magnitude below rejects nothing a writer produces -- and
+    this is also the only thing that closes the H5Tdecode path, which has no
+    other ceiling.
+    (2) BOUND THE REJECTION PATH: see the_teardown_recurses_too.  A cap alone
+    moves the crash from decode into cleanup.
+    (3) OPTIONALLY convert the descent to an explicit stack, which removes the
+    dependence on thread stack size entirely.  (1)+(2) is the cheap fix; (3) is
+    the durable one.
+systemic:
+  semantic_boundary: >-
+    the datatype message as one object: its nesting depth counted and bounded
+    before any H5T_t is allocated, on every entry point that decodes a datatype
+    -- object header and application buffer alike -- with a rejection path that
+    does not itself recurse to the rejected depth.
+  status: closed_in_bounded_path
+  owner: libhdf5 for the fix; h5policy depth limit already landed
+  description: >-
+    h5policy counts the nesting in a preflight and refuses the shape without
+    descending it, so no frame and no H5T_t is ever created for a deep type.  All
+    profiles carry a cap, including legacy.  The remaining work is entirely
+    libhdf5's, and it spans two entry points rather than one.
+  landed_changes:
+    - h5policy/pickles (datatype.recursion_depth; H5_RESOURCE_DATATYPE_RECURSION_DEPTH)
+    - registry/validation-coverage.yml (datatype.recursion_depth, family datatypes)
+    - h5policy/tests/cve/dtype_unbounded_recursion.h5 (5000 VLen levels)
+    - h5policy/tests/cve/dtype_compound_unbounded_recursion.h5 (the compound form)
+    - h5policy/tests/expected/cve-dtype_unbounded_recursion.yml
+    - h5policy/tests/expected/cve-dtype_compound_unbounded_recursion.yml
+    # These two name the SAME file, valid/nested_datatypes.h5, with opposite
+    # expected decisions, which is deliberate rather than a contradiction:
+    # -- added 2026-09-01, for the H5Tdecode half --
+    - h5policy/tests/check_datatype_recursion_depth.py (unit-style libhdf5 probe;
+      no fixture is possible because the input is a buffer, not a file)
+    - h5policy/tests/run.sh (its own phase, folded into the suite exit status)
+    - h5policy/tests/expected/valid-nested_datatypes.yml
+      # untrusted-strict, `accept` -- ordinary nesting is still accepted, which is
+      # what stops the depth limit from being a blanket refusal.
+    - h5policy/tests/expected/integration-datatype_recursion_depth.yml
+      # the same file under `profile_overrides: resources:
+      # max_datatype_recursion_depth: 1`, expecting reject_resource.  It exercises
+      # the LIMIT MECHANISM at a reduced ceiling rather than a deep shape -- and it
+      # pins `forbidden_findings: [H5_CORRUPT_DATATYPE_RECURSION_LIMIT]`, i.e. that
+      # exceeding the depth is reported as a resource matter and never as
+      # corruption.  The deep shape is covered by the two cve/ fixtures above.
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/cve/dtype_unbounded_recursion.h5
+  direct_fixtures:
+    - h5policy/tests/cve/dtype_unbounded_recursion.h5
+    - h5policy/tests/cve/dtype_compound_unbounded_recursion.h5
+  expectations:
+    - h5policy/tests/expected/cve-dtype_unbounded_recursion.yml
+    - h5policy/tests/expected/cve-dtype_compound_unbounded_recursion.yml
+  generator: >-
+    h5policy-gencorpus assembles the VLen fixture as
+    prefix + (8-byte VLen wrapper) * 5000 + suffix.
+  deeper_variants_recipe: >-
+    To sweep the depth, parameterise that construction.  FOUR size fields scale
+    at 8 bytes per level -- superblock EOF, root object-header address, the
+    dataset header's chunk-0 size, and the datatype message size -- and THREE
+    lookup3 checksums must be recomputed: the superblock, the dataset object
+    header's chunk 0, and the root-group object header.  A builder that rewrites
+    only the size fields produces files h5policy rejects as
+    H5_CORRUPT_BAD_CHECKSUM, and a depth-5000 self-test does NOT catch that,
+    because at depth 5000 the baked-in checksums are already correct.  Validate
+    any such builder by reproducing the tracked fixture byte-for-byte AFTER the
+    checksum step, and have it refuse depths above 8187.
+  h5tdecode_recipe: >-
+    The H5Tdecode path needs no file.  The encoded-datatype buffer is
+    0x03 (H5O_DTYPE_ID), 0x00 (H5T_ENCODE_VERSION), then N copies of the 8-byte
+    VLen wrapper 19 00 00 00 10 00 00 00, then the 12-byte 1-byte-integer leaf
+    10 00 00 00 01 00 00 00 00 00 08 00.  Pass it to H5Tdecode2 with its true
+    length.  No tracked probe exists for this; see coverage_gaps.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true    # h5policy refuses in a preflight
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unverified
+    no_legacy_fallback: unverified
+
+backports: []
+
+fuzz_seed: >-
+  The depth is a single-integer axis and a generator produces it directly, so
+  byte mutation adds nothing: sweep the depth against the STACK SIZE, which is
+  the second axis and the one that decides the outcome.  The interesting
+  boundaries are the format cap (8187), the default-stack threshold on the
+  H5Tdecode path (19437), and the object-header stack thresholds
+  (2304 / 3072 / 3584 KiB).
+
+compatibility_backport_risks: >-
+  A depth cap rejects files libhdf5 currently reads, so it is compatibility
+  visible -- but no writer emits types this deep: the fixture exists only because
+  a generator assembles the bytes directly, and the library's own writer would
+  have to recurse to the same depth to produce one.  A limit derived from the
+  format ceiling should therefore reject nothing real.  Test before fixing the
+  number: the deepest datatype any real corpus file carries, all six recursion
+  sites, and the H5Tdecode entry points -- whose callers may legitimately pass
+  types deeper than an object header can hold, which is the one place a cap could
+  break working code.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: '>= 1.8.23'
+  patched: none
+  method: >-
+    Counted self-recursive calls to H5O__dtype_decode_helper and any mention of a
+    depth or recursion limit in src/H5Odtype.c at 1_8_23, 1_10_11, 1_12_3,
+    1_14_0, 1.14.6, 2.0.0, 2.1.0 and develop.
+  finding: >-
+    Five self-recursive sites through 1.14.6 and six from 2.0.0 -- the complex
+    datatype class adds a recursion SITE, not a bound -- and ZERO
+    depth/recursion-limit mentions at every tag.  No cap has ever existed.
+  not_audited: >-
+    Tags before 1.8.23 were not examined, so the true lower bound is probably
+    earlier.
+  label: established
+
+sibling_audit: >-
+  Within libhdf5: six self-recursive sites, of which only the VLen one is
+  measured.  The others -- compound member, enum parent, array parent, complex --
+  share the helper and so share the missing cap, and a compound or array frame is
+  likely LARGER than a VLen one, which would lower the crash depth rather than
+  raise it.  H5T__free/H5T_close_real is a second recursion over the same chain.
+  H5Tdecode1 (the legacy one-argument form) additionally passes
+  p_size == SIZE_MAX, which sets skip = true and disables the buffer bounds
+  checks outright -- the source is candid about it: "The buffer end can't be
+  determined when it's an unbounded buffer passed via H5Tdecode(), so don't bounds
+  check and hope for the best" (src/H5Odtype.c).  That is an OVER-READ concern
+  layered on this recursion one and is not measured here.
+  A sibling stack-exhaustion defect at a different site is
+  registry/cases/shared-message-self-reference-recursion.yml.
+  Within h5policy: no defect.  The preflight decides the depth from the message
+  without descending, and an accepting control fixture
+  (valid-nested_datatypes.yml) pins that ordinary nesting is still accepted.
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    CLOSED 2026-09-01.  The H5Tdecode path now has a probe:
+    h5policy/tests/check_datatype_recursion_depth.py, run by h5policy/tests/run.sh
+    as its own phase.  It builds the encoded buffer in memory (no fixture is
+    possible -- the input is memory, not a file), sets the child's stack itself
+    rather than inheriting the machine's, and distinguishes three outcomes: a
+    crash is the recorded state and PASSES; a clean REJECTION fails loudly because
+    it means libhdf5 gained a depth limit and this record is stale; a clean DECODE
+    fails as inconclusive because the depth/stack margin has stopped testing
+    anything.  A shallow control runs first so a deep-case crash cannot be
+    confused with a stack too small for libhdf5 itself.  All four branches were
+    exercised by perturbation before the phase was wired in.
+  - >-
+    The tracked expectation's h5cve contract (`allowed_statuses:
+    [unexercised, verified]`) is STACK-SIZE DEPENDENT: true on the default 8 MiB
+    stack, false below ~2.3 MiB.  The expectation now says so in a comment, but
+    nothing enforces the stack size under which it was measured.
+  - >-
+    Only the VLen recursion site is measured; the other five are source-derived.
+  - >-
+    Windows default thread stacks are 1 MiB, between the two measured points, so
+    the depth-1200 shape sits near that boundary.  Not measured.
+  - No big-endian measurement, and no non-glibc allocator.
+open_questions:
+  - >-
+    Does the legacy H5Tdecode1 bounds-check skip turn this into an out-of-bounds
+    READ as well as a stack exhaustion?  The recursion consumes the buffer as it
+    descends; with the end pointer unknown, a truncated deep chain would keep
+    reading.  Not measured, and it would change the severity class.
+  - >-
+    Is there a nesting shape cheaper than 8 bytes per level?  If one exists the
+    8187 ceiling drops proportionally, and with it the stack needed to crash the
+    object-header path.
+
+provenance:
+  found_by: >-
+    a supplied specimen, triaged through the h5cve bundle workflow.  The specimen
+    is BYTE-IDENTICAL to the tracked fixture named under reproducers -- unusually
+    for this directory, the corpus fixture IS the specimen rather than a reduced
+    stand-in, so no separate provenance hash is needed to identify it.
+  input_sha256: a7e8ef39543d3d9c6491c02a4e0832d6f989d356f469f6556e2ca7f863e5b13b
+  input_bytes: 40157
+  h5policy_commit: d0ed2c7
+  poke_version: GNU poke 4.3

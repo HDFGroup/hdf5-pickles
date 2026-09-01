@@ -175,6 +175,16 @@ else
     echo "  skipped: h5cc or cc unavailable"
 fi
 
+# The H5Tdecode half of registry/cases/datatype-nesting-depth-uncapped.yml.  No
+# corpus fixture can cover it: H5Tdecode takes a buffer from the application, so
+# there is no object header and no two-byte message-size field to cap the nesting
+# -- and no file to put in tests/.  The check re-measures the recorded state and
+# fails if libhdf5 has GAINED a depth limit (a fix worth noticing) or if the
+# depth/stack margin has stopped testing anything.  Needs h5cc; skipped otherwise.
+echo "== datatype nesting depth via H5Tdecode (libhdf5) =="
+dtype_depth_status=0
+python3 "$tests_dir/check_datatype_recursion_depth.py" || dtype_depth_status=1
+
 # Full expected-fixture canary matrix.  The versioned policy records which
 # activation violations are intentional regressions for the selected build;
 # coverage_gap and unexercised remain visible in the JSON artifact.
@@ -299,6 +309,7 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $path_report_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
+      && $dtype_depth_status -eq 0 \
       && $matrix_status -eq 0 && $mut_status -eq 0 \
       && $cve_corpus_status -eq 0 \
       && $mut_heap_status -eq 0 \
@@ -308,5 +319,5 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status pathunit=$path_unit_status seam=$seam_status report=$report_status pathreport=$path_report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status cvecorpus=$cve_corpus_status mut=$mut_status mutheap=$mut_heap_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status pathunit=$path_unit_status seam=$seam_status report=$report_status pathreport=$path_report_status corpus=$corpus_status diff=$diff_status probe=$probe_status dtypedepth=$dtype_depth_status matrix=$matrix_status cve=$cve_status cvecorpus=$cve_corpus_status mut=$mut_status mutheap=$mut_heap_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
 exit 1
