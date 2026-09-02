@@ -1,0 +1,230 @@
+# The link-message decoder checks the DECLARED name length and never looks at
+# the bytes it copied.  A declared length of 1 whose single byte is NUL yields a
+# link whose name is the empty string, and that name is handed to the
+# application through iteration -- the path that, for an old-style group, would
+# have refused it.
+#
+# Filed 2026-09-02 from a sweep prompted by
+# registry/cases/symtab-empty-link-name-path-split.yml, which records the
+# old-style form.  The two are neighbours, not duplicates: there the check
+# EXISTS and is applied on one path of two; here there is no content check at
+# all, on either path, and the write side asserts what the read side does not
+# enforce.
+schema_version: 1
+
+id: compact-link-name-not-checked-after-decode
+title: the link-message decoder bounds the declared name length but never
+  examines the decoded name, so a NUL byte inside the name silently truncates
+  it -- to the empty string when the NUL comes first
+status: oracle-hardened          # h5policy rejects; libhdf5 delivers the name
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: message_envelope
+versions: [1]                    # v1 link messages -- compact, new-style groups
+root_cause_classification: local_decode
+violated_invariant:
+  - envelope.link_name_nonempty
+validation_closure: >-
+  the link message's name field as a whole: the declared length, the bytes it
+  covers, and the requirement that those bytes contain no NUL -- checked
+  together, at decode, before the name is used as a C string by everything
+  downstream.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - h5policy (oracle) -- rejects, H5_CORRUPT_LINK_NAME_EMPTY
+  - "libhdf5 H5O__link_decode (src/H5Olink.c:200-209)"
+  - "delivered to the application by H5Lvisit2/H5Literate2 and returned by
+     H5Lget_name_by_idx"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0 @ develop b7b85e7abf9,
+#    re-read 2026-09-02) -------------------------------------------------------
+defect: >-
+  THE LENGTH IS CHECKED AND THE CONTENT IS NOT.
+      if (len == 0)
+          HGOTO_ERROR(H5E_OHDR, H5E_CANTLOAD, NULL, "invalid name length"); /* :200-201 */
+      if (H5_IS_BUFFER_OVERFLOW(p, len, p_end))
+          HGOTO_ERROR(...);                                                 /* :204 */
+      if (NULL == (lnk->name = (char *)H5MM_malloc(len + 1)))
+          HGOTO_ERROR(...);                                                 /* :206 */
+      H5MM_memcpy(lnk->name, p, len);                                       /* :208 */
+      lnk->name[len] = '\0';                                                /* :209 */
+  A zero declared length is refused at :200.  Nothing after that looks at the
+  bytes.  From :209 onward the name is a C string, so a NUL anywhere inside the
+  copied region ENDS it: the effective name is the prefix before the first NUL,
+  and the declared length is never consulted again.
+  WITH THE NUL FIRST the name is the empty string, which is the measured case
+  and the one the corpus carries.
+  THE ENCODER ASSERTS WHAT THE DECODER DOES NOT ENFORCE.  H5O__link_encode has
+      len = (uint64_t)strlen(lnk->name);
+      assert(len > 0);                                                      /* :307 */
+  -- compiled out of every shipping build.  So the library's own statement that
+  a link name is nonempty exists only on the write side, and only under NDEBUG
+  being unset.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  MEASURED_2026_09_02: >-
+    On malformed/nul_compact_link_name.h5, whose generator declares a name
+    length of 1 and stores 0x00 as the single name byte, with the enclosing v2
+    object-header checksum re-sealed so the name is the only defect.
+  the_name_reaches_the_application: >-
+    develop b7b85e7abf9, a group with two links, one of them nulled:
+      H5Gget_num_objs        2
+      H5Lget_name_by_idx[0]  len=0 ""     -- returned
+      H5Lget_name_by_idx[1]  len=1 "t"
+      H5Lvisit2 callback     fires with len=0 ""   <- THE POINT
+      H5Lvisit2 overall      FAILS afterwards
+      H5Oopen("")            refused
+    THE CONTRAST WITH THE OLD-STYLE FORM IS THE REASON THIS IS A SEPARATE
+    RECORD.  For a symbol-table group, iteration REFUSES an empty name at
+    src/H5Gent.c:385 and the callback never sees it; only the index path returns
+    it.  Here the callback receives it.  So the same malformed condition is
+    refused, half-refused, or delivered depending on which group storage the
+    file uses -- three behaviours for one rule.
+  truncation_is_source_derived_not_measured: >-
+    A NUL in the MIDDLE of the name truncates it to the prefix, by the same three
+    lines: memcpy copies `len` bytes, :209 terminates at `len`, and every
+    consumer treats lnk->name as a C string.  Two stored names differing only
+    after a NUL therefore decode to one name, which is an aliasing hazard rather
+    than an emptiness one.  NOT MEASURED -- the corpus fixture has a
+    one-character name, so only the leading-NUL case has a specimen here.  A
+    two-link file whose names collide after truncation would settle what libhdf5
+    does about the duplicate, and that is the interesting question.
+  oracle: >-
+    reject_corrupt with H5_CORRUPT_LINK_NAME_EMPTY.  h5policy checks the decoded
+    name, not only the declared length.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: delivers the empty name to the caller, then fails the visit
+  libhdf5_version: develop b7b85e7abf9
+  classification: verdict-aligned, behaviour-divergent
+  note: >-
+    H5Lvisit2 does eventually fail, so a harness watching only the return code
+    sees agreement and records no divergence -- while the application has
+    already been handed a link name that names nothing.  Whether the callback
+    was invoked is not part of any verdict this repository records, which is why
+    a read-only differential cannot see this.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented
+  description: >-
+    One check at src/H5Olink.c:209, after the terminator is written:
+        if (strlen(lnk->name) != len)
+            HGOTO_ERROR(H5E_OHDR, H5E_BADVALUE, NULL, "link name contains NUL");
+    This is stronger than testing for an empty name and costs the same: it
+    rejects the leading-NUL case AND the embedded-NUL truncation, and it states
+    the invariant the encoder already asserts -- that the stored length and the
+    string length agree.
+    A weaker `if (!*lnk->name)` would close only the measured case and leave the
+    truncation, so it is worth preferring the length comparison even though the
+    corpus only carries the first.
+systemic:
+  semantic_boundary: >-
+    the link name as a unit -- declared length, covered bytes, and no interior
+    NUL -- established at decode, so that no consumer of lnk->name can see a
+    string the file did not declare.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder, landed); libhdf5 open
+  description: >-
+    h5policy validates the decoded name rather than the declared length alone,
+    so the empty and truncated forms are both rejected before any consumer sees
+    them.  No oracle change was required by this case.
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  direct_fixtures:
+    - h5policy/tests/malformed/nul_compact_link_name.h5
+  expectations:
+    - h5policy/tests/expected/malformed-nul_compact_link_name.yml
+  generator: >-
+    h5policy-gencorpus _make_nul_compact_link_name: overwrite the one-byte name
+    of link `d` with 0x00 in the root group's v2 object header and re-seal the
+    header checksum, so the empty name is the only defect.
+  not_covered: >-
+    No fixture carries an interior NUL, so the truncation half has no specimen.
+    See measured.truncation_is_source_derived_not_measured.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unmeasured
+    no_legacy_fallback: true
+
+backports: []
+
+fuzz_seed: >-
+  One byte, and the boundary is obvious: place a NUL at each offset within a
+  link name and compare the decoded name against the declared length.  The
+  interesting outputs are not crashes but STRINGS -- an empty name, a truncated
+  name, and two links that decode to the same name -- which a fuzzer scoring
+  only on signals will not notice.
+
+compatibility_backport_risks: >-
+  None identified.  A conforming writer cannot emit an interior NUL: the encoder
+  derives the length with strlen, so the length and the string agree by
+  construction on the write path.
+
+sibling_audit: >-
+  The old-style form is registry/cases/symtab-empty-link-name-path-split.yml,
+  where the check exists and is applied on one path of two.  Together the two
+  records cover both group storage forms for this rule.
+  NOT AUDITED: the dense (fractal-heap) form, which is the third storage and has
+  its own decoder; whether soft-link VALUES have the same interior-NUL exposure
+  (malformed/softlink_empty_name.h5 exists but was not analysed for this); and
+  whether attribute names, which are decoded by a different message, check
+  their content or only their length.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range.  Measured on develop b7b85e7abf9 only; the older
+    releases were not exercised for this and no archaeology was run.  The shape
+    -- a length check with no content check -- is not obviously new, but that is
+    an impression and not a measurement.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    THE TRUNCATION HALF HAS NO FIXTURE and no measurement; only the leading-NUL
+    case is covered.  A two-link file whose names collide after truncation is
+    the missing specimen, and the question it answers -- what libhdf5 does with
+    the duplicate -- is the one that decides whether this is a naming nuisance
+    or an aliasing defect.
+  - >-
+    NO VERSION RANGE.  One measured point.
+  - >-
+    NOTHING ASSERTS THAT THE CALLBACK IS INVOKED WITH THE BAD NAME.  The
+    expectation asserts the oracle verdict; the delivery to the application is
+    what makes this different from its old-style sibling and no harness here
+    watches callbacks.
+open_questions:
+  - >-
+    Do two links whose names collide after NUL truncation produce a duplicate
+    name in a group, and does libhdf5 detect it?  Source says the names are
+    compared as C strings, which would make them equal; unmeasured.
+  - >-
+    Does the dense (fractal-heap) link decoder check the decoded name, or only
+    its length, as this one does?
+
+provenance:
+  found_by: >-
+    an entry-point differential run over the whole corpus 2026-09-02 -- asking
+    link iteration and index-based naming the same question about each file and
+    comparing -- while investigating the old-style sibling.  The fixture already
+    existed and its expectation already asserted the oracle verdict; what was
+    unrecorded is what libhdf5 does.
+  measured_on: 2026-09-02
+  hdf5_build: >-
+    HDF5 2.3.0 @ develop b7b85e7abf9 (newest available), RelWithDebInfo without
+    sanitizers.  Workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

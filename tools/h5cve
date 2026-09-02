@@ -310,6 +310,11 @@ def cmd_matrix(args):
     findings = findings_registry()
     policy = yaml.safe_load(open(args.policy)) if args.policy else {"defaults": {}}
     defaults = policy.get("defaults", {}).get("allowed_statuses", [])
+    # The identity of the build every row was measured against.  Carried in the
+    # artifact because the consumer (`h5cve evidence`) pins it, and a pin the
+    # generator does not supply is one a human has to remember -- which is how
+    # the file came to record `libhdf5_version: null`.
+    measured_build = None
     overrides = policy.get("fixture_overrides", {})
     rows = []
     for path in sorted(glob.glob(os.path.join(EXPECTED_DIR, "*.yml"))):
@@ -352,6 +357,8 @@ def cmd_matrix(args):
                              "status": "coverage_gap", "h5cve_policy": effective_policy})
                 continue
             rep, _ = _probe(fixture, args.baseline, exercise)
+            if measured_build is None:
+                measured_build = rep.get("build") or None
             canary = _canary_summary(rep, None, exercise)
             alignment = _oracle_alignment(rep, expected.get("expected_decision"))
             if effective_policy.get("require_oracle_alignment") and alignment == "divergent":
@@ -371,7 +378,7 @@ def cmd_matrix(args):
         permitted = fixture_policy.get("allowed_statuses",
                     overrides.get(row.get("fixture"), {}).get("allowed_statuses", defaults))
         row["allowed"] = row["status"] in permitted
-    report = {"policy": args.policy, "rows": rows}
+    report = {"policy": args.policy, "build": measured_build, "rows": rows}
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
         with open(args.output, "w") as f:
@@ -482,11 +489,26 @@ def cmd_evidence(args):
         expectations[os.path.basename(path)] = yaml.safe_load(open(path)) or {}
 
     rows = report.get("rows", [])
-    build = next((r.get("build") for r in rows if r.get("build")), None)
+    # PIN WHAT WAS MEASURED, not what someone remembered to type.  This used to
+    # read `args.libhdf5_version`, which defaults to None, so a regeneration
+    # without the flag silently recorded `libhdf5_version: null` -- and the
+    # build identity was already in hand and thrown away.  The flag stays as an
+    # override for a matrix artifact produced by an older tool that carries no
+    # build.
+    build = report.get("build") or {}
     doc = {
         "schema_version": 1,
         "generated_by": "h5cve evidence",
-        "libhdf5_version": args.libhdf5_version,
+        "libhdf5_version": args.libhdf5_version or build.get("libhdf5_version")
+                           or build.get("hdf5_version_configured"),
+        # A bare version cannot tell two builds apart, and this repository has
+        # measured two builds of "2.3.0" five weeks apart that disagree about
+        # whether a defect is present.  So the pin carries the build identity
+        # as well, when the matrix supplied one.
+        "libhdf5_build": {k: build[k] for k in
+                          ("configured_on", "build_mode", "sanitizers",
+                           "settings_sha256")
+                          if k in build} or None,
         "records": _evidence_for_rows(rows, expectations),
     }
     header = (
