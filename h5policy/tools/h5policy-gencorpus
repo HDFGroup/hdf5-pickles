@@ -1563,6 +1563,9 @@ def _gen_malformed(root):
     _make_chunk_stored_size_below_framing(
         f"{root}/malformed/chunk_stored_size_below_framing.h5",
         f"{root}/valid/chunk_v1_btree_fletcher.h5")
+    _make_chunk_filter_mask_all_skipped(
+        f"{root}/malformed/chunk_filter_mask_all_skipped.h5",
+        f"{root}/valid/chunk_v1_btree_fletcher.h5")
     _make_chunk_data_over_metadata(
         f"{root}/malformed/chunk_data_over_metadata.h5",
         f"{root}/valid/chunked_v1_btree.h5")
@@ -8705,6 +8708,78 @@ def _make_chunk_zero_stored_size(path, base_path):
         raise RuntimeError(
             f"key[0] parse looks wrong: size={size0} addr={addr} (file {len(raw)} bytes)")
     struct.pack_into("<I", raw, key0, 0)         # stored size -> 0, address kept
+    _patch(path, bytes(raw))
+
+
+
+def _chunk_v1_key0(raw):
+    """Offset of key[0] and of the address that follows it, in the first type-1
+    (chunked-storage) v1 B-tree node.  Same layout note as
+    _make_chunk_zero_stored_size: 24-byte node header, then
+    key[0] | addr[0] | key[1] | ... with n+1 keys for n children, each key being
+    chunk size (4) | filter mask (4) | offsets (ndims * 8), ndims being the
+    dataset rank PLUS ONE.  Returns (key0, addr0, stored_size)."""
+    at = raw.find(b"TREE")
+    while at >= 0 and raw[at + 4] != 1:
+        at = raw.find(b"TREE", at + 4)
+    if at < 0:
+        raise RuntimeError("could not locate a type-1 (chunk) v1 B-tree node")
+    ndims = 3                                    # rank 2 + the element dimension
+    key0 = at + 24
+    addr0 = key0 + 8 + 8 * ndims
+    size0 = struct.unpack_from("<I", raw, key0)[0]
+    addr = struct.unpack_from("<Q", raw, addr0)[0]
+    if size0 == 0 or not (0 < addr < len(raw)):
+        raise RuntimeError(
+            f"key[0] parse looks wrong: size={size0} addr={addr} (file {len(raw)} bytes)")
+    return key0, addr0, size0
+
+
+def _make_chunk_filter_mask_all_skipped(path, base_path):
+    """A chunk that claims every pipeline filter was skipped while its stored
+    size is smaller than the unfiltered chunk.
+
+    A fully set mask is legitimate on its own: libhdf5 sets it when the pipeline
+    fails or would grow the chunk, and stores the chunk RAW.  On that path the
+    stored size is exactly the unfiltered chunk size, and nothing re-derives it
+    afterwards.  Here the mask says "skipped" while the record still declares a
+    stored size of 8, so H5D__chunk_lock allocates 8 bytes, reads 8 bytes into
+    them, finds the pipeline skipped, and caches the result as the dataset's
+    100-byte (5 x 5 int32) chunk.
+
+    MEASURED, h5py/libhdf5 1.14.5: H5Dread returns rc=0 and hands back 92 bytes
+    of heap past the allocation as dataset values, one 8-byte pair of which
+    decodes as a live pointer.  libhdf5 2.3.0 rejects the same file at the
+    post-unfilter size check (H5Dchunk.c:4855, added by d926e3cbd0b and first
+    released in 2.2.0); no version before that checks the size anywhere in the
+    function.
+
+    TWO BYTES of the base file change, both inside key[0]: the low byte of the
+    stored size (0x68 -> 0x08) and the low byte of the filter mask (0x00 ->
+    0x01).  Neither is sufficient alone, which is the point -- a mask of 1 with
+    the stored size left at 104 was measured to read back CORRECT values on
+    1.14.5, and a stored size of 8 with the mask left at 0 fails fletcher32's
+    own checksum.  The contradiction is between the two fields.
+
+    WHY 8 AND NOT SOMETHING SMALLER: 8 is above fletcher32's four-byte framing,
+    so chunk.stored_size does not fire and this fixture pins the filter-mask
+    rule alone.  Below 4 the sibling fixture chunk_stored_size_below_framing.h5
+    already claims the file.
+
+    A mask bit at or ABOVE the pipeline's filter count is deliberately not a
+    fixture: H5Z_pipeline's reverse loop runs over pline->nused only, so such a
+    bit is never inspected, and 1.14.5 was measured to read that file back with
+    correct values.  Rejecting it would be a false positive.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    key0, _addr0, size0 = _chunk_v1_key0(raw)
+    if size0 <= 8:
+        raise RuntimeError(
+            f"base chunk stores {size0} bytes; the fixture needs a larger one")
+    struct.pack_into("<I", raw, key0, 8)         # above fletcher32's framing
+    struct.pack_into("<I", raw, key0 + 4, 0x1)   # the pipeline's only filter
     _patch(path, bytes(raw))
 
 

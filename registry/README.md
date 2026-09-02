@@ -57,7 +57,7 @@ So the citation has to say what it points at, and the checker holds it to that:
 
 ```
 h5_datatype.pk:1180 (member_off > elm_size)
-h5_walk.pk:806 (H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS)
+h5_walk.pk:820 (H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS)
 h5_group.pk:194-262 (h5policy_local_heap_data_addr, data_seg_addr)
 ```
 

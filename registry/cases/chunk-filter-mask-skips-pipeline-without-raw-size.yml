@@ -1,0 +1,310 @@
+# A chunk record can declare that its whole filter pipeline was skipped.  That
+# is a real libhdf5 feature -- an incompressible chunk is stored raw -- but on
+# that path the stored size IS the unfiltered chunk size, and before 2.2.0
+# nothing re-established that on read.  Claim the skip with a smaller stored
+# size and the chunk enters the cache as a full-size chunk backed by a short
+# allocation, so every read of it returns heap past the end as dataset values.
+#
+# Found 2026-09-02 by auditing the one field of the v1 B-tree chunk key that no
+# h5policy walker read.
+schema_version: 1
+
+id: chunk-filter-mask-skips-pipeline-without-raw-size
+title: a chunk whose filter mask skips its entire pipeline is treated as raw
+  data at its declared stored size, so a short stored size makes every read of
+  that chunk return heap bytes past the chunk allocation
+status: oracle-hardened          # h5policy rejects as of 2026-09-02; libhdf5 fixed in 2.2.0
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  Nothing here needs
+  filing: the defect is already fixed upstream (see version_range), so this
+  record exists to pin the oracle rule and the affected range, not to report.
+
+# -- Triage -------------------------------------------------------------------
+record: chunk_index
+versions: [3, 4]                 # the layout versions that index with a v1 B-tree
+root_cause_classification: local_decode
+violated_invariant:
+  - chunk.filter_mask_consistent
+validation_closure: >-
+  one object header.  The chunk-index record supplies the mask and the stored
+  size; the filter pipeline message supplies the filter count; the datatype and
+  the layout's chunk dimensions supply the unfiltered size.  All four are
+  messages of the SAME object, which is what makes the rule a strict tightening
+  -- the writer derived the mask from the pipeline it had just run, and derived
+  the raw-path stored size from the same dimensions and datatype.  It is not a
+  one-clause check, and it cannot be: the mask alone is legal and the stored
+  size alone is legal.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-09-02 (was: accept)"
+  - "libhdf5 H5Dread -> H5D__read -> H5D__chunk_read -> H5D__chunk_lock (1.14.5 src/H5Dchunk.c:4515-4545)"
+  - "-> H5Z_pipeline (src/H5Z.c:1404-1410) -- the masked filter is skipped, *nbytes is left at the STORED size"
+  - "-> back in H5D__chunk_lock, the short buffer is cached as the dataset's chunk; the disclosure happens on every later copy out of it"
+  - "shipped consumers: any H5Dread, h5dump with data, h5ls with data; NOT h5dump -H / h5stat / h5debug, which never decode a chunk"
+
+# -- The defect ---------------------------------------------------------------
+defect: >-
+  The v1 B-tree chunk key is
+    chunk size (4) | filter mask (4) | offsets (ndims * 8)
+  and the mask is a bitmap of filters that were NOT applied to this chunk.
+  H5Z_pipeline honours it directly (src/H5Z.c:1404-1410):
+    if (pline && (flags & H5Z_FLAG_REVERSE)) {
+        for (i = pline->nused; i > 0; --i) {
+            idx = i - 1;
+            if (*filter_mask & ((unsigned)1 << idx)) {
+                failed |= (unsigned)1 << idx;
+                continue;                    /* filter excluded */
+            }
+  -- a skipped filter leaves *nbytes untouched, so it stays at whatever the
+  caller read off disk.
+  In 1.14.5's H5D__chunk_lock the caller is (src/H5Dchunk.c, the
+  H5_addr_defined(chunk_addr) arm):
+    size_t my_chunk_alloc = chunk_alloc;     /* the STORED size */
+    size_t buf_alloc      = chunk_alloc;
+    chunk = H5D__chunk_mem_alloc(my_chunk_alloc, ...);
+    H5F_shared_block_read(..., chunk_addr, my_chunk_alloc, chunk);
+    if (old_pline && old_pline->nused) {
+        ...
+        H5Z_pipeline(old_pline, H5Z_FLAG_REVERSE, &(udata->filter_mask),
+                     err_detect, filter_cb, &my_chunk_alloc, &buf_alloc, &chunk);
+        /* nothing compares my_chunk_alloc against chunk_size */
+    }
+  The buffer is `stored_size` bytes.  The pipeline is skipped, so it stays
+  `stored_size` bytes.  The entry is then cached as this dataset's chunk, whose
+  size is the layout's chunk_size, and every subsequent copy out of it reads
+  chunk_size bytes.  With chunk_size == 100 and stored_size == 8 that is a
+  92-byte heap over-read whose contents are returned to the caller as data.
+  THE FIX IS THE POST-UNFILTER SIZE CHECK, which develop has and 1.14.5 does not
+  (2.3.0 src/H5Dchunk.c:4854-4857):
+    /* Make sure the chunk is the correct size after being unfiltered */
+    if (chunk_nbytes != chunk_size)
+        HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, NULL,
+                    "chunk size is incorrect after being unfiltered");
+  It is a strict tightening: a chunk libhdf5 wrote always unfilters back to
+  chunk_size, and a fully masked one was stored AT chunk_size.
+  WHY THE OBVIOUS EARLIER GUARD DOES NOT CATCH IT.  develop also carries
+    if (H5_UNLIKELY((chunk_disk_size != (hsize_t)chunk_size) &&
+                    H5_addr_defined(chunk_addr) &&
+                    (!old_pline || !old_pline->nused)))
+        HGOTO_ERROR(..., "incorrect chunk size returned from index for unfiltered chunk");
+  -- but its third clause asks whether the DATASET has a pipeline, not whether
+  this CHUNK used one.  A masked chunk on a filtered dataset passes it.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  MEASURED: 2026-09-02.
+  oracle_as_found: >-
+    ACCEPT.  No h5policy walker read the filter-mask field at all: the v1 leaf
+    read the 4-byte stored size at key_off and stepped past the next four bytes
+    to the offsets.  A false accept inside the oracle's boundary -- the mask is
+    a chunk-index field, not chunk data.
+  oracle_now: >-
+    REJECT_CORRUPT, H5_CORRUPT_CHUNK_FILTER_MASK, with evidence
+    chunk.stored_size actual=8 expected=100 comparison=equal.
+  libhdf5_1_14_5: >-
+    ACCEPTS AND DISCLOSES.  h5py 3.13.0 / libhdf5 1.14.5, on the tracked
+    fixture: H5Dread returns rc=0 for the whole 10x10 int32 dataset, and the
+    first chunk's values past element 1 are heap contents --
+      row 0 = [0, 1, 716082000, 32689, 10820200, 5, ...]
+    where the pair (716082000, 32689) is a live 0x7FB1-prefixed pointer.  92
+    bytes disclosed per read, no error, no crash.  H5Dget_chunk_info confirms
+    the library read the patched record: chunk (0,0) filter_mask=1, size=8.
+  libhdf5_2_3_0: >-
+    REJECTS on data access and only on data access: h5dump -H rc=0, h5stat rc=0,
+    h5dump with data rc=1.  The header is structurally clean, which is why a
+    header-only differential cannot see this.
+  control_a: >-
+    Mask set to 1 with the stored size LEFT at 104: 1.14.5 reads the dataset
+    back with CORRECT values.  The 104-byte allocation over-covers the 100-byte
+    chunk, so nothing is disclosed.  h5policy still rejects (104 != 100), which
+    is right -- no writer emits it -- but this control is why the rule cannot be
+    described as "a set mask bit is dangerous".
+  control_b: >-
+    Stored size set to 8 with the mask LEFT at 0: fletcher32 runs, fails its own
+    checksum, libhdf5 rejects cleanly.  Neither edit is sufficient alone.
+  negative_result_undefined_filter_bit: >-
+    A mask bit at or ABOVE the pipeline's filter count is NOT a finding, and the
+    first version of this rule wrongly made it one.  H5Z_pipeline's reverse loop
+    runs `for (i = pline->nused; i > 0; --i)`, so a bit at an index the pipeline
+    does not have is never inspected.  Measured: the base fixture with mask 0x2
+    on a single-filter (fletcher32) pipeline reads back with CORRECT values on
+    1.14.5 and h5dump 2.3.0 prints the data at rc=0.  Rejecting it would have
+    been a false positive on a file libhdf5 reads correctly -- an invariant-A
+    violation manufactured out of a structure that is merely unwritable.
+  asan: >-
+    NOT OBTAINED.  The disclosure is measurable without a sanitizer -- the heap
+    bytes come back through H5Dread as dataset values, which is the externally
+    visible result -- so an ASan run would confirm the allocation boundary but
+    would not change the conclusion.  It would be needed to bound the over-read
+    precisely on a build whose allocator rounds differently.
+  width: >-
+    NOT MEASURED at 32 bits.  Nothing in the path is width-sensitive: there is
+    no arithmetic wrap here, only a size comparison that is absent, so the
+    outcome should not depend on pointer width.  Unverified.
+  escalation_to_write: >-
+    NOT ATTEMPTED.  The read path is what was measured.  Whether the short
+    cached chunk can be flushed back -- writing heap contents into the file, or
+    overflowing on the write side -- is open; see open_questions.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt          # was: accept, until 2026-09-02
+  libhdf5: 1.14.5 accepts and returns out-of-bounds heap as data; 2.3.0 rejects on read
+  libhdf5_version: 1.14.5 (h5py 3.13.0) and 2.3.0 (measured, both)
+  classification: >-
+    WAS A-prime against 1.14.5 -- an oracle false accept over a silent
+    information disclosure.  Against 2.3.0 it is an A+ soft warning of the usual
+    header-clean/data-fatal shape.  Closed on the oracle side 2026-09-02.
+  note: >-
+    NO TOLERANCE AND NO A~ PREDICATE NEEDED.  h5dump -H opens the file, so
+    invariant A looks violated on the differential's 2.3.0 build, but the
+    data-forcing probe returns nonzero and h5policy-diff demotes the row to the
+    A+ soft warning it already handles for the stored-size siblings.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: oracle_only
+  description: >-
+    libhdf5: already fixed on the 2.2.0+ line by the post-unfilter size check.
+    Nothing is proposed for the 1.14.x branch here; whether that check is
+    backportable is not assessed.
+    h5policy: landed.  The mask and its stored size are recorded together at the
+    v1 chunk key and compared in h5policy_finalize_ohdr_dataset.
+    WHY THE TWO FIELDS ARE RECORDED TOGETHER: the rule compares a mask against
+    the size beside it.  Recording the mask from one record and reusing the
+    smallest stored size the walk saw -- the shape the sibling stored-size rule
+    uses -- would compare a mask to a size it does not describe, and would
+    report a finding on a file where each record is individually consistent.
+systemic:
+  semantic_boundary: >-
+    a chunk's declared storage must be consistent with the pipeline state it
+    declares.  The mask is the only field in the chunk key that CHANGES the
+    meaning of another field in the same key, and libhdf5's readers treat the
+    two independently.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder) -- landed; libhdf5 fixed upstream at 2.2.0
+  landed_changes:
+    - h5policy/pickles/h5_chunkindex.pk (h5policy_chunk_record_mask_seen, called
+      from the v1 B-tree leaf, which now also reads the 4 bytes after the stored
+      size)
+    - h5policy/pickles/h5_layout.pk (records the pipeline's filter count, gated
+      to role == "dataset" so the dense-link and dense-attribute heap pipelines
+      cannot supply it)
+    - h5policy/pickles/h5_walk.pk + h5_validate.pk (the per-object state, its
+      reset, and the comparison in h5policy_finalize_ohdr_dataset)
+    - registry/findings/catalog/chunk_index.yml (H5_CORRUPT_CHUNK_FILTER_MASK)
+    - registry/validation-coverage.yml (chunk.filter_mask_consistent)
+    - h5policy-gencorpus _chunk_v1_key0 + _make_chunk_filter_mask_all_skipped,
+      and the expectation
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: h5policy/tests/malformed/chunk_filter_mask_all_skipped.h5
+  control_fixture: h5policy/tests/valid/chunk_v1_btree_fletcher.h5
+  expectations:
+    - h5policy/tests/expected/malformed-chunk_filter_mask_all_skipped.yml
+    - h5policy/tests/expected/valid-chunk_v1_btree_fletcher.yml
+  generator: >-
+    h5policy-gencorpus _make_chunk_filter_mask_all_skipped, from the valid
+    control.  TWO BYTES change, both inside key[0]: the low byte of the stored
+    size (0x68 -> 0x08) and the low byte of the filter mask (0x00 -> 0x01).  The
+    prefix carries no checksum and both edits are size-neutral.
+    Key-layout traps are the same ones _make_chunk_zero_stored_size documents --
+    n+1 keys for n children, the trailing key is a legitimate zero-size
+    sentinel, and the key stride uses the LAYOUT dimensionality (rank + 1).  The
+    shared helper _chunk_v1_key0 asserts the parse before patching.
+  why_8: >-
+    8 is above fletcher32's four-byte framing, so H5_CORRUPT_CHUNK_STORED_SIZE
+    does not fire and the fixture pins this rule alone.  Sizes below 4 belong to
+    malformed/chunk_stored_size_below_framing.h5.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true          # h5policy never runs the pipeline
+    no_external_open: true
+    no_user_callback: true
+    no_legacy_fallback: false       # the v1 B-tree index is the legacy path
+
+backports: []
+
+fuzz_seed: >-
+  The chunk key's filter mask is a productive mutation axis that no
+  length-oriented mutator reaches, because the interesting value is 1 -- not an
+  extreme, and harmless on its own.  It is only interesting PAIRED with the
+  stored size in the same key, which is the general lesson: mutate a flag field
+  together with the field whose meaning it changes, not independently.
+
+compatibility_backport_risks: >-
+  None for the oracle rule.  It fires only when every bit of the pipeline is
+  masked AND the stored size differs from nelmts * element_size, and libhdf5's
+  own raw-storage path produces exactly that size.
+
+sibling_audit: >-
+  NOT SWEPT.  The mask is recorded only at the V1 B-TREE leaf.  The v2 B-tree,
+  fixed-array and extensible-array record layouts also carry a filter mask for
+  filtered datasets, and their walkers do not read it, so the same file shape
+  built on a modern index is still accepted.  That is a coverage limit of this
+  change, listed under coverage_gaps, not a claim that those paths are safe --
+  H5D__chunk_lock is common to all of them, so the defect is index-independent
+  and only the fixture is v1-specific.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: ">= 1.8.0 (unverified lower bound), < 2.2.0"
+  fixed_in: 2.2.0
+  upstream_fix: >-
+    d926e3cbd0b "Various fixes to handling of chunk buffers (#6184)", 2026-04-29,
+    which added the post-unfilter `chunk_nbytes != chunk_size` check to
+    H5D__chunk_lock.  First tag containing it: 2.2.0.  Pinned with
+    `git log -S"chunk size is incorrect after being unfiltered" -- src/H5Dchunk.c`
+    and `git tag --contains`.
+  label: >-
+    Upper bound MEASURED (1.14.5 discloses, 2.3.0 rejects) and the fix commit is
+    identified.  The lower bound is asserted from the shape of the code, not
+    bisected: the string is absent from every tag before 2.2.0, but no build
+    older than 1.14.5 was run.
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    ONLY THE V1 B-TREE INDEX RECORDS THE MASK.  See sibling_audit.  A file with
+    the same contradiction on a fixed-array, extensible-array or v2 B-tree index
+    is still accepted by h5policy today.
+  - >-
+    NO 32-BIT AND NO ASAN MEASUREMENT.  See measured.width and measured.asan for
+    why neither was judged necessary for the conclusion, and what each would
+    add.
+  - >-
+    THE 1.14.x BRANCH IS NOT ASSESSED FOR A BACKPORT.  The fix is a three-line
+    check, but whether the 1.14 H5D__chunk_lock reaches it on every arm --
+    particularly the partial-edge-chunk disable-filters paths -- was not read.
+open_questions:
+  - >-
+    Can the short cached chunk be flushed BACK to the file?  If a read populates
+    the cache with a stored_size-byte allocation labelled as a chunk_size-byte
+    chunk, a subsequent partial write to that chunk would write into it and then
+    flush chunk_size bytes.  That is a heap over-read into the file at best and
+    an over-write at worst.  NOT ATTEMPTED -- the whole measurement here is on
+    the read path.
+  - >-
+    Does the same contradiction reach H5Ocopy / h5repack, whose chunk path
+    (H5D__chunk_copy_cb, src/H5Dchunk.c:6996-7006) runs its own H5Z_pipeline
+    with the record's mask and has its own size check afterwards?  Unread.
+
+provenance:
+  found_by: >-
+    auditing the v1 B-tree chunk key field by field against what h5policy
+    reads.  The stored size was already checked twice over; the four bytes after
+    it were read by nothing.  No specimen, no fuzzer -- the rule came first and
+    the measurement followed.
+  hdf5_build: >-
+    libhdf5 1.14.5 as bundled with h5py 3.13.0 (the disclosure measurement), and
+    libhdf5 2.3.0 from the local source tree at develop b7b85e7abf9 with the
+    baseline RelWithDebInfo/-DNDEBUG install, settings_sha256
+    7ce6203229fbd356cbdbaab0e1b333c4319c0063743003226a9fb8d05f47819c, x86-64
+    (the rejection measurement and the source reading).  Workstation-local;
+    paths not recorded.
+  poke_version: GNU poke 4.3
