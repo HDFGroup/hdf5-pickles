@@ -1542,6 +1542,11 @@ def _gen_malformed(root):
     _make_bad_heap_free_list(f"{root}/malformed/bad_heap_free_list.h5")
     _make_heap_free_list_size_wrap(
         f"{root}/malformed/heap_free_list_size_wrap.h5")
+    # The same structure failing one node later, which is what makes a
+    # rejection non-durable: see the generator.  h5policy-probe's durability
+    # pass reports `not_durable` here and nowhere else in the corpus.
+    _make_heap_free_list_chain_break(
+        f"{root}/malformed/heap_free_list_chain_break.h5")
     _make_lheap_data_segment_alias(
         f"{root}/malformed/lheap_data_segment_alias.h5",
         f"{root}/valid/two_symbol_table_groups.h5")
@@ -8461,6 +8466,86 @@ def _make_heap_free_list_size_wrap(path):
     struct.pack_into("<Q", raw, heap + 16, off)                  # head -> our node
     struct.pack_into("<Q", raw, dblk_addr + off, 1)              # next == H5HL_FREE_NULL
     struct.pack_into("<Q", raw, dblk_addr + off + 8, 0xFFFFFFFFFFFFFFFF)  # size
+    _patch(path, bytes(raw))
+
+
+def _make_heap_free_list_chain_break(path):
+    """A local-heap free-list chain that fails on its SECOND node.
+
+    The fixture for a defect the corpus otherwise cannot see: a rejection that
+    does not survive being asked twice.
+
+    The first node is legal and is PUBLISHED into heap->freelist at
+    H5HLcache.c:265; the chain then points at an offset the bound at :240
+    refuses, so H5HL__fl_deserialize fails and the data-block load fails with
+    it.  What it leaves behind is the point.  The validation lives inside
+
+        if (NULL == heap->dblk_image)                    /* H5HLcache.c:713 */
+
+    and the failed attempt has already allocated that image (:715), while the
+    error path at :732 destroys only the dblk.  The image hangs off the H5HL_t
+    on the CACHED heap prefix -- an entry that loaded fine -- so the next
+    protect skips the whole branch, validation included, and hands the heap
+    over.  Measured: the first H5Lget_name_by_idx on the root group fails and
+    the second succeeds.
+
+    WHY THE SECOND NODE AND NOT THE FIRST.  Either position exposes the bypass,
+    because the image is allocated before any node is examined.  Failing on the
+    second one also leaves a node live on heap->freelist, which is the state
+    that turns this into memory corruption when the wrapped-size defect next
+    door supplies that node -- so this fixture encodes the dangerous shape
+    rather than the minimal one.
+
+    h5policy rejects the file outright (H5_CORRUPT_LOCAL_HEAP_FREE_LIST): its
+    free-list walk bounds every node against the segment before publishing any
+    of them.
+
+    This is the regression test for h5policy-probe's durability pass, which
+    reports `not_durable` here and `not_applicable` on every other corpus
+    fixture.  See registry/cases/local-heap-free-list-bound-wraps.yml for the
+    neighbouring defect and the bundle recorded against it.
+    """
+    # FOUR LONG NAMES, and the length is load-bearing.  A heap that libhdf5
+    # never had to grow is written with its data segment immediately after its
+    # prefix, and the two are then ONE cache object (H5HL_t.single_cache_obj):
+    # the free list is deserialized during the prefix load, so a failure means
+    # the prefix never enters the cache and every retry re-reads and re-fails.
+    # That file is durable and tests nothing here.  Growing the heap once moves
+    # the data segment away from the prefix, which is what splits them into two
+    # cache entries -- and the split is the whole precondition, because the
+    # bypass needs the prefix to load SUCCESSFULLY and keep the H5HL_t on which
+    # the failed data-block attempt leaves its image.  Measured: one short name
+    # gives a contiguous 88-byte segment; four 40-character names give a
+    # 352-byte segment at a different address.
+    raw = _base_bytes(
+        lambda h: [h.create_dataset("g" * 40 + str(i), data=np.arange(2, dtype="i4"))
+                   for i in range(4)],
+        libver="earliest")
+    heap = raw.find(b"HEAP")
+    if heap < 0:
+        raise RuntimeError("could not locate the local heap")
+    if raw[8] != 0:
+        raise RuntimeError(f"expected a version-0 superblock, got {raw[8]}")
+    if raw[14] != 8:
+        raise RuntimeError(f"expected 8-byte lengths, got {raw[14]}")
+    dblk_size = struct.unpack_from("<Q", raw, heap + 8)[0]
+    head = struct.unpack_from("<Q", raw, heap + 16)[0]
+    dblk_addr = struct.unpack_from("<Q", raw, heap + 24)[0]
+    if dblk_addr == heap + 32:
+        raise RuntimeError(
+            "the heap data segment is contiguous with its prefix, so the two "
+            "are one cache object and the retry cannot bypass anything")
+    if head == 1 or head + 16 > dblk_size:
+        raise RuntimeError(f"no usable free-list head to build on (head {head})")
+    # Keep libhdf5's own first node exactly as written -- it is legal, and
+    # leaving it alone means nothing in the segment is clobbered -- and point it
+    # at an offset the segment bound refuses.
+    nxt = dblk_size - 8
+    if nxt <= 1 or nxt + 16 <= dblk_size:
+        raise RuntimeError(
+            f"next offset {nxt} must be a real offset that the segment bound "
+            f"refuses (dblk_size {dblk_size})")
+    struct.pack_into("<Q", raw, dblk_addr + head, nxt)
     _patch(path, bytes(raw))
 
 

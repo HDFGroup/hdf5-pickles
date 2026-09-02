@@ -67,6 +67,50 @@ Exit `0` clean · `2` a forbidden event (or crash) occurred · `3` build/toolcha
 unavailable. Compiled artifacts are cached under `.build/` (git-ignored), keyed
 by the toolchain + configuration so a build swap recompiles.
 
+## Durability of a refusal, and the `durability` block
+
+A refusal is evidence of safety only if it **holds**. libhdf5 has at least two
+structures whose validation runs once per open and whose rejected result is then
+reused:
+
+- the **metadata cache image**, whose load is one-shot — `H5C_protect` clears
+  `load_image` before calling `H5C__load_cache_image`, so the failing call
+  consumes the attempt;
+- the **local heap**, whose free-list validation sits inside
+  `if (NULL == heap->dblk_image)` (`src/H5HLcache.c:713`), so a failed attempt
+  leaves the image behind and the next protect skips the check.
+
+In both, the first call fails and the file is then used. A probe that watches one
+call cannot tell that apart from a refusal that holds, and `rejected_in_traversal`
+reads as "libhdf5 refuses this" either way.
+
+So every run ends with a **durability pass**: a *fresh* `H5Fopen`, then the same
+read issued twice.
+
+```json
+"durability": {"first_call_failed": true, "verdict": "not_durable"}
+```
+
+`verdict` is `not_applicable` when the first call succeeded (there was no refusal
+to test), `durable` when both calls failed, and `not_durable` when the first
+failed and the second succeeded. That last case has one reading: the refusal did
+not hold, and any verdict taken from the first call alone overstates what the
+library refuses. `--forbid nondurable_rejection` turns it into exit 2.
+
+Two design points, both learned the hard way:
+
+- **The pass uses its own open.** The main pass has already primed whatever
+  caches it touched, so repeating a call there would measure the main pass rather
+  than the file.
+- **It stays out of `outcome`, `materialization` and the activation counters.**
+  Folding a retry into the primary verdict is exactly how an earlier
+  creation-order fallback came to hide real refusals: only the retry's result
+  reached `call_errors`, and files libhdf5 had refused were reported as accepted.
+  The primary verdict still comes from the first pass alone.
+
+Measured when this was added: of 18 valid and 60 malformed corpus fixtures, none
+report `not_durable`, so the signal is specific rather than ambient.
+
 ## Resource limits, and the `limits` block
 
 The probed process runs under `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_FSIZE`,

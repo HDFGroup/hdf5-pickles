@@ -112,6 +112,10 @@ struct probe_stats {
     unsigned long chunk_sweep_skipped; /* datasets where the sweep was not applicable */
     unsigned long free_sections;     /* sections reported by the free_space canary */
     unsigned long free_sections_oob; /* ...of those, extents not inside the file */
+    /* Durability of a refusal.  -1 not attempted, 0 the refusal held, 1 the
+     * SAME call succeeded the second time -- see the durability pass below. */
+    int rejection_durable;
+    int durability_first_failed;
     int exercise_write;
     int exercise_chunk_index;
     int exercise_btree;
@@ -143,6 +147,7 @@ static void init_stats(struct probe_stats *st)
         "H5Fget_mdc_size", "H5Gget_create_plist", "H5Fget_free_sections"
     };
     memset(st, 0, sizeof *st);
+    st->rejection_durable = -1;      /* -1 = the durability pass found nothing to judge */
     for (int i = 0; i < EP_COUNT; i++)
         st->entry_points[i].name = names[i];
 }
@@ -814,6 +819,46 @@ int main(int argc, char **argv)
         rc = 0;
     }
 
+    /* ---- Durability pass -------------------------------------------------
+     *
+     * A refusal is only evidence of safety if it HOLDS.  libhdf5 has at least
+     * two structures whose validation runs once per open and whose rejected
+     * result is then reused: the metadata cache image, whose load is one-shot
+     * (H5C_protect clears load_image before H5C__load_cache_image), and the
+     * local heap, whose free-list validation sits inside
+     * `if (NULL == heap->dblk_image)` so a failed attempt leaves the image
+     * behind and the next protect skips the check.  In both cases the first
+     * call fails, and the file is then used.
+     *
+     * This pass asks the only question that cannot be answered by watching one
+     * call: make the SAME call twice, in a fresh open, and compare.  A fresh
+     * open is what makes it sound -- the main pass above has already primed
+     * whatever caches it touched, so repeating a call there would measure the
+     * main pass rather than the file.  First fails and second succeeds is a
+     * non-durable refusal with no other reading; anything else is reported as
+     * it happened and judged by whoever reads it.
+     *
+     * Kept out of `call_errors`, `materialization` and the activation counters:
+     * this is a separate question from what the exercise measured, and folding
+     * it into the primary verdict is how the earlier creation-order retry came
+     * to hide real refusals. */
+    if (rc == 0 && !efl) {
+        hid_t f2 = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
+        if (f2 >= 0) {
+            char    nbuf[256];
+            ssize_t first = H5Lget_name_by_idx(f2, "/", H5_INDEX_NAME, H5_ITER_INC,
+                                               0, nbuf, sizeof nbuf, H5P_DEFAULT);
+            if (first < 0) {
+                ssize_t again = H5Lget_name_by_idx(f2, "/", H5_INDEX_NAME,
+                                                   H5_ITER_INC, 0, nbuf,
+                                                   sizeof nbuf, H5P_DEFAULT);
+                st.durability_first_failed = 1;
+                st.rejection_durable = (again < 0) ? 1 : 0;
+            }
+            H5Fclose(f2);
+        }
+    }
+
     printf("{\n");
     printf("  \"tool\": \"h5probe\",\n");
     printf("  \"exercise\": \"%s\",\n", exercise);
@@ -832,6 +877,12 @@ int main(int argc, char **argv)
     printf("    \"free_sections\": %lu,\n", st.free_sections);
     printf("    \"free_sections_out_of_bounds\": %lu,\n", st.free_sections_oob);
     printf("    \"call_errors\": %lu\n", st.call_errors);
+    printf("  },\n");
+    printf("  \"durability\": {\n");
+    printf("    \"first_call_failed\": %s,\n", st.durability_first_failed ? "true" : "false");
+    printf("    \"verdict\": \"%s\"\n",
+           st.rejection_durable < 0 ? "not_applicable" :
+           st.rejection_durable == 1 ? "durable" : "not_durable");
     printf("  },\n");
     printf("  \"family_exercise\": {\"name\": \"%s\", \"attempts\": %lu, \"completed\": %lu},\n",
            exercise, st.family_attempts, st.family_completed);

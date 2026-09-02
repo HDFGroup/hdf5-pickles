@@ -171,6 +171,33 @@ if command -v h5cc >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
     "$overlay_dir/tools/h5policy-probe" \
         "$tests_dir/malformed/continuation_overlaps_source.h5" \
         --forbid "$forbid" || probe_status=1
+
+    # The durability pass, and its own regression test.  A refusal is evidence
+    # of safety only if it HOLDS, and libhdf5's local-heap free-list validation
+    # does not: it lives inside `if (NULL == heap->dblk_image)`, so the failed
+    # attempt's image makes the next protect skip the check
+    # (registry/cases/local-heap-free-list-bound-wraps.yml).  The probe now
+    # measures that -- same read, twice, in a fresh open -- and this fixture is
+    # the only corpus file that exhibits it.
+    #
+    # THREE OUTCOMES, and only one is a pass, because "no violation" here is
+    # ambiguous in a way that matters: it means either the detector regressed or
+    # libhdf5 stopped bypassing its own rejection.  The second would be excellent
+    # news and must not be swallowed as a green run.
+    heap_break="$tests_dir/malformed/heap_free_list_chain_break.h5"
+    "$overlay_dir/tools/h5policy-probe" "$heap_break" \
+        --forbid nondurable_rejection >/dev/null 2>&1
+    case $? in
+        2) echo "  PASS non-durable rejection still detected on $(basename "$heap_break")" ;;
+        3) echo "  skipped: probe build unavailable for the durability check" ;;
+        0) echo "  FAIL durability check found nothing on $(basename "$heap_break") --"
+           echo "       either h5policy-probe's durability pass regressed, or libhdf5"
+           echo "       no longer reuses a heap whose free-list validation failed."
+           echo "       Measure before assuming the first: the second is a real fix."
+           probe_status=1 ;;
+        *) echo "  FAIL durability check errored on $(basename "$heap_break")"
+           probe_status=1 ;;
+    esac
 else
     echo "  skipped: h5cc or cc unavailable"
 fi
