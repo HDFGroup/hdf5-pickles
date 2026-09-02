@@ -35,6 +35,7 @@ citations rather than by review.
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 import re
 import subprocess
@@ -70,6 +71,28 @@ def find_anchor():
         if m:
             return "h5_group.pk", i, m.group(1)
     raise AssertionError("no `fun h5policy_*` in h5_group.pk to anchor on")
+
+
+def find_missing_pickle():
+    """A pickle name that is genuinely absent, derived rather than written down.
+
+    Written down, the name is two things at once: the fixture this test feeds
+    the checker, and a citation-shaped literal sitting in a tracked file -- so
+    the repo-wide scan reports it, and this test file fails the very gate it
+    tests.  That is not hypothetical; it is how the gate landed, and the whole
+    tree was red until this function replaced the literal.
+
+    Deriving the name fixes both halves.  The source no longer spells a
+    citation at all -- every one it feeds the checker is interpolated -- so the
+    scan has nothing to catch here and the file stays under the gate rather than
+    being exempted from it.  And unlike a hard-coded placeholder, the derivation
+    PROVES the file is absent instead of assuming it, which is the same rule
+    find_anchor() follows for the positive control.
+    """
+    for n in itertools.count():
+        name = f"h5_absent_{n}.pk"
+        if not (PICKLES / name).exists():
+            return name
 
 
 def expect(label, text, tag=None):
@@ -137,8 +160,9 @@ def main() -> int:
            f"# see {name}:{src_len + 1000} ({token})\n",
            "CITATION_OUT_OF_RANGE")
 
+    missing = find_missing_pickle()
     expect("a citation of a nonexistent pickle is caught",
-           "# see h5_not_a_real_pickle.pk:10 (something)\n",
+           f"# see {missing}:10 (something)\n",
            "CITATION_UNKNOWN_PICKLE")
 
     expect("a backwards range is caught",
