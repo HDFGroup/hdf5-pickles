@@ -71,10 +71,16 @@ import tempfile
 
 TESTS = Path(__file__).resolve().parent
 MALFORMED = TESTS / "malformed" / "heap_free_list_size_wrap.h5"
+BYPASSED = TESTS / "malformed" / "heap_free_list_chain_break_wrapped.h5"
 VALID = TESTS / "valid" / "old_style_group.h5"
 
-SHORT_NAME = 40      # measured: completes on this fixture
-LONG_NAME = 56       # measured: faults on this fixture
+# Per fixture, because the threshold is arithmetic and not a constant: the
+# insert overflows once `node offset + need` passes dblk_size.  size_wrap's node
+# sits at 32 in an 88-byte segment; the bypassed one at 200 in 352 bytes.
+SHORT_NAME = 40      # measured: completes on heap_free_list_size_wrap
+LONG_NAME = 56       # measured: faults on heap_free_list_size_wrap
+BYPASSED_SHORT = 120  # measured: completes on the bypassed fixture
+BYPASSED_LONG = 160   # measured: faults on it
 
 PROBE_C = r"""
 /* Open for writing and create one group.  The name length is the parameter that
@@ -170,6 +176,34 @@ def main() -> int:
                         f"{MALFORMED.name} at {SHORT_NAME} characters returned "
                         f"rc={rc} verdict={verdict!r}.  Expected a clean create; "
                         f"the fixture's geometry may have changed.")
+
+        # MEASUREMENT 2, and the one the retains-image record asks for: the
+        # same overflow reached through a heap libhdf5 REFUSED.  Its short-name
+        # control matters for the same reason as the one above -- a different
+        # segment geometry means a different threshold, and a fixture whose
+        # geometry drifted would otherwise pass silently.
+        if BYPASSED.is_file():
+            verdict, rc = run(binary, BYPASSED, BYPASSED_SHORT, tmp)
+            if rc < 0 or verdict != "created":
+                return fail(f"the SHORT-NAME control did not complete: "
+                            f"{BYPASSED.name} at {BYPASSED_SHORT} characters "
+                            f"returned rc={rc} verdict={verdict!r}.")
+            verdict, rc = run(binary, BYPASSED, BYPASSED_LONG, tmp)
+            if rc >= 0:
+                return fail(
+                    f"{BYPASSED.name} at {BYPASSED_LONG} characters completed "
+                    f"cleanly (rc={rc} verdict={verdict!r}).\n"
+                    f"        This is the file where a REFUSED heap is reused: "
+                    f"a clean completion means either libhdf5 stopped reusing "
+                    f"it (see registry/cases/"
+                    f"local-heap-failed-load-retains-image.yml) or stopped "
+                    f"admitting the wrapped node, and the two need telling "
+                    f"apart before either is assumed.")
+            print(f"  PASS a REFUSED heap is still reused and still writes past "
+                  f"its allocation ({BYPASSED.name}, {BYPASSED_LONG}-character "
+                  f"name, signal {-rc})")
+        else:
+            print(f"  note: {BYPASSED.name} absent; the bypass route is unchecked")
 
         # THE MEASUREMENT.
         verdict, rc = run(binary, MALFORMED, LONG_NAME, tmp)

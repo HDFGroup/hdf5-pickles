@@ -108,8 +108,20 @@ Two design points, both learned the hard way:
   reached `call_errors`, and files libhdf5 had refused were reported as accepted.
   The primary verdict still comes from the first pass alone.
 
-Measured when this was added: of 18 valid and 60 malformed corpus fixtures, none
-report `not_durable`, so the signal is specific rather than ambient.
+Measured over the WHOLE corpus (317 files: valid, malformed, policy and cve):
+272 `not_applicable`, 24 `durable`, 13 with no verdict (the probe crashed or the
+open was refused), and **8 `not_durable`** --
+`malformed/heap_free_list_chain_break.h5` and seven metadata-cache-image
+fixtures (`malformed/mdci_*`, `cve/mdci_dup_addr_witness.h5`).
+
+CORRECTION, and the reason the number is quoted with its scope: an earlier note
+here said "of 18 valid and 60 malformed corpus fixtures, none report
+`not_durable`, so the signal is specific rather than ambient". That sweep was an
+alphabetical `head -60` and never reached the `mdci_*` files. The signal is
+specific — 8 of 317 — but it was never zero, and the cache-image cluster is a
+SECOND structure with the same property: `H5C_protect` clears `load_image`
+before calling `H5C__load_cache_image`, so the failing call consumes the attempt
+and every later access succeeds. Different mechanism, same observable.
 
 ## Resource limits, and the `limits` block
 

@@ -1,0 +1,254 @@
+# Two libhdf5 functions read a symbol-table link name out of the same local heap
+# with the same three statements.  One of them rejects an empty name; the other
+# does not.  So whether a file is readable depends on which API the caller used,
+# and the permissive path hands back a name no path resolution accepts.
+#
+# Promoted 2026-09-02 from a supplied specimen that carried it alongside two
+# heap defects; the specimen is identified by provenance.input_sha256 below.
+# The finding was already in the catalog and already emitted by five tracked
+# fixtures -- what was missing was anyone asking what libhdf5 does with it.
+schema_version: 1
+
+id: symtab-empty-link-name-path-split
+title: the empty-link-name check exists on the iteration path and not on the
+  index path, so H5Lvisit2 refuses a file whose links H5Lget_name_by_idx
+  enumerates with empty names
+status: oracle-hardened          # h5policy rejects; libhdf5 half-rejects
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: message_envelope
+versions: [0]                    # v1 symbol table entries, old-style groups
+root_cause_classification: local_decode
+violated_invariant:
+  - envelope.link_name_nonempty
+validation_closure: >-
+  the symbol-table entry together with the heap block its name offset points
+  into: the name must be nonempty and NUL-terminated within the block, checked
+  once, in one place, so that every reader of that name agrees about whether the
+  entry is usable.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - h5policy (oracle) -- rejects, H5_CORRUPT_LINK_NAME_EMPTY
+  - "libhdf5 H5Lvisit2 / H5Literate2 -> H5G__ent_to_link (src/H5Gent.c:384-385)
+     -- REJECTS"
+  - "libhdf5 H5Lget_name_by_idx and H5Gget_objname_by_idx ->
+     H5G__stab_get_name_by_idx_cb (src/H5Gstab.c:656-660) -- ACCEPTS, returns \"\""
+  - "shipped tools that iterate (h5ls, h5dump) refuse the group; an application
+     that enumerates by index does not"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0 @ develop b7b85e7abf9,
+#    re-read 2026-09-02) -------------------------------------------------------
+defect: >-
+  THE TWO PATHS ARE THE SAME THREE STATEMENTS, and they differ by one line.
+    iteration -- H5G__ent_to_link, src/H5Gent.c:379-385
+        if (NULL == (name = (const char *)H5HL_offset_into(heap, ent->name_off)))
+            HGOTO_ERROR(... "unable to get symbol table link name");
+        if (NULL == (lnk->name = H5MM_strndup(name, (block_size - ent->name_off))))
+            HGOTO_ERROR(... "unable to duplicate link name");
+        if (!*lnk->name)
+            HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "invalid link name");
+    by index -- H5G__stab_get_name_by_idx_cb, src/H5Gstab.c:656-660
+        if ((name = (const char *)H5HL_offset_into(udata->heap, name_off)) == NULL)
+            HGOTO_ERROR(... "unable to get symbol table link name");
+        if (NULL == (udata->name = H5MM_strndup(name, (block_size - name_off))))
+            HGOTO_ERROR(... "unable to duplicate symbol table link name");
+        /* and nothing else */
+  Same heap, same offset, same strndup with the same bound.  The check is on one
+  and not the other, and neither is a wrapper for the other -- they are two
+  hand-written copies of one operation, which is why they could drift.
+  WHAT AN EMPTY NAME IS.  The format gives a link a NUL-terminated name in the
+  group's local heap; a name offset pointing at a NUL yields a zero-length name,
+  which names nothing.  libhdf5 agrees it is invalid -- that is what
+  src/H5Gent.c:385 says -- so this is not a question of interpretation.  The
+  disagreement is only about where the rule is enforced.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  MEASURED_2026_09_02: >-
+    On a single-defect specimen built by changing ONE field of
+    h5policy/tests/valid/old_style_group.h5 -- entry 0's name offset moved to a
+    NUL in the heap -- so nothing else in the file is malformed, and on the
+    tracked fixture malformed/bad_snod_empty_name.h5.  Both behave identically.
+  the_split: >-
+    develop b7b85e7abf9, the single-defect specimen (two links, one emptied):
+      H5Gget_num_objs            2          -- the link is counted
+      H5Lget_name_by_idx[0]      len=0 ""   -- SUCCEEDS
+      H5Lget_name_by_idx[1]      len=3 "top"
+      H5Lvisit2                  FAILED     -- refuses the whole group
+      H5Oopen("")                refused
+    So an application enumerating by index is told there are two links and is
+    handed a name for neither -- one usable, one empty -- while an application
+    iterating is told the group cannot be read at all.
+  released_library: >-
+    Released 1.14.5 (h5py 3.13.0 wheel) does the same on both files:
+    list(f.keys()) raises "Link iteration failed (invalid link name)", and
+    get_objname_by_idx(0) returns b''.  The split is not a develop-only
+    behaviour and is not new.
+  the_availability_effect: >-
+    WORTH SEPARATING FROM THE SPLIT, because it is the part a user notices.  One
+    empty name makes the ENTIRE group unlistable through iteration: the valid
+    sibling link "top" is never reported, because H5G__ent_to_link fails on
+    entry 0 and the iteration stops.  The index path still enumerates both.  So
+    the two paths disagree not only about the malformed entry but about the
+    well-formed ones beside it.
+  impact_ceiling_measured: >-
+    NOT a path-resolution hazard, and this was checked rather than assumed.  The
+    empty name does not alias the root: H5Oopen(f, "") is REFUSED, so a caller
+    that feeds the returned name straight back to the library gets an error
+    rather than the parent group.  What remains is that the caller cannot reach
+    the object and is not told the file is malformed.
+  oracle: >-
+    reject_corrupt with H5_CORRUPT_LINK_NAME_EMPTY, on both files.  h5policy
+    validates the name where it decodes the entry, so there is one answer
+    regardless of which consumer asks.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: refuses on the iteration path, accepts on the index path
+  libhdf5_version: develop b7b85e7abf9 and released 1.14.5, identical behaviour
+  classification: invisible to the differential harness, by construction
+  note: >-
+    h5policy-diff drives h5py, which iterates -- so it sees libhdf5 refuse the
+    file, agrees with h5policy, and records no divergence.  The disagreement is
+    between two libhdf5 entry points, not between libhdf5 and the oracle, and a
+    harness that asks one of them cannot see it.  This is the second finding in
+    this directory with that shape; the first is
+    registry/cases/local-heap-failed-load-retains-image.yml, where the missing
+    question was "does the refusal hold?" rather than "which caller asked?".
+    NO tolerance entry is warranted or present: on the call the harness makes,
+    the two implementations agree.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  description: >-
+    One line, at src/H5Gstab.c:660, matching what src/H5Gent.c:384-385 already
+    does:
+        if (!*udata->name)
+            HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "invalid link name");
+    A strict tightening: no conforming writer emits a zero-length link name, and
+    the library already refuses one through the other path, so this changes the
+    verdict only for files it already considers invalid.
+    BETTER, IF THE CHURN IS ACCEPTABLE: the two functions are hand-written copies
+    of one operation -- offset into the heap, strndup with the block bound, check
+    -- and a shared helper would make a future divergence impossible rather than
+    unlikely.  That is a refactor, not a fix, and it is named here because the
+    one-line form leaves the duplication that produced the defect in place.
+systemic:
+  semantic_boundary: >-
+    the symbol-table entry and the heap block its name lies in, validated once
+    at decode so that every consumer of the name sees the same verdict.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder, landed); libhdf5 open
+  description: >-
+    h5policy checks the name where it decodes the entry, so no consumer can
+    reach an unvalidated one and there is no second path to drift from the
+    first.  No oracle change was required by this case -- the rule and the
+    finding already existed; what this record adds is what libhdf5 does.
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  direct_fixtures:
+    - h5policy/tests/malformed/bad_snod_empty_name.h5      # the symbol-table form
+    - h5policy/tests/malformed/nul_compact_link_name.h5    # the compact-group form
+    - h5policy/tests/malformed/softlink_empty_name.h5      # an empty soft-link name
+  expectations:
+    - h5policy/tests/expected/malformed-bad_snod_empty_name.yml
+  single_defect_specimen: >-
+    Not tracked, and trivially rebuilt: take
+    h5policy/tests/valid/old_style_group.h5, find the SNOD, and set entry 0's
+    8-byte name offset to 0 -- a NUL in that heap.  One field, nothing else
+    touched, and the file then shows the split on its own.  sha256 of the result
+    with the corpus as of this record:
+    c8acaa7fe2eb711ac0f0d226cdb1e947c87e24a32a9fab9ecb33ad60924eee7d
+    (regenerate rather than trust the hash if the base fixture changes).
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unmeasured
+    no_legacy_fallback: true
+
+backports: []
+
+fuzz_seed: >-
+  A name offset is a single field with an obvious boundary -- any offset whose
+  byte is NUL -- so the family is cheap.  The generalisable seed is not the
+  field though: it is the QUESTION.  Two entry points that read the same bytes
+  should be asked the same question and their answers compared, and this
+  repository's harnesses ask one of them.  A differential BETWEEN libhdf5 entry
+  points, rather than between libhdf5 and the oracle, would have found this
+  without a specimen.
+
+compatibility_backport_risks: >-
+  None identified.  Adding the check to the index path rejects only files the
+  iteration path already rejects, and no writer produces a zero-length link
+  name.
+
+sibling_audit: >-
+  NOT SWEPT, and it is the obvious next question: how many other pairs of
+  libhdf5 entry points read the same structure with different validation?  The
+  two here were found from one specimen, not from a search.
+  WITHIN REACH and unexamined: the dense-group equivalents (H5G__dense_lookup vs
+  H5G__dense_get_name_by_idx), the attribute name paths, and whether
+  H5Lget_info_by_idx applies more or less than H5Lget_name_by_idx.
+  NOT part of this record: the two local-heap defects the same specimen carried,
+  registry/cases/local-heap-free-list-bound-wraps.yml and
+  registry/cases/local-heap-failed-load-retains-image.yml.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: >-
+    UNVERIFIED as a range, and deliberately not guessed.  MEASURED identical on
+    released 1.14.5 and develop b7b85e7abf9, which is two points rather than a
+    range.  No archaeology was run: the question "when did the check appear on
+    one path only" needs a sweep of both files across tags, and neither the
+    check's introduction nor the index path's origin was looked up.
+  label: not established
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    NOTHING ASSERTS THE SPLIT.  malformed/bad_snod_empty_name.h5 asserts the
+    ORACLE verdict, and its expectation used to say libhdf5 "rejects this as an
+    invalid link name" -- true of iteration, false of the index path.  The
+    comment is corrected; the behaviour is still unasserted, because every
+    read-only harness here iterates.  A check that calls both entry points on
+    one file and compares would cover it, and would cover the whole class.
+  - >-
+    NO VERSION RANGE.  Two measured points, no archaeology.
+  - >-
+    THE DENSE-GROUP EQUIVALENTS ARE UNEXAMINED -- see sibling_audit.  The
+    finding code is catalogued under dense_index precisely because it is emitted
+    from more than one walker, so the same question exists there and was not
+    asked.
+open_questions:
+  - >-
+    Can an empty link name be WRITTEN through the API, or only forged in the
+    bytes?  H5Lcreate_hard with an empty name is presumably refused, but that
+    was not measured, and the answer decides whether any real writer can produce
+    such a file by accident.
+  - >-
+    Does H5Lget_info_by_idx -- which reaches the same entries -- apply the check
+    or not?  Measured for name_by_idx only.
+
+provenance:
+  found_by: >-
+    a supplied specimen triaged for other defects; the empty-name findings sat
+    in the forensic report and were carried as a scope note through two case
+    records before anyone asked what libhdf5 does with them.  Promoted
+    2026-09-02.
+  input_sha256: d40d6488d7d0f0a005202d610ff9fde0a11ab7c8e23ae6254a7fd87f27844ad2
+  measured_on: 2026-09-02
+  hdf5_build: >-
+    HDF5 2.3.0 @ develop b7b85e7abf9 (newest available), RelWithDebInfo without
+    sanitizers, and released 1.14.5 via the h5py 3.13.0 wheel.  Workstation-local
+    installs; paths not recorded.
+  poke_version: GNU poke 4.3
