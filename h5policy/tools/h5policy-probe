@@ -296,18 +296,60 @@ def ensure_built(h5cc, ident, as_json):
     return probe, trace
 
 
+def inherited_cap(which, want):
+    """`want`, lowered to the hard limit this process already runs under.
+
+    setrlimit RAISES when the requested value exceeds the inherited HARD limit,
+    and a raise inside a preexec_fn reaches the caller as a bare
+    `SubprocessError: Exception occurred in preexec_fn` -- no limit named, no
+    value, no traceback into this file.  That is not hypothetical: running the
+    regression suite under the `ulimit -v` its own guidance recommends (an
+    uncapped h5dump on a corpus fixture can OOM the session) put every child
+    under a 3.9 GiB hard limit, and the tools that ask for 4 GiB died with that
+    message instead of running.
+
+    Clamping in the PARENT rather than the child is deliberate: the parent
+    inherits the same limit, so it can compute the effective value AND report
+    it.  A child that clamped silently would leave a run looking like it had a
+    2 GiB cap when it had 200 MB, which changes what "rejected" means for an
+    allocation-amplification case.
+    """
+    soft, hard = resource.getrlimit(which)
+    if hard != resource.RLIM_INFINITY and want > hard:
+        return hard, True
+    return want, False
+
+
+def effective_limits(cpu, mem_mb, fsize_mb):
+    """The limits actually applicable here, and what was lowered to get them."""
+    mem_b, mem_clamped = inherited_cap(resource.RLIMIT_AS, mem_mb * 1024 * 1024)
+    cpu_s, cpu_clamped = inherited_cap(resource.RLIMIT_CPU, cpu + 2)
+    fsize_b, fsize_clamped = inherited_cap(resource.RLIMIT_FSIZE,
+                                           fsize_mb * 1024 * 1024)
+    return {
+        "mem_mb": mem_b // (1024 * 1024),
+        "mem_mb_requested": mem_mb,
+        "cpu_seconds": max(1, cpu_s - 2),
+        "fsize_mb": fsize_b // (1024 * 1024),
+        "fsize_mb_requested": fsize_mb,
+        "clamped_to_inherited_rlimit": bool(mem_clamped or cpu_clamped
+                                            or fsize_clamped),
+    }
+
+
 def _limits(cpu, mem_mb, fsize_mb, asan=False):
     def apply():
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 2))
+        cpu_hard, _ = inherited_cap(resource.RLIMIT_CPU, cpu + 2)
+        resource.setrlimit(resource.RLIMIT_CPU, (min(cpu, cpu_hard), cpu_hard))
         # ASAN maps an enormous (~20 TB) shadow region at startup; a virtual
         # address-space cap makes it abort before main().  Skip RLIMIT_AS for an
         # ASAN build and rely on RLIMIT_CPU/timeout plus ASAN's own
         # hard_rss_limit_mb (set in the env) to bound runaway memory instead.
         if not asan:
-            soft_as = mem_mb * 1024 * 1024
+            soft_as, _ = inherited_cap(resource.RLIMIT_AS, mem_mb * 1024 * 1024)
             resource.setrlimit(resource.RLIMIT_AS, (soft_as, soft_as))
-        resource.setrlimit(resource.RLIMIT_FSIZE,
-                           (fsize_mb * 1024 * 1024, fsize_mb * 1024 * 1024))
+        fsize, _ = inherited_cap(resource.RLIMIT_FSIZE, fsize_mb * 1024 * 1024)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
         resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
         try:
             resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
@@ -375,7 +417,10 @@ def classify(trace_lines, input_realpath, workdir):
 def probe_file(path, probe, trace, ident, timeout, cpu, mem_mb, fsize_mb,
                exercise="generic", asan=False):
     workdir = tempfile.mkdtemp(prefix="h5probe-")
-    result = {"timed_out": False, "signal": None}
+    limits = effective_limits(cpu, mem_mb, fsize_mb)
+    mem_mb = limits["mem_mb"]          # ASAN's hard_rss_limit_mb uses this too
+    fsize_mb = limits["fsize_mb"]
+    result = {"timed_out": False, "signal": None, "limits": limits}
     try:
         local = os.path.join(workdir, "input.h5")
         shutil.copy(path, local)
@@ -545,6 +590,7 @@ def main():
         "activation": act,
         "forbid": forbid,
         "violations": violations,
+        "limits": result.get("limits"),
     }
     if result.get("asan"):
         out["asan"] = portable_asan(result["asan"])

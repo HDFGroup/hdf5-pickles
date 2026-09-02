@@ -66,9 +66,33 @@ Every substantial token in the parenthesised anchor must appear at the cited lin
 citation and its anchor, including after a `#` comment marker, but nothing else
 may come between them — so a citation with no anchor cannot quietly adopt the
 next parenthetical in the sentence. When a citation does break, the error names
-the missing token, which turns the repair into a grep. Citations into the libhdf5
-tree are deliberately **not** covered: that tree is not in this repo and those
-citations are pinned to a stated upstream version instead.
+the missing token, which turns the repair into a grep.
+
+Citations into the **libhdf5 tree** — 343 distinct file/line pairs, in records,
+expectations, pickles and generators — get a weaker gate of their own,
+`tools/check_upstream_citations.py`: the file exists, the line is in range, and
+the line holds something other than whitespace, a lone brace or a comment
+delimiter. That is all it can check without an anchor, and the anchor is what it
+cannot have. Inferring one from the surrounding prose was built and measured
+first: of 842 citation occurrences, 425 name no function at all in their context,
+and the mismatches were dominated by sentences carrying two citations and two
+function names, which cross-match into false positives. A gate whose false
+positives look like its true positives gets switched off, so this one checks only
+the part that needs no annotation — and misses, by construction, a citation that
+drifts onto *another statement*.
+
+It still earns its place. Measured when it was written, against develop
+`b7b85e7abf9`: **nine** distinct citations had drifted onto a blank line, a bare
+brace or a comment terminator, in **sixteen** places, each one or two lines from
+the statement its own prose described. None was wrong when written; upstream
+inserted lines above them.
+
+The tree is not in this repository and its location is a per-machine path that
+portable provenance forbids recording, so the checker reads `HDF5_SOURCE_DIR`
+(the variable the devcontainer build script already uses) and reports itself
+**SKIPPED** when that is unset or does not name a checkout. A skip is not a pass
+and prints as its own word; the OK line names the upstream revision it agreed
+with, because a citation is only correct *against a stated tree*.
 
 ## Vocabulary (from the strategy doc)
 

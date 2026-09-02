@@ -66,3 +66,26 @@ h5policy-probe FILE --hdf5-bindir /path/to/hdf5/bin --json
 Exit `0` clean · `2` a forbidden event (or crash) occurred · `3` build/toolchain
 unavailable. Compiled artifacts are cached under `.build/` (git-ignored), keyed
 by the toolchain + configuration so a build swap recompiles.
+
+## Resource limits, and the `limits` block
+
+The probed process runs under `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_FSIZE`,
+`RLIMIT_NOFILE` and `RLIMIT_NPROC` (`--cpu`, `--mem-mb`, `--fsize-mb`). Each
+request is **lowered to the hard limit the probe itself inherited**, because
+`setrlimit` above that limit raises, and a raise inside `preexec_fn` reaches the
+caller as `SubprocessError: Exception occurred in preexec_fn` — no limit named
+and no value, which reads as a broken probe rather than as a tight `ulimit`.
+
+The clamp is reported rather than silent. Every `--json` result carries:
+
+```json
+"limits": {"mem_mb": 976, "mem_mb_requested": 2048, "cpu_seconds": 30,
+           "fsize_mb": 64, "fsize_mb_requested": 64,
+           "clamped_to_inherited_rlimit": true}
+```
+
+Read it before trusting a `rejected_in_traversal` on a file whose defect is an
+allocation amplification: under a lowered cap, "the library refused it" and "the
+allocation hit your `ulimit`" look identical from outside. An ASAN build takes
+no `RLIMIT_AS` at all (the shadow map needs terabytes of address space) and is
+bounded by `hard_rss_limit_mb`, which follows the clamped value.

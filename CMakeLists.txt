@@ -132,6 +132,13 @@ add_custom_target(docs-check
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_source_citations.py"
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_source_citations.py"
+    # Citations into the libhdf5 tree.  Skips when HDF5_SOURCE_DIR is unset, so
+    # its own test runs unconditionally -- that test is what proves the skip is
+    # visible rather than silent.
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_upstream_citations.py"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_upstream_citations.py"
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_advisory_draft.py"
     COMMAND "${Python3_EXECUTABLE}"
