@@ -4,6 +4,16 @@
 #
 # Promoted from one working bundle (gitignored h5cve scratch; the specimen is
 # identified by provenance.input_sha256 below).
+#
+# RE-MEASURED 2026-09-02, and three things in this record were WRONG.  (1) The
+# wrong-terminator variant was said not to reach the defect; it does.  (2) The
+# tracked fixture was described as proving the oracle rule while only the
+# untracked bundle variant showed the memory error; the fixture shows it too,
+# with a long enough name.  (3) The width note said a 64-bit-tuned specimen need
+# not reproduce at 32 bits; the same file faults at both.  Each correction is
+# marked where it applies, and the evidence is in
+# measured.REMEASURED_2026_09_02.  The defect itself is unchanged and unfixed at
+# develop b7b85e7abf9; a RELEASE is now measured faulting.
 # That specimen carries TWO independent defects.  The other one -- the
 # superblock driver-info address -- is recorded separately in
 # registry/cases/driver-info-block-fields-unbounded.yml.  They share a file and
@@ -64,12 +74,79 @@ defect: >-
   A NOTE ON THE SENTINEL, because it is a trap for anyone building variants:
   H5HL_FREE_NULL is 1, not 0 or all-ones.  variant_flnull.h5 (next-offset
   all-ones) and variant_ovf.h5 (next-offset 1, i.e. the actual terminator) are
-  both rejected by h5policy with the same two findings, but only variant_ovf
-  reaches the libhdf5 hole.  Guessing the terminator wrong produces a specimen
-  that looks equivalent and tests nothing.
+  both rejected by h5policy with the same two findings.
+  CORRECTED 2026-09-02.  This paragraph used to end "but only variant_ovf
+  reaches the libhdf5 hole ... guessing the terminator wrong produces a specimen
+  that looks equivalent and tests nothing."  MEASURED: variant_flnull.h5
+  corrupts the heap as well, aborting the baseline build with glibc's
+  `free(): invalid next size (fast)`, exactly as variant_ovf.h5 does.
+  The reason is the publication order.  The node is linked into heap->freelist
+  at src/H5HLcache.c:265 BEFORE the loop advances, and the error path at :271
+  frees only `fl` -- the node it has NOT linked.  So a chain that fails on its
+  SECOND node still leaves the first, wrapped, node on the free list of a heap
+  the caller goes on to use.
+  What the terminator actually buys is a clean deserialize, not reachability:
+  with next-offset 1 the walk returns SUCCEED and nothing in the error path runs
+  at all.  ONE WRAPPED NODE IS ENOUGH; a well-formed chain is not required, and
+  a variant builder cannot make this defect harmless by getting the sentinel
+  wrong.
 
 # -- Measured behaviour -------------------------------------------------------
 measured:
+  REMEASURED_2026_09_02: >-
+    Re-measured for a repository-advisory draft, at h5policy 117524d with a
+    clean worktree, across five builds and one released library.  THE DEFECT IS
+    UNCHANGED AT develop b7b85e7abf9: src/H5HLcache.c:258 still reads
+    `if ((fl->offset + fl->size) > heap->dblk_size)`.  src/H5HLcache.c and
+    src/H5HL.c are byte-identical between that revision and aa9df72cc21 -- the
+    source the ASan builds were configured from -- so the sanitizer results
+    below describe the newest code and not a stale one.
+    A RELEASED LIBRARY IS MEASURED FAULTING, which this record previously could
+    not say: libhdf5 1.14.5, bundled in the h5py 3.13.0 wheel, SIGSEGVs on
+    `create_group` against the tracked fixture.  So does the shipped h5copy on
+    the newest build.  h5repack does NOT -- it writes a fresh destination and
+    never inserts into the malformed heap, which is worth knowing as a
+    workaround as much as a measurement.
+  write_path_measured_2026_09_02: >-
+    One H5Gcreate2 after H5Fopen(RDWR).  Read-only open, traverse and close is
+    clean on every build tried, so the read/write boundary this record already
+    claimed is now measured on all of them rather than argued.
+      develop b7b85e7abf9, stock          SIGSEGV
+      develop aa9df72cc21, stock          SIGABRT -- glibc reports the damage
+                                          itself: "free(): invalid next size
+                                          (fast)".  NOT a sanitizer-only finding.
+      ASan -DNDEBUG                       heap-buffer-overflow WRITE of size 57,
+                                          memcpy from H5HL_insert (src/H5HL.c:690),
+                                          0 bytes after a 96-byte region; and
+                                          WRITE of size 1 at src/H5HLcache.c:308
+                                          in H5HL__fl_serialize during the
+                                          H5Fclose flush, 0 bytes after a
+                                          56-byte region allocated at :715.
+      32-bit i386, stock                  SIGSEGV
+      released 1.14.5 via h5py            SIGSEGV
+      shipped h5copy (newest build)       SIGSEGV
+    THE NAME memcpy IS THE SERIOUS ONE.  Its length and content are those of the
+    link name the APPLICATION passes -- so the bytes written past the allocation
+    are neither random nor attacker-chosen but application-chosen, which is a
+    third thing again and worth stating precisely rather than rounding to
+    "attacker-controlled".
+  instrument_note_2026_09_02: >-
+    THE ASSERT BUILD CANNOT SEE THIS.  On the ASan build with asserts live, an
+    UNRELATED assert fires first under H5Gcreate2 -- src/H5B.c:858,
+    `assert(0 == bt->level)` -- and aborts before the heap is serialized.  The
+    assert-free sanitizer build is the instrument that shows the overflow; an
+    investigator who reaches for -UNDEBUG here gets a different defect's abort
+    and may conclude the heap is fine.
+  threshold_2026_09_02: >-
+    HOW MUCH NAME IT TAKES, and who chooses it.  On the tracked fixture
+    (dblk_size 88, node at offset 32) H5Gcreate2 with a name of 8, 24 or 40
+    characters completes cleanly; 56 and 72 fault.  On variant_ovf.h5
+    (dblk_size 48) a 12-character name is enough.
+    The name length belongs to the victim application.  dblk_size belongs to the
+    ATTACKER, so the threshold is tunable down to any name an ordinary program
+    would use, and "our names are short" is not a mitigation.
+    This also explains why the tracked fixture looked clean when this record was
+    written -- see the correction under reproducers.wrap_witness.
   REMEASURED: >-
     2026-08-15, at HEAD.  The ORACLE side is confirmed; the probe side of the
     bundle sweep does NOT speak to this record, and that limitation is worth
@@ -112,16 +189,28 @@ measured:
     (src/H5HLcache.c:308) and H5HL_insert (src/H5HL.c:690, reached from
     H5Gcreate2).  Read-only use is clean.
   width: >-
-    NOT measured at 32 bits, and the wrap is inherently width-dependent: the
-    residue depends on SIZE_MAX, so a 32-bit build needs a different size field
-    to reach the same admitted-node state.  A specimen tuned for 64-bit does
-    not necessarily reproduce at 32-bit and vice versa.
+    MEASURED at 32 bits on 2026-09-02: the SAME file faults, SIGSEGV, on the
+    i386 build.
+    CORRECTION.  This field used to say a 64-bit-tuned specimen "does not
+    necessarily reproduce at 32-bit and vice versa", inferring that from the
+    residue depending on SIZE_MAX.  The inference missed the decode: the file
+    field is sizeof_size bytes wide (8 here) and H5_DECODE_LENGTH_LEN lands it
+    in a size_t, so on ILP32 the stored 0xffffffffffffffff TRUNCATES to
+    0xffffffff -- and 32 + 0xffffffff wraps to 31 at 32 bits exactly as it does
+    at 64.  An all-ones size is width-portable by construction; only a size
+    tuned to a particular residue would not be.
+    STILL NOT measured: a 32-bit AddressSanitizer libhdf5, which does not exist
+    in this environment, so the i386 row is a stock crash observation rather
+    than a sanitizer verdict.
 
 # -- Divergence from the selected build ---------------------------------------
 divergence:
   oracle: reject_corrupt
   libhdf5: accepted
-  libhdf5_version: 2.2.0 (measured); additive check still present at 2.3.0 (source-verified)
+  libhdf5_version: >-
+    measured on 2.2.0 (bundle), on develop aa9df72cc21 and b7b85e7abf9, on a
+    32-bit build of the same, and on released 1.14.5 via h5py; the additive
+    check is present and unchanged in all of them
   classification: A -- a real invariant-A disagreement
   note: >-
     libhdf5 accepts the file and h5policy rejects it, so this is a genuine
@@ -162,6 +251,16 @@ containment:
     additive form in the tree for the next reader to copy.
     The fractal-heap equivalents were swept and are NOT the same defect --
     see sibling_audit.
+    WORTH FIXING IN THE SAME CHANGE, neither being this defect.  (a) Bound
+    fl->size at the POINT OF USE in H5HL_insert (src/H5HL.c:690) and
+    H5HL__fl_serialize (src/H5HLcache.c:308).  Both trust the node against the
+    block they were handed, so a bound there contains any future route into the
+    same state, not only this one -- and those are the two sites where the
+    out-of-bounds writes were measured.  (b) src/H5HLcache.c:253 reports
+    "free block size is zero?" while testing the NEXT-OFFSET decoded on the line
+    above, not the size decoded on the line below.  The message and the value do
+    not correspond, which is how a reader comes to believe the size is checked
+    for zero when it is not checked at all.
 systemic:
   semantic_boundary: >-
     heap segments, free lists, IDs, offsets and extents -- the free-list closure
@@ -200,9 +299,20 @@ reproducers:
     (== H5HL_FREE_NULL, the real terminator) with size 2**64-1 behind a legal
     head at offset 32.  Derived from variant_ovf.h5 in the bundle, minus that
     specimen's unrelated driver-info patch.
-    Its sibling variant_flnull.h5 (next-offset all-ones) stays in the bundle as
-    the control showing that picking the wrong terminator produces a specimen
-    which proves nothing; it is not worth tracking.
+    CORRECTED 2026-09-02, twice over.
+    (1) THE TRACKED FIXTURE DOES REPRODUCE THE MEMORY ERROR.  This field
+    implied only the bundle variant could, and the difference turned out to be
+    the group NAME, not the file: at dblk_size 88 a 40-character name is clean
+    and a 56-character one SIGSEGVs, on develop b7b85e7abf9, on 32-bit, and on
+    released 1.14.5 through h5py, with a heap-buffer-overflow WRITE of size 57
+    under ASan.  The corpus therefore already contains a file that demonstrates
+    the write, and what was missing was the operation, not the specimen -- see
+    measured.threshold_2026_09_02 and the write-path coverage gap below.
+    (2) variant_flnull.h5 (next-offset all-ones) is NOT the inert control this
+    field called it: it corrupts the heap too, for the reason given under
+    `defect`.  It remains useful as the file that shows the defect does not need
+    a well-formed chain, which is close to the opposite of what it was kept
+    for.
   generator: >-
     Recorded recipe, not yet a generator: from a valid superblock-v0 file,
     write next-offset 0xffffff0000004545 and size 0xffffffffffffffff at the root
@@ -224,8 +334,12 @@ fuzz_seed: >-
   The free-list head is a good mutation axis: offset and size are adjacent
   size_t fields with a non-obvious terminator sentinel (H5HL_FREE_NULL == 1).
   The interesting boundaries are size == dblk_size - offset (valid),
-  + 1 (rejected by both), and the wrap residues near SIZE_MAX - offset, which
-  differ per target width.
+  + 1 (rejected by both), and the wrap residues near SIZE_MAX - offset.
+  CORRECTED 2026-09-02: those residues do NOT have to differ per target width.
+  The field is sizeof_size bytes in the file and truncates into a size_t on
+  decode, so an all-ones size wraps at both widths from one specimen -- measured.
+  A residue tuned to 64-bit SIZE_MAX specifically would be width-bound; all-ones
+  is not.
 
 compatibility_backport_risks: >-
   Effectively none.  The subtraction form is a strict tightening: every free
@@ -272,11 +386,37 @@ sibling_audit: >-
 
 # -- Affected versions --------------------------------------------------------
 version_range:
-  affected: >-
-    UNVERIFIED as a range.  Measured on 2.2.0; the additive check is still
-    present in the 2.3.0 tree, verified directly at promotion.  1.14.x and
-    1.10.x are explicitly NOT audited -- the bundle names them as open.
-  label: partially established (two points, not a range)
+  affected: ">= 1.8.9"
+  patched: >-
+    None.  The expression is unchanged at develop b7b85e7abf9, so no release and
+    no development branch contains a fix.
+  before_1_8_9: >-
+    AFFECTED DIFFERENTLY, and arguably worse: hdf5-1_8_2 bounds the free-list
+    OFFSET (`free_block >= heap->heap_alloc`) and never checks the size at all,
+    so there is no bound to wrap past.  1.8.9 is where the additive size check
+    appears, in the form it still has.
+  method: >-
+    Archaeology run 2026-09-02 by reading src/H5HLcache.c at hdf5-1_8_2,
+    hdf5-1_8_9, hdf5-1_8_14, hdf5-1_8_22, hdf5-1_10_0, hdf5-1_10_11,
+    hdf5-1_12_3, hdf5_1.14.4, hdf5_1.14.5, hdf5_1.14.6, hdf5_2.0.0, hdf5_2.1.0,
+    2.2.0 and develop b7b85e7abf9.  The additive bound is identical in every one
+    from 1.8.9 on.  This closes the "1.14.x and 1.10.x not audited" item for the
+    PRESENCE of the defect; whether those branches would take a backport
+    cleanly is a different question and still open.
+  the_2_0_0_guard: >-
+    THE SHARPEST FACT IN THE RANGE.  2.0.0 added an overflow guard to this very
+    loop -- `if (free_block > UINT64_MAX - (2 * heap->sizeof_size))` at
+    src/H5HLcache.c:237, for the OFFSET addition at :240 -- so the hazard was
+    recognised here, in this function, and written down.  The second addition,
+    twenty lines below at :258 and on TWO file-supplied values rather than one,
+    was not revisited.  A reviewer asking "was anyone thinking about overflow in
+    this code?" gets the answer yes, which makes the omission harder to read as
+    an oversight of the whole file and easier to read as one of a single line.
+  measured_ends: >-
+    EXECUTED at two points: released 1.14.5 (via the h5py-bundled library) and
+    develop b7b85e7abf9, both faulting on the write path.  2.2.0 was executed by
+    the original bundle.  Everything else is a source read.
+  label: established (ends measured, interior source-derived)
 
 # -- Open items ---------------------------------------------------------------
 coverage_gaps:
@@ -296,20 +436,41 @@ coverage_gaps:
     on the bundle specimen because a read-only traversal never loads the heap
     data block.  Measure before asserting.
   - >-
-    NO WRITE-PATH COVERAGE IN THE TEST MATRIX.  The consequence is RDWR-only,
-    and the corpus and probes are read-only by design.  Whatever asserts this
-    defect has to open RDWR and call H5Gcreate2, which nothing currently does --
-    so a regression here would be invisible to the existing harness.
+    STILL OPEN, AND NOW FULLY SPECIFIED -- NO WRITE-PATH COVERAGE IN THE TEST
+    MATRIX.  The consequence is RDWR-only, and the corpus and probes are
+    read-only by design, so a regression here is invisible to the existing
+    harness.  What was missing when this item was written was thought to be a
+    specimen; it is not.  The recipe is now exact:
+      open malformed/heap_free_list_size_wrap.h5 RDWR (on a COPY -- the call
+      mutates the file), H5Gcreate2 with a name of at least 56 characters, then
+      H5Fclose.  Faults on every build measured.
+    A harness doing that is the whole coverage.  Note it must run against a
+    copy, must tolerate a SIGSEGV as the EXPECTED outcome, and cannot live in
+    the differential harness, which drives h5py read-only.
   - >-
     CLOSED 2026-08-15 for the oracle side -- see measured.REMEASURED.  The
     bundle-specimen PROBE remains uninformative here by construction (the
     superblock defect stops the open first); the tracked fixture is the better
     measurement and re-runs with every suite invocation.
   - >-
-    No 32-bit measurement, and the wrap residue is width-dependent, so a
-    32-bit specimen would need different field values (see measured.width).
+    CLOSED 2026-09-02 -- 32 bits is measured, with the SAME file, and the
+    premise that a different specimen would be needed was wrong.  See
+    measured.width.  What remains unmeasured there is a 32-bit AddressSanitizer
+    libhdf5, which does not exist in this environment.
   - >-
-    Fractal-heap equivalents and the 1.14.x/1.10.x branches are unaudited.
+    PARTIALLY CLOSED 2026-09-02.  The fractal-heap equivalents were audited on
+    2026-08-15 (see sibling_audit).  The 1.14.x and 1.10.x branches are now
+    source-read for the PRESENCE of the defect and 1.14.5 is measured faulting
+    (see version_range); what is still unaudited is whether a backport applies
+    cleanly to those branches.
+  - >-
+    NEW, and it is the open question a submitter will be asked.  Whether the
+    out-of-bounds memcpy in H5HL_insert can be STEERED -- to a chosen address,
+    or to a chosen distance past the allocation -- was not investigated.  What is
+    established is that it writes application-supplied bytes of
+    application-chosen length immediately past a heap allocation whose size the
+    attacker sets.  A severity above "memory corruption of unknown
+    exploitability" needs that question answered.
 open_questions:
   - >-
     ANSWERED 2026-08-15, see registry/cases/decoder-bound-shape-sweeps.yml.
@@ -318,6 +479,14 @@ open_questions:
     the fractal-heap question is answered in the negative.  See sibling_audit.
 
 provenance:
+  remeasured: >-
+    2026-09-02, at h5policy 117524d with a clean worktree, in a rebuilt h5cve
+    bundle (gitignored scratch; the specimen and every variant are identified by
+    sha256, not by path).  Builds: develop aa9df72cc21 and b7b85e7abf9 stock,
+    two AddressSanitizer builds (asserts live and -DNDEBUG), a 32-bit i386
+    build, and released 1.14.5 via the h5py 3.13.0 wheel.  Workstation-local
+    installs; paths not recorded.  Local evidence only -- no web fetch, no
+    advisory retrieval, no outbound action.
   found_by: >-
     a supplied specimen, triaged through the h5cve bundle workflow in
     an untracked working bundle; promoted 2026-08-15, split from the
