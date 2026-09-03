@@ -16,7 +16,7 @@ title: the v2 B-tree total record count is enforced only in the creation-order
   dense walker, and libhdf5 sizes its link table from that count while filling
   it from the real tree -- so a one-off in either direction is a memory-safety
   fault in every shipped tool, from a file the oracle accepts
-status: oracle-gap               # h5policy ACCEPTS; libhdf5 is memory-unsafe
+status: oracle-hardened          # h5policy rejects as of 2026-09-03; libhdf5 unfixed
 disclosure: >-
   n/a -- local analysis only.  No advisory database was consulted, no advisory
   text was retrieved, and no identifier was looked up.  Specimens were produced
@@ -149,7 +149,33 @@ triggers:
       corruption from the assert-only write bound
 
 # -- What closing it takes ----------------------------------------------------
-containment: >-
+containment_done_2026_09_03: >-
+  ORACLE SIDE, LANDED.  Both dense NAME walkers now compare their walked record
+  count against the header's stored total and emit
+  H5_CORRUPT_V2_BTREE_TOTAL_COUNT.  Implemented as a module accumulator
+  (h5policy_dense_name_walk_total / _valid in h5_dense_links.pk, shared by
+  h5_dense_attrs.pk) rather than as a return value, because the two walkers
+  return different things and threading a second result through either would
+  change every recursive call -- and a shared-walker refactor was tried and
+  reverted once already for closure-allocation cost.  The `_valid` flag is the
+  sentinel the creation-order walker spells 0xffffffffffffffffUL: any path that
+  abandons a subtree leaves the total short, and comparing a short total would
+  be a false positive on a file whose real defect caused the bail.  Eight bail
+  paths are marked in the link walker and six in the attribute one.
+  Regression cover: malformed/dense_link_btree_total_nrec.h5 (n+1, the SIGSEGV
+  direction) is tracked, and h5mutate carries all three values as recipes
+  (bt2_total_nrec_zero / _plus_one / _minus_one) verified on eleven
+  dense-bearing seeds.
+  LIBHDF5 SIDE, STILL OPEN.  The assert at src/H5Gdense.c:717 is the write
+  bound and needs to be a real error return, and H5G__dense_build_table needs
+  to refuse a table whose fill count does not match its size before handing it
+  to the sort.  Now that the provenance question is answered, the fix has only
+  one end to attach to: there is no second count to reconcile against, so the
+  comparison has to be walk-count against table-size at the end of
+  H5G__dense_build_table.  Not attempted here -- that is an upstream change to
+  a different tree.
+
+superseded_containment: >-
   ORACLE SIDE, and this is the part that is ready to do: compare the walked
   record count against the stored total at the end of the dense LINK name and
   dense ATTRIBUTE name walkers, exactly as h5policy_dense_corder_* already
@@ -172,18 +198,29 @@ coverage_gaps:
     "the INFLATED direction is unmeasured ... do that before treating this
     record as complete", and doing it reversed the record's severity.
   - >-
-    WHICH FIELD libhdf5 actually reads to size the table is not established.
-    The table is sized from `linfo->nlinks` at src/H5Gdense.c:757, which is the
-    link-info message's count, yet the fault tracks the B-TREE header's
-    total_nrec that this record's specimens edit.  Either the dense path takes
-    nlinks from the B-tree header, or the two are copied from one another
-    somewhere not yet read.  The behaviour is measured; the provenance of the
-    number is not, and the containment below should not be written until it is.
+    RESOLVED 2026-09-03.  This item asked which field libhdf5 sizes the table
+    from, since the table is sized from `linfo->nlinks` yet the fault tracks the
+    B-tree header.  They are the SAME NUMBER: H5O__linfo_decode sets
+    `linfo->nlinks = HSIZET_MAX` unconditionally (src/H5Olinfo.c, "so we query
+    it later"), so the link-info message stores no count at all, and
+    H5G__obj_get_linfo then fills it from H5B2_get_nrec ->
+    `bt2->hdr->root.all_nrec` (src/H5Gobj.c:317-331).  There is no second copy
+    to cross-check against, which is why the comment at src/H5Gobj.c:330 --
+    "(should be same # of records in all indices)" -- is the whole of libhdf5's
+    assurance here.
   - >-
     No 32-bit measurement.
   - >-
-    Only the dense_index clients were measured.  The SOHM index (client 7) and
-    the huge-object trees carry the same header field and were not tried.
+    PARTLY RESOLVED 2026-09-03.  The CHUNK v2 B-tree (clients 10/11) carries the
+    same header field and was measured: on valid/chunk_v2_btree.h5 the edit is
+    caught as H5_CORRUPT_V2_BTREE_ROOT_COUNT, on valid/chunk_v2_btree_deep.h5 it
+    is ACCEPTED by h5policy -- the same missing comparison in a third walker --
+    but libhdf5 shows NO consequence: h5dump -d reads the dataset at rc=0 for
+    n+1, n-1 and the base alike, so a chunk index's total count is not
+    load-bearing for reads.  A detection gap with no measured impact, which is
+    why the h5mutate recipes are restricted to the dense name clients and why
+    the chunk walker is not fixed here.  The SOHM index (client 7) and the
+    huge-object trees are still untried.
   - >-
     Whether any shipped tool does something worse than under-reporting -- for
     instance a repack that writes the truncated index back, making the loss

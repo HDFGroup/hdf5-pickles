@@ -1890,6 +1890,14 @@ def _gen_malformed(root):
     _make_btree_wrong_client(
         f"{root}/malformed/dense_link_btree_wrong_client.h5",
         f"{root}/valid/dense_links.h5", 5, 6, "dense link name index")
+    # The dense name index's total record count, one ABOVE the tree's own.  The
+    # value is n+1 rather than something large on purpose: n+1 is the minimal
+    # inflation and it is already a stock SIGSEGV, because libhdf5 sizes its
+    # link table from this field and fills it by walking the tree.  See
+    # registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml.
+    _make_btree_total_nrec_off_by_one(
+        f"{root}/malformed/dense_link_btree_total_nrec.h5",
+        f"{root}/valid/dense_links.h5", 5, +1, "dense link name index")
     _make_dblock_size_below_floor(
         f"{root}/malformed/dblock_size_below_floor.h5",
         f"{root}/valid/sohm_list.h5", True)
@@ -4269,6 +4277,52 @@ def _bthd_info_for_type(raw, wanted_type):
                         checksum=bthd + 22 + off_size + len_size - 4)
         bthd = raw.find(b"BTHD", bthd + 4)
     raise RuntimeError(f"could not locate v2 B-tree record type {wanted_type}")
+
+
+def _make_btree_total_nrec_off_by_one(path, base_path, client, delta, what):
+    """Patch a v2 B-tree header's TOTAL RECORD COUNT off by one.
+
+    THE DEFECT THIS EXPRESSES, and why one byte is enough.  The link-info
+    message carries no link count at all -- H5O__linfo_decode sets
+    `linfo->nlinks = HSIZET_MAX` unconditionally (src/H5Olinfo.c) -- so
+    H5G__obj_get_linfo fills it from H5B2_get_nrec, i.e. from this field
+    (src/H5Gobj.c:326).  That single number then sizes the link table in
+    H5G__dense_build_table while the tree walk fills it, and nothing compares
+    the two.
+
+    MEASURED on the 2.3.0 baseline, on a 40-link dense group:
+      n+1  h5dump -H and h5ls -r both SIGSEGV.  The table has one slot the walk
+           never fills; H5MM_calloc leaves its `name` NULL and
+           H5G__link_sort_table qsorts into it (ASan: SEGV on 0x0 in strcmp,
+           from H5G__link_cmp_name_inc, src/H5Glink.c:93).
+      n-1  h5dump ABORTS -- the walk overruns the table, past a bound written
+           as `assert(udata->curr_lnk < udata->ltable->nlinks)`
+           (src/H5Gdense.c:717) and compiled out of every Release build.
+      0    the one benign value: `if (ltable->nlinks > 0)` skips the allocation
+           and the group simply reports no links.
+    n+1 is the fixture because it is the minimal inflation and the read-side
+    fault; the abort variant is a heap-corrupting WRITE and is left to the case
+    record's specimens rather than committed to a corpus that is swept
+    in-process.
+    """
+    with open(base_path, "rb") as f:
+        raw = bytearray(f.read())
+    bt = _bthd_info_for_type(raw, client)
+    jenkins = _jenkins_lookup3()
+    stored = struct.unpack_from("<I", raw, bt["checksum"])[0]
+    body = bytes(raw[bt["bthd"]:bt["checksum"]])
+    if jenkins(body) != stored:
+        raise RuntimeError(f"{what}: base header checksum does not verify, so "
+                           f"the patched one would not be attributable")
+    off = bt["bthd"] + 18 + bt["off_size"]
+    value = bt["total"] + delta
+    if value < 0:
+        raise RuntimeError(f"{what}: total record count would go negative")
+    raw[off:off + bt["len_size"]] = value.to_bytes(bt["len_size"], "little")
+    struct.pack_into("<I", raw, bt["checksum"],
+                     jenkins(bytes(raw[bt["bthd"]:bt["checksum"]])))
+    with open(path, "wb") as f:
+        f.write(bytes(raw))
 
 
 def _make_btree_wrong_client(path, base_path, was, becomes, what):

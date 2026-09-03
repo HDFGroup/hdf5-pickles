@@ -225,7 +225,7 @@ and `h5cve verification` renders it `absent`. An empty annotation set with no
 such declaration still renders `not_assessed`, so the mechanism cannot be used
 to tidy a column -- it can only record a review that actually happened.
 
-**64 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
+**65 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -319,8 +319,22 @@ more than the total:
   dereferenced by the sort comparator) and **n-1 is a stock SIGABRT** (more
   callbacks than slots, past a write bound stated as an assert only at
   `src/H5Gdense.c:717` and compiled out of every Release build). h5policy
-  accepts all of them under all four profiles. Zero is the one benign value,
-  and only because a zero-sized table is never allocated. The engine bug is that all three
+  accepted all of them under all four profiles. Zero is the one benign value,
+  and only because a zero-sized table is never allocated.
+- **Closed on the oracle side 2026-09-03.** The provenance question the record
+  raised is answered: the two counts are the same number. `H5O__linfo_decode`
+  sets `linfo->nlinks = HSIZET_MAX` unconditionally, so the link-info message
+  stores no count at all and `H5G__obj_get_linfo` fills it from
+  `H5B2_get_nrec` -- there is no second copy to cross-check, and
+  `src/H5Gobj.c:330`'s "(should be same # of records in all indices)" is the
+  whole of libhdf5's assurance. Both dense name walkers now compare their
+  walked count against the header's stored total, via a module accumulator with
+  the same abandoned-subtree sentinel the creation-order walker uses -- a short
+  total from a bail would otherwise be a false positive on a file whose real
+  defect caused the bail. `malformed/dense_link_btree_total_nrec.h5` pins the
+  n+1 direction and h5mutate carries all three values as recipes. The libhdf5
+  side stays open: it is an upstream change, and the assert at
+  `src/H5Gdense.c:717` is the bound that needs to become an error return. The engine bug is that all three
   locators read the size-of-offsets and size-of-lengths from fixed byte offsets
   9 and 10, which is wrong whenever a user block pushes the superblock past
   byte 0; the self-validating design caught it as a checksum failure rather

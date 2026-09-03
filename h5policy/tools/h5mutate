@@ -581,22 +581,67 @@ def recipe_bt2_depth_inflated(raw, ctx):
     return changed, resealed, "declared depth of 65535"
 
 
-# NOT A RECIPE (YET): total record count of zero on a tree whose root holds
-# records.  It was written, measured on four seeds, and WITHDRAWN because it
-# does not promise one finding -- it produces three outcomes:
-#   valid/dense_links.h5, valid/dense_attribute.h5   -> ACCEPTED, no findings
-#   valid/dense_links_corder.h5, ..._attribute_corder -> H5_CORRUPT_DENSE_INDEX_COUNT_MISMATCH
-#   valid/chunk_v2_btree.h5                          -> H5_CORRUPT_V2_BTREE_ROOT_COUNT
-# The first outcome is a MEASURED FALSE ACCEPT and the reason this is recorded
-# here rather than deleted: h5policy accepts the file (exit 0, zero findings)
-# while libhdf5 opens it and reports 0 of 40 links in the group -- 40 objects
-# made invisible to every reader by one field.  `H5_CORRUPT_V2_BTREE_TOTAL_COUNT`
-# exists but is emitted from exactly ONE place in the oracle
-# (h5policy_dense_corder_node in h5_dense_links.pk), so the rule is live in the
-# creation-order walker and absent from the name-index walker.  Tracked in
-# registry/finding-backlog.yml; the recipe stays `planned` in the record's
-# fuzz_targets until the name walker enforces it, at which point the promise
-# becomes sound.
+# The total-record-count recipes.  These were WITHDRAWN on 2026-09-03 and
+# reinstated the same day, and the round trip is the point: the first version
+# used zero, produced three different outcomes across seeds, and could not
+# promise one finding.  Two of those outcomes were ACCEPT -- a false accept in
+# which the name-index walkers never compared the header's total against their
+# own tree, because the rule was emitted from exactly one site in the oracle
+# (the creation-order walker).  Chasing the inflated direction then showed the
+# accept was memory-unsafe in libhdf5, not merely a detection gap:
+# H5O__linfo_decode sets linfo->nlinks = HSIZET_MAX unconditionally and
+# H5G__obj_get_linfo fills it from H5B2_get_nrec, so this field alone sizes the
+# link table that the tree walk fills, and n+1 segfaults while n-1 corrupts the
+# heap.  See registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml.
+# Both name walkers now enforce it, so the promise is sound and all three
+# values are recipes.  Zero is kept even though it is the one value libhdf5
+# survives -- it is the value a naive mutator reaches first, and it is the
+# regression guard for the walkers' `valid` sentinel.
+
+# The dense NAME indexes, whose walkers enforce the total-count rule and whose
+# header field sizes libhdf5's link table.  Restricted deliberately: the CHUNK
+# v2-B-tree carries the same field, but measured on valid/chunk_v2_btree_deep.h5
+# the same edit produces H5_CORRUPT_V2_BTREE_ROOT_COUNT on one chunk seed, no
+# finding at all on the other, and NO consequence in libhdf5 -- h5dump -d reads
+# the dataset at rc=0 for n+1, n-1 and the base alike.  A chunk index's total
+# count is not load-bearing for reads, so a recipe promising one finding across
+# both client families would be promising something untrue.
+BT2_DENSE_NAME_CLIENTS = {5, 8}
+
+
+def _bt2_total_edit(raw, ctx, delta):
+    h = _bt2_pick(ctx, clients=BT2_DENSE_NAME_CLIENTS)
+    if h is None or h["num_root_records"] == 0:
+        return None
+    stored = int.from_bytes(
+        raw[h["total_nrec_off"]:h["total_nrec_off"] + h["loff"]], "little")
+    value = 0 if delta is None else stored + delta
+    if value < 0:
+        return None
+    changed, resealed = _bt2_edit(raw, h, h["total_nrec_off"], h["loff"], value)
+    return changed, resealed, (
+        f"total record count {stored} -> {value} against a tree holding "
+        f"{stored}")
+
+
+def recipe_bt2_total_nrec_zero(raw, ctx):
+    """Zero: libhdf5 skips the allocation entirely and reports an empty index,
+    so this is the benign value and the one that hides records rather than
+    faulting."""
+    return _bt2_total_edit(raw, ctx, None)
+
+
+def recipe_bt2_total_nrec_plus_one(raw, ctx):
+    """n+1: the link table gets a slot the walk never fills, and the sort
+    comparator dereferences its NULL name.  Stock libhdf5 SIGSEGVs."""
+    return _bt2_total_edit(raw, ctx, +1)
+
+
+def recipe_bt2_total_nrec_minus_one(raw, ctx):
+    """n-1: the walk produces more callbacks than the table has slots, past a
+    bound that is an assert only (src/H5Gdense.c:717) and compiled out of every
+    Release build.  Stock libhdf5 aborts on heap corruption."""
+    return _bt2_total_edit(raw, ctx, -1)
 
 
 BT2_RECIPES = {
@@ -615,6 +660,15 @@ BT2_RECIPES = {
     "bt2_root_addr_out_of_file":
         (recipe_bt2_root_addr_out_of_file, "btree.v2_root_in_file",
          "H5_CORRUPT_OFFSET_OUT_OF_FILE"),
+    "bt2_total_nrec_zero":
+        (recipe_bt2_total_nrec_zero, "btree.v2_counts_consistent",
+         "H5_CORRUPT_V2_BTREE_TOTAL_COUNT"),
+    "bt2_total_nrec_plus_one":
+        (recipe_bt2_total_nrec_plus_one, "btree.v2_counts_consistent",
+         "H5_CORRUPT_V2_BTREE_TOTAL_COUNT"),
+    "bt2_total_nrec_minus_one":
+        (recipe_bt2_total_nrec_minus_one, "btree.v2_counts_consistent",
+         "H5_CORRUPT_V2_BTREE_TOTAL_COUNT"),
     "bt2_chunk_client_swap":
         (recipe_bt2_chunk_client_swap, "btree.v2_client_matches_caller",
          "H5_CORRUPT_V2_BTREE_RECORD_LAYOUT"),

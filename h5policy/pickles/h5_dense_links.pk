@@ -1095,6 +1095,33 @@ var h5policy_dense_name_corders = uint<64>[]();
 var h5policy_dense_name_matched = uint<8>[]();
 var h5policy_dense_name_nonmanaged_reported = 0;
 
+/* THE NAME INDEX'S OWN RECORD COUNT, and why it needs one.
+   The creation-order walker has compared its walked total against the header's
+   stored total since it was written (h5policy_dense_corder_node returns the
+   sum, and h5policy_walk_dense_corder_btree emits
+   H5_CORRUPT_V2_BTREE_TOTAL_COUNT on a mismatch).  Neither NAME walker did --
+   not the dense-link one here, not the dense-attribute one in
+   h5_dense_attrs.pk -- so `H5_CORRUPT_V2_BTREE_TOTAL_COUNT` was emitted from
+   exactly one site in the whole oracle and a name index could disagree with
+   its own tree unchallenged.  That was a measured false accept with a
+   memory-safety consequence in libhdf5; see
+   registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml.
+
+   An accumulator rather than a return value, because the two name walkers
+   return different things -- this one is `void` and the attribute one threads
+   an H5WalkContext -- and threading a second result through either would cost
+   a signature change on every recursive call.  Poke closures are expensive
+   enough here that a shared walker was tried and reverted once already, so a
+   module global is the cheap and idiomatic route: h5_dense_attrs.pk already
+   shares h5policy_dense_name_nonmanaged_reported the same way.
+
+   `valid` is the sentinel the corder walker spells 0xffffffffffffffffUL: any
+   path that abandons a subtree leaves the total short, and comparing a short
+   total against the header would be a FALSE POSITIVE on a file whose real
+   defect is the thing that caused the bail.  */
+var h5policy_dense_name_walk_total = 0UL;
+var h5policy_dense_name_walk_valid = 1;
+
 /* The creation-order walker is the ONE piece of this file that dense
    ATTRIBUTE indexes also run: h5_dense_attrs.pk calls
    h5policy_walk_dense_corder_btree with record_type 9, h5policy_walk_dense_links
@@ -1125,6 +1152,8 @@ fun h5policy_reset_dense_name_index = void:
     h5policy_dense_name_corders = uint<64>[]();
     h5policy_dense_name_matched = uint<8>[]();
     h5policy_dense_name_nonmanaged_reported = 0;
+    h5policy_dense_name_walk_total = 0UL;
+    h5policy_dense_name_walk_valid = 1;
 }
 
 fun h5policy_record_dense_name_heap_id = (uint<64> heap_off,
@@ -1930,7 +1959,14 @@ fun h5policy_dense_links_node = (int ios, H5PolicyProfile profile,
        budget (forensic) never stops.  A valid tree never shares a node, so this
        skips nothing legitimate.  */
     if (!h5policy_mark_visited_btree(node_addr))
-        return;
+        {
+            h5policy_dense_name_walk_valid = 0;
+            return;
+        }
+
+    /* Every node contributes its OWN records, leaf or internal, which is what
+       makes the running sum the tree's true total. */
+    h5policy_dense_name_walk_total = h5policy_dense_name_walk_total + nrec;
 
     if (node_depth == 0UL)
         {
@@ -1947,6 +1983,7 @@ fun h5policy_dense_links_node = (int ios, H5PolicyProfile profile,
             h5policy_emit_error("H5_RESOURCE_BTREE_DEPTH", "resource",
                                 node_addr#B, object,
                                 "dense link v2 B-tree depth exceeds the selected profile limit");
+            h5policy_dense_name_walk_valid = 0;
             return;
         }
 
@@ -1988,16 +2025,21 @@ fun h5policy_dense_links_node = (int ios, H5PolicyProfile profile,
             h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
                                 node_addr#B, object,
                                 "dense link v2 B-tree used node bytes exceed its declared node size");
+            h5policy_dense_name_walk_valid = 0;
             return;
         }
     if (!h5policy_checked_addr_range(node_addr, node_need, file_size,
                                      "dense link v2 B-tree internal node outside file",
                                      node_addr#B, object))
-        return;
+        {
+            h5policy_dense_name_walk_valid = 0;
+            return;
+        }
     if (h5policy_msg_bytes(ios, profile, node_addr#B, 4UL) != H5_FORMAT_BTIN_SIGNATURE)
         {
             h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt", node_addr#B, object,
                                 "dense link v2 B-tree internal node signature mismatch");
+            h5policy_dense_name_walk_valid = 0;
             return;
         }
     h5policy_mark_reached(node_addr, "BTIN");
@@ -2008,6 +2050,7 @@ fun h5policy_dense_links_node = (int ios, H5PolicyProfile profile,
             h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_HEADER",
                                 "corrupt", node_addr#B, object,
                                 "dense link v2 B-tree internal node version or record type is invalid");
+            h5policy_dense_name_walk_valid = 0;
             return;
         }
     h5policy_dense_verify_trailing_checksum(ios, profile, node_addr, node_need,
@@ -2031,12 +2074,17 @@ fun h5policy_dense_links_node = (int ios, H5PolicyProfile profile,
             var child_raw = h5policy_msg_bytes(ios, profile, ptr_off#B, o);
             var child_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(child_raw));
             var child_nrec = h5policy_msg_u64_at(ios, profile, ptr_off#B + o#B, nrec_bytes);
-            if (!h5policy_msg_addr_is_undef(child_raw))
+            if (h5policy_msg_addr_is_undef(child_raw))
+                h5policy_dense_name_walk_valid = 0;
+            else
                 {
                     if (child_addr >= file_size)
-                        h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
-                                            "corrupt", ptr_off#B, object,
-                                            "dense link v2 B-tree child address outside file");
+                        {
+                            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                "corrupt", ptr_off#B, object,
+                                                "dense link v2 B-tree child address outside file");
+                            h5policy_dense_name_walk_valid = 0;
+                        }
                     else
                         h5policy_dense_links_node(ios, profile, child_addr,
                                                   node_depth - 1UL,
@@ -2249,11 +2297,28 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
                             btree_addr#B + 16#B, object,
                             "dense link v2 B-tree root address outside file");
     else
-        h5policy_dense_links_node(ios, profile, bt_root, depth, num_root,
-                                  node_size, record_size, root_addr,
-                                  curr_root_rows, start_size, max_direct_size,
-                                  table_width, off_size, checksum_dblocks,
-                                  len_size, file_size, object);
+        {
+            h5policy_dense_links_node(ios, profile, bt_root, depth, num_root,
+                                      node_size, record_size, root_addr,
+                                      curr_root_rows, start_size, max_direct_size,
+                                      table_width, off_size, checksum_dblocks,
+                                      len_size, file_size, object);
+            /* The header's stored total against the tree's own. libhdf5 has no
+               second copy of this number to fall back on: H5O__linfo_decode
+               sets linfo->nlinks = HSIZET_MAX unconditionally
+               (src/H5Olinfo.c), and H5G__obj_get_linfo then fills it from
+               H5B2_get_nrec -- the very field read here (src/H5Gobj.c:326).
+               That number sizes the link table in H5G__dense_build_table while
+               the tree walk fills it, and nothing compares the two, so a
+               one-off either way is a memory-safety fault in every shipped
+               reader.  See
+               registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml. */
+            if (h5policy_dense_name_walk_valid
+                && h5policy_dense_name_walk_total != name_total)
+                h5policy_emit_error("H5_CORRUPT_V2_BTREE_TOTAL_COUNT", "corrupt",
+                                    btree_addr#B + (18UL + o)#B, object,
+                                    "dense link name index B-tree total record count is inconsistent with its node graph");
+        }
 
     if (corder_btree_addr != 0xffffffffffffffffUL)
         h5policy_walk_dense_corder_btree(

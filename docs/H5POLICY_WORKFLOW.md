@@ -260,7 +260,7 @@ source-derived, its classification mapping is curated, and the corpus and
 exact-build outcomes are measured corroboration.
 
 Registry checks currently account for **329 finding codes** and **0 semantic-
-backlog entries**. Static enumeration resolves **1024 in-pickle message
+backlog entries**. Static enumeration resolves **1026 in-pickle message
 variants**, with **0 unrouted** and **0 unanalyzable** variants. That is complete
 classification coverage for the current emission surface, not complete
 invariant coverage for the HDF5 format.
@@ -286,8 +286,8 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **64
-are `met`, 76 `partial`, 0 `not_assessed`, and 36 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **65
+are `met`, 75 `partial`, 0 `not_assessed`, and 36 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 
