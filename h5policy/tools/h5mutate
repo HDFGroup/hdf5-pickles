@@ -97,9 +97,25 @@ def superblock_offset(raw):
 
 
 def superblock_widths(raw):
-    """(size_of_offsets, size_of_lengths), read from the real superblock."""
+    """(size_of_offsets, size_of_lengths), read from the real superblock.
+
+    The two widths move with the superblock VERSION, which is the second thing
+    that makes them easy to read from the wrong place.  Versions 0 and 1 carry
+    four more version bytes first -- free-space, root symbol-table entry,
+    reserved, shared-header-message -- and put the widths at +13/+14; versions
+    2 and 3 dropped those and put them at +9/+10.  Reading the v2 offsets from
+    a v0 superblock yields (0, 0): offset 10 there is the root symbol-table
+    entry version.  20 of the 64 seeds in tests/valid are v0, so this is the
+    common case, not a legacy corner -- and a zero width silently collapses
+    every derived field offset to the head of the structure.
+    """
     sb = superblock_offset(raw)
-    return raw[sb + 9], raw[sb + 10]
+    version = raw[sb + 8]
+    if version in (0, 1):
+        return raw[sb + 13], raw[sb + 14]
+    if version in (2, 3):
+        return raw[sb + 9], raw[sb + 10]
+    raise ValueError(f"unsupported superblock version {version}")
 
 
 # --------------------------------------------------------------- reseal -------
@@ -898,6 +914,203 @@ FSM_RECIPES = {
 }
 
 
+# ---- global heap collection (virtual_dataset and message_envelope) ----------
+# The fifth family, and the cheapest reseal in the format: a global heap
+# collection carries NO checksum anywhere (pickles/gheap.pk has no chksum
+# field), so every recipe here edits bytes and stops.  One locator serves two
+# records because the same collection is reached two ways -- a virtual
+# dataset's source list, which H5Dopen reads, and an attribute's vlen or
+# reference descriptor, whose bytes are metadata.
+#
+# On-disk layout (pickles/gheap.pk, Section III.E):
+#   collection header, align8(8 + L) bytes:
+#     [sig:4]["GCOL"][ver:1 == 1][reserved:3][coll_size:L][pad to 8]
+#   then objects in file order, each with an align8(8 + L) header:
+#     [obj_idx:2][ref_cnt:2][reserved:4][data_size:L][data, padded to 8]
+#   idx 0 is the FREE-SPACE SENTINEL, and its data_size is the total span of
+#   the free region INCLUDING its own header -- the asymmetry every recipe here
+#   turns on, because it means the sentinel's size is what advances the walk.
+#
+# NOT A RECIPE, and it would be a plausible one to write: bounding obj_idx
+# against H5HG_NOBJS(f, size).  libhdf5's OWN WRITER emits indices past that
+# bound -- the obj[] array is allocated from it but indices beyond it occur in
+# files the library produces and reads back -- so a recipe asserting rejection
+# would be demanding a false positive.  See
+# registry/cases (global-heap object index) and the note in the finding
+# catalog.  The reachable invariants here are the PROGRESS ones.
+
+GCOL_MINSIZE = 4096          # H5HG_MINSIZE
+
+
+def _gcol_referenced(raw, off, base, soff, coll_size):
+    """Does any byte outside the collection carry its (base-relative) address?
+
+    A heap ID is [collection_addr:O][obj_idx:4], so a reference is literally
+    the address encoded at the file's offset width.  Occurrences inside the
+    collection body do not count -- those are payload that happens to match.
+    """
+    needle = (off - base).to_bytes(soff, "little")
+    at = 0
+    while True:
+        i = raw.find(needle, at)
+        if i < 0:
+            return False
+        if not (off <= i < off + coll_size):
+            return True
+        at = i + 1
+
+
+def locate_gcol(raw):
+    """The first global heap collection, with its header and object offsets.
+
+    There is no checksum to authenticate a signature hit, so the header is
+    validated structurally instead: version 1, zero reserved bytes, and a
+    collection that fits in the file.
+    """
+    soff, loff = superblock_widths(raw)
+    hdr = (8 + loff + 7) & ~7
+    at = 0
+    while True:
+        off = raw.find(b"GCOL", at)
+        if off < 0:
+            raise ValueError("no global heap collection in this seed")
+        at = off + 4
+        if off + hdr > len(raw) or raw[off + 4] != 1:
+            continue
+        if raw[off + 5:off + 8] != b"\x00\x00\x00":
+            continue
+        coll = int.from_bytes(raw[off + 8:off + 8 + loff], "little")
+        if coll < hdr or off + coll > len(raw):
+            continue
+        # THE COLLECTION MUST BE REFERENCED, or these recipes cannot promise
+        # anything.  A global heap has no access path of its own: it is reached
+        # only through a heap ID naming its address, so an unreferenced
+        # collection is never loaded by a metadata walk.  MEASURED on
+        # valid/attr_null_vlen_userblock.h5, whose attribute is a NULL vlen
+        # element and whose collection therefore has ZERO references: all six
+        # recipes came back ACCEPTED under untrusted-strict, while the forensic
+        # profile -- which sweeps orphan collections directly -- rejected them
+        # (H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP).  Both answers are correct for
+        # their profile, which is precisely why the seed cannot carry a recipe
+        # that promises one finding.  Every other GCOL-bearing seed has 1 to 12
+        # references.
+        if not _gcol_referenced(raw, off, superblock_offset(raw), soff, coll):
+            continue
+        # Walk the objects, recording the free sentinel if there is one.
+        objs, free_off, pos = [], None, off + hdr
+        while pos + hdr <= off + coll:
+            idx = int.from_bytes(raw[pos:pos + 2], "little")
+            size = int.from_bytes(raw[pos + 8:pos + 8 + loff], "little")
+            objs.append({"off": pos, "idx": idx, "size_off": pos + 8,
+                         "size": size})
+            if idx == 0:
+                free_off = pos
+                break
+            advance = hdr + ((size + 7) & ~7)
+            if advance <= 0:
+                break
+            pos += advance
+        return {"off": off, "soff": soff, "loff": loff, "hdr": hdr,
+                "coll_size": coll, "coll_size_off": off + 8,
+                "objs": objs, "free": free_off,
+                "free_size_off": None if free_off is None else free_off + 8,
+                "free_size": None if free_off is None
+                             else int.from_bytes(
+                                 raw[free_off + 8:free_off + 8 + loff], "little")}
+
+
+def recipe_gcol_free_zero_length(raw, gh):
+    """A zero-length free sentinel.  Because index 0 advances by its RAW size,
+    zero advances the walk by nothing and H5HG__cache_heap_deserialize re-reads
+    the same object header forever -- non-termination, not a fault."""
+    if gh["free"] is None:
+        return None
+    changed = [_set_uint(raw, gh["free_size_off"], gh["loff"], 0)]
+    return changed, [], "free-space sentinel of zero length (zero advance)"
+
+
+def recipe_gcol_free_undersized(raw, gh):
+    """A sentinel smaller than the object header it starts with, so the walk
+    steps into the sentinel's own zeroed payload -- a route INTO the
+    zero-advance loop rather than a distinct defect.  8 is used rather than 1
+    because it is 8-aligned, so the mutant cannot be dismissed as failing an
+    alignment rule instead."""
+    if gh["free"] is None or gh["hdr"] <= 8:
+        return None
+    changed = [_set_uint(raw, gh["free_size_off"], gh["loff"], 8)]
+    return changed, [], (
+        f"free-space sentinel of 8 bytes against a {gh['hdr']}-byte object "
+        f"header")
+
+
+def recipe_gcol_free_short(raw, gh):
+    """A sentinel that stops short of the collection end, leaving a remainder
+    too small to hold an object header."""
+    if gh["free"] is None:
+        return None
+    remaining = gh["off"] + gh["coll_size"] - gh["free"]
+    value = remaining - 8
+    if value <= gh["hdr"]:
+        return None
+    changed = [_set_uint(raw, gh["free_size_off"], gh["loff"], value)]
+    return changed, [], (
+        f"free-space sentinel {gh['free_size']} -> {value}, stopping 8 bytes "
+        f"short of the collection")
+
+
+def recipe_gcol_obj_size_wrap(raw, gh):
+    """An object whose declared size wraps the 8-byte aligner to zero.
+    align8 is ((x + 7) / 8) * 8, so a size in [2**64-7, 2**64-1] wraps."""
+    target = next((o for o in gh["objs"] if o["idx"] != 0), None)
+    if target is None or gh["loff"] != 8:
+        return None
+    changed = [_set_uint(raw, target["size_off"], gh["loff"], (1 << 64) - 1)]
+    return changed, [], (
+        f"object {target['idx']} size {target['size']} -> 2**64-1, wrapping "
+        f"the 8-byte aligner to zero")
+
+
+def recipe_gcol_coll_size_below_min(raw, gh):
+    """A collection smaller than H5HG_MINSIZE."""
+    if gh["coll_size"] <= gh["hdr"]:
+        return None
+    changed = [_set_uint(raw, gh["coll_size_off"], gh["loff"], gh["hdr"])]
+    return changed, [], (
+        f"collection size {gh['coll_size']} -> {gh['hdr']}, below the "
+        f"{GCOL_MINSIZE}-byte minimum")
+
+
+def recipe_gcol_coll_size_over_file(raw, gh):
+    changed = [_set_uint(raw, gh["coll_size_off"], gh["loff"], len(raw) + 4096)]
+    return changed, [], "collection size past the end of file"
+
+
+GCOL_RECIPES = {
+    "gcol_free_zero_length":
+        (recipe_gcol_free_zero_length, "heap.global_progress",
+         "H5_CORRUPT_GLOBAL_HEAP_OBJECT"),
+    "gcol_free_undersized":
+        (recipe_gcol_free_undersized, "heap.global_progress",
+         "H5_CORRUPT_GLOBAL_HEAP_OBJECT"),
+    "gcol_free_short":
+        (recipe_gcol_free_short, "heap.global_object_extent",
+         "H5_CORRUPT_GLOBAL_HEAP_OBJECT"),
+    "gcol_obj_size_wrap":
+        (recipe_gcol_obj_size_wrap, "heap.global_object_extent",
+         "H5_CORRUPT_GLOBAL_HEAP_OBJECT"),
+    "gcol_coll_size_below_min":
+        (recipe_gcol_coll_size_below_min, "heap.global_collection_size",
+         "H5_CORRUPT_GLOBAL_HEAP_HEADER"),
+    # MEASURED, not intended: a collection running past EOF is caught by the
+    # extent arithmetic before the header rule is reached, consistently on all
+    # six referenced seeds.  The finding recorded here is the one it actually
+    # produces.
+    "gcol_coll_size_over_file":
+        (recipe_gcol_coll_size_over_file, "heap.global_collection_size",
+         "H5_CORRUPT_LENGTH_OVERFLOW"),
+}
+
+
 # recipe name -> (fn, intended invariant, intended finding)
 RECIPES = {
     "cont_overlap_source_start":
@@ -964,6 +1177,11 @@ FAMILIES = {
     # client id decides which record family owns the tree, while the geometry
     # fields belong to btree_heap_index's shared validator whatever the client
     # is.  Every row listed here carries these recipes in its `fuzz_targets`.
+    "global_heap": {
+        "records": ["virtual_dataset", "message_envelope"],
+        "analyze": locate_gcol,
+        "recipes": GCOL_RECIPES,
+    },
     "free_space": {
         "record": "validation_controls",
         "analyze": locate_fsm,

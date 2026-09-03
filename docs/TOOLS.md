@@ -335,7 +335,7 @@ error -- and the recipes never parse the file, they edit fields the locator foun
 and reseal what it says encloses them. Adding a family costs its locator; the
 recipes are then a few lines each.
 
-Four families exist:
+Five families exist:
 
 | family | records | recipes | mutations |
 | --- | --- | --- | --- |
@@ -343,6 +343,7 @@ Four families exist:
 | `heap_structures` | 1 | 4 | doubling-table width zero and non-power-of-two, declared heap size one and two bits under the first row |
 | `v2_btree` | 4 | 9 | node size at 0xFFFFFFFF and at the leaf framing, record size zero, in-range wrong client id, chunk client swap, root address out of file, total record count at zero and ±1 |
 | `free_space` | 1 | 6 | a section one byte over the header's declared maximum, class count over the client's, broken section-count identity, list address and size out of file, zero list size |
+| `global_heap` | 2 | 6 | zero-length and under-sized free sentinels, sentinel stopping short, object size wrapping the aligner, collection size below the floor and past EOF |
 
 `free_space` carries a coverage argument the others do not. h5py cannot reach
 free-space managers **at all** — neither a plain open nor an object walk decodes
@@ -358,6 +359,18 @@ heap-buffer-overflow READ of size 8 in `H5FS__sect_link_size`
 (`H5FSsection.c:935`) — the frame
 [`registry/cases/fsm-section-bin-range.yml`](../registry/cases/fsm-section-bin-range.yml)
 records.
+
+`global_heap` is the cheapest family in the engine — a collection carries no
+checksum anywhere, so the reseal step is a no-op — and its locator carries the
+one reachability condition in the tool: the collection must be **referenced**.
+A global heap has no access path of its own; it is reached only through a heap
+ID naming its address. `valid/attr_null_vlen_userblock.h5` proves why that
+matters: its attribute is a NULL vlen element, its collection has zero
+references, and all six recipes came back *accepted* under `untrusted-strict`
+while the forensic profile — which sweeps orphan collections directly —
+rejected them. Both answers are right for their profile, so no recipe can
+promise one finding on that seed, and the locator skips it. Every other
+GCOL-bearing seed has between 1 and 12 references.
 
 Three FSHD fields are off limits to a recipe, and it is not visible in the
 layout: `max_sect_size`, `max_sect_addr` and `serial_sect_count` each *derive* a
@@ -378,10 +391,15 @@ root, so a first-match locator would edit the dense-link tree while the sidecar
 claimed a SOHM target — a recipe recording an intent it did not carry out.
 
 Every locator reads the file's offset and length widths from the **real**
-superblock rather than from fixed byte offsets 9 and 10. A user block puts the
-superblock at 512 or beyond, where those bytes are user data: measured 0/0 on
-`valid/userblock_latest.h5`, whose real widths are 8/8, making every derived
-field offset wrong. The self-validating design caught that as a checksum
+superblock, at the offsets that superblock **version** puts them. Two things go
+wrong with the obvious `raw[9]`/`raw[10]`. A user block puts the superblock at
+512 or beyond, where those bytes are user data — measured 0/0 on
+`valid/userblock_latest.h5`, whose real widths are 8/8. And versions 0 and 1
+carry four more version bytes first, putting the widths at +13/+14 rather than
++9/+10: **20 of the 64 seeds** in `tests/valid` are version 0, so that is the
+common case rather than a legacy corner. Either mistake yields a zero width,
+which silently collapses every derived field offset to the head of the
+structure. The self-validating design caught that as a checksum
 failure rather than a silent wrong-field edit, but no family could run on a
 userblock seed until the widths were read properly.
 

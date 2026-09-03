@@ -286,12 +286,12 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **66
-are `met`, 75 `partial`, 0 `not_assessed`, and 35 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **68
+are `met`, 75 `partial`, 0 `not_assessed`, and 33 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 
-- dedicated typed fuzz targets for 7 of 16 families and no repository
+- dedicated typed fuzz targets for 9 of 16 families and no repository
   OSS-Fuzz integration. The mutation engine is per-family by construction -- a
   locator plus a recipe table -- so a family gains targets only when someone
   writes its locator, and a recipe earns its place only by holding on seeds
