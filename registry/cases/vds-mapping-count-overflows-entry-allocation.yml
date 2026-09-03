@@ -104,13 +104,48 @@ cleanup_amplification: >-
   This is the same structural shape as
   registry/cases/mdci-reconstruct-cleanup-unsafe.yml: a failure-recovery path
   that assumes an invariant the failure has already broken.
-  REACHABILITY IS SOURCE-DERIVED, NOT OBSERVED, and must not be reported
-  otherwise.  On the measured specimen the process dies at :795 on the first
-  entry write, before the cleanup is reached, so neither build exercised it.
-  The shape that WOULD reach it is a count whose product wraps to a
-  successfully-allocated buffer while decode fails for an unrelated reason --
-  the bundle's variant_count_2pow61 (2^61 * 352 wraps to zero) is exactly that
-  and is the specimen to build.  See coverage_gaps.
+  REACHABILITY IS NOW OBSERVED (2026-09-01), and the recipe this field used to
+  propose was WRONG.  Superseded text and correction below; the mechanism above
+  stands.
+  It remains true that the measured specimen dies at :795 on the first entry
+  write and never reaches the cleanup.  What was wrong was the proposed fix for
+  that: `variant_count_2pow61` (2^61 * 352 wraps to ZERO) cannot reach the
+  cleanup either, because a zero-size allocation faults on entry 0's own write
+  exactly as the specimen does.  Measured: ASan reports the WRITE at :795, 30
+  bytes after a 2-byte region.  A product of zero is the one wrap that
+  guarantees you never get out of the decode loop.
+  THE CORRECT RECIPE.  The product must be at least one entry wide, so entry 0
+  decodes and the ordinary payload bound is what fails.  On a 64-bit build
+  sizeof(H5O_storage_virtual_ent_t) is 352 == 2**5 * 11, so
+  `count * 352 mod 2**64` depends only on `count mod 2**59`: writing
+  `count = k * 2**59 + m` gives a product of exactly `m * 352` bytes while
+  list_nused stays astronomically large.
+  TRACKED FIXTURE: cve/vds_nentries_cleanup_overrun.h5, m == 2, count
+  576460752303423490, product 704 bytes, list_nused 576460752303423490.
+  MEASURED ON IT, both builds: stock SIGSEGV inside H5D_close, reached from
+  H5D__virtual_reset_source_dset (:1491) <- H5D__virtual_free_layout_mappings
+  (:1190) <- the done: block (:934).  ASan: heap-buffer-overflow READ of size 8
+  at :1490, 40 bytes after the 704-byte region.
+  AND THE PRIMITIVE IS SHARPER THAN THIS FIELD SAYS.  The first thing to fault
+  is not a free: it is H5D_close called on a value read out of bounds -- an
+  UNTRUSTED POINTER DEREFERENCE.  And the value is FILE-CONTROLLED, not merely
+  garbage: on the tracked fixture it is 0x656372756f735f73, whose bytes in memory
+  order are "s_source" -- a substring of the base's own VDS source name
+  "/private/tmp/h5policy/vds_source_outside.h5", i.e. attacker-supplied string
+  bytes from the file being parsed, sitting in the heap next to the wrapped
+  allocation.  (On a differently-shaped variant the same slot held 0x211, which
+  is allocator metadata, so what lands there depends on the surrounding
+  allocations -- but it is reachable by file content.)  Two
+  further amplifiers in the same loop body were not previously noted: the inner
+  loop is bounded by the out-of-bounds `ent->sub_dset_nalloc`, and both
+  H5MM_xfree calls are gated on out-of-bounds `== SIZE_MAX` comparisons, so
+  adjacent heap decides whether a garbage pointer is freed at all.
+  DOCUMENTATION DRIFT.  The comment this field quotes -- "safe to use on
+  incomplete structures ... PROVIDED the internal structures are initialized
+  with all bytes set to 0" -- has been reworded at HEAD to "we always attempt to
+  free everything even in the case of a failure ... we do not need to zero out
+  the memory in the list".  The stated precondition is gone; the dependence on
+  H5MM_calloc having zeroed every entry the loop visits is not.
 
 # -- Registry finding (not about libhdf5) -------------------------------------
 registry_reading_note: >-
@@ -173,6 +208,18 @@ measured:
   libhdf5_stock_as_recorded: >-
     CRASHED, signal 6 (abort).  No external, plugin, write or network
     activation.  h5dump -pH aborts while materialising the mapping.
+    SCOPE CORRECTED 2026-09-01: this describes the SUPPLIED SPECIMEN (count
+    471649706430073763, product 32), not the tracked fixture.  Running it
+    directly also shows the abort's cause, which was not recorded -- glibc's
+    "malloc(): corrupted top size", i.e. the write reaches heap metadata rather
+    than tripping an assertion.
+    THE TRACKED FIXTURE CRASHES DIFFERENTLY.  vds_nentries_mult_overflow.h5
+    carries 2^61 (product 0), and both the h5cve matrix and a direct run report
+    signal 11 (SIGSEGV), not 6.  Same defect, same write site (:795), different
+    wrap size and so a different fault.  Read a signal number here together with
+    WHICH file it was measured on.  The offsets @ 200 / @ 91 quoted under
+    REMEASURED are likewise the specimen's; in the 6144-byte fixture the GCOL
+    sits at 2048 and the mapping block at 2080.
   libhdf5_asan_as_recorded: >-
     CRASHED, signal 6, heap-buffer-overflow WRITE of size 8 at
     src/H5Dvirtual.c:795 -- the first entry's name field, written through a
@@ -187,13 +234,27 @@ measured:
     isolates the OVERFLOW as the necessary ingredient rather than merely an
     over-large count.
   width: >-
-    64-bit measured; 32-bit NOT measured, and the two are genuinely different.
-    sizeof(H5O_storage_virtual_ent_t) is 352 on x86_64 and a -m32 compile
-    proves 208 on i386.  On 64-bit the count multiplied in size_t wraps to 32
-    bytes.  On 32-bit the count first NARROWS to 3123612579 and its unchecked
-    product wraps to 1171354736 bytes -- a large but plausible allocation, a
-    different failure mode -- while 2^61 narrows to zero.  Host policy blocked
-    running the i386 binary, so no 32-bit outcome is claimed.
+    BOTH WIDTHS NOW MEASURED (2026-09-01); the earlier "host policy blocked
+    running the i386 binary" no longer holds on this host.
+    sizeof(H5O_storage_virtual_ent_t) is 352 on x86_64 and 208 on i386.
+    x86_64: the specimen's count wraps to 32 bytes -> WRITE at :795; stock
+    aborts, and running it directly shows glibc's reason -- "malloc(): corrupted
+    top size", i.e. the write reaches heap metadata rather than tripping an
+    assertion.
+    i386: the count first NARROWS to 3123612579 and its unchecked product wraps
+    to 1171354736 bytes -- a large but plausible allocation.  MEASURED OUTCOME:
+    SIGSEGV, a genuinely different failure mode from the x86_64 abort.
+    AND THE TWO ABIS DISAGREE ABOUT WHICH FILES ARE REJECTED, not merely about
+    how they fail.  The three counts crafted against the 64-bit wrap (2^61,
+    2^59+2, 2^59+10) narrow to 0, 2 and 10 on i386 and are refused with an
+    ordinary H5Dopen2 error and no crash.  That is the concrete form of the
+    warning in compatibility_backport_risks: checked arithmetic must run BEFORE
+    the narrowing.
+    STRUCTURAL CONSEQUENCE, not an accident of these values: the cleanup
+    amplification is 64-bit only.  Leaving list_nused huge on LP64 requires the
+    low 59 bits of the count to be small, which forces the low 32 bits small
+    too, so no single count can amplify on both ABIs.
+    control: count 1 opens cleanly on both widths.
 
 # -- Divergence from the selected build ---------------------------------------
 divergence:
@@ -252,20 +313,44 @@ systemic:
     - registry/findings/catalog (H5_CORRUPT_VDS_MAPPING_HEADER)
     - registry/validation-coverage.yml (vds.mapping_header_complete); on how to
       read its hdf5 validator row, see registry_reading_note
-    - h5policy/tests/cve/vds_nentries_mult_overflow.h5 (tracked crafted seed)
+    - h5policy/tests/cve/vds_nentries_mult_overflow.h5 (generated tracked seed;
+      product 0 -- the decode-loop write)
     - h5policy/tests/expected/cve-vds_nentries_mult_overflow.yml
+    # -- added 2026-09-01, for the cleanup half --
+    - h5policy/tools/h5policy-gencorpus (_make_vds_nentries_cleanup_overrun)
+    - h5policy/tests/cve/vds_nentries_cleanup_overrun.h5 (generated tracked seed;
+      product 704 -- the failure cleanup)
+    - h5policy/tests/expected/cve-vds_nentries_cleanup_overrun.yml
+    - registry/h5cve-matrix-policy.yml (fixture_overrides entry; the selected
+      libhdf5 crashes in the cleanup, so the canary status is `violation`)
 
 # -- Reproducers --------------------------------------------------------------
 reproducers:
   integration_poc: h5policy/tests/cve/vds_nentries_mult_overflow.h5
   direct_fixtures:
-    # ALREADY TRACKED -- this specimen was checked in as a crafted CVE seed
-    # before the record existed.  tests/cve/ is committed rather than generated
-    # (see h5policy/tests/.gitignore), so unlike a malformed/ fixture it needs
-    # no generator to be reproducible.
-    - h5policy/tests/cve/vds_nentries_mult_overflow.h5
+    # RECONCILED 2026-09-01.  The superseded text claimed this fixture was
+    # "byte-identical to the bundle's specimen" and that tests/cve/ is
+    # "committed rather than generated ... needs no generator".  BOTH ARE NOW
+    # FALSE, and the second was already becoming false when it was written.
+    #   * tests/cve/ fixtures are GENERATED by h5policy-gencorpus and also
+    #     tracked, and h5policy/tests/run.sh enforces byte-for-byte
+    #     reproducibility against HEAD.  The .gitignore comment describes why
+    #     they are tracked, not that they are hand-made.
+    #   * vds_nentries_mult_overflow.h5 is produced by
+    #     _make_vds_nentries_overflow from policy/vds_absolute_source.h5 and
+    #     sets the count to 2^61 -- so it is 6144 bytes, superblock v3, GCOL at
+    #     2048.  The supplied specimen is 4264 bytes, superblock v2, GCOL at
+    #     168, count 471649706430073763.  220 bytes differ before the shorter
+    #     file ends, and the two carry DIFFERENT wrap shapes: product 0 versus
+    #     product 32.
+    # provenance.input_sha256 identifies the SUPPLIED SPECIMEN and is correct as
+    # such; it is not, and no longer claims to be, the tracked fixture's digest.
+    # Both fixtures are generated, so both are reproducible without it.
+    - h5policy/tests/cve/vds_nentries_mult_overflow.h5      # product 0 -> decode-loop write, :795
+    - h5policy/tests/cve/vds_nentries_cleanup_overrun.h5    # product 704 -> failure cleanup, :1490
   expectations:
-    - h5policy/tests/expected/cve-vds_nentries_mult_overflow.yml    # profile: legacy
+    - h5policy/tests/expected/cve-vds_nentries_mult_overflow.yml       # profile: legacy
+    - h5policy/tests/expected/cve-vds_nentries_cleanup_overrun.yml     # profile: untrusted-strict
   control_fixture: >-
     h5policy/tests/malformed/vds_nentries_overcount.h5 -- an over-large but
     NON-overflowing count, which libhdf5 rejects cleanly while parsing the
@@ -322,17 +407,37 @@ sibling_audit: >-
 
 # -- Affected versions --------------------------------------------------------
 version_range:
-  affected: >-
-    UNVERIFIED, and deliberately not asserted.  Measured live on 2.3.0 against
-    a local source tree at 4b1ffa68a840, where the bundle records it as a
-    confirmed current-head violation.  No archaeology was run on H5Dvirtual.c
-    and no older tag was built.
+  affected: '>= 1.10.0'
+  affected_for_the_cleanup_half: '>= 2.0.0'
+  patched: none
+  method: >-
+    Archaeology run 2026-09-01.  THE TRAP that made the earlier "no archaeology
+    was run" cheap to leave: the decoder MOVED FILE at 2.0.0, so a sweep of
+    src/H5Dvirtual.c alone returns nothing for every older tag and reads as "the
+    code is not there".  Locate it per tag with
+    `git grep -l 'sizeof(H5O_storage_virtual_ent_t)' <tag> -- 'src/*.c'`, then
+    read the allocation verbatim.  Done at 1_10_0, 1_12_3, 1.14.6, 2.0.0, 2.1.0
+    and develop.
+  finding: >-
+    At 1.10.0, 1.12.3 and 1.14.6 the VDS heap block is decoded in
+    src/H5Olayout.c (H5O__layout_decode), with the identical
+    H5MM_calloc((size_t)tmp_hsize * sizeof(H5O_storage_virtual_ent_t)) and
+    list_nalloc/list_nused assigned straight from the count -- at 1.10.0 without
+    even the `tmp_hsize > 0` guard.  From 2.0.0 the same code is
+    H5D__virtual_load_layout in src/H5Dvirtual.c.  So the unchecked
+    narrow-and-multiply is present at every tag from 1.10.0, the release that
+    introduced VDS, through develop.  Nothing is fixed at any tag.
+  cleanup_half_note: >-
+    H5D__virtual_free_layout_mappings first appears at 2.0.0 (it and
+    H5_CHECK_OVERFLOW are absent from src/H5Dvirtual.c at every earlier tag), so
+    the cleanup finding is claimed for >= 2.0.0 only.  What the pre-2.0.0 failure
+    path did instead was NOT traced -- see coverage_gaps.
   note: >-
-    The H5_CHECK_OVERFLOW calls elsewhere in the same function suggest the
-    guards were added piecemeal as individual problems were found, rather than
-    the allocation site ever having had one -- but that is an inference from
-    code shape, not a measurement.
-  label: not established
+    The earlier inference recorded here -- that the H5_CHECK_OVERFLOW calls
+    elsewhere in the same function suggest the guards were added piecemeal rather
+    than the allocation site ever having had one -- is consistent with what the
+    archaeology found: no tag has ever guarded the allocation.
+  label: established
 
 # -- Open items ---------------------------------------------------------------
 coverage_gaps:
@@ -346,21 +451,35 @@ coverage_gaps:
     CLOSED 2026-08-15 -- see measured.REMEASURED.  No drift on any offset or
     outcome, and the stock abort confirmed live at HEAD.
   - >-
-    THE CLEANUP AMPLIFICATION HAS NO SPECIMEN.  It is source-derived only, and
-    the measured specimen cannot reach it because it dies on the first entry
-    write.  Build the variant_count_2pow61 shape as a tracked fixture (2^61 *
-    352 wraps to zero, so the allocation succeeds trivially while list_nused
-    stays 2^61) and probe it on both builds.  If it reaches
-    H5D__virtual_free_layout_mappings the impact of this record rises from an
-    over-write to an attacker-influenced free.
+    CLOSED 2026-09-01, and the instruction it gave was wrong.  The cleanup
+    amplification now has a tracked fixture --
+    cve/vds_nentries_cleanup_overrun.h5, with expectation
+    expected/cve-vds_nentries_cleanup_overrun.yml -- and it is measured on both
+    builds.  But NOT the variant_count_2pow61 shape this item asked for: a
+    product of zero faults on entry 0's own write and never leaves the decode
+    loop.  The product must be at least one entry wide.  See
+    cleanup_amplification for the arithmetic and the measured frames, and note
+    that the impact rose further than this item anticipated -- to an untrusted
+    pointer dereference (H5D_close on an out-of-bounds value), not only a free.
   - >-
-    No 32-bit runtime measurement, and 32-bit is a DIFFERENT failure mode here
-    rather than the same one (see measured.width).  Host policy blocked
-    execution of the i386 binary; the struct size was obtained by compiling.
+    CLOSED 2026-09-01.  The i386 build runs on the current host, so the
+    conclusion is measured rather than inferred -- see measured.width.  It
+    confirms the two ABIs disagree about which files are REJECTED, not merely
+    about how they fail, and it establishes that the cleanup amplification is
+    64-bit only for a structural reason rather than by accident.
   - >-
-    The tracked expectation runs the `legacy` profile only.  The bundle
-    measured all four, so an untrusted-strict expectation would cost nothing
-    and would pin the H5_POLICY_VDS secondary finding as well.
+    PARTLY CLOSED 2026-09-01.  The new sibling expectation
+    (expected/cve-vds_nentries_cleanup_overrun.yml) runs `untrusted-strict` and
+    pins BOTH H5_CORRUPT_VDS_MAPPING_HEADER and the H5_POLICY_VDS secondary, so
+    the profile point this item makes is now covered by a tracked expectation.
+    cve-vds_nentries_mult_overflow.yml still runs `legacy` alone and was left
+    that way deliberately: changing an existing expectation's profile changes
+    what it asserts, which is a separate decision from adding coverage.
+    h5policy rejects both fixtures under all four profiles (measured).
+  - >-
+    ADDED 2026-09-01.  The pre-2.0.0 failure path was not traced, so whether the
+    cleanup primitive exists before 2.0.0 in another form is unknown.  The
+    over-write half is established from 1.10.0; the cleanup half only from 2.0.0.
 open_questions:
   - >-
     Does H5D__virtual_reset_layout (the copy path's cleanup, reached from

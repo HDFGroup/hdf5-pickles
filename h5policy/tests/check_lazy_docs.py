@@ -42,6 +42,10 @@ DETERMINISTIC_FIELDS = (
     "metadata_bytes_seen",
     "walk_operations",
     "chunk_index_refs",
+    # An attribution input, so it has to be compared live-vs-tracked like the
+    # counters: `family_evidence` is DERIVED from this field and
+    # chunk_index_refs, and a derivation is only as pinned as its inputs.
+    "decode_filters",
 )
 FIXTURE_POLICY = {
     "libver": "latest",
@@ -88,6 +92,14 @@ def ladder(report: dict, name: str) -> list[dict]:
     for index, row in enumerate(rows):
         for field in DETERMINISTIC_FIELDS:
             value = row.get(field)
+            # `decode_filters` is the one deterministic field that is a list of
+            # filter ids rather than a count.
+            if field == "decode_filters":
+                if not isinstance(value, list) or not all(
+                        isinstance(v, int) and not isinstance(v, bool)
+                        for v in value):
+                    fail(f"{name}[{index}].{field} is not a list of filter ids")
+                continue
             if isinstance(value, bool) or not isinstance(value, int):
                 fail(f"{name}[{index}].{field} is not an integer")
     return rows
@@ -190,12 +202,26 @@ def check_narrative(report: dict) -> None:
     records = verification.get("records", {})
     if not records:
         fail("verification coverage has no records")
+    # `met` is allowed for exactly the families the lazy artifact ATTRIBUTES a
+    # ladder to, and required for them.  Checking the two sides against each
+    # other makes this a cross-check of the attribution rather than a weaker
+    # restatement of it: a family cannot claim `met` without an attributed
+    # ladder, and an attributed family cannot silently stay `partial`.
+    attributed = set(report.get("family_evidence") or {})
     for record, values in records.items():
         entry = values.get("lazy_validation_performance", {})
-        if entry.get("status") != "partial":
-            fail(f"{record}: lazy validation status is not partial")
+        status = entry.get("status")
+        expected = "met" if record in attributed else "partial"
+        if status != expected:
+            fail(f"{record}: lazy validation status is {status!r}, expected "
+                 f"{expected!r} ({'attributed' if record in attributed else 'no'} "
+                 f"ladder in registry/lazy-validation.json)")
         if expected_ratio not in entry.get("note", ""):
             fail(f"{record}: lazy validation note lacks {expected_ratio}")
+    unknown = attributed - set(records)
+    if unknown:
+        fail("lazy-validation.json attributes ladders to unknown families: "
+             + ", ".join(sorted(unknown)))
 
 
 def check_live_measurement(tracked: dict) -> None:
@@ -235,6 +261,10 @@ def check_live_measurement(tracked: dict) -> None:
     check_fixture_policy(live, "live")
     if deterministic(live) != deterministic(tracked):
         fail("live deterministic ladder fields differ from the tracked artifact")
+    if (live.get("family_evidence") or {}) != (tracked.get("family_evidence") or {}):
+        fail("live family attribution differs from the tracked artifact: "
+             f"{sorted(live.get('family_evidence') or {})} vs "
+             f"{sorted(tracked.get('family_evidence') or {})}")
 
 
 def main() -> int:

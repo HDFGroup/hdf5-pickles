@@ -1,0 +1,87 @@
+# A chunk record that claims its whole filter pipeline was skipped while
+# declaring a stored size smaller than the unfiltered chunk.
+#
+# WHAT MAKES IT INVALID, given that a set mask bit is perfectly legal.  The mask
+# is a per-chunk bitmap of filters that were NOT applied, and libhdf5's writer
+# does set it: when the pipeline fails, or when a filter would grow the chunk,
+# H5D__chunk_file_alloc keeps the unfiltered buffer, sets the bit and stores the
+# chunk RAW.  On that path the stored size is exactly the unfiltered chunk size.
+# So "every pipeline bit set" and "stored size != nelmts * element size" is a
+# combination no writer can emit -- the file contradicts its own datatype, chunk
+# dimensions and pipeline at once.
+#
+# WHY IT MATTERS.  H5Z_pipeline (H5Z.c:1404-1410) tests each bit in the reverse
+# loop and `continue`s, leaving *nbytes at the size read from disk.  In 1.14.5
+# H5D__chunk_lock allocates `chunk_alloc` (the STORED size), reads that many
+# bytes into it, skips the pipeline, and caches the result as the dataset's
+# chunk -- with no size check anywhere in the function.  Every later read then
+# copies chunk_size bytes out of a stored_size-byte allocation.
+#
+# MEASURED, h5py/libhdf5 1.14.5, this exact file: H5Dread returns rc=0 and hands
+# back 92 bytes past the allocation as int32 dataset values, one 8-byte pair of
+# which decodes as a live pointer.  An in-process heap disclosure with no error
+# and no crash, which is why the header-only differential cannot see it.
+# libhdf5 2.3.0 rejects it at the post-unfilter size check H5Dchunk.c:4855,
+# added by d926e3cbd0b and first released in 2.2.0; no earlier version has that
+# check.  So the affected range is everything below 2.2.0.
+#
+# TWO BYTES separate this from valid/chunk_v1_btree_fletcher.h5, both inside
+# key[0], and NEITHER IS SUFFICIENT ALONE -- that is the fixture's real content:
+#   * mask 0 -> 1 with the stored size left at 104: measured, 1.14.5 reads the
+#     dataset back with CORRECT values (the 104-byte buffer over-covers the
+#     100-byte chunk).  h5policy must and does still reject it, but nothing is
+#     disclosed.
+#   * stored size 104 -> 8 with the mask left at 0: fletcher32 runs and fails
+#     its own checksum, so libhdf5 rejects it and the sibling chunk.stored_size
+#     rule is not even needed.
+# The contradiction is between the two fields, which is why the rule compares
+# them and not either one.
+#
+# WHY 8: it is above fletcher32's four-byte framing, so H5_CORRUPT_CHUNK_STORED_SIZE
+# does not fire and this fixture pins the filter-mask rule alone.  Sizes below 4
+# belong to malformed/chunk_stored_size_below_framing.h5.
+#
+# NOT A FIXTURE, deliberately: a mask bit at or ABOVE the pipeline's filter
+# count.  The reverse loop runs over pline->nused only, so such a bit is never
+# inspected; 1.14.5 was measured to read that file back with correct values, and
+# rejecting it would be a false positive on a file libhdf5 reads correctly.
+#
+# The check lives in h5policy_finalize_ohdr_dataset rather than at the chunk
+# record for the same reason as the stored-size floor: it needs the pipeline
+# message, the datatype and the chunk dimensions, and object header messages
+# arrive in any order.
+#
+# libhdf5 on the differential's build: h5dump -H rc=0 and h5stat rc=0 (the file
+# opens), h5dump with data rc=1.  Header-clean, data-fatal -- the same A+ soft
+# warning shape as the stored-size siblings, needing no tolerance and no A~
+# predicate.
+file: malformed/chunk_filter_mask_all_skipped.h5
+profile: untrusted-strict
+expected_decision: reject_corrupt
+expected_exit: 2
+required_findings: [H5_CORRUPT_CHUNK_FILTER_MASK]
+expected_analysis:
+  complete: true
+  walk_started: true
+  walk_completed: true
+  continue_after_rejection: false
+  findings_truncated: false
+h5cve:
+  # Family named mechanically from the primary finding via registry/findings/.
+  family: chunk_index
+  require_oracle_alignment: true
+  # TWO STATUSES, because the honest answer depends on which libhdf5 the matrix
+  # selects, and this fixture is precisely a version boundary.  From 2.2.0 the
+  # post-unfilter size check refuses the chunk, H5Dread fails, and the
+  # chunk_index exercise never completes -- `unexercised`.  Before 2.2.0 the
+  # read SUCCEEDS (that is the defect: rc=0 with 92 bytes of heap returned as
+  # data), the exercise completes, and the canary sees nothing wrong --
+  # `verified`.  Neither is a defect in this repository, and narrowing to one
+  # would make the matrix red on a build a maintainer might reasonably have.
+  # NOTE what `verified` means here, per the caution under `defaults` in
+  # registry/h5cve-matrix-policy.yml: the read-only canary cannot see a silent
+  # disclosure, so `verified` on an affected build is a limit of the instrument,
+  # not evidence that the file is benign.  The disclosure is measured directly
+  # in registry/cases/chunk-filter-mask-skips-pipeline-without-raw-size.yml.
+  allowed_statuses: [unexercised, verified]
+forbidden: [crash, timeout, external_open, plugin_load, write]

@@ -259,8 +259,8 @@ and the family canary. The tracked exact-build evidence separately records that
 source-derived, its classification mapping is curated, and the corpus and
 exact-build outcomes are measured corroboration.
 
-Registry checks currently account for **328 finding codes** and **0 semantic-
-backlog entries**. Static enumeration resolves **1023 in-pickle message
+Registry checks currently account for **329 finding codes** and **0 semantic-
+backlog entries**. Static enumeration resolves **1028 in-pickle message
 variants**, with **0 unrouted** and **0 unanalyzable** variants. That is complete
 classification coverage for the current emission surface, not complete
 invariant coverage for the HDF5 format.
@@ -269,7 +269,7 @@ invariant coverage for the HDF5 format.
 
 It is broad and explicitly measured, but it is not complete.
 
-The current invariant manifest contains **412 named invariants across 16
+The current invariant manifest contains **413 named invariants across 16
 selected record families**. Those families are security-oriented groupings,
 not a claim that every legal HDF5 representation, payload behavior, or
 application activation has been modeled.
@@ -286,27 +286,42 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **56
-are `met`, 68 `partial`, 26 `not_assessed`, and 26 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **68
+are `met`, 75 `partial`, 0 `not_assessed`, and 33 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 
-- dedicated typed fuzz targets for only 2 of 16 families and no repository
+- dedicated typed fuzz targets for 9 of 16 families and no repository
   OSS-Fuzz integration. The mutation engine is per-family by construction -- a
   locator plus a recipe table -- so a family gains targets only when someone
   writes its locator, and a recipe earns its place only by holding on seeds
-  other than the one it was developed against;
+  other than the one it was developed against. The `v2_btree` family shows the
+  leverage available when one structure is shared: a single BTHD locator
+  carries six recipes for four record families, verified across three client
+  record layouts. It also demonstrates the point of the discipline -- one of
+  its seven candidate recipes was withdrawn after measurement because it
+  produced three different outcomes across seeds, and the accept it produced
+  on two of them is a soundness gap now recorded in
+  `registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`;
 - family-by-family boundary, overflow/allocation, nesting, and progress cases
   that are still partial or not assessed. Reviewed fixture annotations now
-  classify most of these: `count_and_extent_boundaries` is `not_assessed` for
-  only 2 families of 16, but `met` for 1, so what the sweep mostly established
-  is which boundary values the corpus genuinely lacks -- `n` and `n_minus_1` are
-  thin almost everywhere, and `allocation_budget` exists for one family;
+  classify all of these: no column is `not_assessed` for any family any more.
+  The rise in `absent` from 26 to 40 is that conversion, not lost coverage -- a
+  family with no fixture for a category now declares it in the record's
+  `verification_negatives`, with the date it was reviewed and the reason, so an
+  uncovered category reads as a work item rather than as an unanswered
+  question. Getting there took contracting 22 previously family-less
+  expectation files, each with its exact-build canary measured first;
 - truncation coverage that is met for 12 families, sampled/partial for 4, and
   absent for 0;
-- lazy-validation behavior measured for the oracle as a whole, but not yet
-  discharged independently for every family;
-- no-activation-on-failure evidence met for 9 families and partial for 7 where
+- lazy-validation behavior `met` for the 2 families a ladder is measurably
+  attributed to and `partial` for the other 14. The counters are whole-walk
+  totals, so there is no per-family cost signal; what is attributable is
+  whether a ladder's payload growth ran through a family's structures, and
+  `h5policy-lazy` derives that from report fields. The other 14 are covered by
+  the global result and no more, which is a ceiling rather than a pending
+  measurement: several of those families have no data axis to grow;
+- no-activation-on-failure evidence met for 8 families and partial for 8 where
   the selected native build still activates an external resource, crashes, or
   fails to terminate.
 

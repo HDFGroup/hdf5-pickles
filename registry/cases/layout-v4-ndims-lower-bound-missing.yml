@@ -6,6 +6,15 @@
 # Promoted from one working bundle (gitignored h5cve scratch; the specimen is
 # identified by provenance.input_sha256 below).
 #
+# RE-MEASURED 2026-09-01 against the newest available libhdf5, and the verdict
+# MOVED. The crash is confirmed live on every pre-fix build tried -- including
+# released 1.14.5, a 32-bit build, and the shipped h5dump and h5ls -- and it is
+# FIXED ON develop ONLY, incidentally, by the commit that fixed CVE-2026-19025.
+# No release contains that fix. Everything under `measured` is now first-hand;
+# see measured.REMEASURED_2026_09_01 and upstream_fix. Source line numbers in
+# this record are pinned to develop b7b85e7abf9 and were re-read there; the
+# promotion-era numbers were 1-3 lines lower.
+#
 # THIS RECORD IS THE FIRST IN THIS DIRECTORY WHOSE INVARIANT-A EXPLANATION IS
 # "MASKED". The other three explanations in use -- never loaded, unguarded,
 # assert-only -- all describe a check that does not run. Here the check runs,
@@ -39,22 +48,25 @@ activation_before_validation:
   - public_id
 entry_points:
   - h5policy (oracle) -- rejects and names the dimensionality
-  - "libhdf5 H5Dopen2 -> H5D__layout_oh_read -> H5O__layout_decode (src/H5Olayout.c:335)"
-  - "libhdf5 H5Dopen2 -> H5D__chunk_init (src/H5Dchunk.c:1055) -> H5D__chunk_set_info_real (:733)"
+  - "libhdf5 H5Dopen2 -> H5D__layout_oh_read -> H5O__layout_decode (src/H5Olayout.c:338)"
+  - "libhdf5 H5Dopen2 -> H5D__chunk_init (src/H5Dchunk.c:1175) -> H5D__chunk_set_info (:777)
+     -> H5D__chunk_set_info_real (:733)"
+  - "shipped tools: h5dump -r and h5ls -r, both SIGFPE on a pre-fix build"
 
-# -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
+# -- The defect, read out of the source tree (HDF5 2.3.0 @ develop b7b85e7abf9,
+#    re-read 2026-09-01; every line number below was verified there) ----------
 defect: >-
   THE HEADLINE IS AN INCONSISTENCY, not an omission: one function decodes the
   same field three ways and the NEWEST path is the least strict.
-    v1/v2, src/H5Olayout.c:114
+    v1/v2, src/H5Olayout.c:115
         if (!ndims || ndims > H5O_LAYOUT_NDIMS)
             HGOTO_ERROR(... "dimensionality is out of range");
-    v3, src/H5Olayout.c:278-281
+    v3, src/H5Olayout.c:279-282
         if (mesg->u.chunk.ndims > H5O_LAYOUT_NDIMS)
             HGOTO_ERROR(... "dimensionality is too large");
         if (mesg->u.chunk.ndims < 2)
             HGOTO_ERROR(... "bad dimensions for chunked storage");
-    v4+, src/H5Olayout.c:335
+    v4+, src/H5Olayout.c:338
         if (mesg->u.chunk.ndims > H5O_LAYOUT_NDIMS)
             HGOTO_ERROR(... "dimensionality is too large");
         /* and nothing else */
@@ -78,15 +90,15 @@ defect: >-
   prevent.  That is a second, independent ordering defect -- it would bite any
   zero chunk dimension, not only one arriving via ndims == 0.
   AND THE ndims IT LOOPS ON IS THE WRONG ONE.  H5D__chunk_set_info_real is
-  called with dset->shared->ndims -- the DATASPACE rank (src/H5Dchunk.c:776) --
+  called with dset->shared->ndims -- the DATASPACE rank (src/H5Dchunk.c:777) --
   while layout->dim[] was sized by the LAYOUT's ndims.  Its own `if (ndims == 0)`
   guard at :725 therefore checks the dataspace rank, which is perfectly
   nonzero, and says nothing about the layout.  The two counts are conflated.
 
 third_arithmetic_flaw: >-
-  NOT IN THE BUNDLE; found at promotion by reading H5D__chunk_init.  Its
+  NOT IN THE BUNDLE; found at promotion by reading H5D__chunk_construct.  Its
   dimension sanity loop is:
-      for (u = 0; u < layout->u.chunk.ndims - 1; u++) {      /* src/H5Dchunk.c:1055 */
+      for (u = 0; u < layout->u.chunk.ndims - 1; u++) {      /* src/H5Dchunk.c:1056 */
           if (0 == layout->u.chunk.dim[u])
               HGOTO_ERROR(... "chunk size must be > 0, dim = %u ", u);
   `u` and `ndims` are unsigned, so with ndims == 0 the bound `ndims - 1`
@@ -97,10 +109,18 @@ third_arithmetic_flaw: >-
   must be > 0, dim = 0".  The underflowed bound is never reached because the
   first element happens to be the sentinel.  Change anything that leaves dim[0]
   nonzero while ndims is 0 and this loop walks off the array.
-  Contrast src/H5Dchunk.c:1147, which gets the same job right -- it iterates
-  dset->shared->ndims and checks dim[u] == 0 BEFORE dividing at :1150.  So this
-  file contains a correctly ordered version of the check twenty lines from an
-  incorrectly ordered one.
+  Contrast H5D__chunk_init's scaled-dimension block, which gets the same job
+  right -- it iterates dset->shared->ndims and checks dim[u] == 0 at :1146,
+  erroring at :1147, BEFORE dividing at :1150.  So this file contains a
+  correctly ordered version of the check ninety lines from an incorrectly
+  ordered one.
+  RE-READ 2026-09-01 at develop b7b85e7abf9 (promotion cited :1055 and :1147;
+  the file moved by one line).  ONE CORRECTION TO THE PROMOTION TEXT: the
+  underflowing loop is in H5D__chunk_construct, which runs at dataset CREATION,
+  not on the open path this record's crash takes -- see
+  measured.divergent_outcome_on_the_tracked_fixture, which establishes that the
+  open path reaches either :1147 or :733 depending on the dataspace rank.  The
+  underflow is real and worth fixing; it is not what a malformed file reaches.
 
 # -- Why libhdf5 does not crash on the pristine specimen ----------------------
 masking_note: >-
@@ -111,7 +131,8 @@ masking_note: >-
     D2  unknown object-header message type 0xcf     @ 992
     D3  layout version 5 with ndims == 0            @ 1072
     D4  zeroed tail NIL header: 22 messages present against 6 declared @ 0x450
-  libhdf5's object-header message-count check (src/H5Ocache.c:306) rejects the
+  libhdf5's object-header message-count check (src/H5Ocache.c:305-:306,
+  `v1_pfx_nmesgs < oh->nmesgs`) rejects the
   file on D4, during H5O__cache_deserialize, before the layout message is ever
   decoded.  So the pristine specimen is SAFE BY ACCIDENT: stock libhdf5 refuses
   it, and a naive reading of that refusal would conclude the layout defect is
@@ -120,7 +141,7 @@ masking_note: >-
   and stock libhdf5 2.3.0 then takes a SIGFPE from public H5Dopen2
   (variant_nilrepair.h5, probe outcome=crashed signal=8).  The control that
   isolates the version is variant_ohrepair.h5: the same bytes at layout version
-  3 reject cleanly at src/H5Olayout.c:281, because v3 has the lower bound.
+  3 reject cleanly at src/H5Olayout.c:282, because v3 has the lower bound.
   THIS IS A FOURTH EXPLANATION FOR INVARIANT A.  The registry's other records
   use three -- the check was never loaded, the check is absent, or the check is
   assert-only.  All three describe a check that does not run.  "Masked" is
@@ -157,20 +178,49 @@ oracle_false_positive_resolved: >-
 
 # -- Measured behaviour -------------------------------------------------------
 measured:
-  NOT_REMEASURED_AT_PROMOTION: >-
-    Everything under `measured` is the bundle's, recorded against libhdf5 2.3.0
-    at h5policy 9ee1194, and was NOT re-measured at promotion -- this session
-    could not execute the oracle or the probes.  The SOURCE claims in `defect`
-    and `third_arithmetic_flaw` WERE read from the 2.3.0 tree at promotion and
-    are current.
-    Note the bundle's libhdf5 measurements are already 2.3.0, so unlike several
-    sibling records there is no version skew to close here.
+  REMEASURED_2026_09_01: >-
+    The promotion note that used to sit here -- that nothing under `measured`
+    had been executed at promotion -- is DISCHARGED.  Every claim below was
+    re-measured on 2026-09-01 at h5policy d577c64 (clean worktree) in a rebuilt
+    h5cve bundle, against two libhdf5 builds of the same 2.3.0 version string
+    but different source states, which is the distinction that decides this
+    record: develop aa9df72cc21 (pre-fix, the crash) and develop b7b85e7abf9
+    (post-fix, the rejection).  A version string alone does not identify either;
+    see provenance.remeasured for build_mode, sanitizers and settings_sha256.
+    Two things changed materially.  (1) The crash reproduces far more widely
+    than the promotion record claimed -- see libhdf5_remeasured, width and
+    shipped_tools.  (2) libhdf5 now rejects the witness on develop, so this is a
+    fix-confirmation record for the development branch and a live finding for
+    every release; see upstream_fix and version_range.
+    One coverage gap is CLOSED by measurement rather than argument: the routing
+    difference in divergent_outcome_on_the_tracked_fixture is now explained.
+  builds_measured: >-
+    Workstation-local installs; paths not recorded.  baseline pre-fix, 2.3.0 @
+    develop aa9df72cc21, RelWithDebInfo -DNDEBUG, no sanitizers, settings_sha256
+    7ce6203229fbd356cbdbaab0e1b333c4319c0063743003226a9fb8d05f47819c.
+    candidate ASan with asserts live, settings_sha256
+    970f83354e89722436502d348e12c8a33ec783724c3f48adf2d7dd9ae081d219; candidate
+    ASan with -DNDEBUG, settings_sha256
+    b55b23ba6c39855c26c30ce6a4a7f75261306fc13a3b3c7c36b2b0fc58089a77 -- the
+    second is what proves the fault is not an assert.
+    32-bit i386, RelWithDebInfo -m32 -DNDEBUG, settings_sha256
+    ef807c88281cc8210e658e3ad02c169ddc92978526d58dc1cf4f126aa48c7e62.
+    post-fix, 2.3.0 @ develop b7b85e7abf9, RelWithDebInfo, no sanitizers,
+    settings_sha256 5d771823a01dcebd2fc9d40759bbed2f0be2e82d5c8af6179250723e4975b834,
+    built for this measurement.
+    Release reference: libhdf5 1.14.5, the library bundled in the h5py 3.13.0
+    wheel -- the only released binary reachable here.
   oracle_as_recorded: >-
     reject_corrupt, H5_CORRUPT_LOCAL_HEAP_RESERVED @ 96 on / -- which is D1, the
     heap defect, NOT the layout defect this record is about.  h5policy stops at
     the first non-accept finding and the heap comes first in the walk.
     h5policy rejects EVERY ONE of the six variants built for this case; no false
     accept anywhere in the matrix.
+    RE-MEASURED 2026-09-01 at h5policy d577c64: identical verdict on the pristine
+    specimen, and identical forensic finding set (D1 @ 96, D2 @ 992, D3 @ 1075,
+    D4 @ 976).  The variant matrix was rebuilt from scratch and re-run: every
+    variant is reject_corrupt, the two crash witnesses by name
+    (H5_CORRUPT_LAYOUT_DIMENSIONALITY).  Still no false accept.
   libhdf5_as_recorded: >-
     Pristine specimen: rejected_in_traversal on both stock and ASan 2.3.0, with
     both family canaries reporting `unexercised` -- which the bundle correctly
@@ -179,28 +229,89 @@ measured:
     variant_nilrepair.h5 (D4 repaired): stock CRASHES, signal 8 (SIGFPE), from
     public H5Dopen2.
     variant_ohrepair.h5 (same bytes at layout v3): clean rejection at
-    src/H5Olayout.c:281.
+    src/H5Olayout.c:282 (:281 at promotion; the file moved by one line).
+  libhdf5_remeasured: >-
+    All of the above reproduced on the pre-fix build, and the crash is wider than
+    recorded.  On develop aa9df72cc21, variant_nilrepair.h5 and its layout-v4
+    twin both take SIGFPE (signal 8) from public H5Dopen2, with the fault at
+    src/H5Dchunk.c:733 under a debugger and under AddressSanitizer.
+    NOT AN ASSERT.  The ASan build WITHOUT asserts (-DNDEBUG) faults identically
+    -- AddressSanitizer reports `DEADLYSIGNAL ... FPE`, signal 6 after its own
+    handler, and NO memory-error report on any build or any variant.  So the
+    demonstrated consequence is the arithmetic fault and nothing more.
+    RELEASED LIBRARY.  libhdf5 1.14.5, via the h5py 3.13.0 wheel, takes the same
+    SIGFPE on `f['dataset']`.  That is the first measurement of this defect on a
+    released binary; every earlier row was a development build.
+    The layout-v4 twin matters because releases before 2.0 reject layout version
+    5 outright on the version gate.  v4 and v5 encode the layout message
+    identically, so the twin carries the same defect to every library since
+    1.10.0 -- sha256
+    e78727b68095260336dbb9f56a26d74d17784b05c2fb7c6a934a4b2259117f2d.
+    POST-FIX.  On develop b7b85e7abf9 both witnesses are refused at
+    src/H5Olayout.c:592, before any chunk geometry is computed.  See upstream_fix.
+  shipped_tools: >-
+    On the pre-fix build, `h5dump -r` and `h5ls -r` on the layout-v4 witness both
+    die of SIGFPE (exit 136), memory-capped with `ulimit -v`.  On develop
+    b7b85e7abf9 they print an error and exit 1 and 0 respectively.  The defect
+    therefore reaches a user through the shipped command-line tools, not only
+    through an application calling H5Dopen2.
+  escalation_probes_negative: >-
+    Two attempts to turn the crash into memory unsafety, both REFUSED by the
+    library, recorded so the severity ceiling is bounded by measurement:
+    (a) scalar dataspace (rank 0), which would make H5D__chunk_set_info_real's
+    per-dimension loop body never run and hand ndims == 0 to
+    H5D__chunk_set_sizes and its dim[ndims - 1] indexing at src/H5Dchunk.c:816
+    and :823 -- refused at src/H5Dchunk.c:726, "number of dimensions cannot be
+    zero", which is the guard third_arithmetic_flaw notes is checking the
+    DATASPACE rank.  Here that wrong-ndims guard is what blocks the escalation.
+    (b) no sibling dataspace message at all, which would deprive the develop-only
+    check at src/H5Olayout.c:592 of its comparand -- refused earlier on every
+    build, because a dataset without a dataspace cannot be opened.
+    CONSEQUENCE FOR REMEDIATION, and it is the sharpest thing in this record:
+    the divide at :733 is what STOPS H5D__chunk_set_sizes from being reached with
+    ndims == 0.  Fixing the divide alone, without adding the dimensionality lower
+    bound, converts this crash into an out-of-bounds write at :823.  See
+    containment, which now leads with that.
   divergent_outcome_on_the_tracked_fixture: >-
     WORTH KNOWING BEFORE ANYONE CITES THIS RECORD FOR A CRASH.  The tracked
     fixture malformed/layout_v5_zero_ndims.h5 does NOT reproduce the SIGFPE.
-    Its expectation records libhdf5 refusing it cleanly in H5D__chunk_init with
-    "chunk size must be > 0" -- which matches the src/H5Dchunk.c:1055 loop
-    erroring on iteration 0, as described in third_arithmetic_flaw.
-    So the corpus fixture proves the ORACLE rule and the bundle's
-    variant_nilrepair.h5 proves the libhdf5 CRASH, and they are different files
-    reaching different libhdf5 code.  Exactly which structural difference routes
-    one to :1055 and the other to :733 is NOT established -- it was not measured
-    here and cannot be from source alone.  See coverage_gaps.
+    libhdf5 refuses it cleanly in H5D__chunk_init with "chunk size must be > 0",
+    while the bundle's witness divides by zero.  Two files, same defect,
+    different libhdf5 code.
+    THE ROUTING DIFFERENCE IS NOW ESTABLISHED, and it is the DATASPACE RANK.
+    H5D__chunk_init computes scaled dimension info under
+        if (dset->shared->ndims > 1) {          /* src/H5Dchunk.c:1139 */
+            for (u = 0; u < dset->shared->ndims; u++) {
+                if (dset->shared->layout.u.chunk.dim[u] == 0)
+                    HGOTO_ERROR(... "chunk size must be > 0, dim = %u ", u);  /* :1147 */
+    That block holds a CORRECTLY ORDERED zero check -- guard at :1146 before the
+    division at :1150 -- but it runs only when the dataspace rank exceeds 1, and
+    it runs BEFORE the call to H5D__chunk_set_info at :1175.
+    So rank >= 2 is caught cleanly at :1147; rank == 1 skips the whole block and
+    falls through to the divide at :733.  Measured both ways on the pre-fix
+    build: the tracked fixture (object /d, rank 2) is refused at :1147; the
+    witness (object /dataset, rank 1) takes the SIGFPE.
+    The corollary is worth stating: whether this defect crashes libhdf5 or is
+    reported cleanly depends on a field in a DIFFERENT message from the one that
+    is malformed, and the safe path is the accident of a one-dimensional dataset
+    being excluded from a performance optimisation.
   width: >-
-    NOT measured at 32 bits.  A division by zero is not width-dependent, but the
-    `ndims - 1` underflow at :1055 produces UINT_MAX at any width and the
-    consequences of walking a fixed array differ by ABI.
+    MEASURED at 32 bits on 2026-09-01, and the answer is the boring one: the
+    i386 build of 2.3.0 takes the same SIGFPE from the same reproducer.  A
+    division by zero is width-independent, as expected.
+    What is still NOT measured at 32 bits is the part where width would matter --
+    the `ndims - 1` underflows at :1056 and :816/:823 produce UINT_MAX at any
+    width, but the consequence of indexing a fixed array by it differs by ABI,
+    and neither is reachable today (see escalation_probes_negative).  There is
+    also no 32-bit AddressSanitizer libhdf5 here, so the i386 row is a stock
+    crash observation and not a sanitizer verdict.
 
 # -- Divergence from the selected build ---------------------------------------
 divergence:
   oracle: reject_corrupt
-  libhdf5: rejected_in_traversal (pristine) / crashed SIGFPE (D4 repaired)
-  libhdf5_version: 2.3.0
+  libhdf5: rejected_in_traversal (pristine) / crashed SIGFPE (D4 repaired, pre-fix)
+    / rejected at src/H5Olayout.c:592 (D4 repaired, develop b7b85e7abf9)
+  libhdf5_version: 2.3.0 @ develop aa9df72cc21 (pre-fix) and b7b85e7abf9 (post-fix)
   classification: verdict-aligned but reason-divergent
   note: >-
     Both implementations refuse the pristine specimen, so there is no
@@ -211,28 +322,84 @@ divergence:
     count, and NEITHER of those is the layout defect.  Two implementations
     refusing a file for two unrelated reasons is not evidence that a third
     problem in it is handled.
+    STILL TRUE AFTER THE UPSTREAM FIX, in a new way.  On develop b7b85e7abf9 the
+    verdicts agree on the WITNESS too, but again for different reasons: h5policy
+    rejects on the layout's dimensionality, libhdf5 on the disagreement between
+    the layout and the dataspace.  A file that satisfied the second and violated
+    the first would separate them; none is constructible, because ndims == 0 can
+    never equal rank + 1.  So no tolerance entry is warranted here either.
+
+# -- The upstream fix, and what it does not fix -------------------------------
+upstream_fix:
+  commit: b7b85e7abf9
+  dated: 2026-08-28
+  branch: develop only -- no release contains it
+  subject: >-
+    "Fix CVE-2026-19025 (Reject chunked datasets with mismatched chunk/dspace
+    rank at open time)".  Named here because the commit names it; the CVE record
+    itself was NOT retrieved or read -- see disclosure.
+  what_it_does: >-
+    Adds to H5O__layout_decode, at src/H5Olayout.c:565-:594, a check that a
+    chunked layout's ndims equals the sibling DATASPACE rank plus one:
+        if (mesg->type == H5D_CHUNKED && open_oh != NULL) {
+            ... H5O_msg_exists_oh(open_oh, H5O_SDSPACE_ID) ...
+            if (mesg->u.chunk.ndims != (unsigned)rank + 1)
+                HGOTO_ERROR(... "dimensionality of chunks doesn't match the
+                            dataspace");   /* :592 */
+    Zero can never satisfy that, so the witness is now refused at decode time,
+    before any chunk geometry exists.  MEASURED, not inferred.
+  incidental: >-
+    THE FIX WAS NOT LOOKING FOR THIS DEFECT.  Its stated target is a rank
+    MISMATCH producing a zero stride in H5S__hyper_iter_get_seq_list during
+    chunk I/O; the fault in this record is a different divide, in a different
+    function, reached from H5Dopen2 before any I/O.  Whether the two are one
+    vulnerability or siblings is a scoping judgement for whoever holds the CVE
+    record, and it could not be made offline.
+  what_it_leaves_unfixed: >-
+    (1) The v4+ decoder STILL has no lower bound of its own at
+    src/H5Olayout.c:338 -- the dimensionality is now policed by cross-checking a
+    DIFFERENT message, so any future path that decodes a layout message without
+    an open object header (the check is gated on open_oh != NULL) re-opens this
+    crash.  A local bound does not have that property.
+    (2) H5D__chunk_set_info_real still divides at :733 before its :738 guard.
+    (3) The unsigned underflows at :1056 and :816/:823 are unchanged.
+    And per measured.escalation_probes_negative, (2) MUST NOT be fixed without
+    (1): the divide is what currently stops H5D__chunk_set_sizes from being
+    reached with ndims == 0.
 
 # -- Containment vs systemic remediation --------------------------------------
 containment:
-  status: not_implemented        # libhdf5 side; not proposed upstream by this repo
+  status: closed_on_develop_incidentally_open_on_every_release
   description: >-
+    ORDERING WARNING FIRST, because getting it wrong makes things worse: do not
+    fix the divide without adding the dimensionality bound.  The divide at :733
+    is what stops H5D__chunk_set_sizes from being reached with ndims == 0, and
+    that function indexes dim[ndims - 1] at :816 and WRITES through it at :823.
+    Fixing (2) below alone converts a SIGFPE into an out-of-bounds write.
+    Measured, not argued -- see measured.escalation_probes_negative.
     Three changes, in increasing order of scope.
-    (1) Add the missing lower bound at src/H5Olayout.c:335 -- `|| ndims == 0`,
-    matching what :114 already does for v1/v2.  A strict tightening: no
+    (1) Add the missing lower bound at src/H5Olayout.c:338 -- `|| ndims == 0`,
+    matching what :115 already does for v1/v2.  A strict tightening: no
     conforming writer emits a zero-dimensional chunked layout.  This alone
-    closes the reported crash.
+    closes the reported crash, and unlike the shipped develop fix it does not
+    depend on a sibling dataspace message being present and decodable.
     (2) Reorder H5D__chunk_set_info_real so the dim[u] == 0 guard at :738
     precedes the division at :733, and move it out of the non-UNLIMITED branch
-    so it runs on every iteration.  Independent of (1) and worth doing anyway:
-    it protects against any zero chunk dimension, however it arrives.
-    (3) Fix the unsigned underflow at src/H5Dchunk.c:1055 -- `ndims - 1` on an
+    so it runs on every iteration.  Worth doing anyway -- it protects against any
+    zero chunk dimension, however it arrives -- but only WITH (1), per the
+    ordering warning above.
+    (3) Fix the unsigned underflow at src/H5Dchunk.c:1056 -- `ndims - 1` on an
     unsigned with ndims == 0 is UINT_MAX.  With (1) in place ndims cannot be
     zero on that path, so this is defence in depth rather than a live fix, but
-    the expression is wrong on its own terms and src/H5Dchunk.c:1147 shows the
-    correct shape twenty lines away.
-    Do NOT rely on the message-count check at src/H5Ocache.c:306 as containment.
-    It is what masks this defect today, it is unrelated to layout, and a file
-    that satisfies it reaches the crash directly.
+    the expression is wrong on its own terms, and H5D__chunk_init's
+    scaled-dimension block at :1146-:1150 shows the correct shape in the same
+    file.
+    Do NOT rely on the message-count check at src/H5Ocache.c:305-:306 as
+    containment.  It is what masks this defect today, it is unrelated to layout,
+    and a file that satisfies it reaches the crash directly.
+    UPSTREAM STATE: (1) is still absent, (2) and (3) are unchanged, and the
+    crash is nevertheless unreachable on develop because of an unrelated check
+    added for another CVE -- see upstream_fix.  Every RELEASE remains exposed.
 systemic:
   semantic_boundary: >-
     the complete dataset description -- layout message plus dataspace --
@@ -256,6 +423,61 @@ systemic:
       controls, both accepted
     - registry/findings/catalog (H5_CORRUPT_LAYOUT_DIMENSIONALITY)
 
+# -- Advisory shape ------------------------------------------------------------
+# The submission-shaped fields, kept HERE rather than only in a working bundle.
+# A handoff draft written into cases/<id>/ does not survive that tree being
+# cleared -- which has happened once already -- and the measured content of a
+# draft is this record anyway.  What a draft adds is form: a version range in
+# the repository form's syntax, a vector, and weakness ids.  So the form lives
+# with the measurements.  THIS IS NOT AN AUTHORIZATION to create, request an
+# identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    The chunked-layout decoder for message versions 4 and later accepts a
+    dimensionality of zero that the older decoders in the same function reject,
+    and opening such a dataset divides by zero in H5D__chunk_set_info_real,
+    terminating the process
+  identifier: >-
+    Do NOT request one before checking whether CVE-2026-19025 already covers it:
+    the same commit fixes both, for the same field pair.  That CVE's stated
+    fault is a zero stride in H5S__hyper_iter_get_seq_list during chunk I/O;
+    this one is a different divide, in a different function, reached from
+    H5Dopen2 before any I/O.  Same-or-sibling is a scoping judgement for whoever
+    holds the CVE record, and it could not be made offline.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: ">= 1.10.0, < 2.3.0"
+    patched_versions: >-
+      none released; fixed on develop by b7b85e7abf9, and 2.3.0 would be the
+      first release to carry it
+    vulnerable_functions: >-
+      H5O__layout_decode (src/H5Olayout.c:338), H5D__chunk_set_info_real
+      (src/H5Dchunk.c:733, guard at :738), H5D__chunk_set_info
+      (src/H5Dchunk.c:777), H5D__chunk_init (src/H5Dchunk.c:1056, latent),
+      H5D__chunk_set_sizes (src/H5Dchunk.c:816 and :823, latent).  Public entry
+      points: H5Fopen then H5Dopen2/H5Dopen1/H5Oopen on a chunked dataset, and
+      anything that traverses one -- H5Ovisit3, H5Lvisit2, h5dump, h5ls, h5py.
+  severity: Moderate
+  cvss: "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:N/I:N/A:L (base 3.3)"
+  cvss_rationale: >-
+    C:N/I:N are MEASURED, not assumed: no sanitizer memory-error report on any
+    build or variant, and both escalation routes to the out-of-bounds indexing
+    were tried and are blocked by the divide itself.  A service ingesting HDF5
+    without user action re-scores AV:N/UI:N -> 5.3.  If the divide is ever fixed
+    WITHOUT adding the dimensionality bound, H5D__chunk_set_sizes becomes
+    reachable with ndims == 0 and the write at :823 re-scores this entirely --
+    see containment, which leads with that ordering.
+  weaknesses: >-
+    CWE-369 (divide by zero, the measured fault); CWE-1284 (a one-byte
+    dimensionality bounded from above and not below); CWE-20 (three decoders of
+    one field in one function disagreeing); CWE-191 (the latent ndims - 1
+    underflows).
+  workarounds: >-
+    No library setting disables the affected path; chunked-dataset open is not
+    optional.  Validate before opening -- h5policy rejects the specimen and every
+    variant by name.  -UNDEBUG does not help.
+
 # -- Reproducers --------------------------------------------------------------
 reproducers:
   integration_poc: >-
@@ -277,11 +499,33 @@ reproducers:
     variant_ohrepair.h5 is the version control: identical bytes at layout v3,
     rejected cleanly, which is what pins the defect to the v4+ path rather than
     to the byte pattern.
+    REBUILT AND EXTENDED 2026-09-01.  The regenerated variant_nilrepair.h5 is
+    byte-identical to the recorded one (sha256
+    c55bb0dc641e94807163c70470aa7ae9ed20f19a32eee5e0abf360e091dc39a2), which is
+    an independent check that the generator description below is complete.
+    Four variants were added:
+      e78727b68095260336dbb9f56a26d74d17784b05c2fb7c6a934a4b2259117f2d
+        the same file at layout version 4 -- the witness that reaches releases
+        predating layout v5, and the one measured crashing on 1.14.5.
+      547ec2cb91388e767b0bcdd7b6655feda1729c1b640b5c669a3b60865ed14a00
+        chunk rank 2: no divide.  Refused later, at the chunk index.
+      ab2bce2bbcba6d24c69a347f2d055eec0fa90d2718c76f18941f49829087ba8d
+        no sibling dataspace message: refused earlier on every build.
+      30e419df392575a0cb4eb83d1d0981f2db41d9a89a2edee4a617dd7a6c759fa3
+        scalar dataspace: refused at src/H5Dchunk.c:726.
+    The last two are the escalation probes; see
+    measured.escalation_probes_negative.
   generator: >-
-    Deterministic and recorded: make-layout-direct-fixture.c copies input.h5,
-    repairs byte 103 to 0x00 and byte 992 to 0x05 and restores the NIL header at
-    0x450, leaving only layout version 5 with ndims 0.  Result sha256
+    Deterministic and recorded: copy input.h5, repair byte 103 to 0x00 and byte
+    992 to 0x05, and restore the NIL header at 0x450 as an 8-byte v1 message
+    header of type 0x0000, size 0x0088, flags 0x00 -- which spans the rest of the
+    256-byte header -- leaving only layout version 5 with ndims 0.  Result sha256
     c55bb0dc641e94807163c70470aa7ae9ed20f19a32eee5e0abf360e091dc39a2.
+    The NIL size was recovered by search in 2026-09 (the promotion text recorded
+    the repair but not the field values) and confirmed by the sha256 matching.
+    The layout-v4 twin is the same three repairs plus byte 0x430 = 0x04; the
+    other variants differ from it by one further byte each, given in
+    crash_witness.
   assertions:
     stable_finding: true
     fails_before_materialization: false
@@ -326,41 +570,75 @@ sibling_audit: >-
 
 # -- Affected versions --------------------------------------------------------
 version_range:
-  affected: >-
-    UNVERIFIED as a range.  Measured live on 2.3.0 by the bundle, and the
-    missing lower bound at src/H5Olayout.c:335 plus both arithmetic flaws in
-    src/H5Dchunk.c were verified present in the 2.3.0 tree at promotion.  No
-    archaeology was run.
-  note: >-
-    Layout version 4 introduced the encoding this path handles, so the missing
-    bound is likely as old as v4 support -- but that is an inference from
-    feature history, not a measurement.
-  label: not established
+  affected: ">= 1.10.0, < 2.3.0"
+  patched: >-
+    None released.  Fixed on develop by b7b85e7abf9 (see upstream_fix); 2.3.0
+    would be the first release to carry it and is unreleased as of 2026-09-01.
+    Tag 2.2.0 (2026-07-28) does not contain it, nor does any earlier release.
+  method: >-
+    Archaeology run 2026-09-01 by reading src/H5Olayout.c and src/H5Dchunk.c at
+    each tag: hdf5-1_10_0, hdf5-1_10_11, hdf5-1_12_3, hdf5_1.14.5, hdf5_2.0.0,
+    hdf5_2.1.0, 2.2.0, snapshot-2.2.0-rc1, and develop at aa9df72cc21 and
+    b7b85e7abf9.  In every one the v4+ branch bounds ndims only from above, and
+    the divide precedes the guard.  1.10.0 is the lower bound because that is
+    where layout version 4 appears; in 1.10.0 NO decoder path had a lower bound
+    at all -- the v1/v2 `!ndims` and v3 `ndims < 2` checks are later additions,
+    and the v4+ path never received one.
+  measured_ends: >-
+    EXECUTED at two points only: released 1.14.5 (via the h5py-bundled library)
+    and develop aa9df72cc21, both SIGFPE; plus develop b7b85e7abf9, refused.
+    The 1.10, 1.12 and 2.0-2.2 rows are source reads, not runs.  Anyone needing
+    them confirmed by execution should build those tags -- see AGENTS.md, which
+    treats that cost as justified precisely for an affected-product range.
+  label: established (ends measured, interior source-derived)
 
 # -- Open items ---------------------------------------------------------------
 coverage_gaps:
   - >-
-    THE CRASH WITNESS IS NOT TRACKED.  variant_nilrepair.h5 is the only file
-    that reproduces the SIGFPE, and it lives in a gitignored bundle.  The
+    STILL OPEN -- THE CRASH WITNESS IS NOT TRACKED.  The witnesses are the only
+    files that reproduce the SIGFPE and they live in a gitignored bundle.  The
     tracked fixture proves the oracle rule but is refused by libhdf5 through a
-    different route (see measured.divergent_outcome_on_the_tracked_fixture), so
-    the corpus currently contains no regression test for the crash itself.
-    Its generator is recorded and deterministic, so this is cheap.
+    different route (now explained, see
+    measured.divergent_outcome_on_the_tracked_fixture), so the corpus still
+    contains no regression test for the crash itself.
+    CHEAPER THAN IT WAS, and now specified: a tracked fixture would need a
+    ONE-DIMENSIONAL dataspace, since rank >= 2 routes to the clean error at
+    src/H5Dchunk.c:1147.  The existing malformed/layout_v5_zero_ndims.h5 has
+    rank 2, which is exactly why it does not crash.  The generator is recorded,
+    deterministic, and re-verified by sha256.
   - >-
-    THE ROUTING DIFFERENCE IS UNEXPLAINED.  The tracked fixture reaches
-    src/H5Dchunk.c:1055 and errors cleanly; variant_nilrepair.h5 reaches :733
-    and divides by zero.  What structural difference selects between them is not
-    established, and it should be before either file is cited as representative.
+    CLOSED 2026-09-01 -- the routing difference is the dataspace rank, measured
+    both ways; see measured.divergent_outcome_on_the_tracked_fixture.
   - >-
-    NOTHING WAS RE-MEASURED AT PROMOTION (source claims excepted) -- see
-    measured.NOT_REMEASURED_AT_PROMOTION.
+    CLOSED 2026-09-01 -- everything under `measured` is now first-hand; see
+    measured.REMEASURED_2026_09_01.
   - >-
-    No 32-bit measurement, and the :1055 underflow is the part most likely to
-    behave differently there.
+    CLOSED 2026-09-01 for the crash -- it reproduces identically on a 32-bit
+    build.  STILL OPEN for the underflows at :1056 and :816/:823, whose
+    consequences are ABI-dependent and which no build here reaches; and there is
+    no 32-bit AddressSanitizer libhdf5 in this environment.
   - >-
-    The other six "chunk size must be > 0" guards in src/H5Dchunk.c were not
-    audited for guard-after-use ordering.
+    STILL OPEN -- no RELEASE build in the 2.0-2.2 line was executed; those rows
+    of version_range are source reads.  The released binary that was executed is
+    1.14.5, via h5py.
+  - >-
+    STILL OPEN -- the other six "chunk size must be > 0" guards in
+    src/H5Dchunk.c were not audited for guard-after-use ordering.
+  - >-
+    NEW, and it is the residual risk after the upstream fix: the develop check
+    is gated on `open_oh != NULL` and on a decodable sibling dataspace message.
+    No bypass was found -- the no-dataspace variant is refused earlier, measured
+    -- but only the H5Dopen path was swept.  Whether H5Ocopy, a chunk-index
+    resize, or any other consumer recomputes chunk geometry from a layout
+    decoded without an open object header is NOT established.
 open_questions:
+  - >-
+    IS THIS ALREADY COVERED BY CVE-2026-19025?  The same commit fixes both, and
+    ndims == 0 is formally a rank mismatch, but the CVE's stated fault is a zero
+    stride during chunk I/O and this one is a divide at dataset open, in a
+    different function, reached first.  Unanswerable here: no advisory database
+    was consulted and no identifier was looked up.  It gates whether a separate
+    identifier should ever be requested.
   - >-
     Is ndims == 1 handled consistently?  v3 rejects it, v1/v2 and v4+ accept it,
     and h5policy's behaviour across that split was not checked.  If the oracle
@@ -372,6 +650,13 @@ open_questions:
     the previous question is academic or a live compatibility issue.
 
 provenance:
+  remeasured: >-
+    2026-09-01, at h5policy d577c64 with a clean worktree, in a rebuilt h5cve
+    bundle (gitignored scratch; the specimen and every variant are identified by
+    sha256 in this record, not by path).  Builds, with build_mode, sanitizers and
+    settings_sha256, are listed in measured.builds_measured; workstation-local
+    installs, paths not recorded.  Local evidence only -- no web fetch, no
+    advisory retrieval, no outbound action.
   found_by: >-
     a supplied specimen, triaged through the h5cve bundle workflow in
     an untracked working bundle; promoted 2026-08-15.  The
@@ -383,4 +668,9 @@ provenance:
     -fsanitize=address, both rejecting the pristine specimen in traversal;
     stock SIGFPE on variant_nilrepair.h5.  Source verified against the 2.3.0
     tree at promotion.  Workstation-local installs; paths not recorded.
+    2026-09-01: re-measured across five builds and one released library, and the
+    source re-read at develop b7b85e7abf9.  A CAUTION THAT COST TIME HERE -- the
+    version string does not identify the build: the local installs and the
+    checkout both say 2.3.0 while differing by five weeks of develop and by
+    whether this defect is fixed.  Pin the source state, not the version.
   poke_version: GNU poke 4.3

@@ -5,6 +5,7 @@ SCOPES = {"local_decode", "record_local", "aggregate_object",
           "reference_graph", "resource", "policy"}
 import re
 import os
+import subprocess
 import glob
 import sys
 import yaml
@@ -414,6 +415,7 @@ else:
 # about which keys a case must carry.
 CASES_GLOB = "registry/cases/*.yml"
 case_paths = sorted(glob.glob(CASES_GLOB))
+case_fields_now = {}
 for path in case_paths:
     try:
         doc = yaml.safe_load(open(path))
@@ -430,6 +432,88 @@ for path in case_paths:
         print(f"CASE_NOT_A_MAPPING file={path} "
               f"parsed_as={type(doc).__name__}")
         errors += 1
+        continue
+    case_fields_now[os.path.basename(path)] = set(doc)
+
+# A case record that RENAMES one of its own fields leaves every citation of the
+# old name dangling, and nothing walks the citations.  That is not hypothetical:
+# `registry_claim_contradicted` was renamed to `registry_reading_note` in two
+# records on 2026-08-15 -- correctly, with the retraction explained rather than
+# deleted -- and three files went on citing the dead name for weeks.  Two of
+# them did worse than dangle: they kept ASSERTING the claim the rename retracted.
+#
+# So the deny-list is derived from git history rather than declared.  A declared
+# list would depend on the same discipline that failed: whoever renames a field
+# is exactly the person who forgets the citations.  History cannot be forgotten.
+# Every top-level field name a record has ever carried, minus the names any
+# record carries now, is a dead name -- and a dead name may appear only in a
+# record that once had it, which is where the retraction narrative belongs.
+#
+# Precision comes from the source of the name list, not from parsing prose: a
+# scan for citing PHRASES over free text was measured at 165 true citations
+# against 350 false ones ("every", "which", "place"), which would be permanently
+# red and therefore ignored.  Dead field names are former field names, so a
+# whole-word match on them is unambiguous.
+#
+# Blind spot, reported rather than hidden: a dead name too generic to word-match
+# safely (no underscore, or shorter than 10 characters) is skipped and named, so
+# the gap is visible instead of silently unpoliced.
+DEAD_NAME_MIN_LEN = 10
+
+
+def _git(*args):
+    """Run git and return stdout, or None when this is not a checkout."""
+    try:
+        done = subprocess.run(("git",) + args, capture_output=True, text=True)
+    except OSError:
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+if case_fields_now and _git("rev-parse", "--git-dir") is not None:
+    # One diff pass; `+name:` at column 0 is a top-level key being introduced.
+    history = _git("log", "--unified=0", "--no-color", "--format=", "--",
+                   CASES_GLOB.rsplit("/", 1)[0]) or ""
+    field_add = re.compile(r"^\+([a-z][a-z0-9_]*):")
+    ever = {}
+    current_file = None
+    for line in history.splitlines():
+        if line.startswith("+++ b/registry/cases/"):
+            current_file = os.path.basename(line[6:])
+        elif current_file:
+            hit = field_add.match(line)
+            if hit:
+                ever.setdefault(current_file, set()).add(hit.group(1))
+    live_anywhere = set().union(*case_fields_now.values())
+    retired = {}          # dead name -> records that once carried it
+    for basename, seen in ever.items():
+        if basename not in case_fields_now:
+            continue      # the record itself is gone; nothing to keep consistent
+        for name in seen - live_anywhere:
+            retired.setdefault(name, set()).add(basename)
+    for name in sorted(retired):
+        if "_" not in name or len(name) < DEAD_NAME_MIN_LEN:
+            print(f"NOTE retired case field {name!r} is too generic to police "
+                  f"for stale citations (retired from "
+                  f"{', '.join(sorted(retired[name]))})")
+            continue
+        # The retiring records may name the field: that is where the
+        # retraction narrative belongs.  This checker may too, because its
+        # rationale is worth nothing without the real example that motivated it,
+        # and it is the one file whose subject IS dead field names.
+        allowed = {f"registry/cases/{b}" for b in retired[name]}
+        allowed.add("tools/check_registry.py")
+        cited = _git("grep", "-l", "-w", "-F", name, "--", ":/") or ""
+        for citing in sorted(f for f in cited.split() if f):
+            if citing in allowed:
+                continue
+            print(f"CASE_FIELD_CITATION_STALE file={citing} field={name} "
+                  f"retired_from={', '.join(sorted(retired[name]))} "
+                  f"(the field no longer exists; cite the current section, and "
+                  f"leave the retraction narrative in the record)")
+            errors += 1
+else:
+    print("NOTE not a git checkout; stale case-field citations unchecked")
 
 print(f"records={len(records)} findings={len(findings)} "
       f"backlog={len(finding_backlog)} emitted={len(emitted_by)} "
@@ -443,5 +527,4 @@ if errors:
 # The SSP evidence bridge consumes this registry, the exact-build canary map,
 # and the generated native-library measurement.  Keep it in the same gate so a
 # stale control mapping cannot look like audited evidence.
-import subprocess
 sys.exit(subprocess.run([sys.executable, "tools/check_ssp_control_evidence.py"]).returncode)

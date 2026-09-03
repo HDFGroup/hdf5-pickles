@@ -23,9 +23,12 @@ the parent hash, intended invariant/finding, the exact changed byte ranges, and
 which checksums were resealed.  Each mutant is self-validating: h5policy must
 emit the intended finding.
 
-The implemented families cover object-header continuation intervals and
-fractal-heap structural geometry. Use ``list`` to see recipes and their family,
-or ``family --family NAME`` to restrict a batch to one family.
+The implemented families cover object-header continuation intervals,
+fractal-heap structural geometry, and version-2 B-tree header geometry -- the
+last serving four record families from one locator, because a BTHD is one
+structure whose client id decides which family owns the tree. Use ``list`` to
+see recipes and their family, or ``family --family NAME`` to restrict a batch
+to one family.
 
 The one non-trivial reseal primitive (Jenkins lookup3) is reused from the CVE
 seed builder; the OHDR/OCHK/superblock reseal wrappers are thin.
@@ -68,13 +71,61 @@ def _jenkins():
 JENKINS = _jenkins()
 
 
+# ----------------------------------------------------------- superblock -------
+# Every locator needs the file's offset and length widths, and they live in the
+# superblock -- which is NOT necessarily at byte 0.  A user block pushes it to
+# 512, 1024 or beyond, and reading the widths from fixed offsets 9 and 10 then
+# reads user-block bytes instead: measured 0/0 on valid/userblock_latest.h5,
+# whose real widths are 8/8.  Every derived field offset is then wrong.  The
+# self-validating design caught it (the heap family failed verification with a
+# bad checksum rather than mutating the wrong field silently), but a locator
+# that cannot read a userblock seed at all is a coverage hole, not a design
+# feature.
+H5_SIGNATURE = b"\x89HDF\r\n\x1a\n"
+
+
+def superblock_offset(raw):
+    """Where the superblock actually starts.  The format allows it only at
+    byte 0 or at a power-of-two user-block boundary from 512 up, so a signature
+    hit elsewhere is payload, not a superblock."""
+    off = raw.find(H5_SIGNATURE)
+    if off < 0:
+        raise ValueError("no HDF5 signature in this seed")
+    if off != 0 and (off < 512 or off & (off - 1)):
+        raise ValueError(f"HDF5 signature at {off} is not a user-block boundary")
+    return off
+
+
+def superblock_widths(raw):
+    """(size_of_offsets, size_of_lengths), read from the real superblock.
+
+    The two widths move with the superblock VERSION, which is the second thing
+    that makes them easy to read from the wrong place.  Versions 0 and 1 carry
+    four more version bytes first -- free-space, root symbol-table entry,
+    reserved, shared-header-message -- and put the widths at +13/+14; versions
+    2 and 3 dropped those and put them at +9/+10.  Reading the v2 offsets from
+    a v0 superblock yields (0, 0): offset 10 there is the root symbol-table
+    entry version.  20 of the 64 seeds in tests/valid are v0, so this is the
+    common case, not a legacy corner -- and a zero width silently collapses
+    every derived field offset to the head of the structure.
+    """
+    sb = superblock_offset(raw)
+    version = raw[sb + 8]
+    if version in (0, 1):
+        return raw[sb + 13], raw[sb + 14]
+    if version in (2, 3):
+        return raw[sb + 9], raw[sb + 10]
+    raise ValueError(f"unsupported superblock version {version}")
+
+
 # --------------------------------------------------------------- reseal -------
 
 def reseal_superblock(raw):
-    soff = raw[9]
-    off = 12 + 4 * soff
-    struct.pack_into("<I", raw, off, JENKINS(bytes(raw[:off])))
-    return ("superblock", 0)
+    sb = superblock_offset(raw)
+    soff = raw[sb + 9]
+    off = sb + 12 + 4 * soff
+    struct.pack_into("<I", raw, off, JENKINS(bytes(raw[sb:off])))
+    return ("superblock", sb)
 
 
 def reseal_v2_ohdr(raw, off):
@@ -98,10 +149,14 @@ def reseal_ochk(raw, off, size):
 # --------------------------------------------------------------- parse --------
 
 def superblock(raw):
-    if raw[8] not in (2, 3):
+    sb = superblock_offset(raw)
+    if raw[sb + 8] not in (2, 3):
         raise ValueError("only v2/v3 superblocks are supported")
-    soff, loff = raw[9], raw[10]
-    root_off = int.from_bytes(raw[12 + 3 * soff:12 + 3 * soff + soff], "little")
+    soff, loff = raw[sb + 9], raw[sb + 10]
+    # Stored addresses are relative to the superblock's own base, so a
+    # user-block file needs the base added to reach a physical offset.
+    root_off = sb + int.from_bytes(
+        raw[sb + 12 + 3 * soff:sb + 12 + 3 * soff + soff], "little")
     return root_off, soff, loff
 
 
@@ -272,7 +327,7 @@ def locate_frhp(raw):
         raise ValueError("no fractal-heap header in this seed")
     if raw[off + 4] != 0:
         raise ValueError("unsupported fractal-heap header version")
-    soff, loff = raw[9], raw[10]
+    soff, loff = superblock_widths(raw)
     filter_len = struct.unpack_from("<H", raw, off + 7)[0]
     dtable = off + 14 + (10 * loff) + (2 * soff)
     body = 14 + (2 * soff) + (10 * loff) + (8 + 2 * loff + soff)
@@ -356,6 +411,706 @@ def recipe_frhp_first_row_overflow(raw, fh):
 # instrument for that invariant, because it pins one base file.
 
 
+# ---- version-2 B-tree header (btree_heap_index and its three clients) -------
+# The third family, and the first whose ONE locator serves several record
+# families.  A BTHD is signature-findable with a single trailing checksum, the
+# same shape as FRHP, but the structure is shared: the client id in the header
+# selects which of dense_index / chunk_index / shared_messages_legacy owns the
+# tree, while the geometry fields (node_size, record_size) belong to
+# btree_heap_index's shared validator whatever the client is.
+#
+# The locator ENUMERATES rather than taking the first match, which FRHP can get
+# away with and this cannot.  valid/sohm_btree.h5 carries a type-5 dense-link
+# header BEFORE its type-7 SOHM root, so a first-match locator would edit the
+# dense-link tree while the sidecar claimed a SOHM target -- a recipe recording
+# an intent it did not carry out.
+
+# Client ids (H5B2_subid_t order, src/H5B2pkg.h).  Only the ids the corpus
+# actually carries are named; a recipe that needs to pick a WRONG client for a
+# located header uses the neighbour table below.
+BT2_CLIENT_NAMES = {
+    0: "test", 1: "huge_indirect", 2: "huge_indirect_filtered",
+    3: "huge_direct", 4: "huge_direct_filtered", 5: "grp_dense_name",
+    6: "grp_dense_corder", 7: "sohm_index", 8: "attr_dense_name",
+    9: "attr_dense_corder", 10: "chunk_filtered", 11: "chunk_non_filtered",
+}
+# A wrong-but-in-range client for each id we can locate.  In range matters: the
+# point of the invariant is that libhdf5 range-checks the id against the NUMBER
+# of B-tree types and never against the client the caller opened the tree as,
+# so the FILE picks the class.  An out-of-range id would be caught by the range
+# check instead and prove nothing.
+# MEASURED, not assumed: the swap has to keep the RECORD WIDTH the same, or the
+# mismatch is caught as a record-layout error before the client confusion is
+# reached.  Name<->creation-order pairs keep it; the filtered<->non-filtered
+# chunk pair does not, because a filtered chunk record carries extra fields.
+# Verified on valid/dense_links.h5 (5), valid/dense_attribute.h5 (8) and
+# valid/sohm_btree.h5, where this emits H5_CORRUPT_V2_BTREE_RECORD_TYPE, and on
+# valid/chunk_v2_btree.h5 (10), where it emitted H5_CORRUPT_V2_BTREE_RECORD_LAYOUT
+# instead -- which is why the chunk pair is `bt2_chunk_client_swap` below.
+BT2_WRONG_CLIENT = {5: 6, 6: 5, 7: 5, 8: 9, 9: 8}
+BT2_CHUNK_CLIENT = {10: 11, 11: 10}
+
+# Leaf node overhead: 4 signature + 1 version + 1 type + 4 checksum.
+BT2_LEAF_OVERHEAD = 10
+
+
+def reseal_bt2_hdr(raw, off, chksum_off):
+    struct.pack_into("<I", raw, chksum_off, JENKINS(bytes(raw[off:chksum_off])))
+    return ("BTHD", off)
+
+
+def locate_bt2(raw):
+    """Every v2 B-tree header in the seed, with its field offsets.
+
+    Field order is the format's (pickles/v2_btree.pk bt2_hdr): signature,
+    version, record type, node size, record size, depth, split and merge
+    percents, root address, root record count, total record count, checksum.
+    """
+    soff, loff = superblock_widths(raw)
+    headers, at = [], 0
+    while True:
+        off = raw.find(b"BTHD", at)
+        if off < 0:
+            break
+        at = off + 4
+        if off + 16 + soff + 2 + loff + 4 > len(raw) or raw[off + 4] != 0:
+            continue        # not a v0 header, or runs past the seed
+        root_off = off + 16
+        nrr_off = root_off + soff
+        total_off = nrr_off + 2
+        chksum_off = total_off + loff
+        h = {
+            "off": off, "soff": soff, "loff": loff,
+            "record_type": raw[off + 5],
+            "node_size_off": off + 6,
+            "record_size_off": off + 10,
+            "depth_off": off + 12,
+            "root_addr_off": root_off,
+            "num_root_records_off": nrr_off,
+            "total_nrec_off": total_off,
+            "chksum": chksum_off,
+            "node_size": struct.unpack_from("<I", raw, off + 6)[0],
+            "record_size": struct.unpack_from("<H", raw, off + 10)[0],
+            "depth": struct.unpack_from("<H", raw, off + 12)[0],
+            "num_root_records": struct.unpack_from("<H", raw, nrr_off)[0],
+        }
+        # A stored checksum that does not verify means this is not a header we
+        # can edit and reseal honestly -- most likely a false signature hit
+        # inside payload.  Skip it rather than corrupt an unrelated span.
+        if struct.unpack_from("<I", raw, chksum_off)[0] != JENKINS(
+                bytes(raw[off:chksum_off])):
+            continue
+        headers.append(h)
+    if not headers:
+        raise ValueError("no v2 B-tree header in this seed")
+    return {"headers": headers, "soff": soff, "loff": loff}
+
+
+def _bt2_pick(ctx, clients=None):
+    """The first located header, optionally restricted to given client ids."""
+    for h in ctx["headers"]:
+        if clients is None or h["record_type"] in clients:
+            return h
+    return None
+
+
+def _bt2_edit(raw, h, off, width, value):
+    changed = [_set_uint(raw, off, width, value)]
+    return changed, [reseal_bt2_hdr(raw, h["off"], h["chksum"])]
+
+
+def recipe_bt2_node_size_over_file(raw, ctx):
+    h = _bt2_pick(ctx)
+    changed, resealed = _bt2_edit(raw, h, h["node_size_off"], 4, 0xFFFFFFFF)
+    return changed, resealed, (
+        f"node size 0xFFFFFFFF on the {BT2_CLIENT_NAMES.get(h['record_type'], '?')} "
+        f"tree, against a {len(raw)}-byte file")
+
+
+def recipe_bt2_node_size_below_overhead(raw, ctx):
+    """A node too small to hold even its own framing, so leaf capacity is
+    zero.  The lower half of the geometry rule, where the oversize recipe above
+    is the upper."""
+    h = _bt2_pick(ctx)
+    changed, resealed = _bt2_edit(raw, h, h["node_size_off"], 4,
+                                  BT2_LEAF_OVERHEAD)
+    return changed, resealed, (
+        f"node size {BT2_LEAF_OVERHEAD}, exactly the leaf framing, leaving "
+        f"room for zero records")
+
+
+def recipe_bt2_record_size_zero(raw, ctx):
+    h = _bt2_pick(ctx)
+    changed, resealed = _bt2_edit(raw, h, h["record_size_off"], 2, 0)
+    return changed, resealed, "record size of zero"
+
+
+def recipe_bt2_wrong_client(raw, ctx):
+    """An in-range client id that is not the one the caller opened the tree as.
+    In range on purpose: libhdf5 checks the id against the NUMBER of types and
+    then lets the FILE pick the class, so an out-of-range id would be caught by
+    the range check and prove nothing about the confusion."""
+    h = _bt2_pick(ctx, clients=set(BT2_WRONG_CLIENT))
+    if h is None:
+        return None
+    wrong = BT2_WRONG_CLIENT[h["record_type"]]
+    changed = [_set_uint(raw, h["off"] + 5, 1, wrong)]
+    resealed = [reseal_bt2_hdr(raw, h["off"], h["chksum"])]
+    return changed, resealed, (
+        f"client id {wrong} ({BT2_CLIENT_NAMES[wrong]}) on a tree opened as "
+        f"{h['record_type']} ({BT2_CLIENT_NAMES[h['record_type']]})")
+
+
+def recipe_bt2_root_addr_out_of_file(raw, ctx):
+    h = _bt2_pick(ctx)
+    changed, resealed = _bt2_edit(raw, h, h["root_addr_off"], h["soff"],
+                                  len(raw) + 4096)
+    return changed, resealed, "root node address past the end of file"
+
+
+def recipe_bt2_chunk_client_swap(raw, ctx):
+    """The chunk pair of the client confusion: filtered <-> non-filtered.  Its
+    own recipe because the two record layouts differ in width, so the layout
+    check fires before the client mismatch -- a different finding, promised
+    separately rather than folded into `bt2_wrong_client`."""
+    h = _bt2_pick(ctx, clients=set(BT2_CHUNK_CLIENT))
+    if h is None:
+        return None
+    wrong = BT2_CHUNK_CLIENT[h["record_type"]]
+    changed = [_set_uint(raw, h["off"] + 5, 1, wrong)]
+    resealed = [reseal_bt2_hdr(raw, h["off"], h["chksum"])]
+    return changed, resealed, (
+        f"chunk client id {wrong} ({BT2_CLIENT_NAMES[wrong]}) on a tree whose "
+        f"records are laid out for {h['record_type']} "
+        f"({BT2_CLIENT_NAMES[h['record_type']]})")
+
+
+def recipe_bt2_depth_inflated(raw, ctx):
+    """A declared depth far above the real tree.  The intended finding is the
+    RESOURCE one on purpose: measured on four seeds, the profile's depth ceiling
+    is reached before any geometry check, so this recipe pins that the ceiling
+    pre-empts the descent rather than pinning a corruption rule.  It is
+    therefore the one recipe here whose contract depends on a profile setting,
+    which is why the dependency is stated instead of discovered later."""
+    h = _bt2_pick(ctx)
+    changed, resealed = _bt2_edit(raw, h, h["depth_off"], 2, 0xFFFF)
+    return changed, resealed, "declared depth of 65535"
+
+
+# The total-record-count recipes.  These were WITHDRAWN on 2026-09-03 and
+# reinstated the same day, and the round trip is the point: the first version
+# used zero, produced three different outcomes across seeds, and could not
+# promise one finding.  Two of those outcomes were ACCEPT -- a false accept in
+# which the name-index walkers never compared the header's total against their
+# own tree, because the rule was emitted from exactly one site in the oracle
+# (the creation-order walker).  Chasing the inflated direction then showed the
+# accept was memory-unsafe in libhdf5, not merely a detection gap:
+# H5O__linfo_decode sets linfo->nlinks = HSIZET_MAX unconditionally and
+# H5G__obj_get_linfo fills it from H5B2_get_nrec, so this field alone sizes the
+# link table that the tree walk fills, and n+1 segfaults while n-1 corrupts the
+# heap.  See registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml.
+# Both name walkers now enforce it, so the promise is sound and all three
+# values are recipes.  Zero is kept even though it is the one value libhdf5
+# survives -- it is the value a naive mutator reaches first, and it is the
+# regression guard for the walkers' `valid` sentinel.
+
+# The dense NAME indexes, whose walkers enforce the total-count rule and whose
+# header field sizes libhdf5's link table.  Restricted deliberately: the CHUNK
+# v2-B-tree carries the same field, but measured on valid/chunk_v2_btree_deep.h5
+# the same edit produces H5_CORRUPT_V2_BTREE_ROOT_COUNT on one chunk seed, no
+# finding at all on the other, and NO consequence in libhdf5 -- h5dump -d reads
+# the dataset at rc=0 for n+1, n-1 and the base alike.  A chunk index's total
+# count is not load-bearing for reads, so a recipe promising one finding across
+# both client families would be promising something untrue.
+BT2_DENSE_NAME_CLIENTS = {5, 8}
+
+
+def _bt2_total_edit(raw, ctx, delta):
+    h = _bt2_pick(ctx, clients=BT2_DENSE_NAME_CLIENTS)
+    if h is None or h["num_root_records"] == 0:
+        return None
+    stored = int.from_bytes(
+        raw[h["total_nrec_off"]:h["total_nrec_off"] + h["loff"]], "little")
+    value = 0 if delta is None else stored + delta
+    if value < 0:
+        return None
+    changed, resealed = _bt2_edit(raw, h, h["total_nrec_off"], h["loff"], value)
+    return changed, resealed, (
+        f"total record count {stored} -> {value} against a tree holding "
+        f"{stored}")
+
+
+def recipe_bt2_total_nrec_zero(raw, ctx):
+    """Zero: libhdf5 skips the allocation entirely and reports an empty index,
+    so this is the benign value and the one that hides records rather than
+    faulting."""
+    return _bt2_total_edit(raw, ctx, None)
+
+
+def recipe_bt2_total_nrec_plus_one(raw, ctx):
+    """n+1: the link table gets a slot the walk never fills, and the sort
+    comparator dereferences its NULL name.  Stock libhdf5 SIGSEGVs."""
+    return _bt2_total_edit(raw, ctx, +1)
+
+
+def recipe_bt2_total_nrec_minus_one(raw, ctx):
+    """n-1: the walk produces more callbacks than the table has slots, past a
+    bound that is an assert only (src/H5Gdense.c:717) and compiled out of every
+    Release build.  Stock libhdf5 aborts on heap corruption."""
+    return _bt2_total_edit(raw, ctx, -1)
+
+
+BT2_RECIPES = {
+    "bt2_node_size_over_file":
+        (recipe_bt2_node_size_over_file, "btree.v2_node_geometry",
+         "H5_CORRUPT_V2_BTREE_NODE_SIZE"),
+    "bt2_node_size_below_overhead":
+        (recipe_bt2_node_size_below_overhead, "btree.v2_node_geometry",
+         "H5_CORRUPT_V2_BTREE_NODE_SIZE"),
+    "bt2_record_size_zero":
+        (recipe_bt2_record_size_zero, "btree.v2_record_size",
+         "H5_CORRUPT_V2_BTREE_RECORD_SIZE"),
+    "bt2_wrong_client":
+        (recipe_bt2_wrong_client, "btree.v2_client_matches_caller",
+         "H5_CORRUPT_V2_BTREE_RECORD_TYPE"),
+    "bt2_root_addr_out_of_file":
+        (recipe_bt2_root_addr_out_of_file, "btree.v2_root_in_file",
+         "H5_CORRUPT_OFFSET_OUT_OF_FILE"),
+    "bt2_total_nrec_zero":
+        (recipe_bt2_total_nrec_zero, "btree.v2_counts_consistent",
+         "H5_CORRUPT_V2_BTREE_TOTAL_COUNT"),
+    "bt2_total_nrec_plus_one":
+        (recipe_bt2_total_nrec_plus_one, "btree.v2_counts_consistent",
+         "H5_CORRUPT_V2_BTREE_TOTAL_COUNT"),
+    "bt2_total_nrec_minus_one":
+        (recipe_bt2_total_nrec_minus_one, "btree.v2_counts_consistent",
+         "H5_CORRUPT_V2_BTREE_TOTAL_COUNT"),
+    "bt2_chunk_client_swap":
+        (recipe_bt2_chunk_client_swap, "btree.v2_client_matches_caller",
+         "H5_CORRUPT_V2_BTREE_RECORD_LAYOUT"),
+    "bt2_depth_inflated":
+        (recipe_bt2_depth_inflated, "btree.v2_depth_bounded",
+         "H5_RESOURCE_BTREE_DEPTH"),
+}
+
+
+# ---- free-space manager header (validation_controls) ------------------------
+# The fourth family, and the one with a coverage argument the others do not
+# have: h5py cannot reach free-space managers AT ALL -- neither a plain open nor
+# an object walk decodes FSHD/FSSE -- so h5policy-fuzz's oracle cannot judge an
+# FSM mutant, and a false accept in this family is undetectable by the fuzzer by
+# construction.  A self-validating typed recipe is the only generator here whose
+# output can be judged.
+#
+# Field order is the format's (pickles/fsm.pk, H5FS__cache_hdr_serialize):
+#   [sig:4][ver:1][client:1][tot_space:L][tot_sect_count:L]
+#   [serial_sect_count:L][ghost_sect_count:L][nclasses:2][shrink:2][expand:2]
+#   [max_sect_addr:2][max_sect_size:L][sect_addr:O][sect_size:L]
+#   [alloc_sect_size:L][chksum:4]
+#
+# THREE FIELDS ARE OFF LIMITS to a naive edit, and it is not obvious from the
+# layout: max_sect_size, max_sect_addr and serial_sect_count each DERIVE a field
+# width in the FSSE section list that follows --
+#   sect_len_size = H5VM_limit_enc_size(max_sect_size)
+#   sect_off_size = (max_sect_addr + 7) / 8
+#   sect_cnt_size = H5VM_limit_enc_size(serial_sect_count)
+# so changing one re-frames every section record and the list stops decoding.
+# The mutant would then be rejected for the wrong reason, and the recipe would
+# be promising a finding it did not cause.  Every recipe below edits a field
+# that derives nothing.
+
+# libhdf5 registers a fixed number of section classes per client:
+# H5FS_CLIENT_FHEAP_ID (0) has 4, H5FS_CLIENT_FILE_ID (1) has 3
+# (H5MF_FSPACE_SECT_CLS_SIMPLE/SMALL/LARGE, src/H5MF.c).
+FSM_CLIENT_CLASSES = {0: 4, 1: 3}
+
+
+def reseal_fshd(raw, off, chksum_off):
+    struct.pack_into("<I", raw, chksum_off, JENKINS(bytes(raw[off:chksum_off])))
+    return ("FSHD", off)
+
+
+def locate_fsm(raw):
+    """The first free-space manager header, with its field offsets.
+
+    The stored checksum is verified before the header is accepted, so a false
+    "FSHD" hit inside payload is skipped rather than mutated.
+    """
+    soff, loff = superblock_widths(raw)
+    at = 0
+    while True:
+        off = raw.find(b"FSHD", at)
+        if off < 0:
+            raise ValueError("no free-space manager header in this seed")
+        at = off + 4
+        chksum = off + 14 + 7 * loff + soff
+        if chksum + 4 > len(raw) or raw[off + 4] != 0:
+            continue
+        if struct.unpack_from("<I", raw, chksum)[0] != JENKINS(bytes(raw[off:chksum])):
+            continue
+        g = lambda rel, n: int.from_bytes(raw[off + rel:off + rel + n], "little")
+        return {
+            "off": off, "soff": soff, "loff": loff, "chksum": chksum,
+            "client": raw[off + 5],
+            "tot_space_off": off + 6,
+            "tot_sect_count_off": off + 6 + loff,
+            "serial_sect_count_off": off + 6 + 2 * loff,
+            "ghost_sect_count_off": off + 6 + 3 * loff,
+            "nclasses_off": off + 6 + 4 * loff,
+            "max_sect_addr_off": off + 12 + 4 * loff,
+            "max_sect_size_off": off + 14 + 4 * loff,
+            "sect_addr_off": off + 14 + 5 * loff,
+            "sect_size_off": off + 14 + 5 * loff + soff,
+            "alloc_sect_size_off": off + 14 + 6 * loff + soff,
+            "tot_sect_count": g(6 + loff, loff),
+            "serial_sect_count": g(6 + 2 * loff, loff),
+            "ghost_sect_count": g(6 + 3 * loff, loff),
+            "nclasses": g(6 + 4 * loff, 2),
+            "sect_size": g(14 + 5 * loff + soff, loff),
+        }
+
+
+def _fsm_edit(raw, fh, off, width, value):
+    changed = [_set_uint(raw, off, width, value)]
+    return changed, [reseal_fshd(raw, fh["off"], fh["chksum"])]
+
+
+def recipe_fsm_nclasses_over(raw, fh):
+    """More section classes than the client registers.  libhdf5 refuses a
+    stored count above the client's own (H5FS__cache_hdr_deserialize), which is
+    the check the `control.fsm_class_count` invariant mirrors."""
+    registered = FSM_CLIENT_CLASSES.get(fh["client"])
+    if registered is None:
+        return None
+    changed, resealed = _fsm_edit(raw, fh, fh["nclasses_off"], 2, registered + 1)
+    return changed, resealed, (
+        f"{registered + 1} section classes declared against the {registered} "
+        f"libhdf5 registers for client {fh[chr(39)+chr(39)] if False else fh['client']}")
+
+
+def recipe_fsm_section_count_identity(raw, fh):
+    """Break serial + ghost == total by raising the total alone.  Only the
+    TOTAL is touched: serial_sect_count derives the FSSE count width."""
+    changed, resealed = _fsm_edit(raw, fh, fh["tot_sect_count_off"], fh["loff"],
+                                  fh["tot_sect_count"] + 1)
+    return changed, resealed, (
+        f"total section count {fh['tot_sect_count']} -> "
+        f"{fh['tot_sect_count'] + 1} against serial {fh['serial_sect_count']} "
+        f"+ ghost {fh['ghost_sect_count']}")
+
+
+def recipe_fsm_sect_addr_out_of_file(raw, fh):
+    changed, resealed = _fsm_edit(raw, fh, fh["sect_addr_off"], fh["soff"],
+                                  len(raw) + 4096)
+    return changed, resealed, "section-list address past the end of file"
+
+
+def recipe_fsm_sect_size_zero(raw, fh):
+    """A zero-length section-list allocation.  The FSSE checksum lives in the
+    last four bytes of this allocation, so zero leaves no room for the list's
+    own framing."""
+    changed, resealed = _fsm_edit(raw, fh, fh["sect_size_off"], fh["loff"], 0)
+    return changed, resealed, "section-list allocation size of zero"
+
+
+def recipe_fsm_sect_size_over_file(raw, fh):
+    changed, resealed = _fsm_edit(raw, fh, fh["sect_size_off"], fh["loff"],
+                                  len(raw) + 4096)
+    return changed, resealed, (
+        f"section-list allocation size {fh['sect_size']} -> past the end of a "
+        f"{len(raw)}-byte file")
+
+
+# ---- the section list itself (FSSE) -----------------------------------------
+# The recipe this family exists for.  H5FS__sinfo_new sizes sinfo->bins from
+# H5VM_log2_gen(max_sect_size) (H5FSsection.c:129,142), reading max_sect_size
+# from the FSHD; H5FS__sect_link_size then indexes that array with
+# H5VM_log2_gen(sect->size) taken from an FSSE record (:933), guarded only by
+# `assert(bin < sinfo->nbins)` at :934 -- compiled out under NDEBUG.  A section
+# size that selects a bin past the end reads off it at :935 and WRITES off it at
+# :936 and :968.  H5FS__cache_sinfo_deserialize validates the section TYPE and
+# never the size.  See registry/cases/fsm-section-bin-range.yml.
+#
+# The bound is RELATIONAL -- a section size is only wrong relative to the
+# header's max_sect_size -- which is why it survived: every per-record check in
+# the list is self-contained.
+
+
+def _limit_enc_size(value):
+    """H5VM_limit_enc_size: floor(log2(v)) / 8 + 1."""
+    return (value.bit_length() - 1) // 8 + 1 if value else 1
+
+
+def _fsse_first_group(raw, fh):
+    """Physical offset and widths of the section list's first group.
+
+    Returns None when the list is not where the header says it is; the caller
+    turns that into a skip rather than editing an unrelated span.
+    """
+    base = superblock_offset(raw)
+    g = lambda o, n: int.from_bytes(raw[o:o + n], "little")
+    max_addr = g(fh["max_sect_addr_off"], 2)
+    max_size = g(fh["max_sect_size_off"], fh["loff"])
+    sect_addr = g(fh["sect_addr_off"], fh["soff"])
+    # Stored free-space addresses are base-relative like every other HDF5
+    # address; see registry/cases and the userblock audit.
+    phys = base + sect_addr
+    size = fh["sect_size"]
+    if phys + size > len(raw) or size < 4:
+        return None
+    if bytes(raw[phys:phys + 4]) != b"FSSE" or raw[phys + 4] != 0:
+        return None
+    chksum = phys + size - 4
+    if struct.unpack_from("<I", raw, chksum)[0] != JENKINS(bytes(raw[phys:chksum])):
+        return None
+    len_sz = _limit_enc_size(max_size)
+    cnt_sz = _limit_enc_size(fh["serial_sect_count"])
+    group = phys + 5 + fh["soff"]
+    if group + cnt_sz + len_sz > chksum:
+        return None
+    return {"phys": phys, "chksum": chksum, "max_size": max_size,
+            "len_sz": len_sz, "cnt_sz": cnt_sz,
+            "size_off": group + cnt_sz,
+            "size_val": int.from_bytes(
+                raw[group + cnt_sz:group + cnt_sz + len_sz], "little")}
+
+
+def recipe_fsm_sect_size_over_max(raw, fh):
+    """A section larger than the header's declared maximum, which is what sizes
+    the bin array it will be filed into."""
+    grp = _fsse_first_group(raw, fh)
+    if grp is None:
+        return None
+    value = grp["max_size"] + 1
+    if value >= (1 << (8 * grp["len_sz"])):
+        return None        # not encodable in the width the header derives
+    changed = [_set_uint(raw, grp["size_off"], grp["len_sz"], value)]
+    struct.pack_into("<I", raw, grp["chksum"],
+                     JENKINS(bytes(raw[grp["phys"]:grp["chksum"]])))
+    return changed, [("FSSE", grp["phys"])], (
+        f"section size {grp['size_val']} -> {value}, one past the header's "
+        f"declared maximum of {grp['max_size']}")
+
+
+FSM_RECIPES = {
+    "fsm_sect_size_over_max":
+        (recipe_fsm_sect_size_over_max, "control.fsm_section_bin_range",
+         "H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX"),
+    "fsm_nclasses_over":
+        (recipe_fsm_nclasses_over, "control.fsm_class_count",
+         "H5_CORRUPT_FSM_CLASS_COUNT"),
+    "fsm_section_count_identity":
+        (recipe_fsm_section_count_identity, "control.fsm_section_count",
+         "H5_CORRUPT_FSM_SECTION_COUNT"),
+    "fsm_sect_addr_out_of_file":
+        (recipe_fsm_sect_addr_out_of_file, "control.fsm_section_list_in_file",
+         "H5_CORRUPT_OFFSET_OUT_OF_FILE"),
+    "fsm_sect_size_zero":
+        (recipe_fsm_sect_size_zero, "control.fsm_section_list_size",
+         "H5_CORRUPT_FSM_SECTION_LIST_SIZE"),
+    "fsm_sect_size_over_file":
+        (recipe_fsm_sect_size_over_file, "control.fsm_section_list_size",
+         "H5_CORRUPT_FSM_SECTION_LIST_SIZE"),
+}
+
+
+# ---- global heap collection (virtual_dataset and message_envelope) ----------
+# The fifth family, and the cheapest reseal in the format: a global heap
+# collection carries NO checksum anywhere (pickles/gheap.pk has no chksum
+# field), so every recipe here edits bytes and stops.  One locator serves two
+# records because the same collection is reached two ways -- a virtual
+# dataset's source list, which H5Dopen reads, and an attribute's vlen or
+# reference descriptor, whose bytes are metadata.
+#
+# On-disk layout (pickles/gheap.pk, Section III.E):
+#   collection header, align8(8 + L) bytes:
+#     [sig:4]["GCOL"][ver:1 == 1][reserved:3][coll_size:L][pad to 8]
+#   then objects in file order, each with an align8(8 + L) header:
+#     [obj_idx:2][ref_cnt:2][reserved:4][data_size:L][data, padded to 8]
+#   idx 0 is the FREE-SPACE SENTINEL, and its data_size is the total span of
+#   the free region INCLUDING its own header -- the asymmetry every recipe here
+#   turns on, because it means the sentinel's size is what advances the walk.
+#
+# NOT A RECIPE, and it would be a plausible one to write: bounding obj_idx
+# against H5HG_NOBJS(f, size).  libhdf5's OWN WRITER emits indices past that
+# bound -- the obj[] array is allocated from it but indices beyond it occur in
+# files the library produces and reads back -- so a recipe asserting rejection
+# would be demanding a false positive.  See
+# registry/cases (global-heap object index) and the note in the finding
+# catalog.  The reachable invariants here are the PROGRESS ones.
+
+GCOL_MINSIZE = 4096          # H5HG_MINSIZE
+
+
+def _gcol_referenced(raw, off, base, soff, coll_size):
+    """Does any byte outside the collection carry its (base-relative) address?
+
+    A heap ID is [collection_addr:O][obj_idx:4], so a reference is literally
+    the address encoded at the file's offset width.  Occurrences inside the
+    collection body do not count -- those are payload that happens to match.
+    """
+    needle = (off - base).to_bytes(soff, "little")
+    at = 0
+    while True:
+        i = raw.find(needle, at)
+        if i < 0:
+            return False
+        if not (off <= i < off + coll_size):
+            return True
+        at = i + 1
+
+
+def locate_gcol(raw):
+    """The first global heap collection, with its header and object offsets.
+
+    There is no checksum to authenticate a signature hit, so the header is
+    validated structurally instead: version 1, zero reserved bytes, and a
+    collection that fits in the file.
+    """
+    soff, loff = superblock_widths(raw)
+    hdr = (8 + loff + 7) & ~7
+    at = 0
+    while True:
+        off = raw.find(b"GCOL", at)
+        if off < 0:
+            raise ValueError("no global heap collection in this seed")
+        at = off + 4
+        if off + hdr > len(raw) or raw[off + 4] != 1:
+            continue
+        if raw[off + 5:off + 8] != b"\x00\x00\x00":
+            continue
+        coll = int.from_bytes(raw[off + 8:off + 8 + loff], "little")
+        if coll < hdr or off + coll > len(raw):
+            continue
+        # THE COLLECTION MUST BE REFERENCED, or these recipes cannot promise
+        # anything.  A global heap has no access path of its own: it is reached
+        # only through a heap ID naming its address, so an unreferenced
+        # collection is never loaded by a metadata walk.  MEASURED on
+        # valid/attr_null_vlen_userblock.h5, whose attribute is a NULL vlen
+        # element and whose collection therefore has ZERO references: all six
+        # recipes came back ACCEPTED under untrusted-strict, while the forensic
+        # profile -- which sweeps orphan collections directly -- rejected them
+        # (H5_RESOURCE_GLOBAL_HEAP_INFINITE_LOOP).  Both answers are correct for
+        # their profile, which is precisely why the seed cannot carry a recipe
+        # that promises one finding.  Every other GCOL-bearing seed has 1 to 12
+        # references.
+        if not _gcol_referenced(raw, off, superblock_offset(raw), soff, coll):
+            continue
+        # Walk the objects, recording the free sentinel if there is one.
+        objs, free_off, pos = [], None, off + hdr
+        while pos + hdr <= off + coll:
+            idx = int.from_bytes(raw[pos:pos + 2], "little")
+            size = int.from_bytes(raw[pos + 8:pos + 8 + loff], "little")
+            objs.append({"off": pos, "idx": idx, "size_off": pos + 8,
+                         "size": size})
+            if idx == 0:
+                free_off = pos
+                break
+            advance = hdr + ((size + 7) & ~7)
+            if advance <= 0:
+                break
+            pos += advance
+        return {"off": off, "soff": soff, "loff": loff, "hdr": hdr,
+                "coll_size": coll, "coll_size_off": off + 8,
+                "objs": objs, "free": free_off,
+                "free_size_off": None if free_off is None else free_off + 8,
+                "free_size": None if free_off is None
+                             else int.from_bytes(
+                                 raw[free_off + 8:free_off + 8 + loff], "little")}
+
+
+def recipe_gcol_free_zero_length(raw, gh):
+    """A zero-length free sentinel.  Because index 0 advances by its RAW size,
+    zero advances the walk by nothing and H5HG__cache_heap_deserialize re-reads
+    the same object header forever -- non-termination, not a fault."""
+    if gh["free"] is None:
+        return None
+    changed = [_set_uint(raw, gh["free_size_off"], gh["loff"], 0)]
+    return changed, [], "free-space sentinel of zero length (zero advance)"
+
+
+def recipe_gcol_free_undersized(raw, gh):
+    """A sentinel smaller than the object header it starts with, so the walk
+    steps into the sentinel's own zeroed payload -- a route INTO the
+    zero-advance loop rather than a distinct defect.  8 is used rather than 1
+    because it is 8-aligned, so the mutant cannot be dismissed as failing an
+    alignment rule instead."""
+    if gh["free"] is None or gh["hdr"] <= 8:
+        return None
+    changed = [_set_uint(raw, gh["free_size_off"], gh["loff"], 8)]
+    return changed, [], (
+        f"free-space sentinel of 8 bytes against a {gh['hdr']}-byte object "
+        f"header")
+
+
+def recipe_gcol_free_short(raw, gh):
+    """A sentinel that stops short of the collection end, leaving a remainder
+    too small to hold an object header."""
+    if gh["free"] is None:
+        return None
+    remaining = gh["off"] + gh["coll_size"] - gh["free"]
+    value = remaining - 8
+    if value <= gh["hdr"]:
+        return None
+    changed = [_set_uint(raw, gh["free_size_off"], gh["loff"], value)]
+    return changed, [], (
+        f"free-space sentinel {gh['free_size']} -> {value}, stopping 8 bytes "
+        f"short of the collection")
+
+
+def recipe_gcol_obj_size_wrap(raw, gh):
+    """An object whose declared size wraps the 8-byte aligner to zero.
+    align8 is ((x + 7) / 8) * 8, so a size in [2**64-7, 2**64-1] wraps."""
+    target = next((o for o in gh["objs"] if o["idx"] != 0), None)
+    if target is None or gh["loff"] != 8:
+        return None
+    changed = [_set_uint(raw, target["size_off"], gh["loff"], (1 << 64) - 1)]
+    return changed, [], (
+        f"object {target['idx']} size {target['size']} -> 2**64-1, wrapping "
+        f"the 8-byte aligner to zero")
+
+
+def recipe_gcol_coll_size_below_min(raw, gh):
+    """A collection smaller than H5HG_MINSIZE."""
+    if gh["coll_size"] <= gh["hdr"]:
+        return None
+    changed = [_set_uint(raw, gh["coll_size_off"], gh["loff"], gh["hdr"])]
+    return changed, [], (
+        f"collection size {gh['coll_size']} -> {gh['hdr']}, below the "
+        f"{GCOL_MINSIZE}-byte minimum")
+
+
+def recipe_gcol_coll_size_over_file(raw, gh):
+    changed = [_set_uint(raw, gh["coll_size_off"], gh["loff"], len(raw) + 4096)]
+    return changed, [], "collection size past the end of file"
+
+
+GCOL_RECIPES = {
+    "gcol_free_zero_length":
+        (recipe_gcol_free_zero_length, "heap.global_progress",
+         "H5_CORRUPT_GLOBAL_HEAP_OBJECT"),
+    "gcol_free_undersized":
+        (recipe_gcol_free_undersized, "heap.global_progress",
+         "H5_CORRUPT_GLOBAL_HEAP_OBJECT"),
+    "gcol_free_short":
+        (recipe_gcol_free_short, "heap.global_object_extent",
+         "H5_CORRUPT_GLOBAL_HEAP_OBJECT"),
+    "gcol_obj_size_wrap":
+        (recipe_gcol_obj_size_wrap, "heap.global_object_extent",
+         "H5_CORRUPT_GLOBAL_HEAP_OBJECT"),
+    "gcol_coll_size_below_min":
+        (recipe_gcol_coll_size_below_min, "heap.global_collection_size",
+         "H5_CORRUPT_GLOBAL_HEAP_HEADER"),
+    # MEASURED, not intended: a collection running past EOF is caught by the
+    # extent arithmetic before the header rule is reached, consistently on all
+    # six referenced seeds.  The finding recorded here is the one it actually
+    # produces.
+    "gcol_coll_size_over_file":
+        (recipe_gcol_coll_size_over_file, "heap.global_collection_size",
+         "H5_CORRUPT_LENGTH_OVERFLOW"),
+}
+
+
 # recipe name -> (fn, intended invariant, intended finding)
 RECIPES = {
     "cont_overlap_source_start":
@@ -416,6 +1171,27 @@ FAMILIES = {
         "record": "heap_structures",
         "analyze": locate_frhp,
         "recipes": FRHP_RECIPES,
+    },
+    # FOUR records for one locator, and `records` rather than `record` because
+    # that is the whole point of this family: a BTHD is one structure whose
+    # client id decides which record family owns the tree, while the geometry
+    # fields belong to btree_heap_index's shared validator whatever the client
+    # is.  Every row listed here carries these recipes in its `fuzz_targets`.
+    "global_heap": {
+        "records": ["virtual_dataset", "message_envelope"],
+        "analyze": locate_gcol,
+        "recipes": GCOL_RECIPES,
+    },
+    "free_space": {
+        "record": "validation_controls",
+        "analyze": locate_fsm,
+        "recipes": FSM_RECIPES,
+    },
+    "v2_btree": {
+        "records": ["btree_heap_index", "dense_index", "chunk_index",
+                    "shared_messages_legacy"],
+        "analyze": locate_bt2,
+        "recipes": BT2_RECIPES,
     },
 }
 

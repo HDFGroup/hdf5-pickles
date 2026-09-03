@@ -171,9 +171,56 @@ if command -v h5cc >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
     "$overlay_dir/tools/h5policy-probe" \
         "$tests_dir/malformed/continuation_overlaps_source.h5" \
         --forbid "$forbid" || probe_status=1
+
+    # The durability pass, and its own regression test.  A refusal is evidence
+    # of safety only if it HOLDS, and libhdf5's local-heap free-list validation
+    # does not: it lives inside `if (NULL == heap->dblk_image)`, so the failed
+    # attempt's image makes the next protect skip the check
+    # (registry/cases/local-heap-free-list-bound-wraps.yml).  The probe now
+    # measures that -- same read, twice, in a fresh open -- and this fixture is
+    # the only corpus file that exhibits it.
+    #
+    # THREE OUTCOMES, and only one is a pass, because "no violation" here is
+    # ambiguous in a way that matters: it means either the detector regressed or
+    # libhdf5 stopped bypassing its own rejection.  The second would be excellent
+    # news and must not be swallowed as a green run.
+    heap_break="$tests_dir/malformed/heap_free_list_chain_break.h5"
+    "$overlay_dir/tools/h5policy-probe" "$heap_break" \
+        --forbid nondurable_rejection >/dev/null 2>&1
+    case $? in
+        2) echo "  PASS non-durable rejection still detected on $(basename "$heap_break")" ;;
+        3) echo "  skipped: probe build unavailable for the durability check" ;;
+        0) echo "  FAIL durability check found nothing on $(basename "$heap_break") --"
+           echo "       either h5policy-probe's durability pass regressed, or libhdf5"
+           echo "       no longer reuses a heap whose free-list validation failed."
+           echo "       Measure before assuming the first: the second is a real fix."
+           probe_status=1 ;;
+        *) echo "  FAIL durability check errored on $(basename "$heap_break")"
+           probe_status=1 ;;
+    esac
 else
     echo "  skipped: h5cc or cc unavailable"
 fi
+
+# The H5Tdecode half of registry/cases/datatype-nesting-depth-uncapped.yml.  No
+# corpus fixture can cover it: H5Tdecode takes a buffer from the application, so
+# there is no object header and no two-byte message-size field to cap the nesting
+# -- and no file to put in tests/.  The check re-measures the recorded state and
+# fails if libhdf5 has GAINED a depth limit (a fix worth noticing) or if the
+# depth/stack margin has stopped testing anything.  Needs h5cc; skipped otherwise.
+echo "== datatype nesting depth via H5Tdecode (libhdf5) =="
+dtype_depth_status=0
+python3 "$tests_dir/check_datatype_recursion_depth.py" || dtype_depth_status=1
+
+# The WRITE-path consequence of the two local-heap free-list defects.  It needs a
+# phase of its own because every other phase here is read-only by design -- the
+# corpus runner, the exact-build probe and the differential harness all open for
+# reading, and the memory error appears only under H5F_ACC_RDWR.  Until this
+# check existed, a libhdf5 regression OR fix in
+# registry/cases/local-heap-free-list-bound-wraps.yml was invisible to the suite.
+# Works on copies; needs h5cc; skipped otherwise.
+heap_write_status=0
+python3 "$tests_dir/check_heap_write_path.py" || heap_write_status=1
 
 # Full expected-fixture canary matrix.  The versioned policy records which
 # activation violations are intentional regressions for the selected build;
@@ -290,6 +337,47 @@ mut_heap_dir="$repo_dir/cases/_mutheap_$$"
 mut_heap_status=${PIPESTATUS[0]}
 rm -rf "$mut_heap_dir"
 
+# The v2_btree family, on TWO seeds of different client classes.  One locator
+# serves four record families here, and the client id in the header is what
+# selects which -- so a single seed would leave the multi-family claim resting
+# on one record layout.  chunk_v2_btree.h5 is client 10 (chunk) and
+# sohm_btree.h5 carries the dense-link (5) and SOHM (7) trees; neither is the
+# dense_links.h5 the recipes were developed against.
+mut_bt2_status=0
+for bt2_seed in chunk_v2_btree sohm_btree; do
+    mut_bt2_dir="$repo_dir/cases/_mutbt2_${bt2_seed}_$$"
+    "$repo_dir/h5policy/tools/h5mutate" family --family v2_btree \
+        --seed "$tests_dir/valid/$bt2_seed.h5" \
+        --out-dir "$mut_bt2_dir" --verify | grep -E 'PASS|FAIL|mutant\(s\)'
+    [[ ${PIPESTATUS[0]} -eq 0 ]] || mut_bt2_status=1
+    rm -rf "$mut_bt2_dir"
+done
+
+# The free_space family, on a seed of the OTHER client id.  Its recipes are
+# developed against the fractal-heap client (0) that most seeds carry;
+# fsm_persist.h5 is the only file-client (1) seed, and its widths differ
+# throughout -- 8-byte section lengths against 3 -- so it is the seed that
+# proves the recipes are pinned to the format rather than to one geometry.
+mut_fsm_dir="$repo_dir/cases/_mutfsm_$$"
+"$repo_dir/h5policy/tools/h5mutate" family --family free_space \
+    --seed "$tests_dir/valid/fsm_persist.h5" \
+    --out-dir "$mut_fsm_dir" --verify | grep -E 'PASS|FAIL|mutant\(s\)'
+mut_fsm_status=${PIPESTATUS[0]}
+rm -rf "$mut_fsm_dir"
+
+# The global_heap family, on a seed with a DIFFERENT superblock version.  Its
+# recipes are developed against attr_heap_ids.h5, whose superblock is version 0
+# -- widths at +13/+14 -- while objectstore_mapping_example.h5 is version 3,
+# widths at +9/+10.  A family whose locator reads the wrong pair silently gets
+# zero-width fields and every derived offset collapses to the head of the
+# structure, so covering both versions is the check that matters here.
+mut_gcol_dir="$repo_dir/cases/_mutgcol_$$"
+"$repo_dir/h5policy/tools/h5mutate" family --family global_heap \
+    --seed "$tests_dir/valid/objectstore_mapping_example.h5" \
+    --out-dir "$mut_gcol_dir" --verify | grep -E 'PASS|FAIL|mutant\(s\)'
+mut_gcol_status=${PIPESTATUS[0]}
+rm -rf "$mut_gcol_dir"
+
 if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $fsinfo_status -eq 0 \
       && $limits_status -eq 0 && $reached_status -eq 0 \
@@ -299,6 +387,11 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $path_report_status -eq 0 \
       && $corpus_status -eq 0 && $diff_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
+      && $dtype_depth_status -eq 0 \
+      && $heap_write_status -eq 0 \
+      && $mut_bt2_status -eq 0 \
+      && $mut_fsm_status -eq 0 \
+      && $mut_gcol_status -eq 0 \
       && $matrix_status -eq 0 && $mut_status -eq 0 \
       && $cve_corpus_status -eq 0 \
       && $mut_heap_status -eq 0 \
@@ -308,5 +401,5 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status pathunit=$path_unit_status seam=$seam_status report=$report_status pathreport=$path_report_status corpus=$corpus_status diff=$diff_status probe=$probe_status matrix=$matrix_status cve=$cve_status cvecorpus=$cve_corpus_status mut=$mut_status mutheap=$mut_heap_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status pathunit=$path_unit_status seam=$seam_status report=$report_status pathreport=$path_report_status corpus=$corpus_status diff=$diff_status probe=$probe_status dtypedepth=$dtype_depth_status heapwrite=$heap_write_status matrix=$matrix_status cve=$cve_status cvecorpus=$cve_corpus_status mut=$mut_status mutheap=$mut_heap_status mutbt2=$mut_bt2_status mutfsm=$mut_fsm_status mutgcol=$mut_gcol_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
 exit 1

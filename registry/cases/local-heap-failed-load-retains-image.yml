@@ -1,0 +1,512 @@
+# A local-heap data-block load that FAILS validation leaves its block image on
+# the cached heap prefix, and the validation is gated on that image being
+# absent -- so the next protect skips the check and hands the rejected heap
+# over.  The refusal is real, correct, and lasts exactly one call.
+#
+# Promoted from one working bundle (gitignored h5cve scratch; the specimen is
+# identified by provenance.input_sha256 below).
+#
+# THIS IS NOT A "MALFORMED FILE CRASHES" RECORD.  libhdf5's free-list
+# validation works on this specimen: it runs, it refuses the heap, it returns
+# an error.  What this record is about is the state that refusal leaves behind.
+# Every other explanation in this directory for "libhdf5 accepted it" -- never
+# loaded, unguarded, assert-only, masked -- describes a check that does not run
+# or does not fire.  Here it runs AND fires, and the file is used anyway.  That
+# is a fifth explanation, and it is the one an oracle differential cannot see,
+# because both implementations refuse the file on the call anyone measures.
+schema_version: 1
+
+id: local-heap-failed-load-retains-image
+title: a failed local-heap data-block deserialization retains the block image,
+  so the free-list validation is skipped on every later protect and the
+  rejected heap is used -- including the nodes published before the rejection
+status: oracle-hardened          # h5policy rejects at decode; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+# -- Triage -------------------------------------------------------------------
+record: heap_structures
+versions: [0]                    # local heap
+root_cause_classification: premature_activation
+violated_invariant:
+  - heap.free_list_valid         # the rule that is bypassed, not a new one
+validation_closure: >-
+  the cache-load closure: a structure whose deserialization failed must not be
+  reachable through any later protect, and no artifact of the failed attempt
+  may survive to make the next attempt skip its checks.  The free-list rule
+  itself is already correct and already closed in the bounded decoder; what is
+  open is the DURABILITY of applying it.
+activation_before_validation:
+  - native_construction
+  - cache_publication
+entry_points:
+  - h5policy (oracle) -- rejects at decode; nothing is cached, so nothing is reused
+  - "libhdf5 H5HL_protect (src/H5HL.c:341) -> H5HL__cache_datablock_deserialize
+     (src/H5HLcache.c:713 guard, :722 validation, :732 partial cleanup)"
+  - "read side: H5Lget_name_by_idx, H5Lvisit2; write side: H5Gcreate2, which
+     protects the heap FOUR times in one call"
+  - "shipped tools: h5ls -r exits 0 showing nothing, h5dump -H reports an
+     internal error"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0 @ develop b7b85e7abf9,
+#    re-read 2026-09-02; every line number below was verified there) ----------
+defect: >-
+  THE GUARD ON THE VALIDATION IS THE ARTIFACT THE FAILED ATTEMPT CREATES.
+      if (NULL == heap->dblk_image) {                        /* :713 */
+          if (NULL == (heap->dblk_image =
+                       H5FL_BLK_MALLOC(lheap_chunk, heap->dblk_size)))
+              HGOTO_ERROR(...);                              /* :715 */
+          H5MM_memcpy(heap->dblk_image, image, len);         /* :719 */
+          if (FAIL == H5HL__fl_deserialize(heap))            /* :722 */
+              HGOTO_ERROR(H5E_HEAP, H5E_CANTINIT, NULL, "can't initialize free list");
+      }
+      ret_value = dblk;                                      /* :727 */
+    done:
+      if (!ret_value && dblk)
+          if (FAIL == H5HL__dblk_dest(dblk))                 /* :732 */
+              HDONE_ERROR(...);
+  Three facts combine, and none of them is wrong on its own.
+  (1) THE IMAGE IS ALLOCATED BEFORE THE VALIDATION RUNS -- :715 and :719 precede
+  :722 -- and it is stored on the H5HL_t, which hangs off the CACHED heap
+  prefix, an entry that loaded successfully and stays in the cache.
+  (2) THE FAILURE PATH FREES THE WRONG THING.  :732 destroys the dblk this call
+  created.  It does not free heap->dblk_image and does not undo what
+  H5HL__fl_deserialize already wrote into heap->freelist.
+  (3) THE GUARD IS THE IMAGE.  On the next protect heap->dblk_image is
+  non-NULL, so the whole branch -- allocation, copy, AND validation -- is
+  skipped, and the function returns a fresh dblk for a heap that failed to
+  validate.
+  So the check is enforced at most once per heap per open.  Every access after
+  the first uses the rejected heap, with whatever partial free list was built
+  before the rejection -- and H5HL__fl_deserialize publishes each node into
+  heap->freelist at :265 BEFORE the chain is fully walked, so a failure on node
+  n leaves nodes 0..n-1 live.
+  NO APPLICATION-LEVEL RETRY IS REQUIRED.  A single H5Gcreate2 protects the
+  heap four times by itself: the first fails, the next three succeed
+  unvalidated, and the call reports success.
+
+the_counter_example: >-
+  THE SAME TREE GETS THIS RIGHT TWENTY FILES AWAY, which is what makes the fix
+  a matter of following existing practice rather than inventing any.
+  H5O__cache_deserialize sets `udata->made_attempt = true` at src/H5Ocache.c:309
+  -- AFTER H5O__chunk_deserialize and after the message-count check, so the flag
+  means "we loaded it", not "we tried" -- and the caller consumes it at
+  src/H5Oint.c:1084 to decide whether the just-loaded header is subject to the
+  message-count rule.  Flag set after validation, acted on by the caller.
+  The local heap sets its equivalent -- the image -- before validation and never
+  clears it.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  MEASURED_2026_09_02: >-
+    First-hand, at h5policy 117524d with a clean worktree, across five builds
+    and one released library.  Nothing in this record is inherited from an
+    earlier session.
+  the_trace: >-
+    Breakpoints on src/H5HL.c:331 (entry to the protect), :342 (data-block
+    protect failed) and :354 (protect succeeded, pinning), plus
+    src/H5HLcache.c:715, :241 and :265.  Three successive H5Lget_name_by_idx
+    calls for the SAME index:
+      protect: prots=0 single=0 dblk_image=(nil)
+        >> datablock deserialize: allocating image      (H5HLcache.c:715)
+        >> node published into heap->freelist           (H5HLcache.c:265)
+        >> free-list bound REJECTS a node               (H5HLcache.c:241)
+        -> dblk protect FAILED
+      idx 1 -> FAILED
+      protect: prots=0 single=0 dblk_image=0x...
+        -> dblk protect OK, pinning
+      idx 1 -> len=0 name=""
+      protect: prots=0 single=0 dblk_image=0x...
+        -> dblk protect OK, pinning
+      idx 1 -> len=0 name=""
+    The deserializer runs ONCE.  The first call fails; every later call succeeds
+    against the retained image.
+  isolation: >-
+    A variant whose free-list node declares 2**40 -- a size that does NOT wrap,
+    so the bound at src/H5HLcache.c:258 refuses it exactly as intended and
+    nothing is ever published -- shows the bypass with no memory error at all:
+    first read FAILED, second and third succeed.  That file is the proof that
+    this record is about the durability of a CORRECT rejection and not about
+    the neighbouring wrapped-bound defect.
+  consequence_on_the_specimen: >-
+    The specimen's node also wraps the additive bound (see
+    registry/cases/local-heap-free-list-bound-wraps.yml), so it IS published
+    before the walk fails, and the bypass then hands out a heap whose free list
+    contains a block claiming 2**64-1 bytes.  One H5Gcreate2 on a read-write
+    copy of the UNMODIFIED specimen:
+      develop b7b85e7abf9, stock   SIGABRT, glibc "free(): invalid next size (fast)"
+      develop aa9df72cc21, stock   SIGABRT, same
+      32-bit i386, stock           SIGABRT
+      ASan -DNDEBUG                heap-buffer-overflow WRITE, src/H5HLcache.c:310
+                                   in H5HL__fl_serialize, 0 bytes after a
+                                   56-byte region
+    No variant and no repair -- which the specimen behind the wrapped-bound
+    record could not manage, and the difference is this defect.
+  released_library: >-
+    libhdf5 1.14.5, bundled in the h5py 3.13.0 wheel.  THE BYPASS REPRODUCES;
+    the corruption does not.  Three list(f.keys()) calls in one process:
+      attempt 1: RuntimeError: Link iteration failed (bad heap free list)
+      attempt 2: RuntimeError: Link iteration failed (invalid link name)
+      attempt 3: RuntimeError: Link iteration failed (invalid link name)
+    The first is the free-list validation refusing the heap.  The second and
+    third come from src/H5Gent.c:385, which is DOWNSTREAM of the validation and
+    reachable only with the heap in hand.  On the same library create_group
+    completed and closed without corruption, so the write-path outcome above is
+    demonstrated on development builds only.
+  what_a_consumer_sees: >-
+    H5Gget_num_objs 3; first H5Lget_name_by_idx fails; the same call repeated
+    succeeds with len=0 name=""; H5Lvisit2 fails; h5ls -r EXITS 0 printing only
+    "/ Group" with three links silently absent; h5dump -H exits 1 with an
+    internal error from its object-table build.
+    An application that treats the first error as recoverable -- which the API
+    invites -- gets silently different data on the retry, so two runs of the
+    same program over the same file can disagree about a group's contents.
+  the_probe_verdict_is_misleading_here: >-
+    WORTH KNOWING BEFORE CITING A PROBE RESULT AS SAFETY EVIDENCE.
+    h5policy-probe reported `rejected_in_traversal` on both builds for this
+    specimen.  That verdict is correct about the first operation and wrong about
+    the file: the probe stops at the first failure and the library does not.
+    The probe now measures the difference; see systemic.landed_changes.
+  the_second_instance: >-
+    THE CLASS HAS A SECOND MEMBER, in the tracked corpus, found with the
+    durability pass this case produced.  A full sweep of all 317 corpus files
+    reports 8 `not_durable`: heap_free_list_chain_break.h5 (this record) and
+    SEVEN metadata-cache-image fixtures -- malformed/mdci_duplicate_entry_address,
+    mdci_entry_bad_age, mdci_entry_bad_ring, mdci_entry_bad_type_id,
+    mdci_parent_addr_self, mdci_parent_addr_unresolved, and
+    cve/mdci_dup_addr_witness.
+    MEASURED on malformed/mdci_entry_bad_ring.h5: the first
+    H5Lget_name_by_idx fails and the second and third return a REAL link name
+    (len=1, "a").  So the file's contents become readable after the refusal --
+    the same observable as the local heap, reached differently.
+    THE MECHANISM IS NOT THE SAME, and the difference is worth keeping straight.
+    The local heap RETAINS AN ARTIFACT (dblk_image) that becomes the guard on
+    its own validation.  The cache image CONSUMES ITS ATTEMPT: H5C_protect
+    clears load_image before calling H5C__load_cache_image (src/H5Centry.c),
+    so the failing call spends the one load and later accesses simply proceed
+    without an image.  Same class -- a refusal that does not hold -- and two
+    unrelated causes, which is the argument for treating "is this refusal
+    durable?" as a question to ask of every structure rather than a property of
+    one.
+    NOT filed as a defect here.  The cache-image behaviour is already documented
+    in this repository as the reason an earlier probe retry masked real
+    rejections; what is new is that it is MEASURABLE now, and that it shares a
+    class with this record.  Whether it warrants its own case record is an open
+    question for a maintainer, not a conclusion this record should reach.
+  width: >-
+    Measured at 32 bits: the same file, the same SIGABRT.  The bypass is not
+    width-dependent -- it is a control-flow property, not an arithmetic one.
+    NOT measured: a 32-bit AddressSanitizer libhdf5, which does not exist in
+    this environment.
+
+# -- Divergence from the selected build ---------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: rejects the first call, then accepts every later one
+  libhdf5_version: >-
+    measured on develop aa9df72cc21 and b7b85e7abf9, on a 32-bit build of the
+    same, under AddressSanitizer, and on released 1.14.5 via h5py
+  classification: not an invariant-A disagreement, and that is the problem
+  note: >-
+    Both implementations refuse the file on the call a differential harness
+    makes, so invariant A agrees and NO tolerance entry is warranted.  The
+    disagreement is in what happens next, and no read-once harness can see it:
+    h5policy rejects at decode and caches nothing, while libhdf5 rejects and
+    then reuses the rejected structure.
+    THIS IS THE STRUCTURAL POINT OF THE RECORD.  A harness that asks each
+    question once cannot distinguish a refusal that holds from one that does
+    not, and every harness in this repository asked each question once until
+    this case.  The fix was to make the probe ask twice; see
+    systemic.landed_changes.
+
+# -- Containment vs systemic remediation --------------------------------------
+containment:
+  status: not_implemented        # libhdf5 side; unfixed in every version examined
+  description: >-
+    Two shapes, and the second is the one that matches the invariant.
+    (1) In the failure path at src/H5HLcache.c:730-733, free heap->dblk_image
+    and reset heap->freelist, so the next protect re-reads and re-validates.
+    Small, local, and enough for what is measured here.
+    (2) Record the failure on the H5HL_t and refuse later protects of a heap
+    whose free list was rejected.  Stronger, because it does not depend on the
+    image being the ONLY retained artifact: the invariant is "a heap whose
+    validation failed must not be used", and (1) enforces it only for as long
+    as nothing else is cached across the failure.  H5O__cache_deserialize's
+    made_attempt flag is the shape to copy -- see the_counter_example.
+    WORTH FIXING ALONGSIDE, and not this defect: H5HL__fl_deserialize publishes
+    each node into heap->freelist at :265 before the chain is walked, so a
+    failure on node n leaves nodes 0..n-1 live.  Building the list into a local
+    and committing it only on success would make the failure path clean by
+    construction and would remove the route this specimen takes to memory
+    corruption, independently of whether (1) or (2) lands.
+systemic:
+  semantic_boundary: >-
+    the cache-load closure -- a failed deserialization must leave no reachable
+    state, and no artifact of it may serve as the guard on a later validation.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder, landed); libhdf5 open
+  description: >-
+    h5policy decodes the free list once, bounds every node against the segment
+    before publishing any of them, and caches nothing across a rejection, so it
+    has no second attempt to skip anything.  No oracle rule changed for this
+    case -- heap.free_list_valid was already correct and already rejects the
+    specimen and all three variants.
+    What DID change is the measurement surface, because the defect was
+    invisible to every harness here.
+  landed_changes:
+    - "h5policy/tools/probe/h5probe.c -- a durability pass: a fresh H5Fopen and
+       the same read issued twice, reported as `durability` and kept out of the
+       primary outcome, materialization and activation counters"
+    - "h5policy/tools/h5policy-probe -- surfaces the block and adds
+       `--forbid nondurable_rejection`"
+    - "h5policy/tests/malformed/heap_free_list_chain_break.h5 and its
+       expectation -- a free-list chain that fails on its SECOND node; the only
+       corpus fixture that reports `not_durable` for the LOCAL-HEAP route.
+       Seven metadata-cache-image fixtures report it for a different one; see
+       measured.the_second_instance"
+    - "h5policy/tests/run.sh -- the three-way assertion on that fixture: a
+       violation passes, no violation FAILS and says why it is ambiguous"
+    - h5policy/tools/h5policy-gencorpus -- _make_heap_free_list_chain_break
+
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working bundle; see the same field in
+# registry/cases/layout-v4-ndims-lower-bound-missing.yml for why.  NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    A failed local-heap data-block deserialization retains the block image, so
+    the free-list validation is skipped on every subsequent protect and the
+    rejected heap is used -- including the free-list nodes published before the
+    rejection
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  framing: >-
+    LEAD WITH THIS OR THE REPORT READS AS A DUPLICATE.  The validation WORKS on
+    the specimen: it runs, refuses the heap, and returns an error.  The defect is
+    that the refusal lasts one call -- within a single H5Gcreate2 the library
+    rejects the heap once and then accepts it three times.  The wrapped-bound
+    defect it shields is a separate report
+    (registry/cases/local-heap-free-list-bound-wraps.yml).
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: ">= 1.8.9"
+    patched_versions: none
+    vulnerable_functions: >-
+      H5HL__cache_datablock_deserialize (src/H5HLcache.c:713 guard, :722
+      validation, :732 partial cleanup), H5HL__fl_deserialize
+      (src/H5HLcache.c:265, publishing before the chain is walked), H5HL_protect
+      (src/H5HL.c:341).  Public entry points: H5Fopen then any operation
+      touching an old-style group's local heap -- H5Lget_name_by_idx, H5Lvisit2,
+      H5Gget_objname_by_idx, and on a read-write open H5Gcreate2 and
+      H5Lcreate_*.
+  severity: Moderate to High, depending on one unanswered question
+  cvss: >-
+    CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H (base 7.8) for the demonstrated
+    write; CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:L (base 4.0) for the bypass
+    considered alone.
+  cvss_rationale: >-
+    The BYPASS alone is an integrity problem: a rejected structure is used, and
+    two identical calls return different answers.  That score survives even if
+    every bound in the deserializer were perfect.  The WRITE is where C:H/I:H/A:H
+    comes from; a submitter who attributes it entirely to the wrapped bound may
+    prefer to score this at 4.0 and raise that one.  The counter-argument: the
+    wrap alone needs a well-formed chain to be reached, while the bypass reaches
+    it from a chain the library has already refused.  AV:N/UI:N for an ingesting
+    service gives 9.8 and 6.5 respectively.
+  weaknesses: >-
+    CWE-754 (a detected, reported failure not acted on by the next caller);
+    CWE-459 (the error path frees the dblk and retains the image and the partial
+    free list); CWE-787 (the measured out-of-bounds write); CWE-1188 ("the image
+    exists" treated as "the heap is valid").
+  workarounds: >-
+    Do not open untrusted files for writing.  Treat the first HDF5 error on a
+    file as fatal for that file -- the bypass needs something to ask again --
+    though note a single H5Gcreate2 asks again internally, so this only helps
+    read-side.  Validate first: h5policy rejects the specimen and all three
+    variants.
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  integration_poc: >-
+    the promoted specimen, UNMODIFIED; an untracked working file identified by
+    provenance.input_sha256.  One H5Gcreate2 on a read-write copy aborts the
+    process.
+  direct_fixtures:
+    - h5policy/tests/malformed/heap_free_list_chain_break.h5   # the bypass; not_durable
+    - h5policy/tests/malformed/heap_free_list_chain_break_wrapped.h5  # bypass + wrap: the memory error
+    - h5policy/tests/malformed/heap_free_list_size_wrap.h5     # the neighbouring wrapped bound
+  expectations:
+    - h5policy/tests/expected/malformed-heap_free_list_chain_break.yml
+    - h5policy/tests/expected/malformed-heap_free_list_size_wrap.yml
+  the_fixtures_one_subtlety: >-
+    THE HEAP MUST BE NON-CONTIGUOUS.  A heap libhdf5 never had to grow is
+    written with its data segment immediately after its prefix, and the two are
+    then ONE cache object: the free list is deserialized during the PREFIX load,
+    a failure means the prefix never enters the cache, every retry re-reads, and
+    the refusal is durable -- a file that tests nothing.  The generator writes
+    four 40-character link names to force one heap growth, which moves the
+    segment away from the prefix and splits them into two cache entries.  The
+    bypass needs the prefix load to SUCCEED and keep the H5HL_t the failed
+    data-block attempt wrote its image into.
+    Measured: one short name gives a contiguous 88-byte segment; four
+    40-character names give a 352-byte segment at a different address.  A first
+    attempt at the fixture missed this and reported `durable` -- correctly.
+  bundle_variants: >-
+    Identified by sha256, deterministic, generator recorded in the bundle:
+      c6f6f8538f4778ad500a27d877c26f60b3ca38a8e1f8a7715bccc6b888f70740
+        size 2**40 -- a correct rejection on the FIRST node, so nothing is
+        published: the bypass isolated from the wrap, with no memory error.
+      825ebf27b3aaf2ff98b7c2956e74347be7da4da044da0ab5933c1beb1227e62a
+        next-offset 1, so the walk completes and the wrapped node is admitted
+        with no failure: the wrap alone, reached without this defect.
+      056df28be36d0364dbacdf5a4bdaadaa7b5fcd6d28a9ff101c622ad9f1eb4169
+        a node that genuinely fits: nothing fails, nothing is bypassed.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: false
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+    no_user_callback: unmeasured
+    no_legacy_fallback: true
+
+backports: []
+
+fuzz_seed: >-
+  UNUSUALLY CHEAP, because the interesting property is not a field value but a
+  RETRY.  Any mutation that makes H5HL__fl_deserialize fail is a seed; a harness
+  that issues the same read twice and compares the two verdicts turns every
+  free-list rejection already in the corpus into a test for this bypass, and
+  would have found it without a specimen.  That is now what h5policy-probe's
+  durability pass does.
+
+compatibility_backport_risks: >-
+  None identified for either containment shape.  Freeing the image on failure
+  costs one re-read on a path that is already an error path.  Refusing later
+  protects of a rejected heap changes behaviour only for files the library has
+  already refused once.
+
+sibling_audit: >-
+  SWEPT 2026-09-02.  All 32 cache deserialize callbacks in src/ were extracted
+  and checked for the shape that makes this defect: a write into an object that
+  OUTLIVES the failed attempt, reachable before an error return.  Four write
+  into the caller's object; only one gates validation on what it wrote.
+    src/H5HLcache.c:713   THIS DEFECT.
+    src/H5Ocache.c:309    The counter-example and the model fix; see
+                          the_counter_example.
+    src/H5Fsuper_cache.c:460, :466, :479, :577
+                          The superblock deserializer writes
+                          f->shared->sizeof_addr, sizeof_size and sym_leaf_k --
+                          into the FILE's shared struct -- before later error
+                          returns, so a rejected superblock leaves its
+                          dimensions behind.  NOT the same bypass: the
+                          superblock loads once and a failure aborts the open,
+                          so there is no second attempt to skip anything.
+                          UNMEASURED whether any path re-reads those values.
+    src/H5HFcache.c:1705  A LEAD, CHASED AND CLOSED.  The filtered fractal-heap
+                          dblock takes ownership of udata->dblk and nulls it
+                          while udata->decompressed stays true, which looked
+                          identical: a retry finding decompressed == true and
+                          dblk == NULL would hit the assert-only
+                          `assert(udata->dblk)` at :1701 and, under NDEBUG, set
+                          dblock->blk = NULL -- the NULL-blk memcpy already
+                          recorded for filtered heaps.  IT CANNOT HAPPEN:
+                          H5HF_dblock_cache_ud_t is a STACK LOCAL of
+                          H5HF__man_dblock_protect (src/H5HFdblock.c:421) and
+                          both fields are reset immediately before each protect
+                          (:470-:471), so nothing survives a failed load.
+  THE DISTINCTION IS THE REUSABLE PART.  "Writes into the caller's object" is
+  the wrong search and produces four hits; "writes into an object that outlives
+  the failed attempt" is the right one and produces one.  The local heap is
+  exposed because its retained artifact hangs off a CACHED object -- the prefix,
+  which loaded fine.
+  MEASURED NEIGHBOUR, not part of this record: the two name-reading paths
+  disagree.  Link ITERATION applies the empty-name check at src/H5Gent.c:385;
+  H5Lget_name_by_idx reaches the heap through H5G__stab_get_name_by_idx and does
+  not, so it returns len=0 where iteration errors.  Present in released 1.14.5
+  and at HEAD alike.
+  NOT part of this record: the wrapped free-list bound the specimen also
+  carries, which is registry/cases/local-heap-free-list-bound-wraps.yml.
+
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: ">= 1.8.9"
+  patched: >-
+    None.  The guard is unchanged at develop b7b85e7abf9, so no release and no
+    development branch contains a fix.
+  method: >-
+    Source read at hdf5-1_8_9, hdf5-1_8_22, hdf5-1_10_0, hdf5-1_10_11,
+    hdf5-1_12_3, hdf5_1.14.5, hdf5_2.0.0, 2.2.0 and develop b7b85e7abf9.  The
+    validation has sat inside the retain-image guard in every one -- spelled
+    `udata->heap->dblk_image` in the 1.8/1.10 era and `heap->dblk_image` now --
+    and no version frees the image on the failure path.  The 1.8-era form reads
+    the block from the file inside the same branch, so it retains a buffer that
+    was never validated for exactly the same reason.
+  measured_ends: >-
+    EXECUTED on develop aa9df72cc21 and b7b85e7abf9, on a 32-bit build, under
+    AddressSanitizer, and on released 1.14.5 via h5py.  Everything between is a
+    source read.
+  label: established (ends measured, interior source-derived)
+
+# -- Open items ---------------------------------------------------------------
+coverage_gaps:
+  - >-
+    CLOSED 2026-09-02, in two steps on the same day.
+    h5policy/tests/check_heap_write_path.py added the RDWR phase (`heapwrite` in
+    run.sh), first asserting the memory error on
+    malformed/heap_free_list_size_wrap.h5 -- where the node is admitted with no
+    deserialize failure, so it did not cover the route THIS record is about.
+    malformed/heap_free_list_chain_break_wrapped.h5 now does: the chain-break
+    shape with the surviving node's size wrapped, so a heap libhdf5 REFUSED is
+    handed over carrying a block claiming the whole address space.  MEASURED:
+    one H5Gcreate2 with a 160-character name SIGSEGVs; 120 completes, and both
+    are asserted so a geometry drift cannot pass silently.
+    The threshold is arithmetic, not a constant -- the insert overflows once
+    `node offset + need` passes dblk_size, and the surviving node sits at offset
+    200 in a 352-byte segment here against 32 in 88 bytes for the size_wrap
+    fixture.  Anyone regenerating either fixture must re-derive it.
+  - >-
+    THE SUPERBLOCK SITE IS UNMEASURED.  src/H5Fsuper_cache.c leaves
+    sizeof_addr, sizeof_size and sym_leaf_k in f->shared after a rejected
+    superblock.  Argued unreachable because the open aborts; not demonstrated.
+  - >-
+    WHETHER THE OOB WRITE CAN BE STEERED was not investigated -- inherited from
+    the neighbouring record, since that is where the write comes from.
+  - >-
+    THE SWEEP COVERED DESERIALIZERS ONLY.  Other cache callbacks that run
+    before a load completes -- verify_chksum, get_final_load_size, image_len --
+    can also write through their udata and were not audited for the same shape.
+open_questions:
+  - >-
+    Does any consumer other than H5HL_protect reach a heap through the cached
+    prefix after a failed data-block load?  The bypass is described here as
+    "the next protect", which is what was measured; whether the H5HL_t is
+    reachable by any other route was not established.
+  - >-
+    ANSWERED 2026-09-02, by measurement -- see measured.the_second_instance.
+    The cache image consumes its attempt and the file becomes readable
+    afterwards, so the observable is the same even though the mechanism is not.
+    What remains open is narrower: whether anything DECODED from a cache image
+    whose load was refused is then trusted, which is a question about the
+    contents rather than about reachability, and was not measured.
+
+provenance:
+  found_by: >-
+    a supplied specimen, triaged through the h5cve bundle workflow in an
+    untracked working bundle; promoted 2026-09-02.  The defect was not the one
+    the specimen was triaged for: the free-list finding is the neighbouring
+    record's, and this one surfaced from asking why a file libhdf5 had just
+    refused went on to corrupt the heap with no variant.
+  input_sha256: d40d6488d7d0f0a005202d610ff9fde0a11ab7c8e23ae6254a7fd87f27844ad2
+  measured_on: 2026-09-02
+  hdf5_build: >-
+    HDF5 2.3.0 @ develop b7b85e7abf9 (newest available) and aa9df72cc21, both
+    RelWithDebInfo without sanitizers; two AddressSanitizer builds (asserts live
+    and -DNDEBUG); a 32-bit i386 build; and released 1.14.5 via the h5py 3.13.0
+    wheel.  src/H5HLcache.c and src/H5HL.c are byte-identical between
+    aa9df72cc21 and b7b85e7abf9, so the sanitizer results describe the newest
+    source.  Workstation-local installs; paths not recorded.
+  poke_version: GNU poke 4.3

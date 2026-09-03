@@ -43,6 +43,17 @@ entry_points:
   - "-> H5HL_protect (src/H5HL.c:341) -> H5AC_protect (src/H5AC.c:1302)"
   - "-> H5C_protect (src/H5Centry.c:3149) -> H5C__load_entry (src/H5Centry.c:1055)"
   - "shipped consumers: h5dump (any mode), h5ls, h5stat"
+  # THE SECOND ENTRY POINT, and the reason this record is not only about a
+  # traversal: a superblock extension IS an object header, and H5F__super_read
+  # interrogates it while the file is being opened.  A continuation message
+  # there is followed with no object opened at all, so the unchecked allocation
+  # happens inside H5Fopen and no property list, access mode or tool option
+  # avoids it.  Measured on the object-header CONTINUATION client; see
+  # measured.continuation_client.
+  - "libhdf5 H5Fopen -> H5F_open (src/H5Fint.c:2117) -> H5F__super_read (src/H5Fsuper.c:670)"
+  - "-> H5O_msg_exists (src/H5Omessage.c:790) -> H5O_protect -> H5AC_protect with H5AC_OHDR_CHK (src/H5Oint.c:1049)"
+  - "-> H5C_protect -> H5C__load_entry (src/H5Centry.c:1055)"
+  - "shipped consumers on that path: EVERY tool, including header-only h5dump -H, h5ls, h5stat, h5debug"
 
 # -- The defect ---------------------------------------------------------------
 defect: >-
@@ -100,6 +111,66 @@ measured:
     NONE.  The buffer is correctly sized for the length requested and nothing is
     read or written out of bounds.  This is an allocation defect, not a
     memory-safety one, and must not be written up as the latter.
+  continuation_build: >-
+    The 2026-09-02 measurement, which is a DIFFERENT build from measured.date
+    above.  Source tree at develop b7b85e7abf9.  baseline: RelWithDebInfo,
+    -DNDEBUG, no sanitizers, settings_sha256
+    7ce6203229fbd356cbdbaab0e1b333c4319c0063743003226a9fb8d05f47819c, x86-64.
+    sanitizer arm: -fsanitize=address, asserts live, configured the same day.
+    Note the tree has since advanced to 44426bfc7d5; every line cited in this
+    record is byte-identical at both commits, checked rather than assumed.
+  continuation_client: >-
+    A SECOND ENTRY POINT FOR THE OBJECT-HEADER CONTINUATION CLIENT, 2026-09-02.
+    Not a new client and not a new defect: that client had already been measured
+    locally, through H5Gopen2("/").  What is new is that this route needs NO
+    object opened at all -- H5Fopen alone reaches it, via a superblock extension;
+    see entry_points -- plus a one-byte base-file witness and the escalation
+    result below.
+    The witness is a stronger one than this record's local-heap specimen: the
+    base file is RECOVERED and the mutation is ONE BYTE.  Base is the HDF5 source
+    tree's own test/testfiles/aggr.h5, 2448 bytes; changing offset 84 from 0x00
+    to 0x89 raises the superblock extension's continuation length from 40 to
+    0x8900000028 == 588410519592 (548 GiB).  Nothing else differs, and the
+    unmodified base is clean on every instrument (h5policy accept, h5dump -H
+    rc=0, no malloc >= 1 MiB).
+    Specimen sha256
+    af8cd85907676118f0501aab5c8cc2d82af4d221576d3e06a036808e6dcf84b9.
+    ASan, stock develop b7b85e7abf9 with the sanitizer build:
+      ERROR: AddressSanitizer: out of memory: allocator is trying to allocate
+             0x8900000028 bytes
+        #1 H5C__load_entry   src/H5Centry.c:1055
+        #4 H5O_protect       src/H5Oint.c:1049
+        #5 H5O_msg_exists    src/H5Omessage.c:790
+        #6 H5F__super_read   src/H5Fsuper.c:670
+        #7 H5F_open          src/H5Fint.c:2117
+    The size arrives unchecked the same way the local-heap one does: H5O_protect
+    passes cont_msg_info.msgs[].size straight into H5AC_protect at
+    src/H5Oint.c:1049, and the decoder that produced it rejects only zero
+    (src/H5Ocont.c:105-106).  The class split is visible in one file twenty lines
+    apart -- H5AC_OHDR carries the flag (src/H5Ocache.c:92), H5AC_OHDR_CHK does
+    not (src/H5Ocache.c:110) -- so an object header's PREFIX is bounded and its
+    CONTINUATION is not.
+    Malloc interposer on the same file, and mid-range sizes are GRANTED exactly
+    as for the local heap: 64 MiB and 1 GiB both granted, peak RSS flat at ~7 MB.
+  escalation_attempted: >-
+    THE MEASUREMENT THIS RECORD ASKED FOR, DONE 2026-09-02 on the continuation
+    client, and the answer is NO -- see coverage_gaps, where this closes the item
+    that said it "would most change the severity".
+    The buffer is never touched because H5F_block_read after the allocation
+    fails, so the obvious escalation is to make that read in-bounds by raising
+    the superblock's stored EOF.  ATTEMPTED, with the superblock checksum
+    recomputed (the Jenkins lookup3 routine was verified against the specimen's
+    own stored value, 0xd5cb91e3, before being trusted).  BLOCKED: the
+    truncated-file check fires first,
+      src/H5Fsuper.c:574  "truncated file: eof = 2448, sblock->base_addr = 0,
+                           stored_eof = 268435544"
+    So a small file cannot make libhdf5 both allocate a large buffer and fill it
+    by this route.  Without that, the read refuses at
+      src/H5FDint.c:258   "addr overflow, addr = 88, size = 1073741824, eoa = 2448"
+    That bound is what keeps the whole class at address space rather than
+    resident memory, and it is a bound in the READ path -- not the check that
+    should be carrying this.  A different route to a filled buffer is not ruled
+    out; only this one was tried.
 
 # -- Divergence ---------------------------------------------------------------
 divergence:
@@ -156,6 +227,19 @@ reproducers:
     address also breaks the heap contents and adds a second finding
     (H5_CORRUPT_LINK_NAME_EMPTY).  The generator must either keep the heap
     contents consistent or the expectation must declare both findings.
+  continuation_poc: >-
+    ONE BYTE over a file that already ships in the HDF5 source tree:
+    test/testfiles/aggr.h5, offset 84, 0x00 -> 0x89.  H5Fopen is the whole PoC --
+    no object need be opened, and h5dump -H reproduces it.
+    THIS CANNOT BE LIFTED INTO THE CORPUS AS IS.  h5policy-gencorpus must be
+    self-contained, so it cannot patch a file out of the HDF5 source tree; a
+    fixture has to build its own base -- an h5py file with a superblock extension
+    carrying an object-header continuation -- and patch the continuation length
+    there.  Not generated; naming the shape so a promotion does not start by
+    rediscovering it.
+    A promotion must also not add a tracked reference to a case artifact, so the
+    specimen is identified here by sha256 only, in
+    measured.continuation_client.
   assertions:
     stable_finding: true
     fails_before_materialization: false
@@ -176,7 +260,17 @@ sibling_audit: >-
   fractal-heap indirect and direct blocks, free-space header and section info,
   SOHM table and list.
   A per-client patch fixes one; the condition at H5Centry.c:1050 fixes all.
-  NOT MEASURED: every unflagged client except the local-heap data block.
+  MEASURED: the local-heap data block and the object-header continuation (the
+  latter added 2026-09-02; see measured.continuation_client).  This line
+  previously read "NOT MEASURED: every unflagged client except the local-heap
+  data block", which was already wrong when written -- the continuation client
+  had been measured through H5Gopen2("/") before this record was drafted.  An
+  advisory written from that sentence alone would have overclaimed novelty, so
+  it is corrected here rather than quietly replaced.
+  STILL NOT MEASURED: v1/v2 B-tree nodes, SNOD, extensible- and fixed-array
+  blocks, fractal-heap indirect and direct blocks, free-space header and section
+  info, SOHM table and list.  The class-flag argument covers them by
+  construction; no witness exists for any of them.
 
 fuzz_seed: >-
   The productive shape is a PAIR of fields in one header: the size, and the
@@ -193,19 +287,54 @@ compatibility_backport_risks: >-
   None identified for the bound itself: a structure libhdf5 wrote always fits
   inside the EOA.  The risk is entirely in the speculative-trim caveat above.
 
+# -- Affected versions --------------------------------------------------------
+version_range:
+  affected: ">= 1.10.0"
+  fixed_in: none
+  label: >-
+    One build measured, the condition read at every tag between.  Behaviour is
+    MEASURED only on 2.3.0 (develop b7b85e7abf9).  The gating condition itself --
+    H5C__verify_len_eoa called only under `type->flags &
+    H5C__CLASS_SPECULATIVE_LOAD_FLAG` in src/H5Centry.c -- was then read directly
+    at 1.10.0, 1.10.1, 1.10.11, 1.12.0, 1.14.0, 1.14.5, 1.14.6, 2.0.0, 2.1.1 and
+    2.2.0, and is present in all of them.  Tags were read rather than inferred
+    from `git tag --contains`, which is unreliable across HDF5's maintenance
+    branches.
+  branch_1_8_note: >-
+    THE 1.8 BRANCH IS EXCLUDED, NOT CLEARED.  1.8.21's H5C_load_entry lives in
+    src/H5C.c and predates the central image-buffer architecture entirely: it
+    delegates to a per-client `load` callback and never allocates an image
+    itself, so neither the flag nor H5C__verify_len_eoa exists there.  Whether
+    the equivalent per-client loaders bound their lengths is a separate question
+    that was NOT asked.  Recording 1.10.0 as the lower bound is therefore a
+    statement about where this code shape begins, not a claim that 1.8 is safe.
+
 coverage_gaps:
   - >-
-    Only the local-heap data block was measured; the other unflagged clients were
-    not, though the class-flag argument covers them by construction.
+    NARROWED 2026-09-02.  Two unflagged clients are now measured -- the local-heap
+    data block and the object-header continuation.  The remaining eleven are
+    listed in sibling_audit and none has a witness.
   - >-
-    The amplification is address space, not resident memory, because the read
-    after the allocation fails.  Whether a file can be built whose read SUCCEEDS
-    -- making the pages resident and the DoS real -- was not investigated, and it
-    is the single measurement that would most change the severity.
+    CLOSED 2026-09-02, and the answer is negative.  "Whether a file can be built
+    whose read SUCCEEDS, making the pages resident and the DoS real" was
+    investigated on the continuation client: raising the superblock's stored EOF
+    so the read would be in bounds is refused by the truncated-file check at
+    src/H5Fsuper.c:574 before anything is allocated.  See
+    measured.escalation_attempted.  The severity therefore stays at address space
+    rather than resident memory -- not by assumption, and not because anyone
+    checked the length, but because a bound in the READ path happens to catch it.
+    ONE ROUTE, NOT A PROOF: a different way to reach a filled buffer is not ruled
+    out, and the other unflagged clients were not asked this question at all.
   - >-
-    Not reproduced at 32 bits; an ILP32-targeted size would be needed.
+    Not reproduced at 32 bits.  For the local-heap witness an ILP32-targeted size
+    would be needed.  For the continuation witness the same is true and the
+    reason is sharper: cont->size is a size_t, so the specimen's 0x8900000028
+    truncates on ILP32 to 0x28 == 40, which is the ORIGINAL value in the base
+    file -- the mutated file simply opens normally there.
   - >-
-    1.14.x and 1.10.x not audited.
+    No release was BUILT other than the measured one.  The version_range below is
+    a source reading of the gating condition at each tag, and the 1.8 branch is
+    excluded rather than cleared -- see the note there.
 
 provenance:
   found_by: >-

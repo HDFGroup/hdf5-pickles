@@ -632,6 +632,63 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
                 loc2 = h5policy_pipeline_framing_offset#B, loc2_len = 1UL,
             });
 
+    /* The chunk's filter mask, against the pipeline it indexes.  A set bit says
+       filter i was not applied to this chunk, and libhdf5 honours it: H5Z_pipeline
+       (H5Z.c:1404-1410) tests the bit per index and `continue`s, leaving *nbytes
+       at the size read from disk.
+
+       A fully set mask is legitimate on its own -- libhdf5 sets it when the
+       pipeline fails or would grow the chunk, and then stores the chunk RAW --
+       but only on a path where the stored size is exactly the unfiltered chunk
+       size.  Claim the skip without matching the size and the chunk enters the
+       cache as a chunk_size-byte chunk backed by a stored_size-byte allocation
+       (1.14.5 H5D__chunk_lock allocates `chunk_alloc`, reads into it, skips the
+       pipeline, and does not re-check), so every later read copies past it.
+
+       MEASURED, h5py/libhdf5 1.14.5, chunk 5x5 int32 with fletcher32, mask 1 and
+       stored size 8: H5Dread returns rc=0 and hands back 92 bytes of heap --
+       including what decodes as a live pointer -- as dataset values.  2.3.0
+       rejects it, at the post-unfilter size check H5Dchunk.c:4855 added by
+       d926e3cbd0b (first released in 2.2.0); every earlier version has no such
+       check anywhere in the function.
+
+       A bit set at or above nfilters is NOT part of this rule: the reverse loop
+       runs over pline->nused only, so such a bit is never inspected, and 1.14.5
+       was measured to read the same file back with correct values.  Rejecting it
+       would be a false positive on a file libhdf5 reads correctly.
+
+       The comparison is here and not at the record because the pipeline message
+       and the chunk index arrive in either order -- the same reason the
+       stored-size floor above is finalized.  The product is computed only when
+       it cannot wrap; a chunk that large is already rejected by the dataspace
+       and chunk-dimension rules.  */
+    if (h5policy_pipeline_has_nfilters != 0UB
+        && h5policy_chunk_has_mask != 0UB
+        && h5policy_pipeline_nfilters > 0UL
+        && h5policy_pipeline_nfilters < 32UL
+        && ctx.has_chunked_layout != 0UB
+        && ctx.chunk_dataset_element_count != 0UL
+        && ctx.datatype_size != 0UL
+        && ctx.chunk_dataset_element_count
+             <= 0xffffffffUL / ctx.datatype_size
+        && (h5policy_chunk_mask_value & ((1UL <<. h5policy_pipeline_nfilters) - 1UL))
+             == ((1UL <<. h5policy_pipeline_nfilters) - 1UL)
+        && h5policy_chunk_mask_stored
+             != ctx.chunk_dataset_element_count * ctx.datatype_size)
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_CHUNK_FILTER_MASK", "corrupt", loc, object,
+            "chunk skips every pipeline filter but is not stored at the unfiltered chunk size",
+            H5Evidence {
+                field = "chunk.stored_size",
+                actual = h5policy_chunk_mask_stored,
+                expected = ctx.chunk_dataset_element_count * ctx.datatype_size,
+                comparison = "equal",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = (h5policy_chunk_mask_offset - 4UL)#B, loc1_len = 4UL,
+                has_loc2 = 1, loc2_role = "expected",
+                loc2 = h5policy_chunk_mask_offset#B, loc2_len = 4UL,
+            });
+
     /* The other decompressed-buffer factor: the filter's cd_values[4] element
        size must be the real datatype element size.  Inflating it overflows
        nelmts * size just as an inflated element count does, even when the count is
@@ -1016,6 +1073,12 @@ fun h5policy_validate_ohdr_raw = (int ios,
     h5policy_chunk_min_stored = 0UL;
     h5policy_chunk_min_stored_offset = 0UL;
     h5policy_chunk_has_stored = 0UB;
+    h5policy_pipeline_nfilters = 0UL;
+    h5policy_pipeline_has_nfilters = 0UB;
+    h5policy_chunk_mask_value = 0UL;
+    h5policy_chunk_mask_stored = 0UL;
+    h5policy_chunk_mask_offset = 0UL;
+    h5policy_chunk_has_mask = 0UB;
     /* Fresh arrays, not truncations: assigning an existing array would alias
        it, and the finalize cross-check must see only this object's shape.  */
     h5policy_dataspace_max_dims = uint<64>[]();
