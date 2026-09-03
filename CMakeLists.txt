@@ -326,6 +326,32 @@ if(POKE_EXECUTABLE)
         TIMEOUT 30
         ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
     )
+    # Unlike the other pickle_*_regression entries, this test writes real
+    # member/assembled files (assemble_family() copies actual bytes between
+    # real IOSes -- the in-memory "*name*" backend pads iosize() to 4096 and
+    # can't stand in for it). WORKING_DIRECTORY is the build tree, not the
+    # source tree, so those scratch files never touch tracked paths.
+    add_test(
+        NAME pickle_family_vfd_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_family_vfd.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    set_tests_properties(pickle_family_vfd_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
+    # Same real-file-I/O rationale as pickle_family_vfd_regression above.
+    add_test(
+        NAME pickle_multi_vfd_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_multi_vfd.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    set_tests_properties(pickle_multi_vfd_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
     add_test(
         NAME pickle_range_reference_regression
         COMMAND "${POKE_EXECUTABLE}" --quiet -L
