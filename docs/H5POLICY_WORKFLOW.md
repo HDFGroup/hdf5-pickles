@@ -286,8 +286,8 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **57
-are `met`, 75 `partial`, 18 `not_assessed`, and 26 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **58
+are `met`, 78 `partial`, 0 `not_assessed`, and 40 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 
@@ -298,14 +298,13 @@ the HDF5 specification. Major visible gaps include:
   other than the one it was developed against;
 - family-by-family boundary, overflow/allocation, nesting, and progress cases
   that are still partial or not assessed. Reviewed fixture annotations now
-  classify most of these: `count_and_extent_boundaries` is now `not_assessed`
-  for no family at all, but `met` for 1, so what the sweep mostly established is
-  which boundary values the corpus genuinely lacks -- `n` is thin almost
-  everywhere (3 families), and `max` and `allocation_budget` reach 4 each. The
-  residue is concentrated differently than it looks: 80 of 367 expectation
-  files carry no `h5cve` family, and every depth and budget fixture in the tree
-  is among them, so the arithmetic and nesting columns read as unassessed while
-  the fixtures that would discharge them sit outside any family contract;
+  classify all of these: no column is `not_assessed` for any family any more.
+  The rise in `absent` from 26 to 40 is that conversion, not lost coverage -- a
+  family with no fixture for a category now declares it in the record's
+  `verification_negatives`, with the date it was reviewed and the reason, so an
+  uncovered category reads as a work item rather than as an unanswered
+  question. Getting there took contracting 22 previously family-less
+  expectation files, each with its exact-build canary measured first;
 - truncation coverage that is met for 12 families, sampled/partial for 4, and
   absent for 0;
 - lazy-validation behavior measured for the oracle as a whole, but not yet

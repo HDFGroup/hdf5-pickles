@@ -217,15 +217,24 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 | `absent` | mechanically demonstrated to be missing |
 | `not_assessed` | not determinable from artifacts; needs classification |
 
-**57 of 176 requirement-slots are currently `met`.** The distribution matters
+No slot is `not_assessed` as of 2026-09-02. Every cell now says one of three
+things: demonstrated, partly demonstrated, or reviewed-and-missing. A family
+with no fixture for a category declares that in its record's
+`verification_negatives` block, with the date it was reviewed and the reason,
+and `h5cve verification` renders it `absent`. An empty annotation set with no
+such declaration still renders `not_assessed`, so the mechanism cannot be used
+to tidy a column -- it can only record a review that actually happened.
+
+**58 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
 - Lazy validation is `partial` everywhere: measured, and holding, but on the
   oracle as a whole rather than family by family.
-- Reviewed fixture/recipe annotations now carry most of the boundary,
-  arithmetic, nesting and reference-semantics evidence: `not_assessed` in those
-  four columns is down to 0, 6, 7 and 5 families respectively. The annotations
+- Reviewed fixture/recipe annotations now carry the boundary, arithmetic,
+  nesting and reference-semantics evidence outright: `not_assessed` in those
+  four columns is 0, and what remains uncovered is `absent` with a reason --
+  4 arithmetic, 5 nesting and 5 reference-semantics families. The annotations
   are a review of what each fixture's documented mechanism actually exercises,
   never an inference from finding-code spelling, which is why a family with many
   fixtures can still be `not_assessed` -- version, flag and checksum fixtures
@@ -234,17 +243,31 @@ more than the total:
   `max` and `allocation_budget` reach 4 each, and `below_minimum` -- a value
   under a structure's own floor rather than one below a count -- is so far a
   single fixture.
-- The 2026-09-02 sweep also measured where the remaining `not_assessed` cells
-  come from, and it is mostly NOT missing coverage: 80 of 367 expectation files
-  carry no `h5cve` family at all, and they include every depth and budget
-  fixture in the tree (`integration-btree_depth`, `-datatype_recursion_depth`,
-  `-walk_operation_budget`, `-accounted_metadata_limit`, the
-  `-v1_chunk_count-deep-*` pair, and the four `*_metadata_limit` files). An
-  uncontracted fixture cannot count for any family, so the arithmetic and
-  nesting columns read as unassessed while the fixtures that would discharge
-  them sit outside the contract. Contracting them is not a documentation edit:
-  a family contract puts a fixture into the canary matrix, so each one needs a
-  measured `allowed_statuses` first.
+- The 2026-09-02 sweep found that the `not_assessed` cells were mostly NOT
+  missing coverage. 80 of 367 expectation files carried no `h5cve` family, and
+  they included every depth and budget fixture in the tree; an uncontracted
+  fixture cannot count for any family, so the arithmetic and nesting columns
+  read as unassessed while the fixtures that would discharge them sat outside
+  the contract. 22 were contracted, each with its canary measured first (a
+  family contract puts a fixture into the matrix, so `allowed_statuses` is a
+  measurement, not a guess): 15 `verified`, 5 `unexercised`, and 2 `violation`
+  that earned matrix-policy overrides. Six are multi-family, because a shared
+  v2-B-tree depth ceiling exercised on a client's index belongs to both. 58
+  expectation files remain uncontracted; none of them is currently the only
+  candidate for a `not_assessed` cell, because there are none left.
+- The reviewed negatives split into two kinds, and the distinction is the
+  useful part. STRUCTURAL: external links cannot nest, because h5policy decodes
+  the target path and never opens it; a dataspace message is a rank byte and a
+  flat array; `validation_controls` is profiles and budgets and references
+  nothing. CONSTRUCTIBLE BUT NOT BUILT, which is the real backlog: a VDS naming
+  itself as its own source, an external link naming its own file, two EFL slots
+  sharing one heap name offset, a v2-B-tree node whose child address names an
+  ancestor (the cycle fixtures that exist are contracted to the CLIENTS, so the
+  shared engine's own guard has no specimen), and an MDCI flush-dependency
+  cycle. One negative is neither: `address_space_bounds` has two fixtures
+  carrying 16-byte lengths at and past 2**64, but compatibility preflight
+  declines the width before either value is decoded, so annotating them would
+  have been vacuous.
 - Dedicated fuzz targets exist for 2 families of 16. `h5mutate` is a locator
   plus a recipe table per family, so the cost of the next family is its locator.
   A recipe is only counted once it emits its intended finding on seeds other
