@@ -678,6 +678,226 @@ BT2_RECIPES = {
 }
 
 
+# ---- free-space manager header (validation_controls) ------------------------
+# The fourth family, and the one with a coverage argument the others do not
+# have: h5py cannot reach free-space managers AT ALL -- neither a plain open nor
+# an object walk decodes FSHD/FSSE -- so h5policy-fuzz's oracle cannot judge an
+# FSM mutant, and a false accept in this family is undetectable by the fuzzer by
+# construction.  A self-validating typed recipe is the only generator here whose
+# output can be judged.
+#
+# Field order is the format's (pickles/fsm.pk, H5FS__cache_hdr_serialize):
+#   [sig:4][ver:1][client:1][tot_space:L][tot_sect_count:L]
+#   [serial_sect_count:L][ghost_sect_count:L][nclasses:2][shrink:2][expand:2]
+#   [max_sect_addr:2][max_sect_size:L][sect_addr:O][sect_size:L]
+#   [alloc_sect_size:L][chksum:4]
+#
+# THREE FIELDS ARE OFF LIMITS to a naive edit, and it is not obvious from the
+# layout: max_sect_size, max_sect_addr and serial_sect_count each DERIVE a field
+# width in the FSSE section list that follows --
+#   sect_len_size = H5VM_limit_enc_size(max_sect_size)
+#   sect_off_size = (max_sect_addr + 7) / 8
+#   sect_cnt_size = H5VM_limit_enc_size(serial_sect_count)
+# so changing one re-frames every section record and the list stops decoding.
+# The mutant would then be rejected for the wrong reason, and the recipe would
+# be promising a finding it did not cause.  Every recipe below edits a field
+# that derives nothing.
+
+# libhdf5 registers a fixed number of section classes per client:
+# H5FS_CLIENT_FHEAP_ID (0) has 4, H5FS_CLIENT_FILE_ID (1) has 3
+# (H5MF_FSPACE_SECT_CLS_SIMPLE/SMALL/LARGE, src/H5MF.c).
+FSM_CLIENT_CLASSES = {0: 4, 1: 3}
+
+
+def reseal_fshd(raw, off, chksum_off):
+    struct.pack_into("<I", raw, chksum_off, JENKINS(bytes(raw[off:chksum_off])))
+    return ("FSHD", off)
+
+
+def locate_fsm(raw):
+    """The first free-space manager header, with its field offsets.
+
+    The stored checksum is verified before the header is accepted, so a false
+    "FSHD" hit inside payload is skipped rather than mutated.
+    """
+    soff, loff = superblock_widths(raw)
+    at = 0
+    while True:
+        off = raw.find(b"FSHD", at)
+        if off < 0:
+            raise ValueError("no free-space manager header in this seed")
+        at = off + 4
+        chksum = off + 14 + 7 * loff + soff
+        if chksum + 4 > len(raw) or raw[off + 4] != 0:
+            continue
+        if struct.unpack_from("<I", raw, chksum)[0] != JENKINS(bytes(raw[off:chksum])):
+            continue
+        g = lambda rel, n: int.from_bytes(raw[off + rel:off + rel + n], "little")
+        return {
+            "off": off, "soff": soff, "loff": loff, "chksum": chksum,
+            "client": raw[off + 5],
+            "tot_space_off": off + 6,
+            "tot_sect_count_off": off + 6 + loff,
+            "serial_sect_count_off": off + 6 + 2 * loff,
+            "ghost_sect_count_off": off + 6 + 3 * loff,
+            "nclasses_off": off + 6 + 4 * loff,
+            "max_sect_addr_off": off + 12 + 4 * loff,
+            "max_sect_size_off": off + 14 + 4 * loff,
+            "sect_addr_off": off + 14 + 5 * loff,
+            "sect_size_off": off + 14 + 5 * loff + soff,
+            "alloc_sect_size_off": off + 14 + 6 * loff + soff,
+            "tot_sect_count": g(6 + loff, loff),
+            "serial_sect_count": g(6 + 2 * loff, loff),
+            "ghost_sect_count": g(6 + 3 * loff, loff),
+            "nclasses": g(6 + 4 * loff, 2),
+            "sect_size": g(14 + 5 * loff + soff, loff),
+        }
+
+
+def _fsm_edit(raw, fh, off, width, value):
+    changed = [_set_uint(raw, off, width, value)]
+    return changed, [reseal_fshd(raw, fh["off"], fh["chksum"])]
+
+
+def recipe_fsm_nclasses_over(raw, fh):
+    """More section classes than the client registers.  libhdf5 refuses a
+    stored count above the client's own (H5FS__cache_hdr_deserialize), which is
+    the check the `control.fsm_class_count` invariant mirrors."""
+    registered = FSM_CLIENT_CLASSES.get(fh["client"])
+    if registered is None:
+        return None
+    changed, resealed = _fsm_edit(raw, fh, fh["nclasses_off"], 2, registered + 1)
+    return changed, resealed, (
+        f"{registered + 1} section classes declared against the {registered} "
+        f"libhdf5 registers for client {fh[chr(39)+chr(39)] if False else fh['client']}")
+
+
+def recipe_fsm_section_count_identity(raw, fh):
+    """Break serial + ghost == total by raising the total alone.  Only the
+    TOTAL is touched: serial_sect_count derives the FSSE count width."""
+    changed, resealed = _fsm_edit(raw, fh, fh["tot_sect_count_off"], fh["loff"],
+                                  fh["tot_sect_count"] + 1)
+    return changed, resealed, (
+        f"total section count {fh['tot_sect_count']} -> "
+        f"{fh['tot_sect_count'] + 1} against serial {fh['serial_sect_count']} "
+        f"+ ghost {fh['ghost_sect_count']}")
+
+
+def recipe_fsm_sect_addr_out_of_file(raw, fh):
+    changed, resealed = _fsm_edit(raw, fh, fh["sect_addr_off"], fh["soff"],
+                                  len(raw) + 4096)
+    return changed, resealed, "section-list address past the end of file"
+
+
+def recipe_fsm_sect_size_zero(raw, fh):
+    """A zero-length section-list allocation.  The FSSE checksum lives in the
+    last four bytes of this allocation, so zero leaves no room for the list's
+    own framing."""
+    changed, resealed = _fsm_edit(raw, fh, fh["sect_size_off"], fh["loff"], 0)
+    return changed, resealed, "section-list allocation size of zero"
+
+
+def recipe_fsm_sect_size_over_file(raw, fh):
+    changed, resealed = _fsm_edit(raw, fh, fh["sect_size_off"], fh["loff"],
+                                  len(raw) + 4096)
+    return changed, resealed, (
+        f"section-list allocation size {fh['sect_size']} -> past the end of a "
+        f"{len(raw)}-byte file")
+
+
+# ---- the section list itself (FSSE) -----------------------------------------
+# The recipe this family exists for.  H5FS__sinfo_new sizes sinfo->bins from
+# H5VM_log2_gen(max_sect_size) (H5FSsection.c:129,142), reading max_sect_size
+# from the FSHD; H5FS__sect_link_size then indexes that array with
+# H5VM_log2_gen(sect->size) taken from an FSSE record (:933), guarded only by
+# `assert(bin < sinfo->nbins)` at :934 -- compiled out under NDEBUG.  A section
+# size that selects a bin past the end reads off it at :935 and WRITES off it at
+# :936 and :968.  H5FS__cache_sinfo_deserialize validates the section TYPE and
+# never the size.  See registry/cases/fsm-section-bin-range.yml.
+#
+# The bound is RELATIONAL -- a section size is only wrong relative to the
+# header's max_sect_size -- which is why it survived: every per-record check in
+# the list is self-contained.
+
+
+def _limit_enc_size(value):
+    """H5VM_limit_enc_size: floor(log2(v)) / 8 + 1."""
+    return (value.bit_length() - 1) // 8 + 1 if value else 1
+
+
+def _fsse_first_group(raw, fh):
+    """Physical offset and widths of the section list's first group.
+
+    Returns None when the list is not where the header says it is; the caller
+    turns that into a skip rather than editing an unrelated span.
+    """
+    base = superblock_offset(raw)
+    g = lambda o, n: int.from_bytes(raw[o:o + n], "little")
+    max_addr = g(fh["max_sect_addr_off"], 2)
+    max_size = g(fh["max_sect_size_off"], fh["loff"])
+    sect_addr = g(fh["sect_addr_off"], fh["soff"])
+    # Stored free-space addresses are base-relative like every other HDF5
+    # address; see registry/cases and the userblock audit.
+    phys = base + sect_addr
+    size = fh["sect_size"]
+    if phys + size > len(raw) or size < 4:
+        return None
+    if bytes(raw[phys:phys + 4]) != b"FSSE" or raw[phys + 4] != 0:
+        return None
+    chksum = phys + size - 4
+    if struct.unpack_from("<I", raw, chksum)[0] != JENKINS(bytes(raw[phys:chksum])):
+        return None
+    len_sz = _limit_enc_size(max_size)
+    cnt_sz = _limit_enc_size(fh["serial_sect_count"])
+    group = phys + 5 + fh["soff"]
+    if group + cnt_sz + len_sz > chksum:
+        return None
+    return {"phys": phys, "chksum": chksum, "max_size": max_size,
+            "len_sz": len_sz, "cnt_sz": cnt_sz,
+            "size_off": group + cnt_sz,
+            "size_val": int.from_bytes(
+                raw[group + cnt_sz:group + cnt_sz + len_sz], "little")}
+
+
+def recipe_fsm_sect_size_over_max(raw, fh):
+    """A section larger than the header's declared maximum, which is what sizes
+    the bin array it will be filed into."""
+    grp = _fsse_first_group(raw, fh)
+    if grp is None:
+        return None
+    value = grp["max_size"] + 1
+    if value >= (1 << (8 * grp["len_sz"])):
+        return None        # not encodable in the width the header derives
+    changed = [_set_uint(raw, grp["size_off"], grp["len_sz"], value)]
+    struct.pack_into("<I", raw, grp["chksum"],
+                     JENKINS(bytes(raw[grp["phys"]:grp["chksum"]])))
+    return changed, [("FSSE", grp["phys"])], (
+        f"section size {grp['size_val']} -> {value}, one past the header's "
+        f"declared maximum of {grp['max_size']}")
+
+
+FSM_RECIPES = {
+    "fsm_sect_size_over_max":
+        (recipe_fsm_sect_size_over_max, "control.fsm_section_bin_range",
+         "H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX"),
+    "fsm_nclasses_over":
+        (recipe_fsm_nclasses_over, "control.fsm_class_count",
+         "H5_CORRUPT_FSM_CLASS_COUNT"),
+    "fsm_section_count_identity":
+        (recipe_fsm_section_count_identity, "control.fsm_section_count",
+         "H5_CORRUPT_FSM_SECTION_COUNT"),
+    "fsm_sect_addr_out_of_file":
+        (recipe_fsm_sect_addr_out_of_file, "control.fsm_section_list_in_file",
+         "H5_CORRUPT_OFFSET_OUT_OF_FILE"),
+    "fsm_sect_size_zero":
+        (recipe_fsm_sect_size_zero, "control.fsm_section_list_size",
+         "H5_CORRUPT_FSM_SECTION_LIST_SIZE"),
+    "fsm_sect_size_over_file":
+        (recipe_fsm_sect_size_over_file, "control.fsm_section_list_size",
+         "H5_CORRUPT_FSM_SECTION_LIST_SIZE"),
+}
+
+
 # recipe name -> (fn, intended invariant, intended finding)
 RECIPES = {
     "cont_overlap_source_start":
@@ -744,6 +964,11 @@ FAMILIES = {
     # client id decides which record family owns the tree, while the geometry
     # fields belong to btree_heap_index's shared validator whatever the client
     # is.  Every row listed here carries these recipes in its `fuzz_targets`.
+    "free_space": {
+        "record": "validation_controls",
+        "analyze": locate_fsm,
+        "recipes": FSM_RECIPES,
+    },
     "v2_btree": {
         "records": ["btree_heap_index", "dense_index", "chunk_index",
                     "shared_messages_legacy"],

@@ -335,13 +335,36 @@ error -- and the recipes never parse the file, they edit fields the locator foun
 and reseal what it says encloses them. Adding a family costs its locator; the
 recipes are then a few lines each.
 
-Three families exist:
+Four families exist:
 
 | family | records | recipes | mutations |
 | --- | --- | --- | --- |
 | `object_header_continuation` | 1 | 6 | target overlapping the source chunk at start/interior/end, zero-size, out-of-file, alias onto an already-decoded chunk |
 | `heap_structures` | 1 | 4 | doubling-table width zero and non-power-of-two, declared heap size one and two bits under the first row |
-| `v2_btree` | 4 | 6 | node size at 0xFFFFFFFF and at the leaf framing, record size zero, in-range wrong client id, filtered/non-filtered chunk client swap, root address out of file |
+| `v2_btree` | 4 | 9 | node size at 0xFFFFFFFF and at the leaf framing, record size zero, in-range wrong client id, chunk client swap, root address out of file, total record count at zero and ±1 |
+| `free_space` | 1 | 6 | a section one byte over the header's declared maximum, class count over the client's, broken section-count identity, list address and size out of file, zero list size |
+
+`free_space` carries a coverage argument the others do not. h5py cannot reach
+free-space managers **at all** — neither a plain open nor an object walk decodes
+FSHD/FSSE — so `h5policy-fuzz`'s oracle cannot judge an FSM mutant, and a false
+accept in that family is undetectable by the fuzzer by construction. A
+self-validating typed recipe is the only generator here whose output can be
+judged. Its headline recipe, `fsm_sect_size_over_max`, targets a relational
+bound: a section size is only wrong *relative* to the header's `max_sect_size`,
+which is what sizes the bin array the section gets filed into. Measured on the
+generated mutant, the assert-enabled build stops at
+`assert(bin < sinfo->nbins)` and the NDEBUG+ASan build reports a
+heap-buffer-overflow READ of size 8 in `H5FS__sect_link_size`
+(`H5FSsection.c:935`) — the frame
+[`registry/cases/fsm-section-bin-range.yml`](../registry/cases/fsm-section-bin-range.yml)
+records.
+
+Three FSHD fields are off limits to a recipe, and it is not visible in the
+layout: `max_sect_size`, `max_sect_addr` and `serial_sect_count` each *derive* a
+field width in the FSSE section list that follows, so editing one re-frames
+every section record and the list stops decoding — the mutant would then be
+rejected for the wrong reason and the recipe would be promising a finding it did
+not cause.
 
 `v2_btree` is the first family whose one locator serves several records. A BTHD
 is signature-findable with a single trailing checksum — the same shape as

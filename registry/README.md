@@ -225,7 +225,7 @@ and `h5cve verification` renders it `absent`. An empty annotation set with no
 such declaration still renders `not_assessed`, so the mechanism cannot be used
 to tidy a column -- it can only record a review that actually happened.
 
-**65 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
+**66 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -292,7 +292,7 @@ more than the total:
   -- that error was cycle reasoning written into the NESTING column, where the
   self-loop fixture that settles it does not appear because it is annotated
   under reference semantics.
-- Dedicated fuzz targets exist for 6 families of 16. `h5mutate` is a locator
+- Dedicated fuzz targets exist for 7 families of 16. `h5mutate` is a locator
   plus a recipe table per family, so the cost of the next family is its locator
   -- and the `v2_btree` family added on 2026-09-03 is the first whose ONE
   locator serves FOUR records: a BTHD is signature-findable with a single
@@ -306,6 +306,16 @@ more than the total:
   `valid/sohm_btree.h5` carries a type-5 dense-link header before its type-7
   SOHM root, so a first-match locator would edit the dense-link tree while the
   sidecar claimed a SOHM target.
+- The `free_space` family (2026-09-03) was chosen for a coverage reason rather
+  than a cell count: h5py cannot reach free-space managers at all, so
+  `h5policy-fuzz`'s oracle cannot judge an FSM mutant and a false accept there
+  is undetectable by the fuzzer by construction. Six recipes over all 12
+  FSHD-bearing seeds, spanning both client ids. Its headline recipe reproduces
+  the `fsm-section-bin-range` defect exactly -- NDEBUG+ASan heap-buffer-overflow
+  READ of size 8 in `H5FS__sect_link_size` -- which is also a reminder that the
+  assert-enabled build MASKS it: `assert(bin < sinfo->nbins)` fires first and
+  returns the same exit code, so the assert build alone would have read as a
+  clean rejection.
 - Writing that family surfaced a MEASURED FALSE ACCEPT and a shared bug in the
   engine. The false accept is
   [`cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`](cases/v2-btree-total-nrec-unchecked-in-name-walker.yml):
