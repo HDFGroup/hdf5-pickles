@@ -69,6 +69,10 @@ controlled outcome; a change that alters any decision is surfaced for review.
   `h5cve verification` consumes these annotations and lists their source
   fixtures or recipes. Missing required categories remain `partial` or
   `not_assessed`; an annotation never upgrades coverage by itself.
+  `count_and_extent_boundaries` requires `zero`, `max`, `n_minus_1`, `n` and
+  `n_plus_one` for `met`; `out_of_file` and `below_minimum` are additional
+  boundary classes that are accepted but not required, because a value under a
+  structure's own floor is not a position on the N-1/N/N+1 ladder.
 - `unit_datatype.pk` — synthetic checks for the bounded, depth-guarded
   datatype validator (recursion cap and truncation handling), run under poke.
 - `unit_messages.pk` — fixed-envelope and dispatch checks for old/new mtime,

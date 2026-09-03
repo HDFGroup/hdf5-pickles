@@ -217,7 +217,7 @@ requirements. Statuses are four-valued and `not_assessed` is **not** a soft
 | `absent` | mechanically demonstrated to be missing |
 | `not_assessed` | not determinable from artifacts; needs classification |
 
-**56 of 176 requirement-slots are currently `met`.** The distribution matters
+**57 of 176 requirement-slots are currently `met`.** The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -225,13 +225,26 @@ more than the total:
   oracle as a whole rather than family by family.
 - Reviewed fixture/recipe annotations now carry most of the boundary,
   arithmetic, nesting and reference-semantics evidence: `not_assessed` in those
-  four columns is down to 2, 9, 9 and 6 families respectively. The annotations
+  four columns is down to 0, 6, 7 and 5 families respectively. The annotations
   are a review of what each fixture's documented mechanism actually exercises,
   never an inference from finding-code spelling, which is why a family with many
   fixtures can still be `not_assessed` -- version, flag and checksum fixtures
   exercise none of these categories. What the sweep establishes is mostly which
-  boundary VALUES the corpus lacks: `n` and `n_minus_1` are thin nearly
-  everywhere, and `allocation_budget` is demonstrated for one family.
+  boundary VALUES the corpus lacks: `n` is thin nearly everywhere (3 families),
+  `max` and `allocation_budget` reach 4 each, and `below_minimum` -- a value
+  under a structure's own floor rather than one below a count -- is so far a
+  single fixture.
+- The 2026-09-02 sweep also measured where the remaining `not_assessed` cells
+  come from, and it is mostly NOT missing coverage: 80 of 367 expectation files
+  carry no `h5cve` family at all, and they include every depth and budget
+  fixture in the tree (`integration-btree_depth`, `-datatype_recursion_depth`,
+  `-walk_operation_budget`, `-accounted_metadata_limit`, the
+  `-v1_chunk_count-deep-*` pair, and the four `*_metadata_limit` files). An
+  uncontracted fixture cannot count for any family, so the arithmetic and
+  nesting columns read as unassessed while the fixtures that would discharge
+  them sit outside the contract. Contracting them is not a documentation edit:
+  a family contract puts a fixture into the canary matrix, so each one needs a
+  measured `allowed_statuses` first.
 - Dedicated fuzz targets exist for 2 families of 16. `h5mutate` is a locator
   plus a recipe table per family, so the cost of the next family is its locator.
   A recipe is only counted once it emits its intended finding on seeds other
@@ -243,14 +256,17 @@ more than the total:
 - Truncation is `met` for 12 families, `partial` for 4 whose seed exceeds the
   sweep budget, and `absent` for 0; see
   [`truncation-sweep.json`](truncation-sweep.json).
-- No-activation-on-failure is `met` for 9 families and `partial` for 7 because
+- No-activation-on-failure is `met` for 8 families and `partial` for 8 because
   the exact-build probe observes an activation or crash in those families.
   `external_file_list` joined that list on 2026-08-24 without libhdf5 changing:
   the probe's fallback single-element read moved from the origin to the last
   element, and the wrapped EFL segment it now reaches is opened before it is
   rejected. A count that goes DOWN because the harness asks a harder question is
   the intended direction -- see
-  the EFL entry under [`cases/`](cases/).
+  the EFL entry under [`cases/`](cases/). `message_envelope` joined on
+  2026-09-02 for the same kind of reason -- not a libhdf5 change, but the
+  regenerated matrix picking up `malformed/attr_gheap_free_undersized.h5`,
+  whose global-heap free-space sentinel never terminates.
 
 `check_registry.py` enforces the report's structure — every manifest record
 present and every requirement scored — and derives the summary counts above.
