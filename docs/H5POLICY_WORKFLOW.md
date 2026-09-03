@@ -286,16 +286,23 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **60
-are `met`, 76 `partial`, 0 `not_assessed`, and 40 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **64
+are `met`, 76 `partial`, 0 `not_assessed`, and 36 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 
-- dedicated typed fuzz targets for only 2 of 16 families and no repository
+- dedicated typed fuzz targets for 6 of 16 families and no repository
   OSS-Fuzz integration. The mutation engine is per-family by construction -- a
   locator plus a recipe table -- so a family gains targets only when someone
   writes its locator, and a recipe earns its place only by holding on seeds
-  other than the one it was developed against;
+  other than the one it was developed against. The `v2_btree` family shows the
+  leverage available when one structure is shared: a single BTHD locator
+  carries six recipes for four record families, verified across three client
+  record layouts. It also demonstrates the point of the discipline -- one of
+  its seven candidate recipes was withdrawn after measurement because it
+  produced three different outcomes across seeds, and the accept it produced
+  on two of them is a soundness gap now recorded in
+  `registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`;
 - family-by-family boundary, overflow/allocation, nesting, and progress cases
   that are still partial or not assessed. Reviewed fixture annotations now
   classify all of these: no column is `not_assessed` for any family any more.

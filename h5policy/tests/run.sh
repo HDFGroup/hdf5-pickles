@@ -337,6 +337,22 @@ mut_heap_dir="$repo_dir/cases/_mutheap_$$"
 mut_heap_status=${PIPESTATUS[0]}
 rm -rf "$mut_heap_dir"
 
+# The v2_btree family, on TWO seeds of different client classes.  One locator
+# serves four record families here, and the client id in the header is what
+# selects which -- so a single seed would leave the multi-family claim resting
+# on one record layout.  chunk_v2_btree.h5 is client 10 (chunk) and
+# sohm_btree.h5 carries the dense-link (5) and SOHM (7) trees; neither is the
+# dense_links.h5 the recipes were developed against.
+mut_bt2_status=0
+for bt2_seed in chunk_v2_btree sohm_btree; do
+    mut_bt2_dir="$repo_dir/cases/_mutbt2_${bt2_seed}_$$"
+    "$repo_dir/h5policy/tools/h5mutate" family --family v2_btree \
+        --seed "$tests_dir/valid/$bt2_seed.h5" \
+        --out-dir "$mut_bt2_dir" --verify | grep -E 'PASS|FAIL|mutant\(s\)'
+    [[ ${PIPESTATUS[0]} -eq 0 ]] || mut_bt2_status=1
+    rm -rf "$mut_bt2_dir"
+done
+
 if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $fsinfo_status -eq 0 \
       && $limits_status -eq 0 && $reached_status -eq 0 \
@@ -348,6 +364,7 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
       && $probe_status -eq 0 && $cve_status -eq 0 \
       && $dtype_depth_status -eq 0 \
       && $heap_write_status -eq 0 \
+      && $mut_bt2_status -eq 0 \
       && $matrix_status -eq 0 && $mut_status -eq 0 \
       && $cve_corpus_status -eq 0 \
       && $mut_heap_status -eq 0 \
@@ -357,5 +374,5 @@ if [[ $unit_status -eq 0 && $message_status -eq 0 \
     echo "ALL TESTS PASSED"
     exit 0
 fi
-echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status pathunit=$path_unit_status seam=$seam_status report=$report_status pathreport=$path_report_status corpus=$corpus_status diff=$diff_status probe=$probe_status dtypedepth=$dtype_depth_status heapwrite=$heap_write_status matrix=$matrix_status cve=$cve_status cvecorpus=$cve_corpus_status mut=$mut_status mutheap=$mut_heap_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
+echo "TESTS FAILED (unit=$unit_status messages=$message_status fsinfo=$fsinfo_status limits=$limits_status reached=$reached_status consumer=$consumer_status pathunit=$path_unit_status seam=$seam_status report=$report_status pathreport=$path_report_status corpus=$corpus_status diff=$diff_status probe=$probe_status dtypedepth=$dtype_depth_status heapwrite=$heap_write_status matrix=$matrix_status cve=$cve_status cvecorpus=$cve_corpus_status mut=$mut_status mutheap=$mut_heap_status mutbt2=$mut_bt2_status trunc=$trunc_status lazy=$lazy_status seamcheck=$seam_check_status reproducibility=$reproducibility_status)"
 exit 1

@@ -225,7 +225,7 @@ and `h5cve verification` renders it `absent`. An empty annotation set with no
 such declaration still renders `not_assessed`, so the mechanism cannot be used
 to tidy a column -- it can only record a review that actually happened.
 
-**60 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
+**64 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -292,8 +292,34 @@ more than the total:
   -- that error was cycle reasoning written into the NESTING column, where the
   self-loop fixture that settles it does not appear because it is annotated
   under reference semantics.
-- Dedicated fuzz targets exist for 2 families of 16. `h5mutate` is a locator
-  plus a recipe table per family, so the cost of the next family is its locator.
+- Dedicated fuzz targets exist for 6 families of 16. `h5mutate` is a locator
+  plus a recipe table per family, so the cost of the next family is its locator
+  -- and the `v2_btree` family added on 2026-09-03 is the first whose ONE
+  locator serves FOUR records: a BTHD is signature-findable with a single
+  trailing checksum, and the client id in the header decides whether
+  `dense_index`, `chunk_index` or `shared_messages_legacy` owns the tree while
+  the geometry fields belong to `btree_heap_index`'s shared validator either
+  way. Six recipes, verified on all 13 BTHD-bearing seeds in `tests/valid`
+  across client ids 5, 8 and 10 -- three record layouts, not three copies of
+  one file. Its locator ENUMERATES headers rather than taking the first match,
+  which the `FRHP` locator can get away with and this cannot:
+  `valid/sohm_btree.h5` carries a type-5 dense-link header before its type-7
+  SOHM root, so a first-match locator would edit the dense-link tree while the
+  sidecar claimed a SOHM target.
+- Writing that family surfaced a MEASURED FALSE ACCEPT and a shared bug in the
+  engine. The false accept is
+  [`cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`](cases/v2-btree-total-nrec-unchecked-in-name-walker.yml):
+  zeroing a dense index's total record count hides every link or attribute from
+  every reader, and h5policy accepts the file under all four profiles because
+  the rule is emitted from exactly one site in the oracle -- the creation-order
+  walker -- and not from either name walker. The engine bug is that all three
+  locators read the size-of-offsets and size-of-lengths from fixed byte offsets
+  9 and 10, which is wrong whenever a user block pushes the superblock past
+  byte 0; the self-validating design caught it as a checksum failure rather
+  than mutating the wrong field silently, but no family could run on a
+  userblock seed. Both now read the real superblock, and `heap_structures`
+  gained `valid/userblock_latest.h5` (0 -> 4 passing recipes) with no change on
+  the seeds it was already verified against.
   A recipe is only counted once it emits its intended finding on seeds other
   than the one it was written against -- the heap recipes were verified on four
   structurally different heaps, and a fifth candidate was rejected for failing

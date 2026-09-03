@@ -335,22 +335,56 @@ error -- and the recipes never parse the file, they edit fields the locator foun
 and reseal what it says encloses them. Adding a family costs its locator; the
 recipes are then a few lines each.
 
-Two families exist:
+Three families exist:
 
-| family | recipes | mutations |
-| --- | --- | --- |
-| `object_header_continuation` | 6 | target overlapping the source chunk at start/interior/end, zero-size, out-of-file, alias onto an already-decoded chunk |
-| `heap_structures` | 4 | doubling-table width zero and non-power-of-two, declared heap size one and two bits under the first row |
+| family | records | recipes | mutations |
+| --- | --- | --- | --- |
+| `object_header_continuation` | 1 | 6 | target overlapping the source chunk at start/interior/end, zero-size, out-of-file, alias onto an already-decoded chunk |
+| `heap_structures` | 1 | 4 | doubling-table width zero and non-power-of-two, declared heap size one and two bits under the first row |
+| `v2_btree` | 4 | 6 | node size at 0xFFFFFFFF and at the leaf framing, record size zero, in-range wrong client id, filtered/non-filtered chunk client swap, root address out of file |
+
+`v2_btree` is the first family whose one locator serves several records. A BTHD
+is signature-findable with a single trailing checksum — the same shape as
+`FRHP` — but the structure is shared: the client id in the header selects
+whether `dense_index`, `chunk_index` or `shared_messages_legacy` owns the tree,
+while the geometry fields belong to `btree_heap_index`'s shared validator
+whichever it is. Its locator **enumerates** headers instead of taking the first
+match, which the `FRHP` locator gets away with and this one cannot:
+`valid/sohm_btree.h5` carries a type-5 dense-link header before its type-7 SOHM
+root, so a first-match locator would edit the dense-link tree while the sidecar
+claimed a SOHM target — a recipe recording an intent it did not carry out.
+
+Every locator reads the file's offset and length widths from the **real**
+superblock rather than from fixed byte offsets 9 and 10. A user block puts the
+superblock at 512 or beyond, where those bytes are user data: measured 0/0 on
+`valid/userblock_latest.h5`, whose real widths are 8/8, making every derived
+field offset wrong. The self-validating design caught that as a checksum
+failure rather than a silent wrong-field edit, but no family could run on a
+userblock seed until the widths were read properly.
 
 The bar for counting a recipe is that it emits its intended finding on seeds
 other than the one it was developed against: the heap recipes were verified on
 four structurally different heaps (dense-link, dense-attribute, shared-message,
-and shared-message huge-object), which is what a recipe has over a committed
-fixture -- one mutation where the corpus needs four base files. A fifth
-candidate was rejected for failing that bar, and the reason is recorded in the
-tool and in the family's `fuzz_targets` block. `run.sh` runs `family --verify`
-for both families as pinned checks, on different seeds, and `h5cve variants`
-uses the engine to populate a case bundle.  The structure-aware **reducer** (`h5cve minimize`) is the
+and shared-message huge-object), and the `v2_btree` recipes on all 13
+BTHD-bearing seeds in `tests/valid`, spanning client ids 5, 8 and 10 — three
+record layouts rather than three copies of one file. That is what a recipe has
+over a committed fixture: one mutation where the corpus needs several base
+files.
+
+Two candidates have been rejected for failing that bar, and both reasons are
+recorded in the tool and in the family's `fuzz_targets` block rather than
+deleted. The second is worth reading as a result in its own right:
+`bt2_total_nrec_zero` produced three different outcomes across seeds, and on
+two of them the outcome was **accept** — a measured false accept in which
+zeroing a dense index's total record count hides every link or attribute from
+every reader while h5policy accepts the file under all four profiles. See
+[`registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`](../registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml).
+
+`run.sh` runs `family --verify` for all three families as pinned checks on
+seeds other than their development ones — `v2_btree` on two seeds of different
+client classes, since a single seed would leave the multi-family claim resting
+on one record layout — and `h5cve variants` uses the engine to populate a case
+bundle.  The structure-aware **reducer** (`h5cve minimize`) is the
 remaining half of roadmap change #5.
 
 Bundles live under `cases/<id>/` (git-ignored working scratch); `promote` is
