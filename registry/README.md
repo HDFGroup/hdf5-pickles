@@ -352,7 +352,15 @@ more than the total:
   defect caused the bail. `malformed/dense_link_btree_total_nrec.h5` pins the
   n+1 direction and h5mutate carries all three values as recipes. The libhdf5
   side stays open: it is an upstream change, and the assert at
-  `src/H5Gdense.c:717` is the bound that needs to become an error return. The engine bug is that all three
+  `src/H5Gdense.c:717` is the bound that needs to become an error return.
+- The same rule was missing for the **chunk** and **SOHM** v2 B-trees, and the
+  cause was a depth gate rather than an absent check: both callers compared the
+  header's total against the root count, but only under `depth == 0`, so a
+  leaf-root tree was checked and a deep one was not. Closed in the shared engine
+  (`h5policy_walk_v2_btree_node`), which now accumulates the walked total behind
+  the same abandoned-subtree sentinel the dense walkers use, with each caller
+  comparing afterwards and emitting its own family's code -- one change for both
+  clients, which is what the shared engine exists for. The engine bug is that all three
   locators read the size-of-offsets and size-of-lengths from fixed byte offsets
   9 and 10, which is wrong whenever a user block pushes the superblock past
   byte 0; the self-validating design caught it as a checksum failure rather
