@@ -375,9 +375,12 @@ Two candidates have been rejected for failing that bar, and both reasons are
 recorded in the tool and in the family's `fuzz_targets` block rather than
 deleted. The second is worth reading as a result in its own right:
 `bt2_total_nrec_zero` produced three different outcomes across seeds, and on
-two of them the outcome was **accept** — a measured false accept in which
-zeroing a dense index's total record count hides every link or attribute from
-every reader while h5policy accepts the file under all four profiles. See
+two of them the outcome was **accept** — a measured false accept in which a
+dense index's total record count is never compared against the node graph.
+Chasing the record's own unmeasured half then escalated it: the count sizes
+libhdf5's link table while the real tree fills it, so **n+1 segfaults** and
+**n-1 aborts on heap corruption** in every shipped tool, from files h5policy
+accepts under all four profiles. See
 [`registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`](../registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml).
 
 `run.sh` runs `family --verify` for all three families as pinned checks on

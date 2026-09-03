@@ -309,10 +309,18 @@ more than the total:
 - Writing that family surfaced a MEASURED FALSE ACCEPT and a shared bug in the
   engine. The false accept is
   [`cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`](cases/v2-btree-total-nrec-unchecked-in-name-walker.yml):
-  zeroing a dense index's total record count hides every link or attribute from
-  every reader, and h5policy accepts the file under all four profiles because
-  the rule is emitted from exactly one site in the oracle -- the creation-order
-  walker -- and not from either name walker. The engine bug is that all three
+  a dense index's total record count is never compared against the node graph
+  in either name walker, because the rule is emitted from exactly one site in
+  the oracle -- the creation-order walker. Zeroing it hides every link or
+  attribute from every reader. Following the record's own `coverage_gaps` item
+  and measuring the INFLATED direction then reversed the severity: libhdf5
+  sizes its link table from the stored count and fills it from the real tree,
+  so **n+1 is a stock SIGSEGV** (a NULL name left in the unfilled slot,
+  dereferenced by the sort comparator) and **n-1 is a stock SIGABRT** (more
+  callbacks than slots, past a write bound stated as an assert only at
+  `src/H5Gdense.c:717` and compiled out of every Release build). h5policy
+  accepts all of them under all four profiles. Zero is the one benign value,
+  and only because a zero-sized table is never allocated. The engine bug is that all three
   locators read the size-of-offsets and size-of-lengths from fixed byte offsets
   9 and 10, which is wrong whenever a user block pushes the superblock past
   byte 0; the self-validating design caught it as a checksum failure rather
