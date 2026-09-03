@@ -286,8 +286,8 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **58
-are `met`, 78 `partial`, 0 `not_assessed`, and 40 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **60
+are `met`, 76 `partial`, 0 `not_assessed`, and 40 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 
@@ -307,8 +307,13 @@ the HDF5 specification. Major visible gaps include:
   expectation files, each with its exact-build canary measured first;
 - truncation coverage that is met for 12 families, sampled/partial for 4, and
   absent for 0;
-- lazy-validation behavior measured for the oracle as a whole, but not yet
-  discharged independently for every family;
+- lazy-validation behavior `met` for the 2 families a ladder is measurably
+  attributed to and `partial` for the other 14. The counters are whole-walk
+  totals, so there is no per-family cost signal; what is attributable is
+  whether a ladder's payload growth ran through a family's structures, and
+  `h5policy-lazy` derives that from report fields. The other 14 are covered by
+  the global result and no more, which is a ceiling rather than a pending
+  measurement: several of those families have no data axis to grow;
 - no-activation-on-failure evidence met for 8 families and partial for 8 where
   the selected native build still activates an external resource, crashes, or
   fails to terminate.

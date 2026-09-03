@@ -225,12 +225,25 @@ and `h5cve verification` renders it `absent`. An empty annotation set with no
 such declaration still renders `not_assessed`, so the mechanism cannot be used
 to tidy a column -- it can only record a review that actually happened.
 
-**58 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
+**60 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
-- Lazy validation is `partial` everywhere: measured, and holding, but on the
-  oracle as a whole rather than family by family.
+- Lazy validation is `met` for 2 families and `partial` for 14, and the split
+  is a measurement rather than a shortfall. The counters the measurement
+  asserts on -- `metadata_bytes_seen` and `walk_operations` -- are whole-walk
+  totals, so there is no per-family cost signal to read. What CAN be
+  established per family is that a ladder's payload growth measurably ran
+  through that family's structures, and `h5policy-lazy` now attributes its
+  ladders from report fields rather than from their names:
+  `chunk_index_refs >= 1` at every point attributes the `filtered` ladder to
+  `chunk_index`; `chunk_index_refs == 0` throughout attributes the `data`
+  ladder's growing contiguous extent to `dataset_layout_filter_fill`, as does
+  the decoded deflate pipeline in `filtered`. The `chunks` control is excluded
+  by construction -- its metadata grows on purpose, which is what proves the
+  counters are sensitive. The remaining 14 are covered by the global result and
+  no more; discharging them individually needs a payload-growing ladder per
+  family, and several families have no data axis to grow at all.
 - Reviewed fixture/recipe annotations now carry the boundary, arithmetic,
   nesting and reference-semantics evidence outright: `not_assessed` in those
   four columns is 0, and what remains uncovered is `absent` with a reason --
@@ -259,15 +272,26 @@ more than the total:
   useful part. STRUCTURAL: external links cannot nest, because h5policy decodes
   the target path and never opens it; a dataspace message is a rank byte and a
   flat array; `validation_controls` is profiles and budgets and references
-  nothing. CONSTRUCTIBLE BUT NOT BUILT, which is the real backlog: a VDS naming
-  itself as its own source, an external link naming its own file, two EFL slots
-  sharing one heap name offset, a v2-B-tree node whose child address names an
-  ancestor (the cycle fixtures that exist are contracted to the CLIENTS, so the
-  shared engine's own guard has no specimen), and an MDCI flush-dependency
-  cycle. One negative is neither: `address_space_bounds` has two fixtures
-  carrying 16-byte lengths at and past 2**64, but compatibility preflight
-  declines the width before either value is decoded, so annotating them would
-  have been vacuous.
+  nothing; and the cache-image flush-dependency graph, which is provably
+  acyclic (parents resolve only against already-indexed entries, so a cycle of
+  length >= 2 needs each of two entries to precede the other). CONSTRUCTIBLE
+  BUT NOT BUILT, which is the real backlog: a VDS naming itself as its own
+  source, an external link naming its own file, two EFL slots sharing one heap
+  name offset, and a v2-B-tree node whose child address names an ancestor --
+  the cycle fixtures that exist are contracted to the CLIENTS
+  (`malformed/bad_sohm_btree_cycle.h5` is a `shared_messages_legacy` fixture),
+  so the shared engine's own guard has no specimen. One negative is neither:
+  `address_space_bounds` has two fixtures carrying 16-byte lengths at and past
+  2**64, but compatibility preflight declines the width before either value is
+  decoded, so annotating them would have been vacuous.
+- A negative is a claim, so it needs the same sourcing as any other. The
+  cache-image nesting negative was committed on 2026-09-02 asserting the
+  opposite of what `registry/cases/mdci-reconstruct-cleanup-unsafe.yml` had
+  already measured, and was corrected on 2026-09-03. Read the family's case
+  records before writing one, and keep each negative about the column it is in
+  -- that error was cycle reasoning written into the NESTING column, where the
+  self-loop fixture that settles it does not appear because it is annotated
+  under reference semantics.
 - Dedicated fuzz targets exist for 2 families of 16. `h5mutate` is a locator
   plus a recipe table per family, so the cost of the next family is its locator.
   A recipe is only counted once it emits its intended finding on seeds other

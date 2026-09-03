@@ -257,6 +257,31 @@ across 1,061× physical growth. The sensitivity control rises
 [`registry/lazy-validation.json`](../registry/lazy-validation.json), not from the
 nominal element-count ratio.
 
+### What this can and cannot say per family
+
+Both counters are whole-walk totals, so there is no per-family cost signal to
+read: "cost is independent of data volume" is measured for the oracle as a
+whole. What *is* attributable per family is narrower — whether a ladder's
+payload growth measurably ran through that family's structures — and the tool
+derives that from report fields rather than from what a ladder is called:
+
+| signal | attributed to |
+|---|---|
+| `chunk_index_refs >= 1` at every point | `chunk_index` |
+| `chunk_index_refs == 0` at every point (a contiguous layout whose stored size grows) | `dataset_layout_filter_fill` |
+| `decode_filters` non-empty at every point | `dataset_layout_filter_fill` |
+
+The `chunks` control is excluded by construction: its metadata grows on
+purpose, so it demonstrates counter sensitivity, not flat cost. The attribution
+lands in `family_evidence` in the artifact, and `h5cve verification` renders
+`lazy_validation_performance` as `met` for exactly those families and `partial`
+for the rest. `partial` there is a ceiling, not a pending measurement — closing
+it needs a payload-growing ladder per family, and families like
+`validation_controls` and `address_space_bounds` have no data axis to grow at
+all. `check_lazy_docs.py` cross-checks the two sides: a family cannot claim
+`met` without an attributed ladder, and an attributed family cannot stay
+`partial`.
+
 ## In-Process Seam Self-Check
 
 Analysing through `h5policy_analyze` instead of the CLI is ~7x faster (the

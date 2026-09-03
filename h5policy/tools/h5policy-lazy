@@ -135,11 +135,65 @@ def measure(path, repeats):
             except json.JSONDecodeError:
                 return None
     m, g = report.get("metrics", {}), report.get("geometry", {})
+    f = report.get("features", {})
     return {"physical_bytes": g.get("physical_bytes"),
             "metadata_bytes_seen": m.get("metadata_bytes_seen"),
             "walk_operations": m.get("walk_operations"),
             "chunk_index_refs": m.get("chunk_index_refs"),
+            # Kept so the family attribution below is auditable from the
+            # artifact rather than taken on trust.
+            "decode_filters": f.get("decode_filters") or [],
             "seconds_best": round(min(times), 4)}
+
+
+# Which registry families a ladder gives FAMILY-SPECIFIC evidence for.
+#
+# The counters this tool asserts on -- `metadata_bytes_seen` and
+# `walk_operations` -- are whole-walk totals.  There is no per-family counter,
+# so "validation cost is independent of data volume" is measured for the oracle
+# as a whole and cannot be split per family by reading the numbers differently.
+# What CAN be established per family is narrower and still worth having: a
+# ladder whose payload growth runs THROUGH a given family's structures
+# demonstrates the property for that path specifically.  So attribute a ladder
+# by what its walk measurably touched, never by what the ladder is named.
+#
+# Derived from report fields, not asserted:
+#   chunk_index_refs >= 1 at every point  -> the chunk index was walked
+#   chunk_index_refs == 0 at every point  -> a contiguous layout, whose stored
+#                                            size is what grows with payload
+#   decode_filters non-empty              -> a filter pipeline was decoded
+#
+# The `chunks` control is excluded: its metadata grows on purpose, so it proves
+# the counters are sensitive, not that any family's cost is flat.
+CONTROL_LADDER = "chunks"
+
+
+def attribute(results):
+    """family -> {ladders, signal} for ladders giving family-specific evidence."""
+    evidence = {}
+
+    def add(family, ladder, signal):
+        entry = evidence.setdefault(family, {"ladders": [], "signals": {}})
+        if ladder not in entry["ladders"]:
+            entry["ladders"].append(ladder)
+        entry["signals"][ladder] = signal
+
+    for name, rows in results.items():
+        if name == CONTROL_LADDER or len(rows) < 2:
+            continue
+        refs = [r.get("chunk_index_refs") for r in rows]
+        filters = [r.get("decode_filters") or [] for r in rows]
+        if all(isinstance(n, int) and n >= 1 for n in refs):
+            add("chunk_index", name, "chunk_index_refs >= 1 at every point")
+        if all(isinstance(n, int) and n == 0 for n in refs):
+            add("dataset_layout_filter_fill", name,
+                "chunk_index_refs == 0 at every point: a contiguous layout "
+                "whose stored size grows with the payload")
+        if all(f for f in filters):
+            add("dataset_layout_filter_fill", name,
+                "a filter pipeline was decoded at every point "
+                f"(decode_filters {filters[0]})")
+    return evidence
 
 
 def main():
@@ -212,7 +266,7 @@ def main():
                                    "ratio": round(ratio, 2), "seconds": times})
 
     report = {"schema_version": 1, "fixture_policy": FIXTURE_POLICY,
-              "ladders": results,
+              "ladders": results, "family_evidence": attribute(results),
               "violations": violations, "total_violations": len(violations)}
 
     if args.json or args.output:
