@@ -56,7 +56,7 @@ unrelated code.
 So the citation has to say what it points at, and the checker holds it to that:
 
 ```
-h5_datatype.pk:1180 (member_off > elm_size)
+h5_datatype.pk:1219 (member_off > elm_size)
 h5_walk.pk:820 (H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS)
 h5_group.pk:194-262 (h5policy_local_heap_data_addr, data_seg_addr)
 ```
@@ -326,7 +326,7 @@ more than the total:
   that do not appear in version-0 files, while GCOL does.
 - Writing that family surfaced a MEASURED FALSE ACCEPT and a shared bug in the
   engine. The false accept is
-  [`cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`](cases/v2-btree-total-nrec-unchecked-in-name-walker.yml):
+  [`registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml`](../registry/cases/v2-btree-total-nrec-unchecked-in-name-walker.yml):
   a dense index's total record count is never compared against the node graph
   in either name walker, because the rule is emitted from exactly one site in
   the oracle -- the creation-order walker. Zeroing it hides every link or

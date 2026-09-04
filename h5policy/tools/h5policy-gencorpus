@@ -1346,6 +1346,74 @@ def _make_drvinfo_block_len_past_eof(path):
     _drvinfo_assemble(path, _drvinfo_block(body_len=1 << 20))
 
 
+def _drvinfo_splice_header(path, addr, body_len=1 << 20):
+    """Overwrite 16 bytes at `addr` with a driver-info block header claiming
+    `body_len` trailing bytes, WITHOUT appending any of them and WITHOUT
+    moving the declared EOF.
+
+    This is the interior-placement sibling of _drvinfo_assemble: that helper
+    always either appends the block (extending the EOA to cover it) or points
+    at bytes near the end that sec2 zero-fills.  Two corpus specimens found
+    during a 2026-09-03 ~/specimens sweep instead had a v0 superblock's
+    driver-info address aliasing bytes ALREADY inside other file structures,
+    with a declared length the physical file never comes close to holding.
+    Splicing only the 16-byte header in place reproduces that shape
+    deterministically: the trailing header bytes (reserved + declared length
+    + driver id) permanently replace whatever those addresses used to hold,
+    so the caller must pick one this validator's OTHER checks leave
+    undisturbed -- see the two callers below for the ones that stay clean;
+    most addresses inside a 2 KB base file corrupt something else too.
+    """
+    raw = bytearray(_base_bytes(
+        lambda h: h.create_dataset("a", data=np.arange(4, dtype="i4")),
+        libver="earliest"))
+    header = _drvinfo_block(body_len=body_len)[:16]
+    raw[addr:addr + len(header)] = header
+    struct.pack_into("<Q", raw, 48, addr)
+    _patch(path, bytes(raw))
+
+
+def _make_drvinfo_block_aliases_root_symtab(path):
+    """The driver-info address (superblock bytes 48-55) points at byte 72,
+    inside the root group's OWN symbol-table-entry scratch space -- part of
+    the superblock's body, not appended file content -- and declares a 1 MiB
+    body four orders of magnitude past the ~2 KB physical file: the same
+    unbounded-length shape as drvinfo_block_len_past_eof.h5, just aliasing
+    existing structure instead of sitting past it.
+
+    Real-world witness: corpus specimen 6497cd7b10ec... (~/specimens sweep,
+    2026-09-03) had its driver-info address at byte 9, inside the
+    superblock's own FIXED fields -- which additionally corrupts several
+    unrelated superblock invariants (sizeof_offsets, the node-K fields, status
+    flags) all at once, and that specimen also carried unrelated, unexamined
+    corruption elsewhere in the file (an unclassified object-header message
+    and a second object header reported outside the file).  Neither is
+    reproduced here: this fixture isolates exactly the one defect it is meant
+    to test, the way every other fixture in this file does.  Byte 72 is the
+    closest interior address that stays clean of the OTHER checks this
+    validator runs on a v0 superblock's root symbol-table entry.
+    See registry/cases/driver-info-block-fields-unbounded.yml.
+    """
+    _drvinfo_splice_header(path, 72)
+
+
+def _make_drvinfo_block_aliases_root_btree(path):
+    """The driver-info address (superblock bytes 48-55) points at byte 255,
+    inside the root group's v1 B-tree node (address 136 in this base file),
+    rather than past all real content the way drvinfo_block_len_past_eof.h5
+    places it.
+
+    Real-world witness: corpus specimen 8ea51ffef5a0... (~/specimens sweep,
+    2026-09-03) had its driver-info address at byte 255 in a 4096-byte file,
+    declaring a ~48 MiB body -- reproduced here at the same offset with the
+    same 1 MiB body the sibling fixtures in this file use (see
+    _make_drvinfo_block_len_past_eof for why 1 MiB and not the wild value: a
+    length near 2**32 can make an uncapped h5dump OOM the whole session).
+    See registry/cases/driver-info-block-fields-unbounded.yml.
+    """
+    _drvinfo_splice_header(path, 255)
+
+
 def _make_drvinfo_block_header_truncated(path):
     """A superblock aiming its driver-info address 8 bytes before EOF, so the
     16-byte header cannot fit.
@@ -1374,6 +1442,10 @@ def _gen_malformed(root):
         f"{root}/malformed/drvinfo_block_len_past_eof.h5")
     _make_drvinfo_block_header_truncated(
         f"{root}/malformed/drvinfo_block_header_truncated.h5")
+    _make_drvinfo_block_aliases_root_symtab(
+        f"{root}/malformed/drvinfo_block_aliases_root_symtab.h5")
+    _make_drvinfo_block_aliases_root_btree(
+        f"{root}/malformed/drvinfo_block_aliases_root_btree.h5")
     _patch(f"{root}/malformed/bad_signature.h5",
            bytes([raw[0] ^ 0xFF]) + raw[1:])
     _patch(f"{root}/malformed/truncated.h5", raw[:32])

@@ -440,6 +440,13 @@ fun h5policy_dtype_leaf = (int ios, H5PolicyProfile profile,
    Collection is off unless a caller asks for it, so datasets pay nothing.  */
 var H5_DTYPE_HEAP_SLOT_LIMIT = 64UL;
 var h5policy_dtype_slot_collect = 0UB;
+/* Set (and cleared) only around an ATTRIBUTE's embedded datatype validation
+   (h5policy_validate_attribute_payload, h5_messages.pk) -- never touched for a
+   dataset or named-datatype's own datatype message, and never read anywhere
+   except the legacy reference-size branches below.  See the comment there for
+   why the attribute context stays a hard rejection while the dataset one is
+   only advisory.  */
+var h5policy_dtype_in_attribute = 0UB;
 /* Nonzero inside a vlen's BASE type.  A vlen of vlen has exactly one ID in the
    element; the inner IDs live in the heap object's bytes, which are not metadata
    and are not at any element offset.  Recording them would fabricate slots. */
@@ -546,12 +553,28 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
     /* A reference's on-disk width is a property of the FILE, not of this
        message: libhdf5 overwrites dt->shared->size from the superblock's
        size-of-offsets when the type is attached to a file (H5Tref.c:256/284/312),
-       and never compares it with what was encoded here.  Any consumer that
-       already sized a buffer from the encoded value is then wrong by the
-       difference -- an attribute's raw-data extent (H5Oattr.c:273) is exactly
-       such a consumer, and reads it back at the post-fixup size
-       (H5Aint.c:769).  Pin the encoded size to the width the file dictates so
-       the size is final before anything derives from it.
+       and never compares it with what was encoded here.  Whether that makes a
+       mismatch corrupt depends on who derives an extent from the encoded value
+       BEFORE the rewrite happens:
+
+         - An ATTRIBUTE's raw-data extent (H5Oattr.c:273) is exactly such a
+           consumer, computed from the encoded size and never revisited, so
+           reading it back at the post-fixup size (H5Aint.c:769) is a real heap
+           over-read -- see registry/cases/datatype-size-not-final.yml.  This
+           stays a hard `corrupt` finding, gated on h5policy_dtype_in_attribute
+           (set only around h5policy_validate_attribute_payload's own datatype
+           call, h5_messages.pk).
+         - A DATASET has no such blind spot: its storage size lives in the
+           layout message, an independent record already cross-checked against
+           the RECOMPUTED size elsewhere (H5_CORRUPT_COMPACT_LAYOUT_SIZE_MISMATCH
+           / ..._CONTIGUOUS_...), and libhdf5's own read path (H5D__contig_check,
+           the compact-size compare) stores/strides by H5T_set_loc's
+           file-determined width -- it never looks at the encoded size at all.
+           Measured 2026-09-03: three corpus specimens with a mismatched legacy
+           reference size on a DATASET open, read, and dereference correctly
+           under libhdf5 2.3.0 / 1.14.5.  Demanding equality there was a live
+           invariant-A false positive, so outside the attribute context this is
+           only H5_ADVISORY_DATATYPE_REFERENCE_SIZE_MISMATCH.
 
        The width comes from the superblock, so the size checks are gated on
        having decoded one: global_sizeof_offsets is 0 until then, and a finding
@@ -598,13 +621,29 @@ fun h5policy_dtype_check = (int ios, H5PolicyProfile profile,
             else if (o == 0UL)
                 ;                        /* no superblock decoded; see above */
             else if (rtype == 0UL && elm_size != o)
-                h5policy_emit_error("H5_CORRUPT_DATATYPE_REFERENCE_SIZE",
-                                    "corrupt", blob_off, object,
-                                    "object reference size does not match the file address size");
+                {
+                    if (h5policy_dtype_in_attribute != 0UB)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_REFERENCE_SIZE",
+                                            "corrupt", blob_off, object,
+                                            "object reference size does not match the file address size");
+                    else
+                        h5policy_emit_warning(
+                            "H5_ADVISORY_DATATYPE_REFERENCE_SIZE_MISMATCH",
+                            blob_off, object,
+                            "object reference size does not match the file address size; libhdf5 recomputes it on a dataset and never reads the declared value");
+                }
             else if (rtype == 1UL && elm_size != o + 4UL)
-                h5policy_emit_error("H5_CORRUPT_DATATYPE_REFERENCE_SIZE",
-                                    "corrupt", blob_off, object,
-                                    "region reference size does not match the file heap identifier size");
+                {
+                    if (h5policy_dtype_in_attribute != 0UB)
+                        h5policy_emit_error("H5_CORRUPT_DATATYPE_REFERENCE_SIZE",
+                                            "corrupt", blob_off, object,
+                                            "region reference size does not match the file heap identifier size");
+                    else
+                        h5policy_emit_warning(
+                            "H5_ADVISORY_DATATYPE_REFERENCE_SIZE_MISMATCH",
+                            blob_off, object,
+                            "region reference size does not match the file heap identifier size; libhdf5 recomputes it on a dataset and never reads the declared value");
+                }
             /* Revised references (2/3/4) take MAX(sizeof_offsets + 10,
                encode_size), so sizeof_offsets + 10 is a lower bound rather
                than an equality.  Only the under-declared direction is a memory

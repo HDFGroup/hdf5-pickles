@@ -6,7 +6,7 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Compare H5PolicyProfile's documented preset tables with the pickle."""
+"""Compare documented profile tables and the H5PL projection with the pickle."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "h5policy/pickles/h5_profiles.pk"
 DOC = ROOT / "h5policy/docs/H5PolicyProfile.md"
+H5PL_API_DOC = ROOT / "docs/H5PL_POLICY_PROFILE_API.md"
+POLICY_GUIDE = ROOT / "h5policy/README.md"
 PROFILES = (
     ("H5_UNTRUSTED_STRICT", "untrusted-strict"),
     ("H5_FORENSIC", "forensic"),
@@ -100,6 +102,31 @@ def documented_profiles(fields: set[str]) -> dict[str, dict[str, int]]:
     return result
 
 
+def documented_h5pl_projection() -> dict[str, tuple[int, str]]:
+    result: dict[str, tuple[int, str]] = {}
+    row = re.compile(
+        r"^\| `([a-z][a-z-]+)` \| `([01])` \| `(allow|deny)` \|$")
+    for line in H5PL_API_DOC.read_text().splitlines():
+        match = row.match(line)
+        if match:
+            result[match.group(1)] = (int(match.group(2)), match.group(3))
+    return result
+
+
+def documented_h5pl_custom_fields(text: str) -> set[str]:
+    match = re.search(
+        r"typedef struct H5PL_resource_limits_t \{(?P<body>.*?)"
+        r"\} H5PL_policy_definition_t;",
+        text,
+        re.DOTALL,
+    )
+    if match is None:
+        fail("H5PL proposal lacks the versioned custom-profile structures")
+    return set(re.findall(
+        r"\b(?:uint64_t|uint8_t)\s+([a-z][a-z0-9_]*);", match.group("body")
+    ))
+
+
 def main() -> int:
     source = source_profiles()
     fields = set(source["untrusted-strict"])
@@ -118,9 +145,72 @@ def main() -> int:
                 f"{field}={documented[profile][field]} "
                 f"(pickle {source[profile][field]})" for field in changed)
             fail(f"{profile} preset drift: {details}")
+
+    if not H5PL_API_DOC.is_file():
+        fail("docs/H5PL_POLICY_PROFILE_API.md is missing")
+    projection = documented_h5pl_projection()
+    expected_profiles = {profile for _, profile in PROFILES}
+    if set(projection) != expected_profiles:
+        fail(
+            "H5PL projection profiles "
+            f"{sorted(projection)!r} != {sorted(expected_profiles)!r}"
+        )
+    for profile, (documented_value, documented_rule) in projection.items():
+        source_value = source[profile]["allow_dynamic_filters"]
+        expected_rule = "allow" if source_value else "deny"
+        if (documented_value, documented_rule) != (source_value, expected_rule):
+            fail(
+                f"H5PL projection drift for {profile}: "
+                f"{documented_value}/{documented_rule} != "
+                f"{source_value}/{expected_rule}"
+            )
+
+    api_text = H5PL_API_DOC.read_text()
+    custom_fields = documented_h5pl_custom_fields(api_text)
+    if custom_fields != fields:
+        missing = sorted(fields - custom_fields)
+        extra = sorted(custom_fields - fields)
+        fail(
+            "H5PL custom definition field drift: "
+            f"missing={missing!r}, extra={extra!r}"
+        )
+    required_api_boundaries = (
+        "does not run h5policy",
+        "VOL and VFD plugins",
+        "before consulting the plugin cache",
+        "programmatically registered",
+        "H5PLset_loading_state()",
+        "HDF5_PLUGIN_PRELOAD",
+        "`trusted_fast` and `untrusted_strict`",
+        "H5PL_POLICY_PROFILE_CUSTOM",
+        "H5PLget_policy_profile_definition",
+        "H5PLset_policy_definition",
+        "H5PLget_policy_definition",
+        "same configuration validation as",
+    )
+    missing_api_boundaries = [
+        fragment for fragment in required_api_boundaries
+        if fragment not in api_text
+    ]
+    if missing_api_boundaries:
+        fail(
+            "H5PL proposal lacks boundary text: "
+            + ", ".join(repr(item) for item in missing_api_boundaries)
+        )
+
+    guide_text = POLICY_GUIDE.read_text()
+    for _, profile in PROFILES:
+        report_profile = profile.replace("-", "_")
+        if f"`{profile}`" not in api_text:
+            fail(f"H5PL proposal lacks CLI profile spelling {profile!r}")
+        if f"`{report_profile}`" not in api_text:
+            fail(f"H5PL proposal lacks report profile spelling {report_profile!r}")
+        if f"`{report_profile}`" not in guide_text:
+            fail(f"h5policy guide lacks report profile spelling {report_profile!r}")
     print(
         f"PROFILE DOCS CHECK OK: {len(PROFILES)} profiles and "
-        f"{len(fields)} fields match the pickle")
+        f"{len(fields)} fields match the pickle; H5PL predefined projection "
+        "and custom definition match")
     return 0
 
 

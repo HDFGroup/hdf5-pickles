@@ -558,6 +558,19 @@ Per-member name entry for version 1 and 2 enumerated datatypes. In version 3 the
 | Pad | `pad` | Zero bytes padding the name to the next 8-byte boundary. |
 
 
+## Enumeration Name - Datatype Version 3
+
+Pickle type: `enum_name_v3`.
+
+Wrapper for one unpadded, NUL-terminated enumeration member name in a version 3 datatype. The wrapper carries the version guard needed by the executable union mapping; it adds no stored bytes of its own.
+
+**Fields: Enumeration Name - Datatype Version 3**
+
+| Field | Pickle identifier | Description |
+|-------|-------------------|-------------|
+| Name | `name` | NUL-terminated enumeration member name with no alignment padding. |
+
+
 ## Array Properties - Datatype Version 2
 
 Pickle type: `array_props2`.

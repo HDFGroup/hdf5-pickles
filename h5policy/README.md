@@ -76,6 +76,9 @@ conservatively declines to pass to the selected `libhdf5`.
 JSON output includes:
 
 - `schema_version`: the integer report-contract version (currently `1`).
+- `profile`: the selected profile identifier. The JSON spellings use
+  underscores (`untrusted_strict` and `trusted_fast`), while the corresponding
+  command-line names use hyphens.
 - `path_encoding`: the byte-path serialization contract, currently
   `utf-8-percent-v1`.
 - `file`: the input byte path encoded according to `path_encoding`.
@@ -140,6 +143,10 @@ profile.
 For an implementation-level reference covering every current profile field,
 including its scope, sentinel behavior, finding class, and test coverage, see
 [`H5PolicyProfile`: Current Semantics](docs/H5PolicyProfile.md).
+For a prospective native-library handoff, see the
+[H5PL policy-profile API extension](../docs/H5PL_POLICY_PROFILE_API.md). That
+draft deliberately covers only the non-core-filter activation rule that H5PL
+and H5Z can enforce; it does not turn H5PL into the metadata preflight.
 
 | Profile            | Mapping     | Resource / analysis budgets          | Feature policy                         |
 | ------------------ | ----------- | ------------------------------------ | -------------------------------------- |
