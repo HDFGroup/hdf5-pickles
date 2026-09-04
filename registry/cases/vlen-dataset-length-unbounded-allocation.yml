@@ -1,0 +1,148 @@
+# A NEGATIVE RESULT for this oracle and a REAL weakness in libhdf5, recorded
+# together because the two conclusions depend on the same measurement --
+# same shape as registry/cases/global-heap-index-allocation-off-book.yml.
+#
+# A disk-resident H5T_VLEN element's sequence length is a 4-byte field in the
+# dataset's own RAW DATA, decoded verbatim by H5T__vlen_disk_getlen
+# (src/H5Tvlen.c) with no bound at all.  H5T__conv_vlen
+# (src/H5Tconv_vlen.c:389-406) multiplies that length by the (fixed) element
+# size and allocates a conversion buffer of the result -- before anything
+# compares the length to the real size of the global-heap object it names.
+# That comparison exists (H5VL__native_blob_get, src/H5VLnative_blob.c:120,
+# `if (hobj_size != size) ... H5E_BADSIZE`) but runs one call later, on the
+# read the allocation was already sized to serve.
+#
+# THE REASON THIS IS NOT AN H5POLICY CHECK: this oracle is metadata-only by
+# design and does not read dataset raw data (h5_walk.pk never touches a
+# dataset's payload).  A vlen sequence's on-disk record for a DATASET element
+# lives in exactly that payload, so it is categorically out of the oracle's
+# declared scope -- unlike the same shape on an ATTRIBUTE, whose value is
+# embedded in the object-header message and therefore IS metadata; see
+# registry/cases/attribute-heap-id-unvalidated.yml, which covers that side
+# (status: oracle-hardened) and whose 2026-09-04 addendum measures the
+# allocation-before-verify cost documented here, on an existing tracked
+# fixture, without any new file.
+schema_version: 1
+
+id: vlen-dataset-length-unbounded-allocation
+title: an H5T_VLEN dataset element's raw-storage sequence length sizes a
+  type-conversion buffer allocation before anything compares it to the real
+  global-heap object -- out of h5policy's scope by design, since dataset raw
+  data is not metadata
+status: no-oracle-change         # measured, triaged, deliberately not enforced
+
+disclosure: >-
+  n/a -- local analysis only. No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up or is proposed.
+
+record: null                     # no h5policy family covers dataset raw data
+root_cause_classification: local_decode
+violated_invariant: []           # none: out of the oracle's declared scope
+
+entry_points:
+  - "libhdf5 H5Dread -> H5T_convert -> H5T__conv_vlen (src/H5Tconv_vlen.c:389-406)"
+  - "libhdf5 H5T__vlen_disk_getlen (src/H5Tvlen.c:717-728) -- the untrusted length"
+  - h5policy (oracle) -- accepts; metadata-only, does not read dataset raw data
+
+# -- Why there is no sound oracle rule here ---------------------------------
+scope_boundary: >-
+  h5policy validates METADATA: object headers, messages, and the structures
+  they reference by address (global-heap collections, B-trees, heaps).  A
+  dataset's raw storage -- contiguous, chunked, or (as here) the vlen
+  sequence records packed into it -- is application DATA, walked by nothing
+  in h5_walk.pk.  A vlen record's declared length is therefore not a field
+  this oracle has ever decoded for a dataset, and adding that decode would
+  mean reading dataset payloads generally, a deliberate design boundary
+  (see project analysis of the family: vlen/global-heap dataset content is
+  read-path only, and the differential harness's own `introspect()` never
+  reads data values either, so "libhdf5 opens" already means "opens and
+  traverses metadata", not "reads safely").
+  Contrast the ATTRIBUTE encoding of the identical record: an attribute's
+  value -- including a vlen descriptor -- is embedded in its object-header
+  message, which IS metadata h5policy walks, and h5policy models the same
+  equality rule there (`attribute.heap_object_length`,
+  registry/cases/attribute-heap-id-unvalidated.yml).  So the invariant is
+  known and stated; only its DATASET-side instance sits outside what this
+  oracle can see without changing what "metadata-only" means.
+
+# -- The libhdf5 weakness, measured ------------------------------------------
+libhdf5_behaviour: >-
+  H5Dread reads the raw record's declared length with no cross-check, sizes
+  an allocation from it, and only refuses the READ afterward. MEASURED
+  (2026-09-04) two ways, both under a stock 2.3.0 baseline (RelWithDebInfo,
+  -DNDEBUG, no sanitizers) and both via a malloc/calloc/realloc size-logging
+  LD_PRELOAD interposer:
+    - A received specimen: a 9800-byte file, one H5T_VLEN{H5T_COMPOUND{i32,
+      f64}} dataset, one element's length field set to 1879048534
+      (0x70000156) against a 12-byte element size. H5Dread requests
+      22548582408 bytes (~21.0 GiB) in a single allocation call, which fails
+      under a 2 GiB RLIMIT_AS and returns H5E_NOSPACE -- the only reason
+      nothing worse happens is the harness's own cap, not anything the
+      library does.
+    - A hand-built ATTRIBUTE fixture (used to confirm the identical order of
+      operations applies through H5Aread as well as H5Dread, since both
+      convert through H5T_convert -> H5T__conv_vlen): one 4-byte field
+      changed from a clean file, native element size 16 bytes, requests
+      30064779272 bytes (~28.0 GiB) before H5VL__native_blob_get's equality
+      check fails the read.
+    - Confirmed a third time against the EXISTING tracked fixture
+      `h5policy/tests/malformed/attr_vlen_heap_seq_len_over.h5` (declared
+      length 2^32-1 against a real 39-byte string object,
+      registry/cases/attribute-heap-id-unvalidated.yml): a single H5Aread of
+      that vlen-string attribute allocates 4294967304 bytes (~4.0 GiB) -- and
+      this allocation SUCCEEDS (no RLIMIT_AS was set for this run) -- before
+      the same equality check fails the read. So an already-tracked fixture
+      that h5policy correctly rejects, and that libhdf5 also correctly
+      refuses, still costs a real multi-gigabyte allocation on the way to
+      that refusal.
+  Present, unchanged, since at least the `hdf5-1_8_0` tag (oldest tag
+  checked; `git log -S` on the multiplication in src/H5Tconv_vlen.c shows it
+  moved intact from src/H5Tconv.c in commit 3876299d75a, "Split H5Tconv.c
+  into modules by type", and the pre-split content already had the identical
+  shape). No fix boundary was found; this is a whole-history, currently
+  unfixed defect.
+  NO MEMORY-SAFETY CLAIM. Nothing overruns and nothing faults on any path
+  measured: the later equality check prevents the mismatched read from ever
+  copying heap bytes into the oversized buffer. This is allocation cost, not
+  corruption -- same shape as
+  registry/cases/global-heap-index-allocation-off-book.yml, and the same
+  reason a sanitizer build adds no signal beyond confirming the request.
+
+oracle_before: accept
+oracle_after: accept -- unchanged, deliberately
+
+coverage_gaps:
+  - >-
+    NO FIXTURE IS TRACKED for the dataset shape, on purpose: h5policy would
+    have to start reading dataset raw data to reject it, which is the
+    boundary this record documents rather than proposes to move. The
+    specimen and its construction are reproducible from the recipe above
+    (one H5T_VLEN dataset, one 4-byte length field) faster than reviewing a
+    stored blob.
+  - >-
+    IF A RULE IS EVER WANTED for the dataset shape, it belongs in the
+    LIBRARY (bound the length against the file's own declared geometry, or
+    move the existing hobj_size-vs-size equality check in
+    H5VL__native_blob_get to run before H5T__conv_vlen grows its buffer),
+    not in this oracle -- the same conclusion
+    registry/cases/attribute-heap-id-unvalidated.yml reaches for the sibling
+    encoding, where h5policy CAN and does check the metadata form.
+  - >-
+    No 32-bit measurement. The multiplication is size_t, so an ILP32 build's
+    ceiling is capped by a 32-bit address space -- likely fails the
+    allocation even sooner -- but this is inferred, not measured.
+  - >-
+    H5Aread on a vlen-typed attribute other than the two measured here
+    (compound base, and the tracked string fixture) was not separately
+    exercised; nested vlen-of-vlen and H5T_REFERENCE region-reference vlen
+    share the same H5T__conv_vlen loop and are plausible siblings, not
+    audited.
+
+provenance: >-
+  A specimen handed over for private-advisory drafting (not from the
+  upstream CVE corpus this repository otherwise triages). h5policy
+  (untrusted-strict and forensic) accepts it with zero findings, correctly,
+  per the scope boundary above. hdf5_build: baseline 2.3.0 RelWithDebInfo,
+  -DNDEBUG, no sanitizers, settings_sha256
+  7c941a8a96fe36a109d8a84ce547d412c9c02de83e4163b69159e270e5efc94f;
+  workstation-local install, path not recorded. poke_version: GNU poke 4.3.
