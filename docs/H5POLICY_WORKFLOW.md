@@ -259,7 +259,7 @@ and the family canary. The tracked exact-build evidence separately records that
 source-derived, its classification mapping is curated, and the corpus and
 exact-build outcomes are measured corroboration.
 
-Registry checks currently account for **329 finding codes** and **0 semantic-
+Registry checks currently account for **330 finding codes** and **0 semantic-
 backlog entries**. Static enumeration resolves **1028 in-pickle message
 variants**, with **0 unrouted** and **0 unanalyzable** variants. That is complete
 classification coverage for the current emission surface, not complete
@@ -269,7 +269,7 @@ invariant coverage for the HDF5 format.
 
 It is broad and explicitly measured, but it is not complete.
 
-The current invariant manifest contains **413 named invariants across 16
+The current invariant manifest contains **414 named invariants across 16
 selected record families**. Those families are security-oriented groupings,
 not a claim that every legal HDF5 representation, payload behavior, or
 application activation has been modeled.
