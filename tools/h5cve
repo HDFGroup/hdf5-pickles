@@ -72,6 +72,26 @@ def portable_path(path):
     if real.startswith(REPO + os.sep):
         return os.path.relpath(real, REPO)
     return os.path.basename(real.rstrip(os.sep)) or real
+
+
+def _rehydrate_seed(stored, cdir):
+    """Turn a portably-stored seed path back into a usable absolute path.
+
+    portable_path() collapses an in-repo seed to a repo-relative path and a
+    foreign seed to a bare basename, so a value read back from case.yml is not
+    directly openable.  Resolve a repo-relative value against REPO and a bare
+    basename against the bundle directory; return None when neither exists so
+    the caller falls back to the bundle's own input.h5.
+    """
+    if not isinstance(stored, str) or not stored:
+        return None
+    if os.path.isabs(stored):
+        return stored if os.path.exists(stored) else None
+    for cand in (os.path.join(REPO, stored),
+                 os.path.join(cdir, os.path.basename(stored))):
+        if os.path.exists(cand):
+            return cand
+    return None
 H5POLICY = os.path.join(REPO, "h5policy", "tools", "h5policy")
 H5PROBE = os.path.join(REPO, "h5policy", "tools", "h5policy-probe")
 H5MUTATE = os.path.join(REPO, "h5policy", "tools", "h5mutate")
@@ -1679,7 +1699,12 @@ def cmd_variants(args):
     the seed carries and skips the rest, so one call covers all of them."""
     cdir = case_dir(args.case)
     case = load_case(cdir)
-    seed = args.seed or case.get("fuzz_seed") or os.path.join(cdir, "input.h5")
+    # fuzz_seed is stored portably (see save below), so a value read back here
+    # may be repo-relative or a bare basename; rehydrate it to an absolute path
+    # before h5mutate sees it, and fall back to the bundle's own input.h5 when
+    # it cannot be located (a portable basename from another machine).
+    seed = args.seed or _rehydrate_seed(case.get("fuzz_seed"), cdir) \
+        or os.path.join(cdir, "input.h5")
     vdir = os.path.join(cdir, "variants")
     p = subprocess.run([H5MUTATE, "family", "--seed", seed,
                         "--out-dir", vdir, "--verify"],
@@ -1700,8 +1725,12 @@ def cmd_variants(args):
                 variants.append({"recipe": sc["recipe"],
                                  "intended_invariant": sc["intended_invariant"],
                                  "intended_finding": sc["intended_finding"]})
-    case["variants"] = {"seed": seed, "engine": "h5mutate", "generated": variants}
-    case["fuzz_seed"] = seed
+    # Emit the seed portably, the same way every other path this tool records
+    # is emitted -- the live `seed` above stays absolute for the subprocess, but
+    # a case bundle must not carry one workstation's directory layout.
+    case["variants"] = {"seed": portable_path(seed), "engine": "h5mutate",
+                        "generated": variants}
+    case["fuzz_seed"] = portable_path(seed)
     save_case(cdir, case)
     if not variants:
         print("variants: 0 applicable -- no mutation family recognises this "
