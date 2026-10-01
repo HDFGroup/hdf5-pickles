@@ -371,7 +371,11 @@ def cmd_matrix(args):
             per_family = fixture_policy.get("family_policies", {}).get(record, {})
             effective_policy = {**fixture_policy, **per_family}
             effective_policy.pop("family_policies", None)
-            exercise = CANARY_BY_RECORD.get(record)
+            # An expectation may name its exercise outright.  CANARY_BY_RECORD maps
+            # one exercise per record, and some surfaces -- region dereference is
+            # the first -- are reached by an exercise that is not any record's
+            # default canary.
+            exercise = effective_policy.get("exercise") or CANARY_BY_RECORD.get(record)
             if not exercise:
                 rows.append({"expectation": os.path.basename(path), "fixture": expected["file"], "record": record,
                              "status": "coverage_gap", "h5cve_policy": effective_policy})
@@ -1285,6 +1289,36 @@ CANARY_BY_RECORD = {
 }
 
 
+# Entry points each named exercise must have completed before its canary may
+# report `verified`.  The keys are also the exercises `verify --exercise` and an
+# expectation's `h5cve.exercise` may select, in addition to "generic".
+CANARY_REQUIRED_ENTRY_POINTS = {
+    "external_link": ("H5Lvisit2", "H5Oopen"),
+    "external_file_list": ("H5Dread", "H5Dwrite"),
+    "virtual_dataset": ("H5Dread",),
+    "datatype": ("H5Tget_size", "H5Tget_class", "H5Tget_nmembers"),
+    "dataspace": ("H5Sget_simple_extent_npoints", "H5Dread"),
+    "dataset_layout": ("H5Dget_create_plist", "H5Dread"),
+    "btree": ("H5Lvisit2", "H5Oopen"),
+    "address_space": ("H5Fopen", "H5Fget_create_plist", "H5Pget_userblock",
+                      "H5Fget_eoa", "H5Fget_filesize", "H5Ovisit3"),
+    "free_space": ("H5Fopen", "H5Fget_filesize",
+                   "H5Fget_free_sections", "H5Ovisit3"),
+    "chunk_index": ("H5Ovisit3", "H5Dopen2", "H5Sselect_elements", "H5Dread"),
+    "dense_index": ("H5Lvisit2",),
+    "heap_structures": ("H5Ovisit3", "H5Aopen_by_idx", "H5Aread"),
+    "shared_messages_legacy": ("H5Ovisit3", "H5Aopen_by_idx", "H5Aget_type"),
+    "message_envelope": ("H5Ovisit3", "H5Oopen", "H5Gget_create_plist"),
+    "legacy_messages": ("H5Ovisit3", "H5Gget_info"),
+    "cache_image": ("H5Fget_mdc_image_info", "H5Fget_mdc_size",
+                    "H5Fget_filesize", "H5Ovisit3"),
+    # H5Ropen_region must have SUCCEEDED at least once: a file with no region
+    # reference, or one whose every dereference was refused, has not shown the
+    # path is safe, only that it was not completed.
+    "region_reference": ("H5Ovisit3", "H5Ropen_region"),
+}
+
+
 def _probe(inp, bindir, exercise="generic"):
     cmd = [H5PROBE, inp, "--json", "--forbid",
            "external_open,plugin_load,write,network,crash"]
@@ -1346,7 +1380,10 @@ def cmd_verify(args):
     inp = os.path.join(cdir, "input.h5")
 
     record = case.get("record")
-    exercise = CANARY_BY_RECORD.get(record)
+    # --exercise overrides the record's canary.  It is how a case with no
+    # catalogued finding -- an oracle accept -- still gets a family exercise:
+    # without it such a case always ran `generic` and reported coverage_gap.
+    exercise = args.exercise or CANARY_BY_RECORD.get(record)
     canary_status = "coverage_gap" if not exercise else None
     exercise = exercise or "generic"
     base, base_rc = _probe(inp, args.baseline, exercise)
@@ -1527,30 +1564,10 @@ def _canary_summary(rep, forced_status=None, exercise=None):
         eps = (rep.get("probe") or {}).get("entry_points", [])
         exercised = [e.get("name") for e in eps if e.get("calls", 0)]
         succeeded = {e.get("name") for e in eps if e.get("successes", 0)}
-        required = {"external_link": ("H5Lvisit2", "H5Oopen"),
-                    "external_file_list": ("H5Dread", "H5Dwrite"),
-                    "virtual_dataset": ("H5Dread",),
-                    "datatype": ("H5Tget_size", "H5Tget_class",
-                                  "H5Tget_nmembers"),
-                    "dataspace": ("H5Sget_simple_extent_npoints", "H5Dread"),
-                    "dataset_layout": ("H5Dget_create_plist", "H5Dread"),
-                    "btree": ("H5Lvisit2", "H5Oopen"),
-                    "address_space": ("H5Fopen", "H5Fget_create_plist", "H5Pget_userblock",
-                                      "H5Fget_eoa", "H5Fget_filesize", "H5Ovisit3"),
-                    "free_space": ("H5Fopen", "H5Fget_filesize",
-                                   "H5Fget_free_sections", "H5Ovisit3"),
-                    "chunk_index": ("H5Ovisit3", "H5Dopen2", "H5Sselect_elements", "H5Dread"),
-                    "dense_index": ("H5Lvisit2",),
-                    "heap_structures": ("H5Ovisit3", "H5Aopen_by_idx", "H5Aread"),
-                    "shared_messages_legacy": ("H5Ovisit3", "H5Aopen_by_idx", "H5Aget_type"),
-                    "message_envelope": ("H5Ovisit3", "H5Oopen",
-                                          "H5Gget_create_plist"),
-                    "legacy_messages": ("H5Ovisit3", "H5Gget_info"),
-                    "cache_image": ("H5Fget_mdc_image_info", "H5Fget_mdc_size",
-                                    "H5Fget_filesize", "H5Ovisit3")}.get(exercise, ())
+        required = CANARY_REQUIRED_ENTRY_POINTS.get(exercise, ())
         traversal_modes = {"btree", "chunk_index", "dense_index",
                            "heap_structures", "shared_messages_legacy", "cache_image",
-                           "message_envelope", "legacy_messages"}
+                           "message_envelope", "legacy_messages", "region_reference"}
         traversed = (rep.get("probe") or {}).get("materialization", {}).get(
             "traversal_calls", 0)
         family_completed = (rep.get("probe") or {}).get(
@@ -1827,6 +1844,10 @@ def main():
     p.add_argument("case")
     p.add_argument("--baseline", help="bindir of the baseline build")
     p.add_argument("--candidate", help="bindir of the candidate build")
+    p.add_argument("--exercise",
+                   choices=("generic", *sorted(CANARY_REQUIRED_ENTRY_POINTS)),
+                   help="probe exercise for the primary canary (default: the "
+                        "case record's mapped canary)")
     p.set_defaults(fn=cmd_verify)
 
     p = sub.add_parser("minimize", help="[deferred: roadmap change #5]")
