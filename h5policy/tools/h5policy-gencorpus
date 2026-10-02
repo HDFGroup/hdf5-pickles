@@ -1036,6 +1036,19 @@ def _gen_coverage(root):
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.unlink(sohm_tiny_src)
 
+    # A conformant enum whose base integer is wider than 32 bytes.  libhdf5
+    # sorts enum members through a fixed uint8_t tbuf[32] scratch buffer whose
+    # only bound is an assert compiled out of release builds, so this legal file
+    # overflows that stack buffer on any member value/name lookup or enum->enum
+    # read (src/H5Tfields.c H5T__sort_value/H5T__sort_name).  h5policy ACCEPTS
+    # it: the enum base/size consistency check (datatype.enum_encoding) passes,
+    # and no invariant bounds the base size against libhdf5's sort buffer.  The
+    # file is the testable witness for that documented coverage gap -- see the
+    # datatypes block of registry/validation-coverage.yml and the accept
+    # expectation.  h5py cannot build it (no native int conversion past 8 bytes),
+    # so it is assembled byte-for-byte and stays deterministic.
+    _make_enum_oversized_base(f"{root}/coverage/dtype_enum_oversized_base.h5")
+
 
 def _make_nul_compact_link_name(path):
     """A group whose compact link message stores a single-NUL name.
@@ -3586,6 +3599,68 @@ def _make_dtype_compound_recursion(path, levels=5000):
     root_addr = 48 + len(dataset_oh)                              # the superblock is 48 bytes
     eof = root_addr + len(root_group_oh)
     sb = (sb_head + struct.pack("<Q", 0) + b"\xff" * 8
+          + struct.pack("<Q", eof) + struct.pack("<Q", root_addr))
+    sb += struct.pack("<I", jenkins(sb))
+
+    _patch(path, sb + dataset_oh + root_group_oh)
+
+
+def _make_enum_oversized_base(path, base_size=40):
+    """A legal enumeration whose base integer storage size exceeds libhdf5's
+    32-byte enum-sort scratch buffer (``uint8_t tbuf[32]`` in H5T__sort_value /
+    H5T__sort_name, src/H5Tfields.c).  The only bound on the per-swap
+    ``H5MM_memcpy(tbuf, ..., size)`` is ``assert(size <= sizeof(tbuf))``, which
+    release (NDEBUG) builds compile out, so any member value/name lookup
+    (H5Tenum_valueof/H5Tenum_nameof), enum->enum dataset read, or h5dump of the
+    dataset overflows the stack.  The enum's declared size equals its base size,
+    so the existing datatype.enum_encoding consistency check passes and h5policy
+    ACCEPTS the file -- it is the witness for a documented coverage gap, not a
+    rejected fixture.
+
+    Assembled from scratch (byte-for-byte deterministic) because h5py cannot
+    build an enum whose base is wider than a native integer: its enum_insert
+    needs a value conversion path that does not exist past 8 bytes.  The envelope
+    (superblock + dataset object header + root-group object header) mirrors the
+    datatype-recursion fixtures; only the datatype message is an enum.  Two
+    members are emitted out of order by BOTH name and value ("ZETA"=all-0xFF
+    before "ALPHA"=all-0x00) so both bubble sorts swap and reach the memcpy.
+    """
+    # The 32-byte buffer is the whole point of the fixture; a base that does not
+    # exceed it would exercise nothing.  Full precision (size*8 bits, which must
+    # fit the 2-byte precision field) keeps datatype.unused_bits from masking the
+    # case the way a partial-precision base would.
+    assert base_size > 32, "regime: enum base must exceed sizeof(tbuf)==32"
+    assert base_size * 8 <= 0xFFFF, "regime: full precision must fit the u16 field"
+
+    jenkins = _jenkins_lookup3()
+
+    # Enum datatype message body: header (class 8, version 3, 2 members, element
+    # size = base_size) + base fixed-point type + unpadded NUL-terminated names +
+    # member values in base-type storage order.
+    enum_hdr = bytes([0x38]) + struct.pack("<H", 2) + bytes([0x00]) + struct.pack("<I", base_size)
+    # Signed fixed-point base (class 0, version 1): bitfield 0x08 = two's-complement
+    # sign, element size = base_size, bit offset 0, precision = base_size*8.
+    base_type = (bytes([0x10, 0x08, 0x00, 0x00]) + struct.pack("<I", base_size)
+                 + struct.pack("<H", 0) + struct.pack("<H", base_size * 8))
+    names = b"ZETA\x00" + b"ALPHA\x00"
+    values = b"\xff" * base_size + b"\x00" * base_size
+    dtype_data = enum_hdr + base_type + names + values
+
+    # Fixed envelope pieces, byte-identical to the datatype-recursion fixtures.
+    dataspace_msg = bytes.fromhex("0104000002000002")
+    ds_trailer = bytes.fromhex("0502000003060804000003000000")
+    root_group_oh = bytes.fromhex(
+        "4f484452020030021200000000ffffffffffffffffffffffffffffffff"
+        "0a020000000006100000010005706f6331363000000000000000d7543402")
+
+    dtype_msg = bytes([0x03]) + struct.pack("<H", len(dtype_data)) + b"\x00" + dtype_data
+    chunk0 = dataspace_msg + dtype_msg + ds_trailer
+    dataset_oh = b"OHDR" + bytes([2, 1]) + struct.pack("<H", len(chunk0)) + chunk0
+    dataset_oh += struct.pack("<I", jenkins(dataset_oh))
+
+    root_addr = 48 + len(dataset_oh)                              # the superblock is 48 bytes
+    eof = root_addr + len(root_group_oh)
+    sb = (bytes.fromhex("894844460d0a1a0a02080800") + struct.pack("<Q", 0) + b"\xff" * 8
           + struct.pack("<Q", eof) + struct.pack("<Q", root_addr))
     sb += struct.pack("<I", jenkins(sb))
 
