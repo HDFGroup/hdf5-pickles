@@ -46,7 +46,8 @@ fun h5policy_walk_frhp_fspace_sections = (
     uint<64> sect_addr, uint<64> used_size, uint<64> alloc_size,
     uint<64> hdr_addr, uint<64> serial_sect, uint<64> nclasses,
     uint<64> max_addr_bits, uint<64> max_sect_size,
-    uint<64> managed_space, uint<64> file_size, string object) H5WalkContext:
+    uint<64> managed_space, uint<64> table_width, uint<64> heap_off_size,
+    uint<64> max_root_rows, uint<64> file_size, string object) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
     if (!h5policy_mark_visited_btree(sect_addr))
@@ -145,16 +146,61 @@ fun h5policy_walk_frhp_fspace_sections = (
                             return ctx;
                         }
                     var heap_off = h5policy_msg_u64_at(ios, profile, cur#B, off_size);
-                    cur = cur + off_size;
-                    /* Each record is [sect_addr:off_size][sect_type:1]; the
-                       type byte is part of H5FS's serialized format even
-                       though H5HF's section classes carry no further payload. */
-                    cur = cur + 1UL;
+                    /* Each record is [heap_offset:off_size][sect_type:1][class
+                       payload].  Only SINGLE (type 0, no payload) and FIRST_ROW
+                       (type 1) are ever serialized; NORMAL_ROW/INDIRECT are
+                       ghost.  A FIRST_ROW record proxies an indirect section and
+                       carries [iblock_off:heap_off_size][start_row:2]
+                       [start_col:2][nentries:2], which libhdf5 uses to index
+                       man_dtable.row_block_size[] (max_root_rows entries)
+                       unchecked -- see H5HF__sect_indirect_deserialize /
+                       H5HF__dtable_span_size. */
+                    var sect_type = h5policy_msg_u64_at(ios, profile,
+                                                        (cur + off_size)#B, 1UL);
+                    cur = cur + off_size + 1UL;
                     if (heap_off > managed_space
                         || sect_size > managed_space - heap_off)
                         h5policy_emit_error("H5_CORRUPT_FSM_SECTION_EXTENT", "corrupt",
                                             (cur - off_size - 1UL)#B, object,
                                             "fractal-heap free-space section extent escapes managed heap space");
+                    if (sect_type == 1UL)
+                        {
+                            var payload = heap_off_size + 6UL;
+                            if (cur > limit || payload > limit - cur)
+                                {
+                                    h5policy_emit_error("H5_CORRUPT_FSM_SECTION_OVERRUN", "corrupt",
+                                                        cur#B, object,
+                                                        "fractal-heap indirect free-space section payload overruns the section list");
+                                    return ctx;
+                                }
+                            var start_row = h5policy_msg_u64_at(
+                                ios, profile, (cur + heap_off_size)#B, 2UL);
+                            var start_col = h5policy_msg_u64_at(
+                                ios, profile, (cur + heap_off_size + 2UL)#B, 2UL);
+                            var nentries = h5policy_msg_u64_at(
+                                ios, profile, (cur + heap_off_size + 4UL)#B, 2UL);
+                            /* end_row = (start_row*width + start_col + nentries
+                               - 1) / width; nentries == 0 underflows end_entry.
+                               Both start_row and the covered end_row must address
+                               within the max_root_rows-entry table. */
+                            var bad = 0UB;
+                            if (nentries == 0UL || table_width == 0UL
+                                || start_row >= max_root_rows)
+                                bad = 1UB;
+                            else
+                                {
+                                    var end_entry = (start_row * table_width)
+                                                    + start_col + nentries - 1UL;
+                                    if (end_entry / table_width >= max_root_rows)
+                                        bad = 1UB;
+                                }
+                            if (bad != 0UB)
+                                h5policy_emit_error(
+                                    "H5_CORRUPT_FHEAP_INDIRECT_SECTION_ROW", "corrupt",
+                                    (cur + heap_off_size)#B, object,
+                                    "fractal-heap free-space indirect section row span addresses outside the doubling table");
+                            cur = cur + payload;
+                        }
                     seen = seen + 1UL;
                     j = j + 1UL;
                 }
@@ -167,8 +213,9 @@ fun h5policy_walk_frhp_fspace_sections = (
    the FSHD/FSSE envelopes and their metadata accounting. */
 fun h5policy_walk_frhp_fspace_manager = (
     int ios, H5PolicyProfile profile, H5WalkContext ctx,
-    uint<64> hdr_addr, uint<64> managed_space, off64 loc,
-    string object) H5WalkContext:
+    uint<64> hdr_addr, uint<64> managed_space,
+    uint<64> table_width, uint<64> heap_off_size, uint<64> max_root_rows,
+    off64 loc, string object) H5WalkContext:
 {
     var o = global_sizeof_offsets as uint<64>;
     var el = global_sizeof_lengths as uint<64>;
@@ -271,7 +318,8 @@ fun h5policy_walk_frhp_fspace_manager = (
         }
     return h5policy_walk_frhp_fspace_sections(
         ios, profile, ctx, sect_addr, used, alloc, hdr_addr, serial, nclasses,
-        max_addr_bits, max_sect_size, managed_space, file_size, object);
+        max_addr_bits, max_sect_size, managed_space,
+        table_width, heap_off_size, max_root_rows, file_size, object);
 }
 
 /* Extract FRHP's managed-space and free-manager fields only after independently
@@ -305,7 +353,36 @@ fun h5policy_walk_frhp_fspace_from_header = (
         return ctx;
     var managed_space = h5policy_msg_u64_at(
         ios, profile, heap_addr#B + (14UL + 2UL*el + 2UL*o)#B, el);
+
+    /* Doubling-table geometry.  A FIRST_ROW free-space section (H5HF section
+       class 1) is the only serialized section whose on-disk record carries a
+       payload -- [iblock_off][start_row][start_col][nentries] -- and libhdf5
+       indexes man_dtable.row_block_size[], an array of max_root_rows entries,
+       with start_row (and the covered row span) WITHOUT any bound; the only
+       guards there are NDEBUG-compiled-out asserts.  Compute max_root_rows and
+       heap_off_size here, where the FRHP header is already in hand, and carry
+       them to the section walk.
+         first_row_bits = floor_log2(start_block_size) + floor_log2(width)
+         max_root_rows  = (max_heap_size_bits - first_row_bits) + 1
+       matching H5HF__dtable_init (src/H5HFdtable.c).  */
+    var dtable = 14UL + (10UL * el) + (2UL * o);
+    var table_width = h5policy_msg_u64_at(ios, profile,
+                                          heap_addr#B + dtable#B, 2UL);
+    var start_size = h5policy_msg_u64_at(ios, profile,
+                                         heap_addr#B + (dtable + 2UL)#B, el);
+    var max_heap_bits = h5policy_msg_u64_at(ios, profile,
+                                            heap_addr#B + (dtable + 2UL + (2UL * el))#B, 2UL);
+    var heap_off_size = h5policy_fspace_bytes_for_bits(max_heap_bits);
+    var max_root_rows = 0UL;
+    if (table_width != 0UL && start_size != 0UL)
+        {
+            /* start_block_size and width are always powers of two, so
+               log2_pow2 is the exact floor(log2). */
+            var first_row_bits = log2_pow2(start_size) + log2_pow2(table_width);
+            if (max_heap_bits >= first_row_bits)
+                max_root_rows = (max_heap_bits - first_row_bits) + 1UL;
+        }
     return h5policy_walk_frhp_fspace_manager(
         ios, profile, ctx, hdf5_addr_to_file_u64(bytes_to_u64_le(fsm_raw)),
-        managed_space, loc, object);
+        managed_space, table_width, heap_off_size, max_root_rows, loc, object);
 }

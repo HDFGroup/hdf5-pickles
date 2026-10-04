@@ -1,0 +1,136 @@
+# Fractal-heap FIRST_ROW free-space section indexes row_block_size[] unchecked.
+#
+# A serialized free-space section of H5HF class 1 (FIRST_ROW) carries an indirect
+# payload whose start_row/start_col/nentries libhdf5 decodes from the file and
+# uses to index man_dtable.row_block_size[] (max_root_rows entries) with no
+# bound. This is the payload-bearing counterpart to the SINGLE-section cases in
+# this family: SINGLE (class 0) carries no payload, so every prior FSM fixture
+# left the FIRST_ROW decode path -- and this invariant -- untested.
+schema_version: 1
+
+id: fheap-indirect-section-row
+title: fractal-heap indirect free-space section start_row indexes the doubling table unchecked
+status: oracle-hardened          # h5policy rejects; libhdf5 containment still planned
+disclosure: "Supplementary measured evidence for an existing upstream private
+  repository advisory (opened 2026-09-27; identifier omitted per repository
+  policy). Original reporter: Guo Zihao, Xiaopeng Inc. Advisory text not
+  retrieved beyond the local saved page; version range below is what this host
+  measured. Attach to the existing advisory -- do not open a duplicate."
+
+record: validation_controls
+root_cause_classification: aggregate_object
+violated_invariant: control.fheap_indirect_section_row
+entry_points:
+  - h5policy (oracle) -- untrusted-strict and forensic, now reject
+  - "libhdf5 H5Fopen(RDWR) + H5Ldelete (any op freeing a managed heap object)
+     -> H5FS_sect_add -> H5FS__sinfo_lock -> H5AC_protect
+     -> H5FS__cache_sinfo_deserialize -> H5HF__sect_row_deserialize
+     -> H5HF__sect_indirect_deserialize -> H5HF__sect_indirect_new
+     -> H5HF__dtable_span_size"
+  - "shipped tools: h5debug <fsse-addr> <fshd-addr> <frhp-addr> via
+     H5FS_sects_debug. NOT reached by a read-only H5Fopen + object walk
+     (h5dump -H completes), and NOT reached by H5Fget_free_sections, which
+     queries the FILE-level manager, not the FRHP's internal client-0 manager."
+
+# ── The defect, read out of the source tree (HDF5 2.3.0 @0761c9ee2bc) ─────────
+defect: >-
+  H5HF__sect_indirect_deserialize (src/H5HFsection.c) decodes start_row,
+  start_col and nentries from a FIRST_ROW section's serial payload with
+  UINT16DECODE and no validation, then calls H5HF__sect_indirect_new
+  (H5HFsection.c:2116), which calls H5HF__dtable_span_size. That routine indexes
+  dtable->row_block_size[start_row] (single-row branch at src/H5HFdtable.c:312;
+  multi-row branch at :297/:303/:308). The array is allocated with
+  max_root_rows entries at H5HFdtable.c:99. Nothing between the decode and the
+  index checks start_row (or the covered row span) against max_root_rows; the
+  only guards, H5HF__sect_indirect_valid (H5HFsection.c ~:3814-3901), are
+  asserts and are compiled out under NDEBUG. nentries == 0 additionally
+  underflows end_entry = (start_entry + nentries) - 1, yielding a huge end_row.
+  The bound is relational -- the array is sized from the FRHP header's
+  doubling-table geometry while the index comes from an FSSE section record -- so
+  it is an aggregate-object invariant: neither record alone establishes it.
+
+boundary_note: >-
+  max_root_rows = (max_heap_size_bits - first_row_bits) + 1, with
+  first_row_bits = log2(start_block_size) + log2(table_width), matching
+  H5HF__dtable_init. Valid rows are 0 .. max_root_rows-1, so start_row ==
+  max_root_rows is the minimal one-past-the-end read. The oracle enforces the
+  full span: it flags nentries == 0, start_row >= max_root_rows, or end_row =
+  (start_row*width + start_col + nentries - 1)/width >= max_root_rows.
+
+# ── Measured behaviour ────────────────────────────────────────────────────────
+measured:
+  oracle_before: >-
+    accepted the crafted file under untrusted-strict and forensic with zero
+    findings -- the FRHP free-space walker read each section record as
+    [heap_offset][type] and assumed a zero-byte payload for every section class,
+    so it never parsed the FIRST_ROW payload nor bounded start_row.
+  oracle_after: >-
+    rejects with H5_CORRUPT_FHEAP_INDIRECT_SECTION_ROW, while still accepting the
+    valid base (h5policy/tests/valid/sohm_list.h5) with zero findings. Proven
+    non-vacuous by reverting the emit alone: with it disabled the fixture is
+    accepted; restored, it is rejected, so no earlier check masks it.
+  libhdf5_stock: >-
+    stock h5debug on the serialized section list SIGSEGVs on the wild variant
+    (start_row = 0xffff). An out-of-bounds READ at a small over-index does not
+    always fault without instrumentation (heap-layout dependent).
+  libhdf5_asan: >-
+    on an ASan build compiled WITH -DNDEBUG (shipped-configuration asserts off),
+    the tracked fixture (start_row == max_root_rows) reports heap-buffer-overflow
+    READ of size 8 in H5HF__dtable_span_size at src/H5HFdtable.c:312, 8 bytes
+    past the row_block_size[] allocation; the wild variant faults as a SEGV at
+    the same site. H5Fopen(RDWR)+H5Ldelete reaches and faults at the same line.
+  width: >-
+    confirmed on both ABIs -- x86-64 and a -m32 i386 NDEBUG build both SIGSEGV on
+    the tracked fixture via h5debug. The index is row_block_size + start_row
+    pointer arithmetic, width-independent in the one-past-the-end case.
+
+# ── Containment vs systemic remediation (strategy doc §11.5) ──────────────────
+containment:
+  status: planned
+  description: >-
+    In H5HF__sect_indirect_deserialize (or H5HF__sect_indirect_new), reject
+    start_row >= hdr->man_dtable.max_root_rows and the covered end_row likewise,
+    and reject nentries == 0, on a non-assert HGOTO_ERROR path before
+    H5HF__dtable_span_size runs. Promote the H5HF__sect_indirect_valid asserts to
+    real errors. Backportable; no effect on well-formed files.
+  status_note: not yet landed upstream as of the measured revision.
+systemic:
+  semantic_boundary: >-
+    the fractal-heap free-space manager aggregate -- FRHP doubling-table geometry
+    plus the whole FSSE section list validated as one object before any section
+    is turned into native state.
+  status: planned
+  owner: n/a
+
+# ── Reproducers ───────────────────────────────────────────────────────────────
+reproducers:
+  direct_fixture: h5policy/tests/malformed/bad_frhp_indirect_section_row.h5
+  direct_fixture_sha256: d135b12c635ae21603911484e7d53949c3c9ef1941bf84e9cf253fc827ffbef4
+  generator: "h5policy-gencorpus _make_bad_frhp_indirect_section_row (rewrites the
+    one SINGLE section of valid/sohm_list.h5 as a FIRST_ROW section with start_row
+    = max_root_rows, relocates the FSSE to EOF, repairs the FSHD and superblock
+    checksums; asserts the base section is SINGLE and the written start_row is out
+    of range)"
+  expectation: h5policy/tests/expected/malformed-bad_frhp_indirect_section_row.yml
+
+sibling_audit: >-
+  FIRST_ROW is the only serialized fractal-heap section class with a nonzero
+  serial_size (H5HF_SECT_INDIRECT_SERIAL_SIZE = heap_off_size + 6,
+  H5HFsection.c:37). SINGLE (class 0) carries no payload; NORMAL_ROW and INDIRECT
+  are ghost classes and are never serialized. The nentries == 0 underflow and the
+  source-stated section-bookkeeping writes are consequences of the same unbounded
+  span (the oracle covers nentries == 0; the writes are source-derived, not
+  independently witnessed here -- the read at H5HFdtable.c:312 is reached first).
+
+coverage_manifest_change: >-
+  validation-coverage.yml validation_controls gains
+  control.fheap_indirect_section_row; findings/catalog/validation_controls.yml
+  gains H5_CORRUPT_FHEAP_INDIRECT_SECTION_ROW (scope aggregate_object, non-shared,
+  so no route rule).
+
+provenance:
+  found_by: "upstream private repository advisory specimen; worked end to end 2026-10-04"
+  hdf5_build: "HDF5 2.3.0 @0761c9ee2bc (develop head, newest available); baseline
+    Release -DNDEBUG asserts off, candidate RelWithDebInfo -fsanitize=address
+    -DNDEBUG asserts off, plus an i386 -m32 -DNDEBUG build for the width check.
+    All workstation-local installs; paths not recorded."
