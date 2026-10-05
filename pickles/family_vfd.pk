@@ -47,11 +47,34 @@
  *   already chose, so the caller always knows where it landed.
  *
  * Load order:
- *   (poke) .load pickles/family_vfd.pk
- *   (poke) .load pickles/common.pk
- *   (poke) .load pickles/superblock.pk   <- and whatever else you need to
- *                                            explore the assembled file
- *                                            (ohdr_msgs.pk, stab.pk, ...)
+ *   (poke) .load pickles/common.pk       <- must be loaded first; declares
+ *                                            open_fresh() (see assemble_family
+ *                                            below), matching every other
+ *                                            pickle in this codebase's
+ *                                            convention of depending on
+ *                                            common.pk without loading it
+ *                                            themselves
+ *   (poke) .load pickles/superblock.pk   <- also a real prerequisite now,
+ *                                            not just for exploring the
+ *                                            assembled file afterward:
+ *                                            assemble_family() maps member
+ *                                            0's own superblock to find its
+ *                                            driver info (see
+ *                                            family_member_size_from_driver_info()
+ *                                            below). Not loaded by this
+ *                                            file itself, matching
+ *                                            common.pk's convention -- see
+ *                                            that file's own comment for
+ *                                            why (no mutable state of its
+ *                                            own, but it's only ever
+ *                                            loaded directly by the two
+ *                                            genuine top-level entry
+ *                                            points, construct.pk and
+ *                                            hdf5_poke_emacs.pk)
+ *   (poke) .load pickles/family_vfd.pk   <- loads ohdr_msgs.pk itself
+ *                                            (a real, VFD-specific
+ *                                            dependency, matching
+ *                                            multi_vfd.pk's own precedent)
  *
  * Quick start:
  *   pattern is exactly the filename the file was created/opened with (e.g.
@@ -73,6 +96,10 @@
  *   From there the assembled file decodes like any ordinary HDF5 file --
  *   load ohdr_msgs.pk / stab.pk / etc. and navigate it exactly as usual.
  */
+
+load "ohdr_msgs.pk";   /* msg_payload_offset_in_ohdr()/oh_msg_drvinfo/DRVINFO_ID/
+                         * SHARED_MSG_UNRESOLVED, for family_member_size_from_driver_info()
+                         * below (v2/v3's object-header-embedded driver info) */
 
 fun family_member_name = (string pattern, int i) string:
 {
@@ -117,21 +144,79 @@ fun family_member_name = (string pattern, int i) string:
     return prefix + num + suffix;
 }
 
-/* poke-version-agnostic replacement for
- * IOS_F_CREATE|IOS_F_TRUNCATE (which requires poke >= 5.0). Probes
- * whether PATH already exists; if so raises E_inval rather than
- * silently mixing stale bytes with new content. */
-fun open_fresh = (string path) int<32>:
+/* Determines the family's real memb_size from member 0's own driver
+ * info, when present, rather than trusting member 0's physical size
+ * blindly. This matters: H5FD__family_sb_encode's own comment in
+ * H5FDfamily.c says outright that the physical size of a reopened
+ * member 0 "isn't safe to use" as the real member_size -- it's only
+ * there as a fallback for files saved without driver info (pre-1.8ish).
+ * On decode, real HDF5 goes further and actively rejects a mismatch
+ * between the recorded size and what's expected.
+ *
+ * Driver info's location depends on member 0's own superblock version:
+ *   v0/v1 -- a direct superblock field (drv_info_addr_raw).
+ *   v2/v3 -- moved into the Superblock Extension, embedded as an
+ *            object-header message (0x0014) -- the same mechanism
+ *            multi_discover() already uses for multi's own driver info.
+ *
+ * Member 0 may itself have a user block preceding its superblock (an
+ * ordinary HDF5 feature, independent of which VFD is in use) -- its size
+ * isn't recorded anywhere, so locate_superblock() (superblock.pk) scans
+ * for the real signature first, same as multi_patch_eof() already does
+ * for multi's member files. Without this, a user-blocked member 0 would
+ * fail the signature check at offset 0, be silently caught below, and
+ * fall back to physical-size inference -- exactly the fragile behavior
+ * this function exists to replace.
+ *
+ * Returns the recorded member_size, or 0UL if no usable driver info was
+ * found (caller should fall back to physical-size inference, matching
+ * pre-driver-info files and real HDF5's own fallback behavior). Never
+ * raises -- any failure decoding member 0 just means "no driver info
+ * available", not "this file is invalid" (that's assemble_family's own
+ * job to decide, from the physical bytes it actually has). */
+fun family_member_size_from_driver_info = (string member0_path) uint<64>:
 {
+    var result = 0UL;
     try {
-        var probe = open(path, IOS_F_READ);
-        close(probe);
-        raise E_inval;
+        var f = open(member0_path, IOS_F_READ);
+        set_ios(f);
+        try {
+            reset_global_hdf5_base_addr();
+            var sig_addr = locate_superblock(f);
+            var sb = superblock @ sig_addr#B;
+
+            if (sb.super_vers < 2UB) {
+                var addr_raw = sb.super.v0_v1.drv_info_addr_raw;
+                if (hdf5_bytes_fit_u64(addr_raw) && !is_undef_bytes(addr_raw)) {
+                    var dib = file_drv_info @ bytes_to_off(addr_raw);
+                    if (file_drv_type(dib.drv_id) == 2)
+                        result = dib.drv_info.fami.member_size;
+                }
+            } else {
+                var ext_raw = sb.super.v2_v3.ext_addr_raw;
+                if (hdf5_bytes_fit_u64(ext_raw) && !is_undef_bytes(ext_raw)) {
+                    var payload_off = SHARED_MSG_UNRESOLVED;
+                    try {
+                        payload_off = msg_payload_offset_in_ohdr(bytes_to_off(ext_raw),
+                                                                  DRVINFO_ID as uint<8>, 0UH, 0);
+                    } catch (Exception e) {
+                        payload_off = SHARED_MSG_UNRESOLVED;
+                    }
+                    if (payload_off != SHARED_MSG_UNRESOLVED) {
+                        var dvi = oh_msg_drvinfo @ payload_off;
+                        if (file_drv_type(dvi.drv_id) == 2)
+                            result = dvi.drv_info.fami.member_size;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            result = 0UL;
+        }
+        close(f);
     } catch (Exception e) {
-        if (e.code == E_inval.code)
-            raise e;
+        result = 0UL;
     }
-    return open(path, IOS_F_CREATE | IOS_F_WRITE | IOS_F_READ);
+    return result;
 }
 
 fun assemble_family = (string pattern, string output_path) uint<64>:
@@ -143,10 +228,37 @@ fun assemble_family = (string pattern, string output_path) uint<64>:
     var total = 0UL;
     var prev_short = 0;   /* was member i-1 shorter than memb_size? */
 
+    /* Determine the stride before processing any member: prefer the
+     * authoritative driver-info-recorded size over member 0's physical
+     * size (see family_member_size_from_driver_info() above). Doing this
+     * up front -- rather than specially trusting whatever member 0
+     * happens to be, the way this used to work -- means member 0 gets
+     * validated against the stride exactly like every other member
+     * below, closing the gap where a short/corrupt member 0 itself was
+     * never caught (the short-interior check only ever compared later
+     * members against a stride member 0 had itself defined). */
+    var member0_name = family_member_name(pattern, 0);
+    var driver_memb_size = 0UL;
+    try {
+        driver_memb_size = family_member_size_from_driver_info(member0_name);
+    } catch (Exception e) {
+        driver_memb_size = 0UL;
+    }
+
     while (!done) {
         var member_name = family_member_name(pattern, i);
+        /* Only the "does this member exist" probe is allowed to mean
+         * "no more members, stop normally" -- validation failures below
+         * (short interior member, oversized member) must never be
+         * caught here, or they'd be silently treated as ordinary loop
+         * termination instead of propagating as real errors. */
+        var mf = -1;
         try {
-            var mf = open(member_name, IOS_F_READ);
+            mf = open(member_name, IOS_F_READ);
+        } catch (Exception e) {
+            done = 1;
+        }
+        if (!done) {
             /* Reaching here proves member i-1 (if any) was not the last
              * member. A short i-1 is then an interior short member --
              * real HDF5 never produces this (only the last physical
@@ -161,8 +273,8 @@ fun assemble_family = (string pattern, string output_path) uint<64>:
 
             var msize = iosize(mf) /#B;
             if (i == 0)
-                memb_size = msize;
-            else if (msize > memb_size) {
+                memb_size = (driver_memb_size > 0UL) ? driver_memb_size : msize;
+            if (msize > memb_size) {
                 close(mf);
                 close(out);
                 raise E_inval;   /* larger than the discovered stride */
@@ -174,8 +286,6 @@ fun assemble_family = (string pattern, string output_path) uint<64>:
             total = (i as uint<64>) * memb_size + msize;
             prev_short = (msize < memb_size);
             i = i + 1;
-        } catch (Exception e) {
-            done = 1;
         }
     }
     close(out);

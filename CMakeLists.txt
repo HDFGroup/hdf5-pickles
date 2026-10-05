@@ -364,6 +364,11 @@ if(POKE_EXECUTABLE)
                 family_vfd_regress_oversized-00000.h5
                 family_vfd_regress_oversized-00001.h5
                 family_vfd_regress_oversized_out.h5
+                family_vfd_regress_v0drv-member0.h5
+                family_vfd_regress_v2drv-member0.h5
+                family_vfd_regress_shortdrv-00000.h5
+                family_vfd_regress_shortdrv-00001.h5
+                family_vfd_regress_shortdrv_out.h5
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     )
     set_tests_properties(pickle_family_vfd_regression_cleanup PROPERTIES
@@ -392,8 +397,10 @@ if(POKE_EXECUTABLE)
                 multi_vfd_regress-o.h5
                 multi_vfd_regress_unpatched.h5
                 multi_vfd_regress_out.h5
+                multi_vfd_regress_ohdr_highest_out.h5
                 multi_vfd_regress_synth-o.h5
                 multi_vfd_regress_synth-o2.h5
+                multi_vfd_regress_hostile_mapping-o.h5
                 multi_vfd_regress_userblock.h5
                 multi_vfd_regress_threshold-s.h5
                 multi_vfd_regress_threshold-o.h5

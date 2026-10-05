@@ -7,15 +7,18 @@
  * CMakeLists.txt, not the source tree.
  *
  * Only load each pickle once across the whole load graph: re-loading a
- * file poke already loaded transitively (e.g. this file separately
- * loading common.pk after multi_vfd.pk already did) reliably segfaults
- * poke 5.0 -- confirmed by bisection down to a bare `load "common.pk";
- * load "common.pk";` crashing on its own. multi_vfd.pk already loads
- * common.pk (which itself loads h5_format_constants.pk and lookup3.pk)
- * and lookup3.pk; only superblock.pk (which brings in stab.pk) needs
- * loading here. */
-load "multi_vfd.pk";
+ * file poke already loaded transitively reliably segfaults poke 5.0 --
+ * confirmed by bisection down to a bare `load "common.pk"; load
+ * "common.pk";` crashing on its own. common.pk must come first (it
+ * declares open_fresh()/H5_FORMAT_FILE_SIGNATURE/etc. multi_vfd.pk uses,
+ * and global_sizeof_offsets superblock.pk's own constraint sets) --
+ * neither multi_vfd.pk nor superblock.pk load it themselves, matching
+ * every other pickle in this codebase's convention of depending on
+ * common.pk without loading it. superblock.pk must precede multi_vfd.pk:
+ * multi_patch_eof() calls its locate_superblock(). */
+load "common.pk";
 load "superblock.pk";
+load "multi_vfd.pk";
 
 var failures = 0;
 fun expect_multi = (string name, int cond) void:
@@ -201,6 +204,41 @@ fun read_eof_addr = (string path, uint<64> base_offset = 0UL) uint<64>:
  * across all six members even though it's the deferred one. */
 expect_multi("patched_eof_addr_is_true_cross_member_max",
              read_eof_addr("multi_vfd_regress_out.h5") == 0x9007UL);
+
+/* --- assemble_multi(): highest-addressed eager member regression ---
+ *
+ * The test above always has the (deferred, never-copied) draw member at
+ * the highest address, so iosize(out) genuinely falls short of true_eof
+ * there regardless of any staleness in iosize() itself. Reordering so an
+ * EAGERLY-copied member (ohdr here) is the highest one instead exercises
+ * the real bug: on a just-written, not-yet-reopened IOS, iosize() can
+ * report a stale, short size (confirmed on both poke 4.3 and 5.0 --
+ * writing bytes 100..103 reports iosize==103 until closed and reopened),
+ * which used to make the old iosize(out)<true_eof check fire even though
+ * ohdr's bytes were already fully written all the way to true_eof --
+ * stomping its real last byte with 0. */
+fun byte_at = (string path, uint<64> off) byte:
+{
+    var f = open(path);
+    set_ios(f);
+    var b = byte @ off#B;
+    close(f);
+    return b;
+}
+
+var members_ohdr_highest = [
+  multi_member { path = "multi_vfd_regress-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress-b.h5", start_addr = 0x1000UL },
+  multi_member { path = "multi_vfd_regress-r.h5", start_addr = 0x3000UL },   /* draw, deferred, no longer highest */
+  multi_member { path = "multi_vfd_regress-g.h5", start_addr = 0x4000UL },
+  multi_member { path = "multi_vfd_regress-l.h5", start_addr = 0x5000UL },
+  multi_member { path = "multi_vfd_regress-o.h5", start_addr = 0x9000UL }];  /* ohdr, now the highest, eagerly copied */
+
+var copied_ohdr_highest = assemble_multi(members_ohdr_highest, "multi_vfd_regress_ohdr_highest_out.h5");
+expect_multi("assemble_multi_preserves_last_byte_of_highest_eager_member",
+             byte_at("multi_vfd_regress_ohdr_highest_out.h5", 0x9005UL) == 0x11UB);
+expect_multi("assemble_multi_highest_eager_member_true_eof",
+             read_eof_addr("multi_vfd_regress_ohdr_highest_out.h5") == 0x9006UL);
 
 /* --- multi_patch_eof(): user-block offset regression ---
  *
@@ -451,6 +489,25 @@ try {
 }
 expect_multi("discover_rejects_candidate_without_driver_info_message",
               rejected_wrong_candidate);
+
+/* A hostile/corrupt mapping byte (9, not a valid H5F_mem_t selector) in a
+ * real driver-info message is rejected cleanly by multi_discover(),
+ * rather than crashing deep inside array indexing -- this is the
+ * realistic untrusted-file attack surface for the lower-level regression
+ * already covered directly in unit_drv_info.pk. */
+make_ohdr_member("multi_vfd_regress_hostile_mapping-o.h5",
+                  [9UB, 0UB, 0UB, 0UB, 0UB, 0UB],
+                  ["%s-a.h5"],
+                  [0x1000UL],
+                  [0x1100UL]);
+
+var rejected_hostile_mapping = 0;
+try {
+    var ignored6 = multi_discover("multi_vfd_regress_hostile_mapping-o.h5", "testbase");
+} catch (Exception e) {
+    rejected_hostile_mapping = (e.code == E_inval.code);
+}
+expect_multi("discover_rejects_hostile_mapping_byte", rejected_hostile_mapping);
 
 if (failures != 0) {
     printf("UNIT MULTI_VFD: %i32d failure(s)\n", failures);

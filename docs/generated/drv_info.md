@@ -48,17 +48,14 @@ Driver Information Block referenced by version 0 and 1 superblocks when driver-s
 
 Pickle union arm: `multi`.
 
-Payload for the multi-file driver (`NCSAmult`). The mapping assigns HDF5 metadata and raw-data usage classes to member files, followed by address ranges and padded member file names.
+Payload for the multi-file driver (`NCSAmult`). The type decodes only the fixed 8-byte header (mapping and reserved bytes). The member address ranges and padded member file names that follow are read by `multi_decode_drv_members()`, and only once the driver is confirmed to be `NCSAmult`.
 
 **Fields: Multi**
 
 | Field | Pickle identifier | Description |
 |-------|-------------------|-------------|
-| Member Mapping | `member_mapping` | Six-byte mapping from usage class to member file index: superblock, B-tree, raw data, global heap, local heap, and object header. Values 1 through 6 select member files. |
+| Member Mapping | `member_mapping` | Six-byte mapping from usage class to member file index: superblock, B-tree, raw data, global heap, local heap, and object header. 0 = this category uses its own member; 1-6 = shares that category's member. |
 | Reserved | `reserved` | Reserved two-byte field. Must be zero. |
-| N Members | `n_members` | Derived count of distinct non-zero member file indices in `member_mapping`. |
-| Member Addrs | `member_addrs` | Array of `multi_drv_member_addr` records, one for each distinct mapped member file. |
-| Member Names Raw | `member_names_raw` | Raw member file name bytes. Names are NUL-terminated and each encoded name is padded to an 8-byte boundary. |
 
 ### Fami
 
@@ -97,3 +94,17 @@ Address range descriptor for one member file in the multi-file virtual file driv
 |-------|-------------------|-------------|
 | Start Address | `start_addr` | Virtual start address covered by this member file. |
 | Eoa Address | `eoa_addr` | End-of-allocation address for this member file. |
+
+
+## Multi Driver Member Arrays
+
+Pickle type: `multi_drv_members`.
+
+Variable-length tail of the multi-file driver payload, returned by `multi_decode_drv_members()`. Sized by the number of distinct members in `member_mapping`.
+
+**Fields: Multi Driver Member Arrays**
+
+| Field | Pickle identifier | Description |
+|-------|-------------------|-------------|
+| Member Addrs | `member_addrs` | Array of `multi_drv_member_addr` records, one for each distinct member file. |
+| Member Names Raw | `member_names_raw` | Raw member file name bytes. Names are NUL-terminated and each encoded name is padded to an 8-byte boundary. |

@@ -16,8 +16,6 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-load "common.pk";
-load "lookup3.pk";
 load "ohdr_msgs.pk";
 
 /*
@@ -99,10 +97,25 @@ load "ohdr_msgs.pk";
  *   etc. multi-aware automatically.
  *
  * Load order:
- *   (poke) .load pickles/multi_vfd.pk
- *   (poke) .load pickles/superblock.pk   <- and whatever else you need to
- *                                            explore the assembled file
- *                                            (ohdr_msgs.pk, stab.pk, ...)
+ *   (poke) .load pickles/common.pk       <- must be loaded first; declares
+ *                                            open_fresh(), H5_FORMAT_FILE_
+ *                                            SIGNATURE, lookup3_hashlittle(),
+ *                                            hdf5_u32_le_bytes() this file
+ *                                            uses, matching every other
+ *                                            pickle in this codebase's
+ *                                            convention of depending on
+ *                                            common.pk without loading it
+ *                                            themselves
+ *   (poke) .load pickles/superblock.pk   <- must precede multi_vfd.pk:
+ *                                            multi_patch_eof() calls its
+ *                                            locate_superblock(). Not
+ *                                            loaded by this file itself,
+ *                                            matching common.pk's
+ *                                            convention
+ *   (poke) .load pickles/multi_vfd.pk    <- loads ohdr_msgs.pk itself;
+ *                                            load anything else you need
+ *                                            to explore the assembled file
+ *                                            afterward
  *
  * Quick start:
  *   Category order below matches H5F_mem_t (H5Fpublic.h) minus 1, i.e. the
@@ -293,41 +306,13 @@ fun multi_u64_le_bytes_n = (uint<64> v, int n) byte[]:
  * checksum) at offset 0 of `output_path` to declare true_eof. Field
  * offsets are computed from the superblock's own sizeof_offsets byte, not
  * hardcoded -- see the v2/v3 layout comment in superblock.pk. */
-/* Real HDF5 files may have a user block (arbitrary reserved space, size
- * 0 or a power of two >= 512) preceding the superblock -- its size isn't
- * recorded anywhere a reader can just look up, so the signature must be
- * searched for: offset 0, then 512, 1024, 2048, ... doubling, matching
- * H5FD_locate_signature() in H5FDint.c. Raises E_inval if no match is
- * found within the file. (h5policy's h5_validate.pk has the same
- * algorithm as h5policy_locate_superblock(), but it's h5policy-specific
- * -- global state, audit-trail side effects -- so this is a separate,
- * side-effect-free copy rather than a cross-package dependency.) */
-fun multi_locate_superblock = (int<32> ios) uint<64>:
-{
-    var fsize = iosize(ios) /#B;
-    var candidate = 0UL;
-    var tried_512 = 0;
-    while (1) {
-        if (candidate + 8UL <= fsize
-            && (byte[8] @ ios : candidate#B) == H5_FORMAT_FILE_SIGNATURE)
-            return candidate;
-        if (!tried_512) {
-            candidate = 512UL;
-            tried_512 = 1;
-        } else if (candidate * 2UL + 8UL <= fsize) {
-            candidate = candidate * 2UL;
-        } else {
-            raise E_inval;   /* signature not found within the file */
-        }
-    }
-}
 
 fun multi_patch_eof = (string output_path, uint<64> true_eof) void:
 {
     var ios = open(output_path);
     set_ios(ios);
 
-    var sig_addr = multi_locate_superblock(ios);
+    var sig_addr = locate_superblock(ios);
 
     var super_vers = byte @ (sig_addr + 8UL)#B;
     if (super_vers < 2UB) {
@@ -377,23 +362,6 @@ fun multi_patch_eof = (string output_path, uint<64> true_eof) void:
  * superblock eof_addr/checksum to the true virtual EOF across all six
  * members. Returns the number of bytes actually copied (excludes the
  * deferred raw-data member). */
-/* poke-version-agnostic replacement for
- * IOS_F_CREATE|IOS_F_TRUNCATE (which requires poke >= 5.0). Probes
- * whether PATH already exists; if so raises E_inval rather than
- * silently mixing stale bytes with new content. */
-fun open_fresh = (string path) int<32>:
-{
-    try {
-        var probe = open(path, IOS_F_READ);
-        close(probe);
-        raise E_inval;
-    } catch (Exception e) {
-        if (e.code == E_inval.code)
-            raise e;
-    }
-    return open(path, IOS_F_CREATE | IOS_F_WRITE | IOS_F_READ);
-}
-
 fun assemble_multi = (multi_member[6] members, string output_path) uint<64>:
 {
     /* Check every member's start_addr, and the true cross-member EOF,
@@ -420,17 +388,29 @@ fun assemble_multi = (multi_member[6] members, string output_path) uint<64>:
 
     var out = open_fresh(output_path);
     var total = 0UL;
+    var highest_written = 0UL;
     i = 0;
     while (i < 6) {
-        if (i != MULTI_DRAW_INDEX)
-            total = total + multi_copy_member(out, members[i]);
+        if (i != MULTI_DRAW_INDEX) {
+            var sz = multi_copy_member(out, members[i]);
+            total = total + sz;
+            var end = members[i].start_addr + sz;
+            if (end > highest_written)
+                highest_written = end;
+        }
         i = i + 1;
     }
 
-    /* Extend the sparse file to the full declared EOF even when the
-     * deferred raw-data category is the highest-addressed member, so the
-     * real backing extent never falls short of what eof_addr declares. */
-    if (iosize(out) /#B < true_eof)
+    /* Extend the sparse file to the full declared EOF when the highest
+     * byte actually written falls short of it (true when the deferred
+     * raw-data category is the highest-addressed member) -- tracked from
+     * the copy loop's own return values, not iosize(out): iosize() on a
+     * just-written, not-yet-reopened IOS can report a stale, short size
+     * (confirmed on both poke 4.3 and 5.0: writing bytes 100..103 reports
+     * iosize==103 until the IOS is closed and reopened), which would
+     * otherwise make this check fire even when the highest member's bytes
+     * are already fully in place -- stomping its real last byte with 0. */
+    if (highest_written < true_eof)
         byte @ out : (true_eof - 1UL)#B = 0UB;
     close(out);
 
@@ -547,9 +527,21 @@ fun multi_discover = (string ohdr_candidate_path, string base_name) multi_member
     }
 
     var mapping = dvi.drv_info.multi.member_mapping;
+    /* count_unique()/multi_category_indices() can no longer raise on a
+     * hostile byte (see multi_resolve_category()'s own comment) -- now
+     * that we know dtype == 1 really is multi data, explicitly validate
+     * it here instead. */
+    try {
+        multi_validate_mapping(mapping);
+    } catch (Exception e) {
+        close(of);
+        raise e;
+    }
     var n_unique = count_unique(mapping) as int;
-    var addrs = dvi.drv_info.multi.member_addrs;
-    var templates = multi_split_names(dvi.drv_info.multi.member_names_raw, n_unique);
+    var members = multi_decode_drv_members(dvi.drv_info'offset + 8#B, mapping,
+                                            dvi.drv_info_size as uint<64>);
+    var addrs = members.member_addrs;
+    var templates = multi_split_names(members.member_names_raw, n_unique);
     var cat_idx = multi_category_indices(mapping);
 
     var result = multi_member[6]();

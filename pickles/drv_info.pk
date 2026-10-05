@@ -102,12 +102,50 @@ fun file_drv_type = (char[8] id) int:
  * merged into: 0 (H5FD_MEM_DEFAULT) on disk means "identity" -- this
  * category owns its own member -- not "unmapped"/"skip". Any other
  * value names which other category's member this one shares. */
+/* Never raises: poke evaluates every arm of a union's fields regardless
+ * of which arm the discriminant actually selects (confirmed directly --
+ * see the regression note on multi_validate_mapping() below), so this
+ * runs even while decoding a *non*-multi driver info block (e.g. family's
+ * NCSAfami), where `mapping` isn't really a mapping at all -- just
+ * whichever bytes happen to sit there. An out-of-range byte is treated
+ * the same as 0 (identity/self): always a safe, in-bounds category, so
+ * multi_category_indices()'s array indexing can never go out of bounds,
+ * without this function ever needing to raise. Real validation of
+ * genuine multi-driver data lives in multi_validate_mapping() instead,
+ * called explicitly once the caller already knows it's looking at multi
+ * data -- see its own comment for why that split exists. */
 fun multi_resolve_category = (byte[6] mapping, int cat) int:
 {
     var raw = mapping[cat] as int;
-    if (raw == 0)
+    if (raw == 0 || raw > 6)
         return cat + 1;
     return raw;
+}
+
+/* Explicit validation for genuine multi-driver mapping bytes: raises
+ * E_inval naming the offending category/byte if any is outside 0..6.
+ * Deliberately separate from multi_resolve_category() above -- that one
+ * can't raise, because poke evaluates oh_msg_drvinfo's/file_drv_info's
+ * `multi` arm unconditionally, even while decoding family or unknown
+ * driver info (confirmed directly: a union's non-selected arms still
+ * have their fields evaluated, not skipped based on the discriminant).
+ * Before this split, decoding any real family driver info block with a
+ * member_size whose low byte exceeded 6 made the *family* decode fail
+ * with a *multi*-flavored error, despite never involving multi data at
+ * all. Call this explicitly once the caller has confirmed dtype == 1
+ * (see multi_discover()) -- not from inside the shared type itself. */
+fun multi_validate_mapping = (byte[6] mapping) void:
+{
+    var cat = 0;
+    while (cat < 6) {
+        var raw = mapping[cat] as int;
+        if (raw != 0 && raw > 6) {
+            printf("multi_validate_mapping: category %v's mapping byte %v is not a valid H5F_mem_t selector (must be 0 or 1-6)\n",
+                   cat, raw);
+            raise E_inval;
+        }
+        cat = cat + 1;
+    }
 }
 
 /* For each of the 6 categories (0=SUPER..5=OHDR), the 0-based index into
@@ -171,6 +209,89 @@ type multi_drv_member_addr = struct {
     uint<64> eoa_addr;
 };
 
+type multi_drv_members = struct {
+    multi_drv_member_addr[] member_addrs;
+    byte[] member_names_raw;
+};
+
+/* Reads the multi driver's variable-length member_addrs/member_names_raw,
+ * starting at data_off (right after the fixed 8-byte mapping+reserved
+ * header). Only call this once dtype == 1 is already confirmed and
+ * `mapping` has passed multi_validate_mapping() -- these fields are
+ * deliberately NOT part of oh_msg_drvinfo's/file_drv_info's own multi
+ * arm (which holds only the fixed-size member_mapping/reserved).
+ *
+ * Why: poke evaluates every arm of a union's fields regardless of which
+ * one the discriminant actually selects (see multi_resolve_category()'s
+ * own comment) -- so if member_addrs/member_names_raw stayed in the type
+ * itself, sized by n_members = count_unique(member_mapping), merely
+ * mapping oh_msg_drvinfo/file_drv_info over a *non*-multi driver info
+ * block (family's NCSAfami, or an unknown driver) would still try to
+ * read member_addrs[n_members] from garbage bytes reinterpreted as a
+ * mapping -- which, if n_members ever came out larger than what's
+ * actually present (easily happens with garbage input), reads straight
+ * off the end of the real data. Moving these fields out of the type
+ * entirely, into this explicitly-called function, means that read only
+ * ever happens when a caller deliberately asks for it, already knowing
+ * it's looking at real multi data. */
+fun multi_decode_drv_members = (off64 data_off, byte[6] mapping, uint<64> drv_info_size)
+    multi_drv_members:
+{
+    var n_members = count_unique(mapping) as int;
+    var addrs = multi_drv_member_addr[n_members] @ data_off;
+    var names_raw = byte[multi_drv_names_size(drv_info_size as uint<32>, n_members as uint<64>)]
+                    @ (data_off + ((n_members as uint<64>) * 16UL)#B);
+    return multi_drv_members { member_addrs = addrs, member_names_raw = names_raw };
+}
+
+/* Shared per-arm print bodies for the drv_info union, used by both
+ * file_drv_info._print (v0/v1, direct superblock field) and
+ * oh_msg_drvinfo._print (v2/v3, object-header message 0x0014) -- the union
+ * they decode is identical; only each type's own fixed header fields
+ * (version/reserved layout, drv_info_size width) differ, so those are
+ * printed by the caller.
+ *
+ * Deliberately three small functions, not one shared function taking all
+ * three arms' values -- confirmed directly that a *non-selected* arm's
+ * field is NOT safely re-accessible after construction (unlike the
+ * construction-time evaluation multi_resolve_category()'s own comment
+ * describes): accessing e.g. drv_info.multi.member_mapping when `fami`
+ * was the arm actually selected raises "invalid element". Each caller
+ * must keep its own dtype-gated if/else and only call the one function
+ * for the arm it just confirmed is selected -- same as the original,
+ * working code did. */
+fun drv_info_print_multi = (byte[6] member_mapping, off64 members_off,
+                             uint<64> drv_info_size) void:
+{
+    printf("  multi_drv_info {\n");
+    printf("    member_mapping [1=super 2=btree 3=raw 4=gheap 5=lheap 6=ohdr]:\n");
+    printf("      super=%v  btree=%v  raw=%v  gheap=%v  lheap=%v  ohdr=%v\n",
+           member_mapping[0], member_mapping[1], member_mapping[2],
+           member_mapping[3], member_mapping[4], member_mapping[5]);
+    var n_members = count_unique(member_mapping);
+    printf("    [derived] n_unique_members=%u64d\n", n_members);
+    var members = multi_decode_drv_members(members_off, member_mapping, drv_info_size);
+    var i = 0UL;
+    while (i < n_members) {
+        printf("    member[%u64d]: start=%u64d  eoa=%u64d\n",
+               i, members.member_addrs[i].start_addr, members.member_addrs[i].eoa_addr);
+        i = i + 1UL;
+    }
+    printf("    member_names_raw=%v\n", members.member_names_raw);
+    printf("    [string format] member_names=%v\n", char_array_to_string(members.member_names_raw));
+    printf("  }\n");
+}
+
+fun drv_info_print_fami = (uint<64> member_size) void:
+{
+    printf("  fami_drv_info {\n    member_size=%u64d\n  }\n", member_size);
+}
+
+fun drv_info_print_raw = (byte[] data) void:
+{
+    printf("  raw_drv_info {\n    data=%v\n  }\n", data);
+}
+
 /* ----------------------------------------------------------------------- *
  * Driver Information Block  (Section II.B)
  *
@@ -190,9 +311,8 @@ type file_drv_info = struct {
         struct {
             byte[6] member_mapping;
             byte[2] reserved       == [0UB, 0UB];
-            var n_members = count_unique(member_mapping);
-            multi_drv_member_addr[n_members] member_addrs;
-            byte[multi_drv_names_size(drv_info_size, n_members)] member_names_raw;
+            /* member_addrs/member_names_raw deliberately NOT here -- see
+             * multi_decode_drv_members()'s own comment for why. */
         } multi : (dtype == 1);
 
         struct {
@@ -204,6 +324,23 @@ type file_drv_info = struct {
         } raw;
     } drv_info;
 
+    /* On an unknown/third-party driver (dtype == 0, selecting `raw`
+     * above), the multi/fami arms above still get speculatively
+     * evaluated against whatever bytes are actually there (poke
+     * evaluates every arm of a union regardless of the discriminant --
+     * see multi_resolve_category()'s own comment). If drv_info_size is
+     * small enough that those 8-byte reads would run past the real
+     * data, this is safe, not a crash risk: confirmed directly (3
+     * isolated tests) that a *non-selected* arm's read running past the
+     * available bytes is silently tolerated -- only a failure in the
+     * arm the discriminant actually selects propagates, and even that
+     * surfaces as a clean "constraint violation", not a raw/uncontrolled
+     * exception. The one way this type's own decode can genuinely fail
+     * on an unknown driver is a corrupt drv_info_size claiming more
+     * bytes than the file has for `raw.data` itself -- same clean
+     * failure mode as any other corrupt declared size elsewhere in this
+     * codebase. */
+
     method _print = void:
     {
         printf("file_drv_info {\n");
@@ -214,32 +351,12 @@ type file_drv_info = struct {
         printf("\"\n");
         printf("  file_drv_type=%i32d (0=unknown 1=NCSAmult 2=NCSAfami)\n", dtype);
         if (dtype == 1) {
-            printf("  multi_drv_info {\n");
-            printf("    member_mapping [1=super 2=btree 3=raw 4=gheap 5=lheap 6=ohdr]:\n");
-            printf("      super=%v  btree=%v  raw=%v  gheap=%v  lheap=%v  ohdr=%v\n",
-                   drv_info.multi.member_mapping[0], drv_info.multi.member_mapping[1],
-                   drv_info.multi.member_mapping[2], drv_info.multi.member_mapping[3],
-                   drv_info.multi.member_mapping[4], drv_info.multi.member_mapping[5]);
-            var n_members = count_unique(drv_info.multi.member_mapping);
-            printf("    [derived] n_unique_members=%u64d\n", n_members);
-            var i = 0UL;
-            while (i < n_members) {
-                printf("    member[%u64d]: start=%u64d  eoa=%u64d\n",
-                       i, drv_info.multi.member_addrs[i].start_addr,
-                       drv_info.multi.member_addrs[i].eoa_addr);
-                i = i + 1UL;
-            }
-            printf("    member_names_raw=%v\n", drv_info.multi.member_names_raw);
-            printf("    [string format] member_names=%v\n", char_array_to_string(drv_info.multi.member_names_raw));
-            printf("  }\n");
+            drv_info_print_multi(drv_info.multi.member_mapping,
+                                  drv_info'offset + 8#B, drv_info_size as uint<64>);
         } else if (dtype == 2) {
-            printf("  fami_drv_info {\n");
-            printf("    member_size=%u64d\n", drv_info.fami.member_size);
-            printf("  }\n");
+            drv_info_print_fami(drv_info.fami.member_size);
         } else {
-            printf("  raw_drv_info {\n");
-            printf("    data=%v\n", drv_info.raw.data);
-            printf("  }\n");
+            drv_info_print_raw(drv_info.raw.data);
         }
         printf("}\n");
     }
