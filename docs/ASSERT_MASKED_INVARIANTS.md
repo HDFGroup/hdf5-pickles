@@ -1009,9 +1009,16 @@ the specific overflow either.
 (`H5A__dense_copy_fh_cb → H5O__attr_decode`) — confirmed by direct
 code-reading to have the identical version-check-first structure
 (`H5Oattr.c:147-149`), and very likely the same position-dependent
-mechanism, but not independently fixture-tested; SOHM, not checked at
-all; whether an even larger claimed length can be pushed past a genuinely
-unmapped page rather than just past one ASan-tracked redzone.
+mechanism, but not independently fixture-tested; SOHM, now code-read (not fixture-tested) — the same mechanism applies, and in fact lacks the
+version-check-first gate the link path has: a heap-stored shared message is
+read through `H5SM__read_mesg_fh_cb`, which unconditionally `H5MM_malloc`s
+and `H5MM_memcpy`s the claimed tiny-object length out of the 8-byte heap ID
+(`H5SM.c:2293`, `:2297`), with no clamp in `H5HF__tiny_op_real`
+(`H5HFtiny.c:247`) and no version check before it, so a corrupted
+heap-header `id_len` (`H5HFcache.c:214`) reaches the overread more directly
+than the dense-link path does; whether an even larger claimed length can be
+pushed past a genuinely unmapped page rather than just past one ASan-tracked
+redzone.
 
 ## Status: remaining areas (not started)
 
