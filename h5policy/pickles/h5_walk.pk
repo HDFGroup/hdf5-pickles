@@ -255,6 +255,121 @@ fun h5policy_reset_reached = void:
     h5policy_reached_truncated = 0;
 }
 
+/* Object class of every object header the walk validated, decided the way
+   libhdf5 decides it (H5O__obj_class_real tests H5O_obj_class_g in reverse):
+   GROUP if a symbol-table or link-info message is present, else DATASET if a
+   datatype and a dataspace are, else NAMED DATATYPE if a datatype is.  The
+   codes are H5O_type_t's own, so evidence reads the same as libhdf5's.
+
+   Only positive evidence is recorded as group or named datatype; a header that
+   fits none of the three is H5POLICY_OHDR_CLASS_UNKNOWN, and nothing is judged
+   against it.  Recording follows h5policy_mark_reached: append-only, no
+   membership test, no tick, capped, so it can never move a verdict.  */
+var H5POLICY_OHDR_CLASS_GROUP = 0UL;
+var H5POLICY_OHDR_CLASS_DATASET = 1UL;
+var H5POLICY_OHDR_CLASS_NAMED_DATATYPE = 2UL;
+var H5POLICY_OHDR_CLASS_UNKNOWN = 3UL;
+var h5policy_ohdr_class_addrs = uint<64>[]();
+var h5policy_ohdr_classes = uint<64>[]();
+
+/* Region references found in ATTRIBUTE values, waiting for the walk to finish
+   so their targets can be judged: the target is usually visited after the
+   attribute that names it, or never.  Parallel arrays, capped: references past
+   H5POLICY_MAX_REGION_REFS are not judged, and h5policy_region_ref_truncated
+   records that they were dropped.  */
+var h5policy_region_ref_targets = uint<64>[]();
+var h5policy_region_ref_locs = uint<64>[]();
+var h5policy_region_ref_widths = uint<64>[]();
+var h5policy_region_ref_objects = string[]();
+var h5policy_region_ref_truncated = 0;
+var H5POLICY_MAX_REGION_REFS = 4096UL;
+
+fun h5policy_record_ohdr_class = (H5WalkContext ctx, uint<64> addr) void:
+{
+    if (h5policy_ohdr_class_addrs'length as uint<64> >= H5POLICY_MAX_REACHED)
+        return;
+    var cls = H5POLICY_OHDR_CLASS_UNKNOWN;
+    if (ctx.has_symbol_table != 0UB || ctx.has_link_info != 0UB)
+        cls = H5POLICY_OHDR_CLASS_GROUP;
+    else if (ctx.has_datatype != 0UB && ctx.has_dataspace != 0UB)
+        cls = H5POLICY_OHDR_CLASS_DATASET;
+    else if (ctx.has_datatype != 0UB)
+        cls = H5POLICY_OHDR_CLASS_NAMED_DATATYPE;
+    h5policy_ohdr_class_addrs += [addr];
+    h5policy_ohdr_classes += [cls];
+}
+
+fun h5policy_note_region_ref_target = (uint<64> target, off64 loc,
+                                       uint<64> width, string object) void:
+{
+    if (h5policy_region_ref_targets'length as uint<64> >= H5POLICY_MAX_REGION_REFS)
+        {
+            h5policy_region_ref_truncated = 1;
+            return;
+        }
+    h5policy_region_ref_targets += [target];
+    h5policy_region_ref_locs += [(loc/#B) as uint<64>];
+    h5policy_region_ref_widths += [width];
+    h5policy_region_ref_objects += [object];
+}
+
+/* Judge every attribute region reference against the class of the header it
+   names.  H5Ropen_region opens that object and hands it to the DATASET
+   dataspace callback without checking its type (src/H5R.c,
+   H5R__open_region_api_common), so a group or committed-datatype target is
+   read as an H5D_t: measured SIGSEGV on 2.3.0 at both widths.  libhdf5 writes
+   such references itself -- H5Rcreate_region accepts any object -- so this is a
+   WARNING about a hazardous but writer-producible file, not a corruption.
+
+   The message states only the fact.  Whether H5Ropen_region is reached depends
+   on the encoding: a LEGACY reference is converted at read time against the
+   target's dataspace message, so a real group or datatype is refused there
+   (measured) and only a header forged to carry one gets through; a REVISED
+   reference is not, and reaches the crash.
+
+   A target the walk never validated (unlinked, or skipped) is not judged: its
+   class is unknown here, and guessing it would be a fabricated finding.
+
+   Report time, outside the walk: a linear lookup per reference, bounded by the
+   two caps above, and deliberately not ticked -- see h5policy_mark_reached.  */
+fun h5policy_judge_region_ref_targets = void:
+{
+    for (var r = 0UL; r < h5policy_region_ref_targets'length as uint<64>; r = r + 1UL)
+        {
+            var cls = H5POLICY_OHDR_CLASS_UNKNOWN;
+            for (var i = 0UL; i < h5policy_ohdr_class_addrs'length as uint<64>; i = i + 1UL)
+                if (h5policy_ohdr_class_addrs[i] == h5policy_region_ref_targets[r])
+                    {
+                        cls = h5policy_ohdr_classes[i];
+                        break;
+                    }
+            if (cls != H5POLICY_OHDR_CLASS_GROUP
+                && cls != H5POLICY_OHDR_CLASS_NAMED_DATATYPE)
+                continue;
+            var loc = h5policy_region_ref_locs[r]#B;
+            var ev = H5Evidence {
+                field = "attribute.region_reference_target",
+                actual = cls,
+                expected = H5POLICY_OHDR_CLASS_DATASET,
+                comparison = "equal",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = loc, loc1_len = h5policy_region_ref_widths[r],
+            };
+            if (cls == H5POLICY_OHDR_CLASS_GROUP)
+                h5policy_emit_warning_ev(
+                    "H5_ADVISORY_REGION_REFERENCE_TARGET_NOT_DATASET",
+                    loc, h5policy_region_ref_objects[r],
+                    "attribute region reference names a group, not a dataset",
+                    ev);
+            else
+                h5policy_emit_warning_ev(
+                    "H5_ADVISORY_REGION_REFERENCE_TARGET_NOT_DATASET",
+                    loc, h5policy_region_ref_objects[r],
+                    "attribute region reference names a committed datatype, not a dataset",
+                    ev);
+        }
+}
+
 /* Object headers are walked breadth-first.  Link messages enqueue child object
    headers here; h5policy_walk_reachable_metadata drains the queue while
    enforcing max link depth and continue-after-rejection policy.  */
@@ -428,6 +543,16 @@ fun h5policy_reset_traversal_state = void:
        missed detection the other direction costs. */
     h5policy_lheap_prfx_addrs = uint<64>[]();
     h5policy_lheap_seg_addrs = uint<64>[]();
+    /* Per walk, like the visited sets: a class or a pending reference left
+       from an earlier file would judge this file's references against the
+       wrong headers. */
+    h5policy_ohdr_class_addrs = uint<64>[]();
+    h5policy_ohdr_classes = uint<64>[]();
+    h5policy_region_ref_targets = uint<64>[]();
+    h5policy_region_ref_locs = uint<64>[]();
+    h5policy_region_ref_widths = uint<64>[]();
+    h5policy_region_ref_objects = string[]();
+    h5policy_region_ref_truncated = 0;
     h5policy_current_object_depth = 0UL;
     h5policy_current_object_msg_count = 0UL;
     h5policy_current_object_root_msg_count = 0UL;

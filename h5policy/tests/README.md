@@ -21,6 +21,11 @@ controlled outcome; a change that alters any decision is surfaced for review.
     allowed_statuses: [unexercised, verified]
   ```
 
+  `exercise:` names the probe exercise outright, overriding the family's mapped
+  canary.  Use it when the surface under test is reached by an exercise that is
+  no record's default -- `region_reference`, which calls `H5Ropen_region`, is
+  the case that introduced it.
+
   The contract is what `../../tools/h5cve matrix` consumes; a fixture without one
   is reported as a coverage gap rather than inheriting a pass. `allowed_statuses`
   states intent, not observation — a fixture permitted to report `violation`

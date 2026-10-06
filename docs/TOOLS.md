@@ -86,7 +86,7 @@ invariant through [`registry/findings/`](../registry/findings/).
 ```text
 h5cve init  <id> --poc FILE                 # bundle: PoC, sha256, case.yml, advisory draft
 h5cve triage <case>                         # oracle + census + registry mapping
-h5cve verify <case> --baseline BINDIR [--candidate BINDIR]   # exact-build probes
+h5cve verify <case> --baseline BINDIR [--candidate BINDIR] [--exercise NAME]  # exact-build probes
 h5cve variants <case> [--seed VALID]        # typed semantic variants via h5mutate
 h5cve minimize <case>                        # deferred: structure-aware reducer
 h5cve promote <case>                        # draft tests expectation + registry case
@@ -95,6 +95,12 @@ h5cve matrix [--baseline BINDIR] [--output F]  # exact-build canary matrix
 h5cve evidence [--matrix F]                 # measured libhdf5 verdict per family
 h5cve verification                          # §12 requirement status per family
 ```
+
+`verify` runs the primary canary the case's record maps to.  `--exercise`
+overrides it, which is how a case with no catalogued finding — an oracle
+accept — still reaches a family surface instead of the generic open.  The
+`region_reference` exercise is the one that needs this: it is no record's
+default canary, and it is the only exercise that calls `H5Ropen_region`.
 
 `triage` names the violated invariant from the primary finding. Ambiguous
 finding codes are emitted by more than one walker, so the mapping is resolved

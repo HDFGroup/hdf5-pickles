@@ -21,7 +21,7 @@
  * every object, opens datasets, reads a bounded sample of raw data (exercising
  * filters, decompression, external/VDS storage), and reads attributes.  Named
  * exercise modes additionally drive entry points that a generic object walk
- * does not reach (external-link traversal and EFL writes).
+ * does not reach (external-link traversal, EFL writes, region dereference).
  *
  * It reports a single JSON object on stdout describing what libhdf5 did and the
  * exact build identity.  It does NOT judge correctness: the h5policy oracle owns
@@ -78,6 +78,7 @@ enum entry_point_id {
     EP_H5AREAD,
     EP_H5AGET_TYPE,
     EP_H5RGET_REGION,
+    EP_H5ROPEN_REGION,
     EP_H5FGET_INFO2,
     EP_H5GGET_INFO,
     EP_H5FGET_CREATE_PLIST,
@@ -130,6 +131,7 @@ struct probe_stats {
     int exercise_dataset_layout;
     int exercise_address_space;
     int exercise_free_space;
+    int exercise_region_reference;
     struct entry_point_stat entry_points[EP_COUNT];
 };
 
@@ -141,7 +143,7 @@ static void init_stats(struct probe_stats *st)
         "H5Tget_nmembers", "H5Tget_member_type", "H5Tget_super",
         "H5Sget_simple_extent_npoints", "H5Dget_create_plist",
         "H5Sselect_elements", "H5Aopen_by_idx", "H5Aread", "H5Aget_type",
-        "H5Rget_region",
+        "H5Rget_region", "H5Ropen_region",
         "H5Fget_info2", "H5Gget_info", "H5Fget_create_plist", "H5Pget_userblock",
         "H5Fget_eoa", "H5Fget_filesize", "H5Fget_mdc_image_info",
         "H5Fget_mdc_size", "H5Gget_create_plist", "H5Fget_free_sections"
@@ -417,6 +419,69 @@ static void probe_attr_regions(hid_t obj, hid_t at, hssize_t np, size_t ts,
     }
 }
 
+/* region_reference: open the REGION of every region reference an object holds.
+ *
+ * H5Ropen_region is the one public call that opens the object a reference
+ * names AND then treats it as a dataset; nothing else in this probe reaches it,
+ * so before this mode a file whose only defect is behind that call came back
+ * `accepted` from every exercise.  Measured: a region reference whose target is
+ * a group or a committed datatype -- which H5Rcreate_region writes without
+ * complaint -- crashes H5Ropen_region on 2.3.0 at both widths, while the
+ * generic walk and H5Rget_region both complete.
+ *
+ * Both encodings are read through the REVISED memory type, H5T_STD_REF.  That
+ * conversion is itself part of the surface: a legacy (H5T_STD_REF_DSETREG)
+ * reference is decoded against its target at read time, so a refusal there is
+ * recorded as a refused read, not skipped.  Object references are read too but
+ * never opened -- they name no region.
+ *
+ * Bounded like every other read here: an object holding more than
+ * PROBE_MAX_ELEMENTS references is skipped rather than truncated, because a
+ * partial read leaves the tail of an H5R_ref_t buffer unconverted and there is
+ * no safe way to release it. */
+static void probe_region_refs(hid_t obj, int is_attr, struct probe_stats *st)
+{
+    hid_t ftype = is_attr ? H5Aget_type(obj) : H5Dget_type(obj);
+    hid_t space = is_attr ? H5Aget_space(obj) : H5Dget_space(obj);
+    H5R_ref_t *refs = NULL;
+    if (ftype < 0 || space < 0) { st->call_errors++; goto done; }
+    if (H5Tget_class(ftype) != H5T_REFERENCE ||
+        (H5Tequal(ftype, H5T_STD_REF) <= 0 && H5Tequal(ftype, H5T_STD_REF_DSETREG) <= 0))
+        goto done;
+
+    hssize_t n = H5Sget_simple_extent_npoints(space);
+    if (n <= 0 || n > PROBE_MAX_ELEMENTS)
+        goto done;
+    refs = (H5R_ref_t *)calloc((size_t)n, sizeof *refs);
+    if (!refs) goto done;
+
+    herr_t io = is_attr ? H5Aread(obj, H5T_STD_REF, refs)
+                        : H5Dread(obj, H5T_STD_REF, H5S_ALL, H5S_ALL, H5P_DEFAULT, refs);
+    entry_point_result(st, is_attr ? EP_H5AREAD : EP_H5DREAD, io >= 0);
+    if (io < 0) {
+        st->call_errors++;
+        goto done;          /* nothing was converted, so nothing is released */
+    }
+    for (hssize_t i = 0; i < n; i++) {
+        if (H5Rget_type(&refs[i]) == H5R_DATASET_REGION2) {
+            hid_t sp = H5Ropen_region(&refs[i], H5P_DEFAULT, H5P_DEFAULT);
+            entry_point_result(st, EP_H5ROPEN_REGION, sp >= 0);
+            if (sp < 0)
+                st->call_errors++;
+            else {
+                st->family_completed++;
+                H5Sclose(sp);
+            }
+        }
+        H5Rdestroy(&refs[i]);
+    }
+
+done:
+    free(refs);
+    if (space >= 0) H5Sclose(space);
+    if (ftype >= 0) H5Tclose(ftype);
+}
+
 static void probe_attributes(hid_t obj, struct probe_stats *st)
 {
     H5O_info2_t oi;
@@ -451,6 +516,8 @@ static void probe_attributes(hid_t obj, struct probe_stats *st)
                 free(buf);
             }
         }
+        if (st->exercise_region_reference)
+            probe_region_refs(a, 1, st);
         if (at >= 0) H5Tclose(at);
         if (as >= 0) H5Sclose(as);
         H5Aclose(a);
@@ -500,6 +567,8 @@ static herr_t visit_cb(hid_t root, const char *name, const H5O_info2_t *info,
         if (obj < 0) { st->call_errors++; return 0; }
         st->datasets++;
         probe_attributes(obj, st);
+        if (st->exercise_region_reference)
+            probe_region_refs(obj, 0, st);
         exercise_dataset_io(obj, st);
         H5Dclose(obj);
         return 0;
@@ -623,7 +692,8 @@ int main(int argc, char **argv)
                       strcmp(exercise, "shared_messages_legacy") == 0 ||
                       strcmp(exercise, "cache_image") == 0 ||
                       strcmp(exercise, "message_envelope") == 0 ||
-                      strcmp(exercise, "legacy_messages") == 0;
+                      strcmp(exercise, "legacy_messages") == 0 ||
+                      strcmp(exercise, "region_reference") == 0;
     int generic = strcmp(exercise, "generic") == 0;
     if (!external_link && !efl && !vds && !datatype && !btree && !family_mode &&
         strcmp(exercise, "dense_index") != 0 && !generic) {
@@ -657,6 +727,7 @@ int main(int argc, char **argv)
     st.exercise_dataset_layout = strcmp(exercise, "dataset_layout") == 0;
     st.exercise_address_space = strcmp(exercise, "address_space") == 0;
     st.exercise_free_space = strcmp(exercise, "free_space") == 0;
+    st.exercise_region_reference = strcmp(exercise, "region_reference") == 0;
     if (!generic) st.family_attempts = 1;
     const char *decision;
     int rc;
@@ -811,7 +882,8 @@ int main(int argc, char **argv)
                        !st.exercise_shared_messages && !st.exercise_cache_image &&
                        !st.exercise_message_envelope && !st.exercise_legacy_messages && !st.exercise_datatype &&
                        !st.exercise_dataspace && !st.exercise_dataset_layout &&
-                       !st.exercise_address_space && !st.exercise_free_space)
+                       !st.exercise_address_space && !st.exercise_free_space &&
+                       !st.exercise_region_reference)
                        st.family_completed++; }
         }
         H5Fclose(f);
