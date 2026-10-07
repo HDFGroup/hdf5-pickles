@@ -1815,6 +1815,9 @@ def _gen_malformed(root):
     _make_bad_frhp_fsm_section_extent(
         f"{root}/malformed/bad_frhp_fsm_section_extent.h5",
         f"{root}/valid/sohm_list.h5")
+    _make_bad_frhp_indirect_section_row(
+        f"{root}/malformed/bad_frhp_indirect_section_row.h5",
+        f"{root}/valid/sohm_list.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
     _make_contiguous_data_past_eof(
@@ -5183,6 +5186,97 @@ def _make_bad_frhp_fsm_section_extent(path, base_path):
         fsm["managed"].to_bytes(fsm["off_size"], "little")
     struct.pack_into("<I", raw, fsm["sect_checksum"],
                      _jenkins_lookup3()(bytes(raw[fsm["sect_addr"]:fsm["sect_checksum"]])))
+    _patch(path, bytes(raw))
+
+
+def _make_bad_frhp_indirect_section_row(path, base_path):
+    """Rewrite the one serialized fractal-heap free section as a FIRST_ROW
+    (class 1) indirect section whose start_row addresses past the doubling
+    table's row_block_size[] array.
+
+    libhdf5 decodes a FIRST_ROW section's indirect payload -- [iblock_off]
+    [start_row][start_col][nentries] -- and uses start_row (and the covered row
+    span) to index man_dtable.row_block_size[], an array of max_root_rows
+    entries, with no bound; the structural checks are NDEBUG-compiled-out
+    asserts (H5HF__sect_indirect_deserialize -> H5HF__sect_indirect_new ->
+    H5HF__dtable_span_size, src/H5HFdtable.c).  The base has exactly one SINGLE
+    section (class 0, zero payload); it is rewritten as a FIRST_ROW section with
+    start_row = max_root_rows (the first out-of-range row), start_col 0,
+    nentries 1 -- the minimal one-past-the-end read.  The section grows by the
+    payload width, so the FSSE is relocated to EOF, the owning client-0 FSHD's
+    section-list address/size fields and checksum are rewritten, and the
+    superblock EOF and checksum are repaired.  The extent fields are left
+    unchanged so the row-span violation is the only fault.
+
+    Regime asserts (an untested regime, not an untested value): the base's one
+    section must be SINGLE so the fixture genuinely introduces the payload-bearing
+    class, and the written start_row must actually exceed max_root_rows so the
+    guard is non-vacuous.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    L, O = raw[10], raw[9]
+    if (L, O) != (8, 8):
+        raise RuntimeError("base is not an 8-byte offset/length file")
+    fsm = _frhp_fsm_sinfo(raw)
+    sa, off_size = fsm["sect_addr"], fsm["off_size"]
+
+    # The FRHP's own client-0 FSHD: the one whose section-list field == sa.
+    hdr = -1
+    i = raw.find(b"FSHD")
+    while i >= 0:
+        if raw[i + 5] == 0 and int.from_bytes(
+                raw[i + 14 + 5 * L:i + 14 + 5 * L + O], "little") == sa:
+            hdr = i
+            break
+        i = raw.find(b"FSHD", i + 4)
+    if hdr < 0:
+        raise RuntimeError("fractal-heap client-0 FSHD not found")
+
+    # FRHP doubling-table geometry -> max_root_rows and heap_off_size.
+    frhp = raw.find(b"FRHP")
+    dtable = 14 + 10 * L + 2 * O
+    table_width = struct.unpack_from("<H", raw, frhp + dtable)[0]
+    start_size = int.from_bytes(raw[frhp + dtable + 2:frhp + dtable + 2 + L],
+                                "little")
+    max_heap_bits = struct.unpack_from("<H", raw, frhp + dtable + 2 + 2 * L)[0]
+    if table_width == 0 or start_size == 0:
+        raise RuntimeError("degenerate fractal-heap geometry in base")
+    first_row_bits = (start_size.bit_length() - 1) + (table_width.bit_length() - 1)
+    if first_row_bits > max_heap_bits:
+        raise RuntimeError("base doubling table has no managed rows")
+    max_root_rows = (max_heap_bits - first_row_bits) + 1
+    heap_off_size = (max_heap_bits + 7) // 8
+
+    prefix = 5 + O
+    cnt_len = fsm["first_section"] - (sa + prefix)          # node_count + sect_size widths
+    node_grp = bytes(raw[sa + prefix:sa + prefix + cnt_len])
+    sect_addr_field = bytes(raw[fsm["first_section"]:fsm["first_section"] + off_size])
+    type_byte = raw[fsm["first_section"] + off_size]
+    if type_byte != 0:
+        raise RuntimeError(
+            f"base section is class {type_byte}, expected SINGLE (0); "
+            "fixture would not introduce the FIRST_ROW payload regime")
+    backptr = bytes(raw[sa + 5:sa + 5 + O])                 # -> hdr
+
+    start_row = max_root_rows                               # first out-of-range row
+    if start_row < max_root_rows:
+        raise RuntimeError("start_row is not past the doubling table")
+    serial = (0).to_bytes(heap_off_size, "little") + struct.pack(
+        "<HHH", start_row, 0, 1)
+    body = (b"FSSE" + bytes([0]) + backptr + node_grp +
+            sect_addr_field + bytes([1]) + serial)
+    new_used = len(body) + 4
+    new_sa = len(raw)
+    raw += body + struct.pack("<I", _jenkins_lookup3()(body))
+
+    raw[hdr + 14 + 5 * L:hdr + 14 + 5 * L + O] = new_sa.to_bytes(O, "little")
+    raw[hdr + 14 + 5 * L + O:hdr + 14 + 6 * L + O] = new_used.to_bytes(L, "little")
+    raw[hdr + 14 + 6 * L + O:hdr + 14 + 7 * L + O] = new_used.to_bytes(L, "little")
+    struct.pack_into("<I", raw, hdr + 78,
+                     _jenkins_lookup3()(bytes(raw[hdr:hdr + 78])))
+    struct.pack_into("<Q", raw, 28, len(raw))              # superblock v3 EOF
+    struct.pack_into("<I", raw, 44,
+                     _jenkins_lookup3()(bytes(raw[0:44])))  # superblock checksum
     _patch(path, bytes(raw))
 
 
