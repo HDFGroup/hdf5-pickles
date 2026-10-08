@@ -1,6 +1,6 @@
 # Assert-masked deserializer invariants
 
-**Status: draft, work in progress.** This catalogs GitHub issue #87: places
+**Status: all seven areas complete (first pass).** This catalogs GitHub issue #87: places
 where a value decoded from untrusted HDF5 file bytes is validated only by
 `assert()` — or by ordinary `if (...) HGOTO_ERROR(...)` code wrapped in
 `#ifndef NDEBUG` — rather than a real, always-on check. Both mechanisms
@@ -9,7 +9,7 @@ so both count as "assert-masked" here.
 
 All seven of the issue's named areas are now complete (SOHM, Extensible
 arrays, V2 B-trees, Free-space managers, Metadata-cache images, Fractal
-heaps, Dataset chunk records). This is a first pass, not a final document.
+heaps, Dataset chunk records).
 
 ## Scope
 
