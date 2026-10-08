@@ -1,0 +1,279 @@
+/* Regression coverage for the "family" VFD member-name pattern parser and
+ * assemble_family()'s real file-copying behavior. */
+load "common.pk";      /* must come first -- declares open_fresh() */
+load "superblock.pk";  /* assemble_family() now maps member 0's own
+                         * superblock to find its driver info -- not
+                         * loaded by family_vfd.pk itself, matching
+                         * common.pk's convention */
+load "family_vfd.pk";
+
+var failures = 0;
+fun expect_family = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else {
+        printf("FAIL %s\n", name);
+        failures = failures + 1;
+    }
+}
+
+expect_family("zero_padded_first_member",
+              family_member_name("fam-%05d.h5", 0) == "fam-00000.h5");
+expect_family("zero_padded_multi_digit_member",
+              family_member_name("fam-%05d.h5", 42) == "fam-00042.h5");
+expect_family("zero_padded_overflows_width_without_truncating",
+              family_member_name("fam-%02d.h5", 12345) == "fam-12345.h5");
+expect_family("plain_no_padding",
+              family_member_name("fam-%d.h5", 7) == "fam-7.h5");
+expect_family("prefix_and_suffix_preserved_verbatim",
+              family_member_name("/data/run-%03d.member.h5", 5)
+              == "/data/run-005.member.h5");
+
+var rejected = 0;
+try {
+    var ignored = family_member_name("no-percent-d.h5", 0);
+} catch (Exception e) {
+    rejected = 1;
+}
+expect_family("pattern_without_percent_d_is_rejected", rejected);
+
+var rejected_bad_spec = 0;
+try {
+    var ignored = family_member_name("fam-%05s.h5", 0);
+} catch (Exception e) {
+    rejected_bad_spec = 1;
+}
+expect_family("percent_specifier_other_than_d_is_rejected", rejected_bad_spec);
+
+/* --- assemble_family(): real file-copying regression ---
+ * Runs against real on-disk member files (not the in-memory "*name*" IOS
+ * used elsewhere in pickles/tests/ -- that backend pads iosize() up to a
+ * fixed 4096-byte buffer, which would silently break assemble_family's
+ * "copy exactly iosize(member) bytes" accounting). WORKING_DIRECTORY for
+ * this test is the CMake build directory (see CMakeLists.txt), not the
+ * source tree, so these scratch files never touch tracked/source paths.
+ */
+
+fun make_member = (string path, byte pattern, int count) void:
+{
+    var ios = open_fresh(path);
+    var data = byte[count]();
+    var i = 0;
+    while (i < count) {
+        data[i] = pattern;
+        i = i + 1;
+    }
+    byte[count] @ ios : 0#B = data;
+    close(ios);
+}
+
+fun bytes_all_equal = (byte[] b, byte v) int:
+{
+    var ok = 1;
+    var i = 0;
+    while (i < b'length) {
+        if (b[i] != v) ok = 0;
+        i = i + 1;
+    }
+    return ok;
+}
+
+/* Members 0 and 1 are both interior (member 2 follows), so both must
+ * equal memb_size (= member 0's real size, 10 bytes) -- matching real
+ * HDF5's fixed-stride addressing (H5FDfamily.c: u = addr / memb_size).
+ * Member 2 is last, so it's allowed to be shorter. */
+make_member("family_vfd_regress-00000.h5", 0xAAUB, 10);
+make_member("family_vfd_regress-00001.h5", 0xBBUB, 10);
+make_member("family_vfd_regress-00002.h5", 0xCCUB, 6);
+
+var assembled_total = assemble_family("family_vfd_regress-%05d.h5",
+                                       "family_vfd_regress_out.h5");
+expect_family("assemble_family_total_matches_fixed_stride_placement",
+              assembled_total == 26UL);   /* 2*10 (memb_size) + 6 (last, short) */
+
+/* Comparisons run while the IOS is still open: a mapped byte[] is a lazy
+ * proxy into its IOS, not a detached copy -- indexing it after close()
+ * re-reads from a closed IOS and raises "no IOS" instead of comparing
+ * already-fetched bytes. */
+var out_ios = open("family_vfd_regress_out.h5", IOS_F_READ);
+var out_size = iosize(out_ios) /#B;
+var member0_intact = bytes_all_equal(byte[10] @ out_ios : 0#B, 0xAAUB);
+var member1_intact = bytes_all_equal(byte[10] @ out_ios : 10#B, 0xBBUB);
+var member2_intact = bytes_all_equal(byte[6]  @ out_ios : 20#B, 0xCCUB);
+close(out_ios);
+
+expect_family("assemble_family_stops_at_first_missing_member",
+              out_size == 26UL);
+expect_family("assemble_family_preserves_first_member_bytes", member0_intact);
+expect_family("assemble_family_preserves_second_member_bytes", member1_intact);
+expect_family("assemble_family_preserves_third_member_bytes", member2_intact);
+
+var no_members_total = assemble_family("family_vfd_regress_nomatch-%05d.h5",
+                                        "family_vfd_regress_empty.h5");
+expect_family("assemble_family_returns_zero_when_first_member_is_missing",
+              no_members_total == 0UL);
+
+/* A short *interior* member (member 1, followed by member 2) is rejected
+ * rather than silently gap-filled: real HDF5 only ever allows the last
+ * physical file to be shorter than memb_size (see assemble_family's own
+ * comment on the fixed-stride placement). */
+make_member("family_vfd_regress_shortmid-00000.h5", 0x11UB, 10);
+make_member("family_vfd_regress_shortmid-00001.h5", 0x22UB, 6);
+make_member("family_vfd_regress_shortmid-00002.h5", 0x33UB, 14);
+
+var rejected_short_interior = 0;
+try {
+    var ignored = assemble_family("family_vfd_regress_shortmid-%05d.h5",
+                                   "family_vfd_regress_shortmid_out.h5");
+} catch (Exception e) {
+    rejected_short_interior = (e.code == E_inval.code);
+}
+expect_family("assemble_family_rejects_short_interior_member",
+              rejected_short_interior);
+
+/* A member larger than the discovered stride (memb_size = member 0's
+ * size) is also rejected -- it's inconsistent with fixed-stride
+ * addressing regardless of its position. */
+make_member("family_vfd_regress_oversized-00000.h5", 0x44UB, 10);
+make_member("family_vfd_regress_oversized-00001.h5", 0x55UB, 14);
+
+var rejected_oversized = 0;
+try {
+    var ignored2 = assemble_family("family_vfd_regress_oversized-%05d.h5",
+                                    "family_vfd_regress_oversized_out.h5");
+} catch (Exception e) {
+    rejected_oversized = (e.code == E_inval.code);
+}
+expect_family("assemble_family_rejects_member_larger_than_stride",
+              rejected_oversized);
+
+/* --- assemble_family(): driver-info-authoritative stride regression ---
+ *
+ * H5FD__family_sb_encode's own comment in H5FDfamily.c says member 0's
+ * physical size "isn't safe to use" as the real memb_size -- it's only
+ * a fallback for files saved without driver info. These build a real
+ * NCSAfami driver info block (v0's direct superblock field, and v2's
+ * object-header-embedded message) recording a specific member_size, and
+ * confirm family_member_size_from_driver_info() reads it correctly for
+ * both superblock layouts -- then prove the actual gap this closes: a
+ * member 0 that's physically shorter than its own recorded member_size,
+ * with member 1 present, is now rejected. Before this fix it couldn't
+ * be: memb_size used to be derived from member 0's own physical size,
+ * so member 0 could never be "short" relative to itself. */
+
+fun ascii_bytes2 = (string s) byte[]:
+{
+    var b = byte[s'length]();
+    var i = 0;
+    while (i < s'length) { b[i] = s[i] as uint<8>; i = i + 1; }
+    return b;
+}
+
+fun le_bytes = (uint<64> v, int n) byte[]:
+{
+    var out = byte[n]();
+    var i = 0;
+    while (i < n) {
+        out[i] = (i < 8) ? ((v .>> (i * 8)) & 0xffUL) as uint<8> : 0UB;
+        i = i + 1;
+    }
+    return out;
+}
+
+/* Minimal valid v0 superblock + stab_ent (cache_type=0, scratch pad) +
+ * NCSAfami driver info block recording member_size, all in one file.
+ * The file's total length written here (120 bytes: 96 fixed structures
+ * + 24-byte driver info block) is member 0's real physical size --
+ * deliberately independent of member_size, to prove which one wins. */
+fun make_family_v0_member0 = (string path, uint<64> member_size) void:
+{
+    var sb = [0UB]                           /* super_vers = 0 */
+            + [0UB, 0UB, 0UB, 0UB]            /* fs_info_vers, root_stab_vers, res1, shared_hdr_vers */
+            + [8UB, 8UB]                      /* sizeof_offsets, sizeof_lengths */
+            + [0UB]                           /* res2 */
+            + le_bytes(4UL, 2)                /* stab_leaf_k */
+            + le_bytes(16UL, 2)               /* stab_internal_k */
+            + [0UB, 0UB, 0UB, 0UB]            /* status_flags */
+            + byte[8]()                       /* base_addr_raw = 0 */
+            + byte[8]()                       /* fs_info_addr_raw = 0, unused */
+            + le_bytes(500UL, 8)              /* eof_addr_raw (must be > base_addr) */
+            + le_bytes(96UL, 8)               /* drv_info_addr_raw -- right after fixed structures */
+            /* stab_ent: lnk_nm_off, ohdr_addr, cache_type=0, res, pad[16] */
+            + byte[8]() + byte[8]() + le_bytes(0UL, 4) + byte[4]() + byte[16]();
+
+    var drv_info = [0UB] + byte[3]()                       /* version, reserved */
+                 + le_bytes(8UL, 4)                        /* drv_info_size = 8 (just member_size) */
+                 + ascii_bytes2("NCSAfami")
+                 + le_bytes(member_size, 8);
+
+    var ios = open_fresh(path);
+    byte[8] @ ios : 0#B = H5_FORMAT_FILE_SIGNATURE;
+    byte[sb'length] @ ios : 8#B = sb;
+    byte[drv_info'length] @ ios : 96#B = drv_info;
+    close(ios);
+}
+
+/* Minimal valid v2 superblock + a v2 object header at ext_addr holding
+ * the NCSAfami driver info message (0x0014) -- the same mechanism
+ * multi_discover() uses for multi's driver info, now exercised for
+ * family's v2/v3 case too. */
+fun make_family_v2_member0 = (string path, uint<64> member_size) void:
+{
+    var ext_addr = 48UL;   /* right after the fixed 48-byte v2 superblock */
+
+    var sb_body = H5_FORMAT_FILE_SIGNATURE
+                + [2UB]                       /* super_vers */
+                + [8UB, 8UB]                  /* sizeof_offsets, sizeof_lengths */
+                + [0UB]                       /* status_flags (v2) */
+                + byte[8]()                   /* base_addr_raw = 0 */
+                + le_bytes(ext_addr, 8)       /* ext_addr_raw */
+                + le_bytes(500UL, 8)          /* eof_addr_raw */
+                + le_bytes(ext_addr, 8);      /* root_obj_addr_raw: just needs to be < eof */
+    var sb = sb_body + hdf5_u32_le_bytes(lookup3_hashlittle(sb_body, 0U));
+
+    var payload = [0UB] + ascii_bytes2("NCSAfami")
+                + le_bytes(8UL, 2)             /* drv_info_size = 8 */
+                + le_bytes(member_size, 8);
+    var msg_size = payload'length;
+    var message = [0x14UB] + le_bytes(msg_size as uint<64>, 2) + [0UB] + payload;
+    var chunk0_size = message'length;
+    var ohdr = H5_FORMAT_OHDR_SIGNATURE + [2UB, 0UB] + [chunk0_size as uint<8>] + message;
+
+    var ios = open_fresh(path);
+    byte[sb'length] @ ios : 0#B = sb;
+    byte[ohdr'length] @ ios : ext_addr#B = ohdr;
+    close(ios);
+}
+
+make_family_v0_member0("family_vfd_regress_v0drv-member0.h5", 200UL);
+expect_family("driver_info_read_correctly_v0",
+              family_member_size_from_driver_info("family_vfd_regress_v0drv-member0.h5") == 200UL);
+
+make_family_v2_member0("family_vfd_regress_v2drv-member0.h5", 300UL);
+expect_family("driver_info_read_correctly_v2",
+              family_member_size_from_driver_info("family_vfd_regress_v2drv-member0.h5") == 300UL);
+
+/* The gap being closed: member 0 (v0 layout, physically 120 bytes) records
+ * member_size=200 in its own driver info; member 1 exists. Before this fix,
+ * memb_size was derived from member 0's physical size (120), so member 0
+ * could never be flagged "short" relative to itself -- member 1 would have
+ * silently landed at offset 120 instead of the true stride, 200. */
+make_family_v0_member0("family_vfd_regress_shortdrv-00000.h5", 200UL);
+make_member("family_vfd_regress_shortdrv-00001.h5", 0x77UB, 10);
+
+var rejected_short_member0 = 0;
+try {
+    var ignored3 = assemble_family("family_vfd_regress_shortdrv-%05d.h5",
+                                    "family_vfd_regress_shortdrv_out.h5");
+} catch (Exception e) {
+    rejected_short_member0 = (e.code == E_inval.code);
+}
+expect_family("assemble_family_rejects_member0_short_relative_to_driver_info",
+              rejected_short_member0);
+
+if (failures != 0) {
+    printf("UNIT FAMILY_VFD: %i32d failure(s)\n", failures);
+    exit(1);
+}
+printf("UNIT FAMILY_VFD: all passed\n");
