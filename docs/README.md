@@ -26,6 +26,9 @@ matrix](HDF5%20File%20Format%20Specification%20Evolution.md), and the
 [object-store mapping](Mapping%20HDF5%20Binary%20Primitives%20onto%20an%20Object%20Store.md),
 which is a design proposal rather than an implemented subsystem. Security-case
 work follows the separate [CVE strategy](A%20CVE%20strategy%20for%20the%20HDF5%20library.md).
+A related catalog of assert-masked deserializer invariants (checks that
+exist but vanish under `-DNDEBUG`) is tracked separately in
+[ASSERT_MASKED_INVARIANTS.md](ASSERT_MASKED_INVARIANTS.md).
 The [H5PL policy-profile API extension](H5PL_POLICY_PROFILE_API.md) is a draft
 upstream-facing design for carrying the four h5policy profile identities into
 native HDF5 plugin decisions and constructing user-defined blends with the same
