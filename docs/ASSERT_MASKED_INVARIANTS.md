@@ -7,10 +7,9 @@ where a value decoded from untrusted HDF5 file bytes is validated only by
 disappear identically under `-DNDEBUG`, i.e. in every shipped Release build,
 so both count as "assert-masked" here.
 
-Six of the issue's seven named areas are complete (SOHM, Extensible
+All seven of the issue's named areas are now complete (SOHM, Extensible
 arrays, V2 B-trees, Free-space managers, Metadata-cache images, Fractal
-heaps); the other one (Dataset chunk records) is not yet started. This is a
-first pass, not a final document.
+heaps, Dataset chunk records). This is a first pass, not a final document.
 
 ## Scope
 
@@ -261,7 +260,7 @@ agree, and only one direction of their disagreeing is actually guarded:
   write — `ltable->lnks[udata->curr_lnk]` — would run one slot past the
   allocation on the tree's last real record. The *only* thing standing in
   the way is `assert(udata->curr_lnk < udata->ltable->nlinks)`
-  (`H5Gdense.c:716`) — masked under `-DNDEBUG`, at which point the
+  (`H5Gdense.c:717`) — masked under `-DNDEBUG`, at which point the
   out-of-bounds write happens for real, later surfacing as a `SIGABRT`
   (glibc's heap-corruption detector, on some later allocation).
 - **`total_nrec` overstated** (`n+1` instead of `n`): the table gets one
@@ -275,7 +274,7 @@ direct inspection; one is cited from prior work, not reproduced:
 
 - **Confirmed by direct source read:** the guard is still exactly
   `assert(udata->curr_lnk < udata->ltable->nlinks)` at this exact commit
-  (`4ee8adc29cd`) — the same one this whole catalog is measured against.
+  (`a3cf1ea82cc`) — the same one this whole catalog is measured against.
   Not fixed in libhdf5 itself, in either direction.
 - **Confirmed by a live re-test:** `h5policy`, as it stands in the tree
   today, rejects a `total_nrec` off by `+1`, `-1`, or set to `0` — all three
@@ -483,6 +482,143 @@ survived direct measurement:
   heap-buffer-overflow) on one attempt, and `H5FD_read`'s address-vs-EOA
   check (the same one that rules out `curr_root_rows`) on a second,
   deliberately-targeted attempt.
+
+## Dataset chunk records (`H5Dchunk/btree/btree2/farray/earray/single/none.c`, 940 asserts across 7 files — complete)
+
+No `h5policy` coverage gaps in this area, and the one genuine
+assert-masked libhdf5 invariant that surfaced is already covered — a shape
+closest to Metadata-cache images. What makes this area large (940 asserts)
+rather than deep is that a chunked dataset's on-disk records flow through
+one of **six index types**, and four of them reuse a generic structure the
+catalog has already swept:
+
+| Chunk index (`H5D*` glue) | Backing structure | How it reconciles |
+|---|---|---|
+| v2 B-tree (`H5Dbtree2.c`) | `H5B2*` | subsumes into **V2 B-trees**, above |
+| Extensible array (`H5Dearray.c`) | `H5EA*` | subsumes into **Extensible arrays**, above |
+| v1 B-tree (`H5Dbtree.c`) | `H5B*` (`H5Bcache.c`) | node decode is real-checked (see below) |
+| Fixed array (`H5Dfarray.c`) | `H5FA*` | the one never-swept structure — measured clean (below) |
+| Single chunk (`H5Dsingle.c`) | layout message | decodes nothing of its own; measured (below) |
+| Implicit (`H5Dnone.c`) | computed | decodes nothing; arithmetic over layout fields |
+
+The index files decode only **records/elements**, never headers:
+`H5D__btree_decode_key`, `H5D__earray_decode`, `H5D__bt2_unfilt_decode` and
+their filtered variants all produce the same three fields — chunk address,
+`nbytes` (stored size), `filter_mask` — and all four record-based indexes
+route that stored size through one `h5policy` check,
+`h5policy_chunk_record_size_ok` (`h5policy/pickles/h5_chunkindex.pk:78
+(h5policy_chunk_record_size_ok)`), at eight call sites. The v1 B-tree key
+decoder also carries real, always-on decode checks on the coordinate
+offset itself (`H5Dbtree.c:636,642,647` — dimensionality, `dim[u] == 0`,
+and offset alignment, each an `HGOTO_ERROR`), so the only raw-decoded key
+fields are `nbytes`/`filter_mask`, covered as above. The variable-width
+`nbytes` encoding used by EA/FA/B2 is bounded by construction (the width is
+derived from the chunk size and capped at 8), not an untrusted read width.
+
+**The one assert-masked invariant, measured via the single-chunk index.**
+A filtered single chunk stores its one chunk's `nbytes` directly in the
+layout message (`H5Olayout.c:401`, raw `H5F_DECODE_LENGTH`), and that stored
+size feeds the same filter pipeline every chunk does — so a corrupted tiny
+value trips the pipeline's framing arithmetic (fletcher32 subtracts 4
+unconditionally):
+
+| # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
+|---|---|---|---|---|---|
+| 1 | A filtered chunk's stored `nbytes` must clear the pipeline's fixed framing before the chunk is read | `H5Olayout.c:401` (single-chunk, raw decode); the indexed forms decode the same field in their own record callbacks | `H5Dchunk.c:3038` asserts the chunk block is either address-defined with a positive length or address-undefined with zero length, which catches only the `nbytes == 0` case; `nbytes` of 1–3 passes that assert and reaches the filter unguarded | **Measured, both faces.** `nbytes == 0`: debug build `SIGABRT` at the `H5Dchunk.c:3038` assert (assert-masked — under `-DNDEBUG` it proceeds with a defined address and zero length into the filter path). `nbytes` of 1, 3: `SIGSEGV` — the fletcher32 `size − 4` underflow — which is *not* assert-masked and so reaches a Release build too. Both measured on a filtered single-chunk fixture (one chunk, fletcher32), object-header checksum resealed | **Not a gap.** `h5policy` rejects all three: `H5_CORRUPT_CHUNK_STORED_SIZE` "single-chunk chunk record has a zero stored size" for 0, and "filtered chunk record is smaller than the pipeline's fixed framing" (`h5policy/pickles/h5_validate.pk:623 (filtered chunk record is smaller than the pipeline's fixed framing)`) for 1 and 3 — the same framing floor the four indexed paths use |
+
+**This invariant bites filtered chunks specifically.** A non-filtered
+chunk takes its `chunk_block.length` from the *computed* layout chunk size
+(`layout->u.chunk.size`, e.g. `H5Dsingle.c:328`, `H5Dearray.c:1200`,
+`H5Dfarray.c:1129`) — the same value for every chunk, derived from the
+already-decode-checked layout dimensions — not from a corruptible per-chunk
+field, and the index sets the length to `0` exactly when the chunk's
+address is undefined. So the assert holds for non-filtered chunks, and with
+no filter pipeline there is no `size − 4` underflow to reach. The one minor
+exception is the v1 B-tree, whose key struct stores `nbytes` even for an
+unfiltered chunk (`H5Dbtree.c:436`, guarded there by
+`assert(lt_key->nbytes > 0)` at `H5Dbtree.c:434`). Measured on an unfiltered
+v1-B-tree fixture (no checksum to reseal — v1 nodes carry none), in both an
+asserts-live build and a native `-DNDEBUG` Release build: a zero `nbytes`
+trips that assert in the debug build (`SIGABRT`), and in the Release build —
+assert compiled out — the read instead returns a **clean error** (`rc < 0`,
+no crash, no out-of-bounds, and the caller's buffer left untouched, so no
+stale memory is disclosed). A tiny *nonzero* `nbytes` behaves the same way
+in both builds, since with no filter pipeline there is no `size − 4`
+underflow to reach.
+`h5policy` rejects the zero case (`H5_CORRUPT_CHUNK_STORED_SIZE`, "v1 B-tree
+chunk record has a zero stored size") and correctly does *not* apply the
+filter-framing floor to a nonzero unfiltered record — there is no filter
+hazard there to guard.
+
+This is the single-chunk member of the filtered-chunk tiny-stored-size
+family already recorded for the indexed paths
+(`registry/cases/filtered-chunk-zero-stored-size.yml`). It is a real,
+measured libhdf5 crash that `h5policy` already independently defends
+against — the same "severe but already covered" shape as V2 B-trees'
+`node_nrec` and Free-space managers' `max_sect_addr`, below under
+**Adjacent findings** — not a new gap.
+
+**The Fixed Array header (`H5FA*`), the one never-swept backing
+structure, measured clean.** Unlike Extensible Arrays, a Fixed Array has
+**no super-block layer**, so Extensible Arrays' severe `nsblks`-underflow
+class (finding 1, above) has no analog here — there is no nested geometry
+formula to underflow. Its header has eight fields; the four identity/
+integrity fields (signature, version, client id, checksum) are real
+always-on decode checks, and the four raw-decoded geometry/location fields
+were each fixture-measured: `nelmts` (inflated to 2⁴⁰), `raw_elmt_size`
+(255 and 1), `max_dblk_page_nelmts_bits` (0 and 255), and `dblk_addr`
+(past-EOF and aliasing). Every one is rejected cleanly by both libhdf5
+(flat ~16 MB resident, no allocation blowup) and `h5policy`. The reason
+`nelmts` cannot drive an Extensible-Arrays-style OOM is structural: its
+only large allocation is the data-block read itself, whose size is
+`nelmts × raw_elmt_size`, so an inflated count is caught by the cache's
+EOA/length bound *before* any allocation — it never gets to allocate
+without the file actually being that large. The data block's own prefix
+adds a real self-consistency check (`H5FAcache.c`, "wrong fixed array
+header address") that ties each block back to its owning header.
+
+**The v1 B-tree node (`H5Bcache.c`) is real-checked at decode.** v1 B-tree
+nodes predate the checksum era and carry no per-node checksum, so V2
+B-trees' worst finding — `node_nrec` driving an unchecked checksum-length
+computation into an out-of-bounds read — structurally cannot recur. Where
+v2 computed a read length from a raw count, v1 bounds its count directly:
+`if (bt->nchildren > shared->two_k) HGOTO_ERROR(...)` (`H5Bcache.c:184`),
+a real always-on check, with the child array allocated at the fixed
+`two_k` maximum rather than from `nchildren`, the node image read at a
+fixed `sizeof_rnode`, the node `level` checked against the expected level,
+and every key/child read guarded by `H5_IS_BUFFER_OVERFLOW`. `H5B.c`'s 128
+asserts are B-tree algorithm and traversal over already-validated nodes —
+the same lifecycle/traversal exclusion applied to `H5EA.c`/`H5B2.c` in the
+areas above.
+
+**The layout message (`H5Olayout.c`), the shared root input, is already
+well-guarded.** The chunk dimensions every index depends on are decoded
+here with real, always-on checks — `ndims` (`H5Olayout.c:115`, "bad number
+of dimensions") and `enc_bytes_per_dim` (`H5Olayout.c:347`) — not asserts.
+The one genuine hazard in the layout message is the *product* of the
+individually-valid dimensions overflowing to a zero chunk size, which is
+already the oracle-hardened case
+`registry/cases/chunk-dim-product-64bit-overflow.yml`. `H5Dlayout.c`'s
+asserts on `ndims`/`enc_bytes_per_dim` (`H5Dlayout.c:190,204,208`) guard
+values the `H5Olayout.c` decode has already validated, so they reconcile
+out. The implicit (`H5Dnone.c`) index stores nothing: it computes each
+chunk address arithmetically as `idx_addr + chunk_idx × chunk.size` over
+those same layout fields, EOA-checked on the read, and is always unfiltered
+(`assert(pline->nused == 0)`), so it carries no filter hazard of its own.
+
+**A `h5policy`-side aside, not a libhdf5 invariant.** While measuring the
+Fixed Array `max_dblk_page_nelmts_bits`, a benign precision divergence
+turned up: for `page_bits == 0`, libhdf5 treats the array as paged
+(`nelmts > (1 << page_bits)` → `10 > 1`) and safely rejects the
+unpaged-on-disk data via a checksum mismatch, while `h5policy`'s
+`is_paged` test adds a `page_bits > 0` guard
+(`h5policy/pickles/h5_chunkindex.pk:786 (is_paged)`) and treats it as
+unpaged, accepting the file. Chased and ruled out as a coverage gap:
+`h5policy` is merely *more lenient* than libhdf5 here, which defends
+itself — no harmful file passes. It is an `h5policy` precision matter (the
+`> 0` guard is unexplained, unlike the documented `< 48` cap), not an
+assert-masked libhdf5 invariant, and belongs with `h5policy` rather than in
+this catalog.
 
 ## Adjacent findings (not literally assert-masked, same danger shape)
 
@@ -1020,8 +1156,9 @@ than the dense-link path does; whether an even larger claimed length can be
 pushed past a genuinely unmapped page rather than just past one ASan-tracked
 redzone.
 
-## Status: remaining areas (not started)
+## Status: all seven named areas complete
 
-| Area | libhdf5 source | Notes |
-|---|---|---|
-| Dataset chunk records | `H5Dchunk/btree/btree2/farray/earray/single/none.c` | `chunk-dim-product-64bit-overflow.yml` names one case directly |
+Every area named in issue #87 has now been swept (the sections above).
+This remains a first pass: most findings are measured, a few are marked
+"traced, not yet measured", and the recommendations are left as
+recommendations rather than changes.
