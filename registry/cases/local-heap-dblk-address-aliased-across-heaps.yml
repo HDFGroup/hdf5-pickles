@@ -22,7 +22,7 @@ id: local-heap-dblk-address-aliased-across-heaps
 title: two local-heap prefixes naming one data-segment address make the metadata
   cache hand the second heap the first heap's data block, leaving the second
   heap's dblk and dblk_image NULL
-status: oracle-hardened   # h5policy rejects as of 2026-08-22; libhdf5 unfixed
+status: oracle-hardened   # h5policy rejects as of 2026-08-22; libhdf5 still crashes at site B on develop (site A closed 2026-10-03, unreleased)
 disclosure: >-
   n/a -- local analysis only.  No advisory database was consulted, no advisory
   text was retrieved, and no identifier was looked up.
@@ -50,8 +50,8 @@ entry_points:
   - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-08-22 (was: accepts, no findings)"
   - "libhdf5 H5G__stab_lookup (src/H5Gstab.c:811) -> H5HL_protect -> H5AC_protect(H5AC_LHEAP_DBLK) [cache HIT]"
   - "libhdf5 H5G__stab_iterate (src/H5Gstab.c:489) -> H5HL_protect -> same hit"
-  - "crash site A: H5HL_unprotect (src/H5HL.c:436) -> H5AC_unpin_entry(NULL) (src/H5AC.c:1438)"
-  - "crash site B: H5G__ent_to_link (src/H5Gent.c:382) -> H5MM_strndup(NULL + name_off) (src/H5MM.c:176)"
+  - "crash site A: H5HL_unprotect -> H5AC_unpin_entry(NULL) (src/H5AC.c:1438) -- CLOSED on develop by 91fc37c3325 (2026-10-03, unreleased); the guard is now at src/H5HL.c:434"
+  - "crash site B: H5G__ent_to_link (src/H5Gent.c:382) -> H5MM_strndup(NULL + name_off) (src/H5MM.c:176) -- STILL LIVE, measured 2026-10-12"
   - "shipped consumers: h5dump -H, h5ls -vr, h5stat, and any H5Ovisit3/H5Gopen2 traversal"
 
 # -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
@@ -94,16 +94,36 @@ defect: >-
   BOTH heap->dblk == NULL and heap->dblk_image == NULL.  Two consumers then
   dereference those NULLs, and which one you hit is a layout accident:
 
-  (A) H5HL_unprotect (src/H5HL.c:425-437), on the last unprotect:
-        assert(heap->dblk);                         /* :432 -- debug builds only */
-        if (FAIL == H5AC_unpin_entry(heap->dblk))   /* :436 */
-      Under NDEBUG the assert is gone and H5AC_unpin_entry(NULL) executes
+  (A) H5HL_unprotect, on the last unprotect.  CLOSED UPSTREAM 2026-10-03 by
+      91fc37c3325, "Fix NULL pointer dereferences in H5HL_protect and
+      H5HL_unprotect", which `git tag --contains` places in NO tagged release --
+      so every released library still has it and every statement below in the
+      past tense is present tense for them.
+      It used to read:
+        assert(heap->dblk);                         /* debug builds only */
+        if (FAIL == H5AC_unpin_entry(heap->dblk))
+      Under NDEBUG the assert was gone and H5AC_unpin_entry(NULL) executed
         cache_ptr = entry_ptr->cache_ptr;           /* src/H5AC.c:1438 */
       on a NULL entry_ptr.  MEASURED, both directions: the shipped Release build
-      SIGSEGVs there, and the assert-enabled build stops at the assert one line
-      earlier.  This is NOT an assert-only defect -- the assert is what HIDES it
-      from a debug build, and removing asserts is what makes it exploitable
-      rather than what contains it.
+      SIGSEGVed there, and the assert-enabled build stopped at the assert one
+      line earlier.  This was NOT an assert-only defect -- the assert is what
+      HID it from a debug build, and removing asserts is what made it
+      exploitable rather than what contained it.
+      It now reads (src/H5HL.c:427-443, re-pinned 2026-10-12 at develop
+      5933130b610):
+        if (NULL == heap->dblk)                     /* :434 */
+            HGOTO_ERROR(... "local heap data block is not in the cache");
+        pin_obj = heap->dblk;                       /* :438 */
+        ...
+        if (FAIL == H5AC_unpin_entry(pin_obj))      /* :442 */
+      -- a real runtime check on both arms, with the prefix arm guarded the same
+      way at :428.  The upstream comment names the cause this record named: the
+      object "is unlinked from the heap when the cache destroys it, which a
+      damaged file can provoke".
+      WHAT THAT FIX IS NOT: it is a NULL guard at the consumer, not the
+      ownership comparison proposed below.  The alias is still accepted, the
+      second heap is still handed the first heap's data block, and crash site
+      (B) is untouched -- see measured.REMEASURED_2026_10_12.
 
   (B) H5G__ent_to_link (src/H5Gent.c:379-382):
         if (NULL == (name = (const char *)H5HL_offset_into(heap, ent->name_off)))
@@ -115,7 +135,9 @@ defect: >-
       (char *)0 + name_off, which is non-NULL for any name_off > 0, so the
       caller's NULL guard passes and strndup reads from the zero page.
 
-  THE FIX IS ONE COMPARISON, in H5HL_protect right after the protect returns:
+  THE FIX IS ONE COMPARISON, in H5HL_protect right after the protect returns --
+  and the upstream NULL guards of 2026-10-03 are NOT it; they stop one
+  dereference without stopping the alias:
     if (dblk->heap != heap)
         HGOTO_ERROR(H5E_HEAP, H5E_CANTPROTECT, NULL,
                     "local heap data block is already owned by another heap");
@@ -130,6 +152,27 @@ defect: >-
 
 # -- Measured behaviour -------------------------------------------------------
 measured:
+  REMEASURED_2026_10_12: >-
+    2026-10-12, at HEAD, against the newest build available here: libhdf5 2.3.0,
+    source tree at develop 5933130b610, baseline RelWithDebInfo with asserts off,
+    settings_sha256 9cc649d75c7f760b782a54500f5ccbfbc71163fc1dc97c6a2a0ed66daa53e2dd.
+    THE DEFECT IS STILL LIVE.  The exact-build canary on
+    malformed/lheap_data_segment_alias.h5 reports outcome `crashed`, signal 11
+    (SIGSEGV), and the fixture is recorded under heap_structures.crashes_on in
+    registry/libhdf5-evidence.yml.
+    WHAT MOVED: crash site (A) is gone.  Upstream 91fc37c3325 (2026-10-03,
+    unreleased) turned the asserts in H5HL_protect and H5HL_unprotect into real
+    NULL checks, so the H5AC_unpin_entry(NULL) path now returns an error instead
+    of faulting.  Crash site (B) is what the fixture reaches now, and the
+    symbolised candidate (ASan, NDEBUG) backtrace is the one this record already
+    describes, unchanged: H5MM_strndup (src/H5MM.c:176) from H5G__ent_to_link
+    (src/H5Gent.c:382), reached through H5G__node_iterate, H5B_iterate,
+    H5G__stab_iterate (src/H5Gstab.c:504) and H5G_visit -- a SEGV on address 0x8,
+    which is `(char *)NULL + name_off` exactly as predicted.
+    So the upstream change narrowed the defect from two crash sites to one and
+    did not close it.  The ownership comparison this record proposes is still
+    not implemented, and the alias is still accepted.
+    Found while re-pinning this record's source citations, not from a report.
   MEASURED: >-
     2026-08-22, at HEAD, against libhdf5 2.3.0 (source tree at develop
     f8f0379c7c5ef3cd4939cb9e115d2fd3502e1748).  Both a fuzzer specimen and a
@@ -177,7 +220,8 @@ measured:
     Specimen, symbolised (this closes the bundle's "no full debug backtrace"
     limit):
       H5AC_unpin_entry (thing=0x0) at src/H5AC.c:1438
-      H5HL_unprotect (heap=0x...) at src/H5HL.c:436
+      H5HL_unprotect (heap=0x...) -- the unpin call, which at the time passed
+      heap->dblk directly; that line no longer exists, see the (A) paragraph
       H5G__stab_lookup at src/H5Gstab.c:832
       H5G__obj_lookup -> H5G__traverse_real -> H5G_traverse -> H5G_loc_find
       -> H5G__open_name -> H5VL__native_group_open -> H5Gopen2
@@ -439,11 +483,16 @@ coverage_gaps:
     deliberately carries no h5cve block until
     `h5policy-probe --exercise heap_structures` has actually been run.
   - >-
-    THE ASSERT-ENABLED BUILD HIDES CRASH SITE (A).  Anyone re-measuring on the
-    ASan build stops at assert(heap->dblk) (src/H5HL.c:432) and may record this
-    as assert-only.  It is not: the shipped Release build reaches
+    THE ASSERT-ENABLED BUILD HID CRASH SITE (A), on every build that predates
+    91fc37c3325 -- which is every tagged release.  Anyone re-measuring one of
+    those on an assert-enabled build stops at assert(heap->dblk) and may record
+    this as assert-only.  It is not: the shipped Release build reaches
     H5AC_unpin_entry(NULL).  Measure both builds or the severity is wrong by a
     category.
+    OBSOLETE ON DEVELOP as of 2026-10-03: the assert is now a runtime NULL check
+    on both builds, so site (A) no longer discriminates between them.  The
+    lesson is kept because it applies to every released version and because it
+    is the general trap -- see the (A) paragraph for what replaced the assert.
   - >-
     No 32-bit measurement (expected identical -- no arithmetic involved -- but
     unmeasured), and no RDWR/write-path measurement.

@@ -1901,6 +1901,18 @@ def _gen_malformed(root):
     _make_zero_v2_btree_record_size(
         f"{root}/malformed/zero_v2_btree_record_size.h5",
         f"{root}/valid/dense_links.h5")
+    # The dense-ATTRIBUTE companion (record type 8).  Same field, same divisor,
+    # different client role -- which is a different finding route, a different
+    # invariant (heap.btree_record_size, not dense.btree_record_size) and a
+    # different set of libhdf5 entry points: attribute metadata is reached
+    # through H5A__get_ainfo -> H5B2_open (src/H5Aint.c:2018), so `h5ls -r`
+    # never touches it while h5dump, h5dump -A, h5ls -rv and h5stat all do.
+    # valid/dense_attribute.h5 carries exactly one BTHD and it is type 8, at
+    # depth 1 -- an INTERNAL root, unlike the depth-0 leaf root of the
+    # dense-link base next to it.
+    _make_zero_v2_btree_record_size(
+        f"{root}/malformed/dense_attr_btree_record_size_zero.h5",
+        f"{root}/valid/dense_attribute.h5", record_type=8, expect_depth=1)
     _make_oversize_v2_btree_node_size(
         f"{root}/malformed/oversize_v2_btree_node_size.h5",
         f"{root}/valid/dense_links.h5")
@@ -2806,7 +2818,7 @@ def _make_nbit_precision_mismatch(path):
 def _make_nbit_bit_offset_mismatch(path):
     """An n-bit descriptor whose bit offset contradicts the datatype message.
 
-    cd_values[7] comes from H5T_get_offset() (H5Znbit.c:482).  Patched 4 -> 0,
+    cd_values[7] comes from H5T_get_offset() (H5Znbit.c:492).  Patched 4 -> 0,
     which is the value a full-width type would legitimately carry -- the point
     being that the word is individually plausible and only wrong RELATIVE to the
     datatype message, which is the whole class of defect this rule covers."""
@@ -5558,15 +5570,63 @@ def _make_bad_dense_corder_leaf_checksum(path, base_path, record_type):
     _patch(path, bytes(raw))
 
 
-def _make_zero_v2_btree_record_size(path, base_path):
-    """Dense-link name index with a checksum-valid zero record width.
+def _make_zero_v2_btree_record_size(path, base_path, record_type=None,
+                                    expect_depth=None):
+    """A v2 B-tree header with a checksum-valid zero record width.
 
     libhdf5's H5B2__hdr_init computes leaf capacity by dividing usable node
     bytes by this field, so h5dump and h5py receive SIGFPE before they can
-    reject the malformed tree.
+    reject the malformed tree.  The divisor is H5B2_NUM_LEAF_REC
+    (src/H5B2hdr.c:44) applied at :140; the only guard is
+    `assert(cparam->rrec_size > 0)` at :113, compiled out under NDEBUG.
+    See registry/cases/v2-btree-record-size-zero-assert-only.yml.
+
+    `record_type` selects WHICH CLIENT'S TREE to corrupt, and that is the whole
+    point of the parameter rather than a convenience.  One shared validator
+    serves every v2-btree role, so the role appears in the finding message and
+    the message is what routes the finding to a record family
+    (registry/findings/routes/H5_CORRUPT_V2_BTREE_RECORD_SIZE.yml).  A dense
+    LINK name index (type 5) routes to dense_index; a dense ATTRIBUTE name
+    index (type 8) routes to heap_structures, with a different invariant and a
+    different exact-build canary.  A fixture for one therefore guards nothing
+    for the other.  `None` keeps the historical behaviour -- first BTHD in the
+    file -- so the original dense-link fixture is unchanged byte for byte.
+
+    `expect_depth` pins the tree shape when the caller cares.  Depth is not
+    incidental here: at depth 0 the root is a LEAF and at depth > 0 it is an
+    INTERNAL node, and the two capacity macros differ in exactly the way that
+    decides this defect -- the leaf macro divides by `rrec_size` alone and
+    faults, while the internal macro divides by `rrec_size + pointer_size`
+    (src/H5B2pkg.h:110) and does not.  A base file that silently changed depth
+    would still produce a plausible-looking fixture, so say which shape is
+    intended and fail loudly when the base drifts.
     """
     raw = bytearray(open(base_path, "rb").read())
-    bt = _dense_bthd_info(raw)
+    if record_type is None:
+        bt = _dense_bthd_info(raw)
+    else:
+        bt = _bthd_info_for_type(raw, record_type)
+    if bt["record_size"] == 0:
+        raise RuntimeError(
+            f"{base_path} already encodes a zero record width; the fixture "
+            f"would be identical to its base and would prove nothing")
+    if expect_depth is not None and bt["depth"] != expect_depth:
+        raise RuntimeError(
+            f"{base_path} v2 B-tree depth is {bt['depth']}, expected "
+            f"{expect_depth}: the base file changed shape and this fixture no "
+            f"longer pins the regime its expectation claims")
+    # Verify the checksum formula against the value the base ALREADY stores
+    # before overwriting it.  Without this the patch is checksummed by an
+    # assumed formula, and a wrong one produces a fixture that both libhdf5 and
+    # h5policy reject for the header checksum -- never reaching the field under
+    # test, while still looking like a passing malformed fixture.
+    stored = struct.unpack_from("<I", raw, bt["checksum"])[0]
+    recomputed = _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]]))
+    if stored != recomputed:
+        raise RuntimeError(
+            f"{base_path} BTHD checksum at {bt['checksum']} is {stored:#010x} "
+            f"but lookup3 over the header prefix gives {recomputed:#010x}; "
+            f"the header extent or the checksum formula is wrong")
     struct.pack_into("<H", raw, bt["bthd"] + 10, 0)
     struct.pack_into("<I", raw, bt["checksum"],
                      _jenkins_lookup3()(bytes(raw[bt["bthd"]:bt["checksum"]])))
