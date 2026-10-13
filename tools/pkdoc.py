@@ -24,6 +24,11 @@ Usage:
     python3 tools/pkdoc.py --index docs/spec/index.yml --check
 """
 
+# Defers evaluation of this file's `X | None`-style annotations to strings,
+# so they don't raise TypeError on Python < 3.10 (matches the same import in
+# check_hygiene.py / check_ssp_control_evidence.py / check_tutorial.py).
+from __future__ import annotations
+
 import argparse
 import re
 import sys

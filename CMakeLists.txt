@@ -329,6 +329,102 @@ if(POKE_EXECUTABLE)
         ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
     )
     add_test(
+        NAME pickle_drv_info_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_drv_info.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(pickle_drv_info_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+    )
+    # Unlike the other pickle_*_regression entries, this test writes real
+    # member/assembled files (assemble_family() copies actual bytes between
+    # real IOSes -- the in-memory "*name*" backend pads iosize() to 4096 and
+    # can't stand in for it). WORKING_DIRECTORY is the build tree, not the
+    # source tree, so those scratch files never touch tracked paths.
+    # assemble_family()/make_member() now use a probe-then-create pattern
+    # (see open_fresh() in family_vfd.pk) instead of IOS_F_CREATE|
+    # IOS_F_TRUNCATE, so this project's family/multi pickles no longer
+    # require poke >= 5.0 (see gheber's PR #93 review, point #6). Since
+    # poke itself has no file-delete builtin, open_fresh() raises rather
+    # than silently overwriting a pre-existing path -- so this fixture
+    # cleanup step, which IOS_F_TRUNCATE used to do implicitly, now has to
+    # happen here instead, before every run.
+    add_test(
+        NAME pickle_family_vfd_regression_cleanup
+        COMMAND "${CMAKE_COMMAND}" -E rm -f
+                family_vfd_regress-00000.h5
+                family_vfd_regress-00001.h5
+                family_vfd_regress-00002.h5
+                family_vfd_regress_out.h5
+                family_vfd_regress_empty.h5
+                family_vfd_regress_shortmid-00000.h5
+                family_vfd_regress_shortmid-00001.h5
+                family_vfd_regress_shortmid-00002.h5
+                family_vfd_regress_shortmid_out.h5
+                family_vfd_regress_oversized-00000.h5
+                family_vfd_regress_oversized-00001.h5
+                family_vfd_regress_oversized_out.h5
+                family_vfd_regress_v0drv-member0.h5
+                family_vfd_regress_v2drv-member0.h5
+                family_vfd_regress_shortdrv-00000.h5
+                family_vfd_regress_shortdrv-00001.h5
+                family_vfd_regress_shortdrv_out.h5
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    set_tests_properties(pickle_family_vfd_regression_cleanup PROPERTIES
+        FIXTURES_SETUP family_vfd_fixture
+    )
+    add_test(
+        NAME pickle_family_vfd_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_family_vfd.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    set_tests_properties(pickle_family_vfd_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+        FIXTURES_REQUIRED family_vfd_fixture
+    )
+    # Same real-file-I/O rationale as pickle_family_vfd_regression above.
+    add_test(
+        NAME pickle_multi_vfd_regression_cleanup
+        COMMAND "${CMAKE_COMMAND}" -E rm -f
+                multi_vfd_regress-s.h5
+                multi_vfd_regress-b.h5
+                multi_vfd_regress-r.h5
+                multi_vfd_regress-g.h5
+                multi_vfd_regress-l.h5
+                multi_vfd_regress-o.h5
+                multi_vfd_regress_unpatched.h5
+                multi_vfd_regress_out.h5
+                multi_vfd_regress_ohdr_highest_out.h5
+                multi_vfd_regress_synth-o.h5
+                multi_vfd_regress_synth-o2.h5
+                multi_vfd_regress_hostile_mapping-o.h5
+                multi_vfd_regress_userblock.h5
+                multi_vfd_regress_threshold-s.h5
+                multi_vfd_regress_threshold-o.h5
+                multi_vfd_regress_threshold_out.h5
+                multi_vfd_regress_underthreshold_out.h5
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    set_tests_properties(pickle_multi_vfd_regression_cleanup PROPERTIES
+        FIXTURES_SETUP multi_vfd_fixture
+    )
+    add_test(
+        NAME pickle_multi_vfd_regression
+        COMMAND "${POKE_EXECUTABLE}" --quiet -L
+                "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_multi_vfd.pk"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    set_tests_properties(pickle_multi_vfd_regression PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "POKE_LOAD_PATH=${CMAKE_CURRENT_SOURCE_DIR}/pickles"
+        FIXTURES_REQUIRED multi_vfd_fixture
+    )
+    add_test(
         NAME pickle_range_reference_regression
         COMMAND "${POKE_EXECUTABLE}" --quiet -L
                 "${CMAKE_CURRENT_SOURCE_DIR}/pickles/tests/unit_ranges_refs.pk"

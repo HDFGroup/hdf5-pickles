@@ -1,0 +1,516 @@
+/* Regression coverage for the "multi" VFD assembler: eof/checksum patch
+ * arithmetic and assemble_multi()'s real file-copying behavior.
+ *
+ * Like unit_family_vfd.pk, this runs against real on-disk member files
+ * (not the in-memory "*name*" IOS -- see that file's comment for why) and
+ * needs WORKING_DIRECTORY set to the CMake build directory in
+ * CMakeLists.txt, not the source tree.
+ *
+ * Only load each pickle once across the whole load graph: re-loading a
+ * file poke already loaded transitively reliably segfaults poke 5.0 --
+ * confirmed by bisection down to a bare `load "common.pk"; load
+ * "common.pk";` crashing on its own. common.pk must come first (it
+ * declares open_fresh()/H5_FORMAT_FILE_SIGNATURE/etc. multi_vfd.pk uses,
+ * and global_sizeof_offsets superblock.pk's own constraint sets) --
+ * neither multi_vfd.pk nor superblock.pk load it themselves, matching
+ * every other pickle in this codebase's convention of depending on
+ * common.pk without loading it. superblock.pk must precede multi_vfd.pk:
+ * multi_patch_eof() calls its locate_superblock(). */
+load "common.pk";
+load "superblock.pk";
+load "multi_vfd.pk";
+
+var failures = 0;
+fun expect_multi = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else {
+        printf("FAIL %s\n", name);
+        failures = failures + 1;
+    }
+}
+
+/* --- multi_u64_le_bytes_n(): pure arithmetic --- */
+expect_multi("u64_le_bytes_low_4_of_8",
+             multi_u64_le_bytes_n(0x0102030405060708UL, 4)
+             == [0x08UB, 0x07UB, 0x06UB, 0x05UB]);
+expect_multi("u64_le_bytes_full_8",
+             multi_u64_le_bytes_n(0x0102030405060708UL, 8)
+             == [0x08UB, 0x07UB, 0x06UB, 0x05UB,
+                 0x04UB, 0x03UB, 0x02UB, 0x01UB]);
+/* n > 8 is a real case, not just theoretical: HDF5 superblocks may
+ * legally declare sizeof_addr of 16 or 32, not just 2/4/8 (see
+ * H5Fsuper_cache.c). The high-order bytes beyond the value's own 8 bytes
+ * must be zero -- poke's `.>>` wraps its shift amount modulo 64 instead
+ * of zero-extending, so a naive shift-based encode silently repeats
+ * low-order bytes here instead of writing zero. */
+expect_multi("u64_le_bytes_zero_extended_16",
+             multi_u64_le_bytes_n(0x0102030405060708UL, 16)
+             == [0x08UB, 0x07UB, 0x06UB, 0x05UB,
+                 0x04UB, 0x03UB, 0x02UB, 0x01UB,
+                 0x00UB, 0x00UB, 0x00UB, 0x00UB,
+                 0x00UB, 0x00UB, 0x00UB, 0x00UB]);
+
+/* --- multi_split_names() / multi_expand_name_template(): pure logic --- */
+fun ascii_bytes = (string s) byte[]:
+{
+    var b = byte[s'length]();
+    var i = 0;
+    while (i < s'length) { b[i] = s[i] as uint<8>; i = i + 1; }
+    return b;
+}
+
+/* Two 8-byte entries ("%s-o.h5\0", "%s-b.h5\0"): each is already a
+ * multiple of 8 bytes including its null terminator, so no padding. */
+var split_two_names = multi_split_names(
+    ascii_bytes("%s-o.h5") + [0UB] + ascii_bytes("%s-b.h5") + [0UB], 2);
+expect_multi("split_names_two_unpadded_entries",
+             split_two_names == ["%s-o.h5", "%s-b.h5"]);
+
+/* A 3-byte name ("%s\0") needs 5 bytes of padding to reach the next
+ * multiple of 8 before the following entry starts. */
+var split_padded = multi_split_names(
+    ascii_bytes("%s") + [0UB] + byte[5]() + ascii_bytes("%s-x.h5") + [0UB], 2);
+expect_multi("split_names_respects_8_byte_padding",
+             split_padded == ["%s", "%s-x.h5"]);
+
+expect_multi("expand_name_template_substitutes_base_name",
+             multi_expand_name_template("%s-o.h5", "mfile") == "mfile-o.h5");
+
+var rejected_no_pct_s = 0;
+try {
+    var ignored = multi_expand_name_template("no-percent-s.h5", "mfile");
+} catch (Exception e) {
+    rejected_no_pct_s = 1;
+}
+expect_multi("expand_name_template_without_percent_s_is_rejected", rejected_no_pct_s);
+
+/* --- assemble_multi(): real file-copying + eof/checksum patch regression ---
+ *
+ * Six synthetic members, addresses deliberately small (no need for
+ * terabyte-scale gaps to test the mechanism -- that was verified
+ * separately against real multi fixtures). The raw-data (index 2) member
+ * is placed at the *highest* address on purpose, so the "extend the sparse
+ * file to the full declared EOF even though the deferred member is the
+ * highest-addressed one" path in assemble_multi actually gets exercised.
+ */
+
+fun make_member = (string path, byte pattern, int count) void:
+{
+    var ios = open_fresh(path);
+    var data = byte[count]();
+    var i = 0;
+    while (i < count) {
+        data[i] = pattern;
+        i = i + 1;
+    }
+    byte[count] @ ios : 0#B = data;
+    close(ios);
+}
+
+/* Synthetic v2 superblock: sizeof_offsets/sizeof_lengths = 8, a
+ * caller-chosen (deliberately-wrong-until-patched) eof_addr, and a
+ * root_obj_addr_raw value that only validates once eof_addr is patched to
+ * the true cross-member maximum. */
+fun make_super_member = (string path, uint<64> eof_addr, uint<64> root_addr,
+                          uint<64> userblock_size = 0UL) void:
+{
+    var body = H5_FORMAT_FILE_SIGNATURE
+             + [2UB]      /* super_vers */
+             + [8UB]      /* sizeof_offsets */
+             + [8UB]      /* sizeof_lengths */
+             + [0UB]      /* status_flags */
+             + byte[8]()  /* base_addr = 0 */
+             + byte[8]()  /* ext_addr = 0 (unused by this test) */
+             + multi_u64_le_bytes_n(eof_addr, 8)
+             + multi_u64_le_bytes_n(root_addr, 8);
+    var sealed = body + hdf5_u32_le_bytes(lookup3_hashlittle(body, 0U));
+
+    var ios = open_fresh(path);
+    if (userblock_size > 0UL)
+        byte[userblock_size] @ ios : 0#B = byte[userblock_size]();
+    byte[sealed'length] @ ios : userblock_size#B = sealed;
+    close(ios);
+}
+
+var root_addr = 0x5002UL;    /* inside the ohdr member's own range */
+
+make_super_member("multi_vfd_regress-s.h5", 48UL /* local-only stub eof */, root_addr);
+make_member("multi_vfd_regress-b.h5", 0xBBUB, 5);   /* btree   @ 0x1000 */
+make_member("multi_vfd_regress-r.h5", 0xDDUB, 7);   /* draw    @ 0x9000 -- highest address, deferred */
+make_member("multi_vfd_regress-g.h5", 0x66UB, 3);   /* gheap   @ 0x3000 */
+make_member("multi_vfd_regress-l.h5", 0x55UB, 4);   /* lheap   @ 0x4000 */
+make_member("multi_vfd_regress-o.h5", 0x11UB, 6);   /* ohdr    @ 0x5000 */
+
+var members = [
+  multi_member { path = "multi_vfd_regress-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress-b.h5", start_addr = 0x1000UL },
+  multi_member { path = "multi_vfd_regress-r.h5", start_addr = 0x9000UL },
+  multi_member { path = "multi_vfd_regress-g.h5", start_addr = 0x3000UL },
+  multi_member { path = "multi_vfd_regress-l.h5", start_addr = 0x4000UL },
+  multi_member { path = "multi_vfd_regress-o.h5", start_addr = 0x5000UL }];
+
+/* An unpatched raw copy (same members, no eof/checksum fix) proves the
+ * patch is actually necessary -- not just that assemble_multi happens to
+ * produce something decodable regardless. */
+fun copy_metadata_members_unpatched = (multi_member[6] mm, string output_path) void:
+{
+    var out = open_fresh(output_path);
+    var i = 0;
+    while (i < 6) {
+        if (i != MULTI_DRAW_INDEX)
+            multi_copy_member(out, mm[i]);
+        i = i + 1;
+    }
+    close(out);
+}
+
+fun superblock_decodes = (string path, uint<64> base_offset = 0UL) int:
+{
+    var f = open(path);
+    set_ios(f);
+    var ok = 1;
+    try {
+        var sb = superblock @ base_offset#B;
+    } catch (Exception e) {
+        ok = 0;
+    }
+    close(f);
+    return ok;
+}
+
+copy_metadata_members_unpatched(members, "multi_vfd_regress_unpatched.h5");
+expect_multi("unpatched_assembly_fails_eof_guard",
+             superblock_decodes("multi_vfd_regress_unpatched.h5") == 0);
+
+var copied = assemble_multi(members, "multi_vfd_regress_out.h5");
+expect_multi("assemble_multi_total_excludes_raw_data_member",
+             copied == 48UL + 5UL + 3UL + 4UL + 6UL);    /* r.h5's 7 bytes excluded */
+
+expect_multi("patched_assembly_decodes", superblock_decodes("multi_vfd_regress_out.h5") == 1);
+
+fun read_eof_addr = (string path, uint<64> base_offset = 0UL) uint<64>:
+{
+    var f = open(path);
+    set_ios(f);
+    var sb = superblock @ base_offset#B;
+    var v = bytes_to_u64_le(sb.super.v2_v3.eof_addr_raw);
+    close(f);
+    return v;
+}
+
+/* True EOF = draw member's own end (0x9000 + 7 = 0x9007), the highest
+ * across all six members even though it's the deferred one. */
+expect_multi("patched_eof_addr_is_true_cross_member_max",
+             read_eof_addr("multi_vfd_regress_out.h5") == 0x9007UL);
+
+/* --- assemble_multi(): highest-addressed eager member regression ---
+ *
+ * The test above always has the (deferred, never-copied) draw member at
+ * the highest address, so iosize(out) genuinely falls short of true_eof
+ * there regardless of any staleness in iosize() itself. Reordering so an
+ * EAGERLY-copied member (ohdr here) is the highest one instead exercises
+ * the real bug: on a just-written, not-yet-reopened IOS, iosize() can
+ * report a stale, short size (confirmed on both poke 4.3 and 5.0 --
+ * writing bytes 100..103 reports iosize==103 until closed and reopened),
+ * which used to make the old iosize(out)<true_eof check fire even though
+ * ohdr's bytes were already fully written all the way to true_eof --
+ * stomping its real last byte with 0. */
+fun byte_at = (string path, uint<64> off) byte:
+{
+    var f = open(path);
+    set_ios(f);
+    var b = byte @ off#B;
+    close(f);
+    return b;
+}
+
+var members_ohdr_highest = [
+  multi_member { path = "multi_vfd_regress-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress-b.h5", start_addr = 0x1000UL },
+  multi_member { path = "multi_vfd_regress-r.h5", start_addr = 0x3000UL },   /* draw, deferred, no longer highest */
+  multi_member { path = "multi_vfd_regress-g.h5", start_addr = 0x4000UL },
+  multi_member { path = "multi_vfd_regress-l.h5", start_addr = 0x5000UL },
+  multi_member { path = "multi_vfd_regress-o.h5", start_addr = 0x9000UL }];  /* ohdr, now the highest, eagerly copied */
+
+var copied_ohdr_highest = assemble_multi(members_ohdr_highest, "multi_vfd_regress_ohdr_highest_out.h5");
+expect_multi("assemble_multi_preserves_last_byte_of_highest_eager_member",
+             byte_at("multi_vfd_regress_ohdr_highest_out.h5", 0x9005UL) == 0x11UB);
+expect_multi("assemble_multi_highest_eager_member_true_eof",
+             read_eof_addr("multi_vfd_regress_ohdr_highest_out.h5") == 0x9006UL);
+
+/* --- multi_patch_eof(): user-block offset regression ---
+ *
+ * A real v3 Multi file with a 512-byte user block failed before this fix:
+ * multi_patch_eof() hardcoded byte offsets relative to absolute file
+ * offset 0, so it read/patched the wrong bytes -- inside the user block
+ * -- whenever one precedes the real superblock. */
+make_super_member("multi_vfd_regress_userblock.h5", 999UL /* placeholder, patched below */,
+                   0x210UL, 512UL);
+multi_patch_eof("multi_vfd_regress_userblock.h5", 0x1234UL);
+
+expect_multi("patch_eof_finds_superblock_past_userblock",
+             superblock_decodes("multi_vfd_regress_userblock.h5", 512UL) == 1);
+expect_multi("patch_eof_patches_correct_eof_addr_past_userblock",
+             read_eof_addr("multi_vfd_regress_userblock.h5", 512UL) == 0x1234UL);
+
+fun region_all_zero = (string path, uint<64> off, uint<64> len) int:
+{
+    var f = open(path);
+    set_ios(f);
+    var b = byte[len] @ off#B;
+    var eq = (b == byte[len]());
+    close(f);
+    return eq;
+}
+expect_multi("patch_eof_does_not_touch_userblock_bytes",
+             region_all_zero("multi_vfd_regress_userblock.h5", 0UL, 512UL));
+
+/* --- assemble_multi(): addressability threshold regression ---
+ *
+ * A member set whose true EOF reaches MULTI_MAX_REPRESENTABLE_ADDR is
+ * rejected before any output file is created; one that stays just under
+ * it still assembles normally. Both use a real (tiny) synthetic
+ * superblock member so multi_true_eof()'s own per-member size lookups
+ * succeed -- only the "o" member's address is what's being tested. */
+make_super_member("multi_vfd_regress_threshold-s.h5", 999UL, 0UL);
+make_member("multi_vfd_regress_threshold-o.h5", 0xEEUB, 1);
+
+var members_at_threshold = [
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-o.h5",
+                 start_addr = MULTI_MAX_REPRESENTABLE_ADDR - 1UL }];   /* +1-byte member -> true_eof == threshold */
+
+var rejected_at_threshold = 0;
+try {
+    var t1 = assemble_multi(members_at_threshold, "multi_vfd_regress_threshold_out.h5");
+} catch (Exception e) {
+    rejected_at_threshold = 1;
+}
+expect_multi("assemble_multi_rejects_addr_at_threshold", rejected_at_threshold);
+
+var members_under_threshold = [
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-o.h5",
+                 start_addr = MULTI_MAX_REPRESENTABLE_ADDR - 2UL }];   /* true_eof == threshold - 1 */
+
+var total_under_threshold = assemble_multi(members_under_threshold,
+                                            "multi_vfd_regress_underthreshold_out.h5");
+expect_multi("assemble_multi_accepts_addr_just_under_threshold",
+             total_under_threshold > 0UL
+             && superblock_decodes("multi_vfd_regress_underthreshold_out.h5") == 1);
+
+/* --- multi_resolve_address(): manual per-address resolution regression ---
+ *
+ * Uses real HDF5's own default 6-way address spread -- exactly the shape
+ * assemble_multi() rejects above -- to prove the resolver still works
+ * correctly on a member set assemble_multi() can't build a file for,
+ * since it never builds one at all. */
+var default_addressed_members = [
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0x2aaaaaaaaaaaaaaaUL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0x5555555555555554UL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0x7ffffffffffffffeUL },
+  multi_member { path = "multi_vfd_regress_threshold-s.h5", start_addr = 0xaaaaaaaaaaaaaaa8UL },
+  multi_member { path = "multi_vfd_regress_threshold-o.h5", start_addr = 0xd555555555555552UL }];
+
+var resolved_at_start = multi_resolve_address(default_addressed_members, 0UL);
+expect_multi("resolve_address_at_exact_member_start",
+             resolved_at_start.member_path == "multi_vfd_regress_threshold-s.h5"
+             && resolved_at_start.local_offset == 0UL);
+
+var resolved_into_ohdr = multi_resolve_address(default_addressed_members,
+                                                0xd555555555555552UL + 100UL);
+expect_multi("resolve_address_partway_into_member",
+             resolved_into_ohdr.member_path == "multi_vfd_regress_threshold-o.h5"
+             && resolved_into_ohdr.local_offset == 100UL);
+
+var rejected_default = 0;
+try {
+    var t2 = assemble_multi(default_addressed_members, "multi_vfd_regress_default_out.h5");
+} catch (Exception e) {
+    rejected_default = 1;
+}
+expect_multi("resolve_address_works_on_a_set_assemble_multi_rejects",
+             rejected_default);
+
+fun physical_size = (string path) uint<64>:
+{
+    var f = open(path, IOS_F_READ);
+    var sz = iosize(f) /#B;
+    close(f);
+    return sz;
+}
+
+expect_multi("output_file_physically_extends_to_true_eof_despite_deferred_hole",
+             physical_size("multi_vfd_regress_out.h5") == 0x9007UL);
+
+/* The draw member's own range (0x9000..0x9006, 7 bytes) is also the
+ * file's last 7 bytes, since its end equals true_eof exactly -- read
+ * exactly 7 bytes, not 8, to stay in bounds of the physically-extended
+ * (but not over-extended) output file. The comparison runs while the IOS
+ * is still open: a mapped byte[] is a lazy proxy into its IOS, not a
+ * detached copy -- returning it past close() and comparing afterward
+ * re-reads from a closed IOS and raises "no IOS" (see unit_family_vfd.pk's
+ * assemble_family regression for the same gotcha). */
+fun region_equals = (string path, uint<64> off, byte[] expected) int:
+{
+    var f = open(path);
+    set_ios(f);
+    var b = byte[7] @ off#B;
+    var eq = (b == expected);
+    close(f);
+    return eq;
+}
+
+expect_multi("raw_data_region_is_unpopulated_hole_before_fill",
+              region_equals("multi_vfd_regress_out.h5", 0x9000UL,
+                             [0UB, 0UB, 0UB, 0UB, 0UB, 0UB, 0UB]));
+
+var filled = assemble_multi_fill_raw_data("multi_vfd_regress_out.h5", members[MULTI_DRAW_INDEX]);
+expect_multi("fill_raw_data_returns_member_byte_count", filled == 7UL);
+
+expect_multi("raw_data_region_matches_source_after_fill",
+              region_equals("multi_vfd_regress_out.h5", 0x9000UL,
+                             [0xDDUB, 0xDDUB, 0xDDUB, 0xDDUB, 0xDDUB, 0xDDUB, 0xDDUB]));
+
+/* --- multi_discover(): real object-header parsing regression ---
+ *
+ * Hand-builds a minimal, valid v2 object header holding a driver info
+ * message (0x0014) so msg_payload_offset_in_ohdr()'s raw byte-scanning
+ * (not the full checksummed oh_hdr struct -- no checksum needed here)
+ * finds it, mirroring what a real "-o" member's superblock-extension
+ * object header looks like. Uses a "split"-style mapping (five categories
+ * share one member, the sixth -- raw data -- gets its own) since that's
+ * the realistic case multi_discover() has to reconstruct correctly, not
+ * just the degenerate one-member-for-everything case. */
+
+fun pad_name = (string s) byte[]:
+{
+    var nb = ascii_bytes(s) + [0UB];
+    var pad = (8 - (nb'length % 8)) % 8;
+    return nb + byte[pad]();
+}
+
+/* mapping: 6-entry byte[] (1-based unique member index per category, see
+ * drv_info.pk's own layout comment). templates/starts/eoas: one entry per
+ * distinct member. */
+fun make_ohdr_member = (string path, byte[6] mapping,
+                         string[] templates, uint<64>[] starts, uint<64>[] eoas) void:
+{
+    var n = templates'length;
+    var addr_pairs = byte[]();
+    var i = 0;
+    while (i < n) {
+        addr_pairs = addr_pairs + multi_u64_le_bytes_n(starts[i], 8)
+                                 + multi_u64_le_bytes_n(eoas[i], 8);
+        i = i + 1;
+    }
+    var names = byte[]();
+    i = 0;
+    while (i < n) {
+        names = names + pad_name(templates[i]);
+        i = i + 1;
+    }
+
+    var drv_multi = mapping + [0UB, 0UB] + addr_pairs + names;
+    var drv_info_size = drv_multi'length;
+
+    var payload = [0UB] + ascii_bytes("NCSAmult")
+                + multi_u64_le_bytes_n(drv_info_size as uint<64>, 2) + drv_multi;
+    var msg_size = payload'length;
+    var message = [0x14UB] + multi_u64_le_bytes_n(msg_size as uint<64>, 2) + [0UB] + payload;
+    var chunk0_size = message'length;
+    var header = H5_FORMAT_OHDR_SIGNATURE + [2UB, 0UB] + [chunk0_size as uint<8>] + message;
+
+    var ios = open_fresh(path);
+    byte[header'length] @ ios : 0#B = header;
+    close(ios);
+}
+
+/* super=0 btree=1 draw=2 gheap=3 lheap=4 ohdr=5 (MULTI_DRAW_INDEX) --
+ * everything shares "meta" (unique member 1) except draw, which gets its
+ * own "raw" member (unique member 2). */
+make_ohdr_member("multi_vfd_regress_synth-o.h5",
+                  [1UB, 1UB, 2UB, 1UB, 1UB, 1UB],
+                  ["%s-meta.h5", "%s-raw.h5"],
+                  [0x1000UL, 0x9000UL],
+                  [0x1100UL, 0x9100UL]);
+
+var discovered = multi_discover("multi_vfd_regress_synth-o.h5", "testbase");
+expect_multi("discover_maps_draw_category_to_its_own_member",
+              discovered[MULTI_DRAW_INDEX].path == "testbase-raw.h5"
+              && discovered[MULTI_DRAW_INDEX].start_addr == 0x9000UL);
+expect_multi("discover_maps_shared_categories_to_the_meta_member",
+              discovered[0].path == "testbase-meta.h5" && discovered[0].start_addr == 0x1000UL
+              && discovered[1].path == "testbase-meta.h5" && discovered[1].start_addr == 0x1000UL
+              && discovered[3].path == "testbase-meta.h5" && discovered[3].start_addr == 0x1000UL
+              && discovered[4].path == "testbase-meta.h5" && discovered[4].start_addr == 0x1000UL
+              && discovered[5].path == "testbase-meta.h5" && discovered[5].start_addr == 0x1000UL);
+
+/* Same grouping as above (five share one member, draw gets its own), but
+ * expressed the way real HDF5 actually writes it: 0 means "identity",
+ * not "dense 1-based index". The prior bug (idx = mapping[cat] - 1,
+ * never resolving 0) would have misread this mapping -- it only looked
+ * correct for the dense [1,1,2,1,1,1] case above. super=0(self) btree=1
+ * (shares super) draw=0(self, a *different* identity) gheap=1 lheap=1
+ * ohdr=1. */
+make_ohdr_member("multi_vfd_regress_synth-o2.h5",
+                  [0UB, 1UB, 0UB, 1UB, 1UB, 1UB],
+                  ["%s-meta.h5", "%s-raw.h5"],
+                  [0x1000UL, 0x9000UL],
+                  [0x1100UL, 0x9100UL]);
+
+var discovered2 = multi_discover("multi_vfd_regress_synth-o2.h5", "testbase");
+expect_multi("discover_maps_draw_category_to_its_own_member_non_dense",
+              discovered2[MULTI_DRAW_INDEX].path == "testbase-raw.h5"
+              && discovered2[MULTI_DRAW_INDEX].start_addr == 0x9000UL);
+expect_multi("discover_maps_shared_categories_to_the_meta_member_non_dense",
+              discovered2[0].path == "testbase-meta.h5" && discovered2[0].start_addr == 0x1000UL
+              && discovered2[1].path == "testbase-meta.h5" && discovered2[1].start_addr == 0x1000UL
+              && discovered2[3].path == "testbase-meta.h5" && discovered2[3].start_addr == 0x1000UL
+              && discovered2[4].path == "testbase-meta.h5" && discovered2[4].start_addr == 0x1000UL
+              && discovered2[5].path == "testbase-meta.h5" && discovered2[5].start_addr == 0x1000UL);
+
+var rejected_wrong_candidate = 0;
+try {
+    var ignored = multi_discover("multi_vfd_regress-s.h5", "testbase");
+} catch (Exception e) {
+    rejected_wrong_candidate = 1;
+}
+expect_multi("discover_rejects_candidate_without_driver_info_message",
+              rejected_wrong_candidate);
+
+/* A hostile/corrupt mapping byte (9, not a valid H5F_mem_t selector) in a
+ * real driver-info message is rejected cleanly by multi_discover(),
+ * rather than crashing deep inside array indexing -- this is the
+ * realistic untrusted-file attack surface for the lower-level regression
+ * already covered directly in unit_drv_info.pk. */
+make_ohdr_member("multi_vfd_regress_hostile_mapping-o.h5",
+                  [9UB, 0UB, 0UB, 0UB, 0UB, 0UB],
+                  ["%s-a.h5"],
+                  [0x1000UL],
+                  [0x1100UL]);
+
+var rejected_hostile_mapping = 0;
+try {
+    var ignored6 = multi_discover("multi_vfd_regress_hostile_mapping-o.h5", "testbase");
+} catch (Exception e) {
+    rejected_hostile_mapping = (e.code == E_inval.code);
+}
+expect_multi("discover_rejects_hostile_mapping_byte", rejected_hostile_mapping);
+
+if (failures != 0) {
+    printf("UNIT MULTI_VFD: %i32d failure(s)\n", failures);
+    exit(1);
+}
+printf("UNIT MULTI_VFD: all passed\n");

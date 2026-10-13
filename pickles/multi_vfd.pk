@@ -1,0 +1,560 @@
+/* multi_vfd.pk - HDF5 "multi" VFD virtual-file assembler.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+load "ohdr_msgs.pk";
+
+/*
+ * Covers:
+ *   - The HDF5 "multi" VFD (H5FD_MULTI): one logical HDF5 address space
+ *     partitioned into up to six disjoint per-category virtual ranges
+ *     (superblock/btree/rawdata/globalheap/localheap/objheader, per
+ *     H5F_mem_t in H5Fpublic.h), each backed by its own physical file --
+ *     often with huge (e.g. 1TB) gaps between category ranges.
+ *
+ *   Unlike "family" (see family_vfd.pk), a multi file's naming/address
+ *   layout cannot be bootstrapped from a single member file: the driver
+ *   info message that would describe the other members is itself an
+ *   object header message (0x0014) allocated in the OHDR category, so
+ *   locating it already requires knowing which physical file backs OHDR --
+ *   circular unless that mapping is supplied up front. Real HDF5 doesn't
+ *   solve this by reading the file either: H5Fopen() requires the caller
+ *   to supply the same H5Pset_fapl_multi() member map/name/address
+ *   configuration used at creation time; the on-disk driver info block is
+ *   used to validate that configuration, not to discover it from nothing.
+ *   assemble_multi() follows the same shape: the caller supplies each
+ *   category's physical path and virtual start address directly (a flatter
+ *   form of what H5Pset_fapl_multi's memb_name/memb_addr arrays carry).
+ *   Only configurations where every category has its own distinct member
+ *   file are supported (as produced by H5Pset_fapl_multi with a 1:1
+ *   category->member mapping); categories sharing one physical file (e.g.
+ *   the "split" driver's meta/raw split) are out of scope.
+ *
+ *   assemble_multi() copies five of the six members eagerly (superblock,
+ *   btree, global heap, local heap, object header) via poke's
+ *   ios_copy_bytes, each to its own virtual start address in one real
+ *   output file -- relying on sparse-file support so the address gaps
+ *   between categories cost near-zero real disk (confirmed empirically: a
+ *   5.5TB logical span used ~36KB of actual disk). The sixth, raw data
+ *   (H5FD_MEM_DRAW), is deliberately left unpopulated: this project's
+ *   analyses are about HDF5 *metadata*, and dataset payload bytes are the
+ *   one category that can be large enough to make eager copying wasteful.
+ *   Its virtual range still counts toward the file's declared EOF (so
+ *   addresses into it validate correctly), it's just not filled in until
+ *   assemble_multi_fill_raw_data() is called explicitly.
+ *
+ *   A multi member's own superblock only declares its *local* extent as
+ *   eof_addr -- not the true virtual EOF -- so after assembly eof_addr is
+ *   patched to the true maximum across all six members (including the
+ *   deferred raw-data one, whose range still needs to exist even
+ *   unpopulated) and the superblock checksum is recomputed to match, using
+ *   the existing lookup3.pk / common.pk facilities unchanged. This mirrors
+ *   family_vfd.pk's approach, generalized to v2/v3's checksummed layout at
+ *   whatever sizeof_offsets the file actually uses (not hardcoded to 8).
+ *
+ *   Only superblock versions 2/3 are supported for the EOF/checksum patch
+ *   (the only versions exercised against real fixtures so far); v0/v1
+ *   multi files are out of scope for now -- see multi_patch_eof()'s
+ *   version-check comment below for why (it's not a discovery gap).
+ *
+ *   assemble_multi() only supports member addresses below
+ *   MULTI_MAX_REPRESENTABLE_ADDR (2^48 bytes): a single assembled file is
+ *   one flat address space, and poke cannot represent an offset anywhere
+ *   near what HDF5's *default* addressing produces (H5Pset_fapl_multi
+ *   with memb_addr=NULL spreads categories across fractions of
+ *   HADDR_MAX -- the smallest nonzero default, BTREE's HADDR_MAX/6, is
+ *   already ~2^61). In practice this means only custom, deliberately-small
+ *   addresses are supported -- never HDF5's own default scheme. The
+ *   "split" driver (H5Pset_fapl_split) is a convenience preset over this
+ *   same multi driver, not a separate on-disk format, but its addresses
+ *   are hardcoded unconditionally (meta half at 0, raw half at
+ *   HADDR_MAX/2) with no override available at the API level -- so *every*
+ *   real split file exceeds this limit, with no custom-address escape
+ *   hatch the way general multi has. A rejected file isn't necessarily
+ *   unsupported forever, though: multi_resolve_address() resolves one
+ *   logical address to its real (member file, local offset) directly,
+ *   without ever assembling a flat file, so individual structures can
+ *   still be inspected by hand even when assemble_multi() can't build
+ *   anything. Real HDF5 does the same address-to-member translation
+ *   internally on every access (H5FD_multi_read/_write); the difference is
+ *   that HDF5's translation is transparent to the rest of the library,
+ *   while multi_resolve_address() has to be called explicitly by whoever
+ *   wants to read something -- it doesn't make superblock.pk/ohdr_msgs.pk/
+ *   etc. multi-aware automatically.
+ *
+ * Load order:
+ *   (poke) .load pickles/common.pk       <- must be loaded first; declares
+ *                                            open_fresh(), H5_FORMAT_FILE_
+ *                                            SIGNATURE, lookup3_hashlittle(),
+ *                                            hdf5_u32_le_bytes() this file
+ *                                            uses, matching every other
+ *                                            pickle in this codebase's
+ *                                            convention of depending on
+ *                                            common.pk without loading it
+ *                                            themselves
+ *   (poke) .load pickles/superblock.pk   <- must precede multi_vfd.pk:
+ *                                            multi_patch_eof() calls its
+ *                                            locate_superblock(). Not
+ *                                            loaded by this file itself,
+ *                                            matching common.pk's
+ *                                            convention
+ *   (poke) .load pickles/multi_vfd.pk    <- loads ohdr_msgs.pk itself;
+ *                                            load anything else you need
+ *                                            to explore the assembled file
+ *                                            afterward
+ *
+ * Quick start:
+ *   Category order below matches H5F_mem_t (H5Fpublic.h) minus 1, i.e. the
+ *   order H5Pset_fapl_multi's memb_map/memb_name/memb_addr arrays use:
+ *   0=super, 1=btree, 2=draw (raw data), 3=gheap, 4=lheap, 5=ohdr.
+ *
+ *     var members = [
+ *       multi_member { path = "mfile-s.h5", start_addr = 0UL },
+ *       multi_member { path = "mfile-b.h5", start_addr = 1UL <<. 40 },
+ *       multi_member { path = "mfile-r.h5", start_addr = 2UL <<. 40 },
+ *       multi_member { path = "mfile-g.h5", start_addr = 3UL <<. 40 },
+ *       multi_member { path = "mfile-l.h5", start_addr = 4UL <<. 40 },
+ *       multi_member { path = "mfile-o.h5", start_addr = 5UL <<. 40 }];
+ *
+ *     var total = assemble_multi(members, "/tmp/assembled.h5");
+ *     printf("copied %v bytes (metadata only; raw data deferred)\n", total);
+ *
+ *     var f = open("/tmp/assembled.h5");
+ *     set_ios(f);
+ *     var sb = superblock @ 0#B;
+ *     printf("super_vers=%v\n", sb.super_vers);
+ *     close(f);
+ *
+ *   To later fill in real dataset bytes:
+ *     assemble_multi_fill_raw_data("/tmp/assembled.h5", members[2]);
+ *
+ * If you don't already know the layout (paths + addresses above came from
+ * whatever called H5Pset_fapl_multi() to create the files -- typically
+ * application code you don't have handy): check the superblock version
+ * first (byte 8 of whichever file you believe holds it) -- it decides
+ * which of two independent cases you're in, they don't chain into each
+ * other:
+ *
+ *   - v0/v1: drv_info_addr_raw is a plain local offset in the *same*
+ *     file, so drv_info.pk's file_drv_info @ off decodes directly -- no
+ *     other member needed, and multi_discover() below isn't relevant here.
+ *     This only gets you as far as *looking at* member_mapping /
+ *     member_addrs / member_names_raw, though: assemble_multi() itself
+ *     rejects v0/v1 superblocks outright (multi_patch_eof()'s version
+ *     check), so there's no multi_member[6] / assemble_multi() call to
+ *     make for a v0/v1 file today -- see the "Covers" note above.
+ *
+ *   - v2/v3: the driver info is a message (0x0014) inside the superblock
+ *     extension's object header, which -- per this file's own "Covers"
+ *     note above -- can live in a *different* physical member (whichever
+ *     one the OHDR category routes to). multi_discover() automates
+ *     locating and decoding it: hand it any candidate file you believe
+ *     might hold that object header -- it tries that file for an "OHDR"
+ *     signature at local offset 0 with drv_id == "NCSAmult", and on
+ *     success returns a ready-to-use multi_member[6]. It doesn't matter
+ *     how you arrived at the candidate path; libhdf5's own default naming
+ *     templates just make "<base>-o.h5" a reasonable first guess
+ *     (confirmed against a real fixture's own member_names_raw, which
+ *     literally stores these template strings: "%s-s.h5", "%s-b.h5", ...,
+ *     "%s-o.h5"). multi_discover() raises E_inval with a clear diagnostic
+ *     if a candidate doesn't pan out, so trying another candidate is
+ *     cheap:
+ *
+ *       var members = multi_discover("mfile-o.h5", "mfile");
+ *       var total = assemble_multi(members, "/tmp/assembled.h5");
+ */
+
+/* One category's physical backing file and virtual start address. */
+type multi_member = struct {
+    string   path;
+    uint<64> start_addr;
+};
+
+/* Index of the raw-data (H5FD_MEM_DRAW) category in a multi_member[6],
+ * per H5F_mem_t's enum order (H5Fpublic.h): super=1 btree=2 draw=3
+ * gheap=4 lheap=5 ohdr=6, so index = enum value - 1. */
+var MULTI_DRAW_INDEX = 2;
+
+/* Largest member start_addr / true_eof assemble_multi() will attempt to
+ * represent in one assembled file. The real ceiling is
+ * filesystem-dependent -- verified empirically at exactly 2^55-1 bytes
+ * on this host, independent of poke (confirmed via plain `truncate`,
+ * bypassing poke entirely) -- so this is set ~128,000x below that for
+ * safety margin across platforms, while still comfortably exceeding any
+ * realistic custom-addressed multi/family file. It's also always below
+ * HDF5's own default Multi/Split addressing (the smallest nonzero
+ * default, BTREE's HADDR_MAX/6, is already ~2^61; Split's raw half is
+ * hardcoded to HADDR_MAX/2 with no override), so in practice this means
+ * assemble_multi() only ever supports custom, deliberately-small
+ * addresses -- never HDF5's default addressing scheme, for either
+ * driver. See multi_resolve_address() for inspecting a file that exceeds
+ * this without assembling it. */
+var MULTI_MAX_REPRESENTABLE_ADDR = 0x0001000000000000UL;   /* 2^48, 256 TiB */
+
+fun multi_member_size = (string path) uint<64>:
+{
+    var ios = open(path, IOS_F_READ);
+    var sz = iosize(ios) /#B;
+    close(ios);
+    return sz;
+}
+
+/* Copies one member's full bytes to its virtual offset in the open IOS
+ * `out`. Returns the member's own byte count. */
+fun multi_copy_member = (int out, multi_member m) uint<64>:
+{
+    var mf = open(m.path, IOS_F_READ);
+    var sz = iosize(mf) /#B;
+    if (sz > 0UL)
+        ios_copy_bytes(mf, out, 0#B, m.start_addr#B, sz#B);
+    close(mf);
+    return sz;
+}
+
+fun multi_true_eof = (multi_member[6] members) uint<64>:
+{
+    var eof = 0UL;
+    for (m in members) {
+        var end = m.start_addr + multi_member_size(m.path);
+        if (end > eof) eof = end;
+    }
+    return eof;
+}
+
+type multi_resolved_address = struct {
+    string   member_path;
+    uint<64> local_offset;
+};
+
+/* Given multi_discover()'s (path, start_addr) mapping and an absolute
+ * logical address, finds which real member file holds it and the local
+ * offset within that file -- the same search H5FD_multi_read does
+ * (largest start_addr <= addr). Works regardless of
+ * MULTI_MAX_REPRESENTABLE_ADDR, since it never builds a file: it's the
+ * only way to inspect a default-addressed multi/split file at all, one
+ * structure at a time, directly from the real member files.
+ *
+ * This is a manual, per-call workaround, not a transparent replacement
+ * for assemble_multi: nothing here makes existing pickles (superblock.pk
+ * etc.) multi-aware automatically. Each caller must call this, then open
+ * member_path and map at local_offset itself, e.g.:
+ *
+ *     var r = multi_resolve_address(members, logical_addr);
+ *     var ios = open(r.member_path);
+ *     set_ios(ios);
+ *     var sb = superblock @ r.local_offset#B;
+ *     close(ios);
+ *
+ * Raises E_inval if logical_addr precedes every member's start_addr
+ * (shouldn't happen for a well-formed mapping, since SUPER's start_addr
+ * is always 0). */
+fun multi_resolve_address = (multi_member[6] members, uint<64> logical_addr)
+    multi_resolved_address:
+{
+    var best_path = "";
+    var best_start = 0UL;
+    var found = 0;
+    for (m in members) {
+        if (m.start_addr <= logical_addr && (!found || m.start_addr >= best_start)) {
+            best_path = m.path;
+            best_start = m.start_addr;
+            found = 1;
+        }
+    }
+    if (!found)
+        raise E_inval;
+    return multi_resolved_address {
+        member_path = best_path,
+        local_offset = logical_addr - best_start
+    };
+}
+
+/* Little-endian encode of `v`, zero-extended or truncated to `n` bytes.
+ * `v` is a uint<64> logical value; for n > 8 the extra high-order bytes
+ * are zero. n is not assumed to be <= 8: real HDF5 superblocks may
+ * legally declare sizeof_addr/sizeof_offsets of 16 or 32, not just 2/4/8
+ * (see H5Fsuper_cache.c's sizeof_addr validation) -- and poke's `.>>`
+ * wraps its shift amount modulo the operand's 64-bit width rather than
+ * zero-extending, so shifting by >= 64 must be special-cased instead of
+ * relied on to yield zero. */
+fun multi_u64_le_bytes_n = (uint<64> v, int n) byte[]:
+{
+    var out = byte[n]();
+    var i = 0;
+    while (i < n) {
+        out[i] = (i < 8) ? ((v .>> (i * 8)) & 0xffUL) as uint<8> : 0UB;
+        i = i + 1;
+    }
+    return out;
+}
+
+/* Patches a v2/v3 superblock's eof_addr field (and recomputes its
+ * checksum) at offset 0 of `output_path` to declare true_eof. Field
+ * offsets are computed from the superblock's own sizeof_offsets byte, not
+ * hardcoded -- see the v2/v3 layout comment in superblock.pk. */
+
+fun multi_patch_eof = (string output_path, uint<64> true_eof) void:
+{
+    var ios = open(output_path);
+    set_ios(ios);
+
+    var sig_addr = locate_superblock(ios);
+
+    var super_vers = byte @ (sig_addr + 8UL)#B;
+    if (super_vers < 2UB) {
+        /* Not a discovery limitation -- drv_info.pk's file_drv_info @ off
+         * already decodes v0/v1 driver info directly (drv_info_addr_raw is
+         * a plain local offset, no OHDR-member indirection to resolve).
+         * This check is the actual blocker: v0/v1 needs genuinely
+         * different field-offset arithmetic below, not just a relaxed
+         * version guard -- no superblock-level checksum to recompute at
+         * all, and a more variable set of fields (stab_leaf_k,
+         * stab_internal_k, status_flags, an optional indexed_internal_k /
+         * reserved pair only present when super_vers == 1) precede
+         * eof_addr_raw instead of v2/v3's compact fixed layout. Combined
+         * with no real v0/v1 multi fixture to verify against (every
+         * fixture used to build/test this file is v2), that arithmetic
+         * hasn't been written -- see the "Covers" note above. */
+        printf("multi_patch_eof: superblock version %v not supported (need v2/v3)\n",
+               super_vers);
+        raise E_inval;
+    }
+    var sizeof_offsets = (byte @ (sig_addr + 9UL)#B) as int;
+
+    /* v2/v3 layout after the 8-byte signature (superblock.pk), relative
+     * to sig_addr (the real superblock's own start, past any user
+     * block):
+     *   super_vers(1) sizeof_offsets(1) sizeof_lengths(1) status_flags(1)
+     *   base_addr(sizeof_offsets) ext_addr(sizeof_offsets)
+     *   eof_addr(sizeof_offsets) root_addr(sizeof_offsets) chksum(4) */
+    var eof_off = sig_addr + 12UL + 2UL * (sizeof_offsets as uint<64>);
+    var chksum_off = sig_addr + 12UL + 4UL * (sizeof_offsets as uint<64>);
+    var chksum_len = (chksum_off - sig_addr) as int;
+
+    byte[sizeof_offsets] @ eof_off#B = multi_u64_le_bytes_n(true_eof, sizeof_offsets);
+
+    /* The checksum covers only the superblock's own bytes, starting at
+     * sig_addr -- never the user block prefix (H5Fsuper_cache.c encodes
+     * it via H5_checksum_metadata(_image, ...), where _image is the
+     * superblock's own encode buffer, not the whole file). */
+    var new_chksum = lookup3_hashlittle(byte[chksum_len] @ sig_addr#B, 0U);
+    byte[4] @ chksum_off#B = hdf5_u32_le_bytes(new_chksum);
+
+    close(ios);
+}
+
+/* Assembles the five metadata-category members into one real file at
+ * output_path (raw data deferred -- see file header), then patches its
+ * superblock eof_addr/checksum to the true virtual EOF across all six
+ * members. Returns the number of bytes actually copied (excludes the
+ * deferred raw-data member). */
+fun assemble_multi = (multi_member[6] members, string output_path) uint<64>:
+{
+    /* Check every member's start_addr, and the true cross-member EOF,
+     * against MULTI_MAX_REPRESENTABLE_ADDR before creating any output
+     * file -- a default-addressed multi/split file (or anything else
+     * whose declared addresses exceed what this tool can represent)
+     * gets a clear rejection instead of a half-written file or a raw
+     * poke I/O failure partway through assembly. */
+    var true_eof = multi_true_eof(members);
+    if (true_eof >= MULTI_MAX_REPRESENTABLE_ADDR) {
+        printf("assemble_multi: true EOF %v exceeds the maximum address this tool can represent (%v) -- likely a default-addressed multi/split file; see multi_resolve_address() to inspect it without assembling\n",
+               true_eof, MULTI_MAX_REPRESENTABLE_ADDR);
+        raise E_inval;
+    }
+    var i = 0;
+    while (i < 6) {
+        if (members[i].start_addr >= MULTI_MAX_REPRESENTABLE_ADDR) {
+            printf("assemble_multi: member %v start_addr %v exceeds the maximum address this tool can represent (%v) -- likely a default-addressed multi/split file; see multi_resolve_address() to inspect it without assembling\n",
+                   i, members[i].start_addr, MULTI_MAX_REPRESENTABLE_ADDR);
+            raise E_inval;
+        }
+        i = i + 1;
+    }
+
+    var out = open_fresh(output_path);
+    var total = 0UL;
+    var highest_written = 0UL;
+    i = 0;
+    while (i < 6) {
+        if (i != MULTI_DRAW_INDEX) {
+            var sz = multi_copy_member(out, members[i]);
+            total = total + sz;
+            var end = members[i].start_addr + sz;
+            if (end > highest_written)
+                highest_written = end;
+        }
+        i = i + 1;
+    }
+
+    /* Extend the sparse file to the full declared EOF when the highest
+     * byte actually written falls short of it (true when the deferred
+     * raw-data category is the highest-addressed member) -- tracked from
+     * the copy loop's own return values, not iosize(out): iosize() on a
+     * just-written, not-yet-reopened IOS can report a stale, short size
+     * (confirmed on both poke 4.3 and 5.0: writing bytes 100..103 reports
+     * iosize==103 until the IOS is closed and reopened), which would
+     * otherwise make this check fire even when the highest member's bytes
+     * are already fully in place -- stomping its real last byte with 0. */
+    if (highest_written < true_eof)
+        byte @ out : (true_eof - 1UL)#B = 0UB;
+    close(out);
+
+    multi_patch_eof(output_path, true_eof);
+    return total;
+}
+
+/* Fills in the previously-deferred raw-data member's real bytes into an
+ * already-assembled/patched output file. draw_member should be
+ * members[MULTI_DRAW_INDEX] from the original assemble_multi() call. */
+fun assemble_multi_fill_raw_data = (string output_path, multi_member draw_member) uint<64>:
+{
+    var out = open(output_path);
+    var sz = multi_copy_member(out, draw_member);
+    close(out);
+    return sz;
+}
+
+/* Splits a padded/null-terminated member_names_raw blob (drv_info.pk /
+ * ohdr_msgs.pk's oh_msg_drvinfo) into n separate %s-templated name
+ * strings -- each entry still needs base_name substituted in via
+ * multi_expand_name_template(). Each on-disk entry is a null-terminated
+ * name padded to a multiple of 8 bytes, per drv_info.pk's own layout
+ * comment. */
+fun multi_split_names = (byte[] raw, int n) string[]:
+{
+    var names = string[n]();
+    var pos = 0;
+    var i = 0;
+    while (i < n) {
+        var start = pos;
+        while (pos < raw'length && raw[pos] != 0UB)
+            pos = pos + 1;
+        var s = "";
+        var j = start;
+        while (j < pos) {
+            s = s + (raw[j] as char as string);
+            j = j + 1;
+        }
+        names[i] = s;
+        pos = pos + 1;                 /* skip the null terminator */
+        var entry_len = pos - start;   /* name bytes + null */
+        var pad = (8 - (entry_len % 8)) % 8;
+        pos = pos + pad;
+        i = i + 1;
+    }
+    return names;
+}
+
+/* Substitutes base_name for the first "%s" in tmpl (the on-disk member
+ * name templates, e.g. "%s-o.h5" -> "mfile-o.h5"). */
+fun multi_expand_name_template = (string tmpl, string base_name) string:
+{
+    var pos = -1;
+    var i = 0;
+    while (i + 1 < tmpl'length) {
+        if (tmpl[i] == '%' && tmpl[i + 1] == 's') {
+            pos = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if (pos == -1) {
+        printf("multi_expand_name_template: no '%%s' specifier in template: %s\n", tmpl);
+        raise E_inval;
+    }
+    return tmpl[0:pos] + base_name + tmpl[pos + 2:tmpl'length];
+}
+
+/* Given a candidate physical file believed to hold the superblock
+ * extension's object header (see the "If you don't already know the
+ * layout" note above -- typically the "-o" member under the default
+ * naming convention), locates and decodes the driver info message
+ * (0x0014) at local offset 0 and reconstructs a ready-to-use
+ * multi_member[6] array (same shape assemble_multi() takes), substituting
+ * base_name into the on-disk %s-templated member names.
+ *
+ * Only meaningful for v2/v3 files: v0/v1's driver info is a direct
+ * superblock field, always local to the "-s" member (see drv_info.pk's
+ * own quick start) -- multi_discover() isn't needed there.
+ *
+ * Raises E_inval with a diagnostic printf if ohdr_candidate_path doesn't
+ * hold the driver info message at offset 0, or isn't the multi driver --
+ * try a different candidate file. */
+fun multi_discover = (string ohdr_candidate_path, string base_name) multi_member[6]:
+{
+    var of = open(ohdr_candidate_path);
+    set_ios(of);
+
+    /* A candidate that isn't an object header at all (wrong file, or too
+     * small) can make msg_payload_offset_in_ohdr's scan run past real EOF
+     * while walking garbage as if it were a message list, raising a raw
+     * EOF exception rather than returning SHARED_MSG_UNRESOLVED -- treat
+     * both the same way, since both just mean "not it, try another". */
+    var payload_off = SHARED_MSG_UNRESOLVED;
+    try {
+        payload_off = msg_payload_offset_in_ohdr(0#B, DRVINFO_ID as uint<8>, 0UH, 0);
+    } catch (Exception e) {
+        payload_off = SHARED_MSG_UNRESOLVED;
+    }
+    if (payload_off == SHARED_MSG_UNRESOLVED) {
+        close(of);
+        printf("multi_discover: no driver info message (0x0014) found at offset 0 of %s\n",
+               ohdr_candidate_path);
+        raise E_inval;
+    }
+
+    var dvi = oh_msg_drvinfo @ payload_off;
+    if (file_drv_type(dvi.drv_id) != 1) {
+        close(of);
+        printf("multi_discover: %s's driver info is not the multi (\"NCSAmult\") driver\n",
+               ohdr_candidate_path);
+        raise E_inval;
+    }
+
+    var mapping = dvi.drv_info.multi.member_mapping;
+    /* count_unique()/multi_category_indices() can no longer raise on a
+     * hostile byte (see multi_resolve_category()'s own comment) -- now
+     * that we know dtype == 1 really is multi data, explicitly validate
+     * it here instead. */
+    try {
+        multi_validate_mapping(mapping);
+    } catch (Exception e) {
+        close(of);
+        raise e;
+    }
+    var n_unique = count_unique(mapping) as int;
+    var members = multi_decode_drv_members(dvi.drv_info'offset + 8#B, mapping,
+                                            dvi.drv_info_size as uint<64>);
+    var addrs = members.member_addrs;
+    var templates = multi_split_names(members.member_names_raw, n_unique);
+    var cat_idx = multi_category_indices(mapping);
+
+    var result = multi_member[6]();
+    var cat = 0;
+    while (cat < 6) {
+        var idx = cat_idx[cat];
+        result[cat] = multi_member {
+            path = multi_expand_name_template(templates[idx], base_name),
+            start_addr = addrs[idx].start_addr
+        };
+        cat = cat + 1;
+    }
+
+    close(of);
+    return result;
+}

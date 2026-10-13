@@ -1,0 +1,106 @@
+/* Regression coverage for drv_info.pk's multi-driver member-mapping
+ * resolution: count_unique(), multi_resolve_category(), and
+ * multi_category_indices().
+ *
+ * The on-disk 6-byte member_mapping array (cat 0-indexed, 0=SUPER..5=OHDR)
+ * uses 0 (H5FD_MEM_DEFAULT) to mean "identity" -- this category owns its
+ * own member -- not "unmapped". A prior bug treated 0 as "skip", so an
+ * all-identity mapping [0,0,0,0,0,0] (a real libhdf5 default-2.3.0
+ * fixture shape) computed count_unique == 0 instead of the correct 6.
+ * See upstream's UNIQUE_MEMBERS_CORE macro, H5FDmulti.c. */
+load "common.pk";
+load "drv_info.pk";
+
+var failures = 0;
+fun expect_drv_info = (string name, int cond) void:
+{
+    if (cond)
+        printf("PASS %s\n", name);
+    else {
+        printf("FAIL %s\n", name);
+        failures = failures + 1;
+    }
+}
+
+/* --- multi_resolve_category(): 0 means identity (self), not unmapped --- */
+expect_drv_info("resolve_zero_is_self_super",
+                 multi_resolve_category([0UB, 0UB, 0UB, 0UB, 0UB, 0UB], 0) == 1);
+expect_drv_info("resolve_zero_is_self_ohdr",
+                 multi_resolve_category([0UB, 0UB, 0UB, 0UB, 0UB, 0UB], 5) == 6);
+expect_drv_info("resolve_nonzero_is_the_named_category",
+                 multi_resolve_category([0UB, 3UB, 0UB, 0UB, 0UB, 0UB], 1) == 3);
+
+/* --- count_unique(): all-identity is 6 distinct members, not 0 --- */
+expect_drv_info("count_unique_all_identity_is_six",
+                 count_unique([0UB, 0UB, 0UB, 0UB, 0UB, 0UB]) == 6UL);
+
+/* Dense mapping (every byte already a valid 1-based index) -- the shape
+ * the pre-fix code happened to get right; kept as a sanity check that
+ * the fix doesn't regress the case that was already working. */
+expect_drv_info("count_unique_dense_mapping",
+                 count_unique([1UB, 1UB, 2UB, 1UB, 1UB, 1UB]) == 2UL);
+
+/* Realistic non-dense "split"-style mapping: SUPER/BTREE/GHEAP/LHEAP/OHDR
+ * share one member (via SUPER, cat 0, raw 0 = self); DRAW (cat 2) is its
+ * own member (raw 0 = self, a different resolved value). Two distinct
+ * members, but the raw bytes are all 0 or 1 -- never densely 1..2. */
+expect_drv_info("count_unique_split_style_mapping",
+                 count_unique([0UB, 1UB, 0UB, 1UB, 1UB, 1UB]) == 2UL);
+
+/* --- multi_category_indices(): the actual per-category compacted slot --- */
+expect_drv_info("category_indices_all_identity_are_sequential",
+                 multi_category_indices([0UB, 0UB, 0UB, 0UB, 0UB, 0UB])
+                 == [0, 1, 2, 3, 4, 5]);
+
+expect_drv_info("category_indices_split_style_mapping",
+                 multi_category_indices([0UB, 1UB, 0UB, 1UB, 1UB, 1UB])
+                 == [0, 0, 1, 0, 0, 0]);
+
+/* --- multi_resolve_category()/multi_category_indices()/count_unique():
+ * hostile bytes are now handled safely, never raised ---
+ *
+ * Real H5F_mem_t selectors only run 1-6; a corrupt or hostile mapping
+ * byte (e.g. 9) used to flow straight into slot_for_value (int[7]) as an
+ * array index, raising a raw "out of bounds" exception. A later fix made
+ * these raise a diagnostic E_inval instead -- but poke evaluates every
+ * arm of a union's fields regardless of which one the discriminant
+ * actually selects, so that raise also fired while decoding a
+ * *non*-multi driver info block (e.g. family's NCSAfami), breaking
+ * decoding of data that was never multi-driver data at all. These
+ * functions can no longer raise at all: an out-of-range byte is treated
+ * as identity (same as 0), always a safe, in-bounds category. Real
+ * validation of genuine multi-driver data now lives in
+ * multi_validate_mapping() instead (tested below), called only once a
+ * caller already knows it's looking at multi data. */
+expect_drv_info("resolve_category_treats_invalid_byte_as_identity",
+                 multi_resolve_category([9UB, 0UB, 0UB, 0UB, 0UB, 0UB], 0) == 1);
+
+expect_drv_info("category_indices_treats_invalid_byte_as_identity",
+                 multi_category_indices([0UB, 200UB, 0UB, 0UB, 0UB, 0UB])
+                 == [0, 1, 2, 3, 4, 5]);
+
+expect_drv_info("count_unique_treats_invalid_byte_as_identity",
+                 count_unique([0UB, 0UB, 7UB, 0UB, 0UB, 0UB]) == 6UL);
+
+/* --- multi_validate_mapping(): the real, explicit validation --- */
+var rejected_by_validate_mapping = 0;
+try {
+    multi_validate_mapping([9UB, 0UB, 0UB, 0UB, 0UB, 0UB]);
+} catch (Exception e) {
+    rejected_by_validate_mapping = (e.code == E_inval.code);
+}
+expect_drv_info("validate_mapping_rejects_invalid_byte", rejected_by_validate_mapping);
+
+var accepted_by_validate_mapping = 1;
+try {
+    multi_validate_mapping([0UB, 1UB, 2UB, 1UB, 1UB, 1UB]);
+} catch (Exception e) {
+    accepted_by_validate_mapping = 0;
+}
+expect_drv_info("validate_mapping_accepts_legal_mapping", accepted_by_validate_mapping);
+
+if (failures != 0) {
+    printf("UNIT DRV_INFO: %i32d failure(s)\n", failures);
+    exit(1);
+}
+printf("UNIT DRV_INFO: all passed\n");

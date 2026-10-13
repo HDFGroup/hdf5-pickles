@@ -1214,7 +1214,7 @@ Driver information message (type 0x0014). Stores virtual file driver metadata in
 
 Pickle union arm: `multi`.
 
-Payload for the multi-file driver (`NCSAmult`). It maps each HDF5 usage class to a member file and stores the corresponding virtual address ranges and padded member file names.
+Payload for the multi-file driver (`NCSAmult`). The type decodes only the fixed 8-byte header (mapping and reserved bytes). The member address ranges and padded member file names that follow are read by `multi_decode_drv_members()` (drv_info.pk), and only once the driver is confirmed to be `NCSAmult`.
 
 **Fields: Multi**
 
@@ -1222,9 +1222,6 @@ Payload for the multi-file driver (`NCSAmult`). It maps each HDF5 usage class to
 |-------|-------------------|-------------|
 | Member Mapping | `member_mapping` | Six-byte mapping from usage class to member file index: superblock, B-tree, raw data, global heap, local heap, and object header. |
 | Reserved | `reserved` | Reserved two-byte field. Must be zero. |
-| N Members | `n_members` | Derived count of distinct non-zero member file indices in `member_mapping`. |
-| Member Addrs | `member_addrs` | Array of `multi_drv_member_addr` records, one for each distinct mapped member file. |
-| Member Names Raw | `member_names_raw` | Raw member file name bytes. Names are NUL-terminated and each encoded name is padded to an 8-byte boundary. |
 
 ### Fami
 
