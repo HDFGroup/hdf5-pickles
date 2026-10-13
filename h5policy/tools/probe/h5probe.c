@@ -361,6 +361,41 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
     if (io >= 0 && st->exercise_chunk_index && chunked && swept)
         st->family_completed++;
 
+    /* Datatype canary: the read above uses the file's own type as the memory
+     * type, so no datatype conversion runs.  A type the decoder accepts but
+     * whose geometry is internally inconsistent -- e.g. a complex number type
+     * whose element size is not twice its base type -- faults only when a
+     * DIFFERING memory type forces the conversion path, where H5T__conv_*
+     * reads and writes at the base type's bit positions while striding by the
+     * declared element size.  Read one element converting to the library's
+     * native form of the same type; skip cleanly when native derivation fails,
+     * the native type is identical, or it is variable-length or too large.  A
+     * stock build may complete this read with a silent out-of-bounds access
+     * (the fault surfaces on a sanitizer candidate); a rejecting read is a
+     * clean refusal.  See registry/cases/complex-size-not-twice-base.yml. */
+    if (st->exercise_datatype) {
+        hid_t ntype = H5Tget_native_type(dtype, H5T_DIR_DEFAULT);
+        if (ntype >= 0) {
+            size_t nsize = H5Tget_size(ntype);
+            if (nsize > 0 && nsize <= PROBE_MAX_ELEMENT_BYTES &&
+                H5Tdetect_class(ntype, H5T_VLEN) <= 0 &&
+                H5Tis_variable_str(ntype) <= 0 && H5Tequal(dtype, ntype) == 0) {
+                void *nbuf = calloc((size_t)nsel, nsize);
+                if (nbuf) {
+                    herr_t nio = H5Dread(dset, ntype, memspace, space,
+                                         H5P_DEFAULT, nbuf);
+                    entry_point_result(st, EP_H5DREAD, nio >= 0);
+                    if (nio < 0)
+                        st->call_errors++;
+                    else
+                        st->data_reads++;
+                    free(nbuf);
+                }
+            }
+            H5Tclose(ntype);
+        }
+    }
+
     if (st->exercise_write) {
         memset(buf, 0, tsize);
         io = H5Dwrite(dset, dtype, memspace, space, H5P_DEFAULT, buf);

@@ -152,6 +152,77 @@ def _write_cache_image(path, userblock=0):
         _build_and_run_h5cc_helper(source, helper, args)
 
 
+def _write_complex_base(path):
+    """Write a valid class-11 (complex number) dataset via the installed 2.x
+    h5cc.  h5py here bundles libhdf5 1.14.x, which has no complex class, so this
+    is the only way to put a class-11 datatype in the corpus.  The file uses
+    earliest/latest libver bounds (v1, unchecksummed object header) so the
+    malformed sibling can byte-patch its datatype message in place."""
+    source = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                          "probe", "make_complex.c")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with tempfile.TemporaryDirectory() as build:
+        helper = os.path.join(build, "make_complex")
+        _build_and_run_h5cc_helper(source, helper, [path])
+
+
+# Byte layout of the v5 homogeneous-rectangular complex datatype message that
+# make_complex.c emits, and the offsets of its inline base float's fields.  The
+# outer element size (16) stays put; only the base float is rewritten.
+_COMPLEX_MSG = bytes([0x5B, 0x01, 0x00, 0x00, 16, 0, 0, 0,     # class 11/v5, homog rect, size 16
+                      0x11, 0x20, 0x3F, 0x00, 8, 0, 0, 0,      # base: float v1, LE/implied, sign 63, size 8
+                      0, 0, 64, 0, 52, 11, 0, 52, 0xFF, 0x03, 0, 0])
+_CPLX_BASE_SIZE   = 12   # u32 base type size
+_CPLX_BASE_OFFSET = 16   # u16 bit offset
+_CPLX_BASE_PREC   = 18   # u16 precision
+_CPLX_BASE_EPOS   = 20   # u8 exponent position
+_CPLX_BASE_ESIZE  = 21   # u8 exponent size
+_CPLX_BASE_MPOS   = 22   # u8 mantissa position
+_CPLX_BASE_MSIZE  = 23   # u8 mantissa size
+
+
+def _make_complex_size_not_twice_base(path):
+    """A complex number datatype whose declared element size (16) is NOT twice
+    its base float's size.  The decoder (H5O__dtype_decode_helper, H5T_COMPLEX
+    arm) never checks size == 2 * base_size -- the ENUM and ARRAY arms do -- so
+    the type is accepted and the conversion loop then reads/writes at the base
+    type's bit positions while striding by the declared size (out-of-bounds).
+    This patches the base float to 240 bytes / 960-bit precision with its
+    mantissa at bit 255, leaving the outer size at 16.  See
+    registry/cases/complex-size-not-twice-base.yml."""
+    with tempfile.TemporaryDirectory() as build:
+        base = os.path.join(build, "complex_base.h5")
+        _write_complex_base(base)
+        raw = bytearray(open(base, "rb").read())
+
+    # Regime assertions (AGENTS.md: assert the regime, not the values): a v1
+    # (unchecksummed) object header holding exactly one complex128 datatype
+    # message of the known shape.
+    assert raw[:8] == b"\x89HDF\r\n\x1a\n", "not an HDF5 file"
+    assert b"OHDR" not in raw, "v2 object header: patching would need a checksum"
+    n = raw.count(_COMPLEX_MSG)
+    assert n == 1, "expected exactly one complex128 datatype message, found %d" % n
+    off = raw.index(_COMPLEX_MSG)
+
+    base_size, prec = 240, 960
+    epos, esize, mpos, msize = 0, 11, 255, 255
+    struct.pack_into("<I", raw, off + _CPLX_BASE_SIZE, base_size)
+    struct.pack_into("<H", raw, off + _CPLX_BASE_OFFSET, 0)
+    struct.pack_into("<H", raw, off + _CPLX_BASE_PREC, prec)
+    raw[off + _CPLX_BASE_EPOS]  = epos
+    raw[off + _CPLX_BASE_ESIZE] = esize
+    raw[off + _CPLX_BASE_MPOS]  = mpos
+    raw[off + _CPLX_BASE_MSIZE] = msize
+
+    outer_size = struct.unpack_from("<I", raw, off + 4)[0]
+    # The defect condition, and the decoder's own base-float guards, so the
+    # file is rejected for the size inconsistency and not for an unrelated field.
+    assert outer_size != 2 * base_size, "patch did not break the size relation"
+    assert epos + esize - 1 < base_size * 8 and mpos + msize - 1 < base_size * 8
+    assert not (base_size * 8 > 2 * (prec + 0)), "would trip the unusual-unused-bits check"
+    _patch(path, bytes(raw))
+
+
 def _base_bytes(build, libver="latest"):
     """Return the raw bytes of a fresh h5py base file.
 
@@ -205,6 +276,7 @@ def _gen_valid(root):
     _write(simple_path,
            lambda h: h.create_dataset("a", data=np.arange(6, dtype="i4")))
     _write_cache_image(f"{root}/valid/cache_image.h5")
+    _write_complex_base(f"{root}/valid/complex_dataset.h5")
     _make_attr_null_vlen_userblock(f"{root}/valid/attr_null_vlen_userblock.h5")
     _make_contig_unalloc_size_mismatch(
         f"{root}/valid/contig_unalloc_size_mismatch.h5")
@@ -1469,6 +1541,8 @@ def _gen_malformed(root):
         f"{root}/malformed/drvinfo_block_aliases_root_symtab.h5")
     _make_drvinfo_block_aliases_root_btree(
         f"{root}/malformed/drvinfo_block_aliases_root_btree.h5")
+    _make_complex_size_not_twice_base(
+        f"{root}/malformed/complex_size_not_twice_base.h5")
     _patch(f"{root}/malformed/bad_signature.h5",
            bytes([raw[0] ^ 0xFF]) + raw[1:])
     _patch(f"{root}/malformed/truncated.h5", raw[:32])
