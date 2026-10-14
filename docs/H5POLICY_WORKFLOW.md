@@ -286,8 +286,8 @@ The covered set is `object_header_continuation`, `external_file_list`,
 `dataset_layout_filter_fill`, `dataspace_dimension`, `address_space_bounds`,
 `chunk_index`, `message_envelope`, and `validation_controls`.
 
-The stronger §12 verification score is lower. Of **176 assurance slots**, **68
-are `met`, 75 `partial`, 0 `not_assessed`, and 33 `absent`**. These are eleven
+The stronger §12 verification score is lower. Of **176 assurance slots**, **70
+are `met`, 73 `partial`, 0 `not_assessed`, and 33 `absent`**. These are eleven
 requirements applied to each of the 16 families; they are not a percentage of
 the HDF5 specification. Major visible gaps include:
 

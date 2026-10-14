@@ -16,7 +16,7 @@ id: chunk-dim-product-64bit-overflow
 title: chunked layout dimensions multiply without an overflow check, so a
   product of 2**64 wraps to a zero chunk size and libhdf5 reads and writes past
   a zero-size chunk buffer
-status: oracle-hardened          # h5policy rejects as of 2026-08-24; libhdf5 unfixed
+status: oracle-hardened          # h5policy rejects as of 2026-08-24; libhdf5 NO LONGER FAULTS on develop 5933130b610 -- now a silent accept; needs re-triage, see measured.REMEASURED_2026_10_12
 disclosure: >-
   n/a -- local analysis only.  Nothing was reported upstream from here, no
   advisory database was consulted, and no identifier was looked up.  The
@@ -37,12 +37,13 @@ activation_before_validation:
   - native_construction
 entry_points:
   - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-08-24"
-  - "libhdf5 H5Fopen -> H5Dopen2 -> H5D__chunk_init (src/H5Dchunk.c:1179) -> H5D__chunk_set_sizes (src/H5Dchunk.c:849-860)"
-  - "libhdf5 H5Dread -> H5D__chunk_read (src/H5Dchunk.c:3141) -> H5D__chunk_lock (src/H5Dchunk.c:4829) -> H5D__compact_readvv (src/H5Dcompact.c:409) -> H5VM_memcpyvv (src/H5VM.c:1383)  <-- OOB read"
-  - "libhdf5 H5Dwrite -> H5D__chunk_write (src/H5Dchunk.c:3600) -> H5D__chunk_lock (src/H5Dchunk.c:4887) -> H5D__compact_writevv (src/H5Dcompact.c:467) -> H5VM_memcpyvv (src/H5VM.c:1426)  <-- OOB write"
+  - "libhdf5 H5Fopen -> H5Dopen2 -> H5D__chunk_init (src/H5Dchunk.c:1226) -> H5D__chunk_set_sizes (src/H5Dchunk.c:898-900)"
+  - "libhdf5 H5Dread -> H5D__chunk_read (src/H5Dchunk.c:2938) -> H5D__chunk_lock (src/H5Dchunk.c:5168) -> H5D__compact_readvv (src/H5Dcompact.c:409) -> H5VM_memcpyvv (src/H5VM.c:1383)  <-- OOB read, NOT reproduced on develop 5933130b610; see measured.REMEASURED_2026_10_12"
+  - "libhdf5 H5Dwrite -> H5D__chunk_write (src/H5Dchunk.c:3796) -> H5D__chunk_lock (src/H5Dchunk.c:5168) -> H5D__compact_writevv (src/H5Dcompact.c:467) -> H5VM_memcpyvv (src/H5VM.c:1426)  <-- OOB write, UNMEASURED since the restructure"
   - "shipped consumers: h5dump -d with a subset whose start coordinate is nonzero; any H5Dread or H5Dwrite. NOT h5dump -H / h5ls -v, which never materialize a chunk"
 
-# -- The defect, read out of the source tree (HDF5 2.3.0, develop 51b92ccee54) -
+# -- The defect, read out of the source tree (HDF5 2.3.0, develop 51b92ccee54;
+#    line numbers RE-PINNED 2026-10-12 to develop 5933130b610) ----------------
 defect: >-
   The chunked branch of H5O__layout_decode multiplies the decoded dimensions
   straight through, in both the pre-v4 arm and the shared v4/v5 arm:
@@ -51,8 +52,8 @@ defect: >-
         mesg->u.chunk.size *= mesg->u.chunk.dim[u];
   Per-dimension validation is exactly one test -- dim[u] == 0 is rejected -- and
   nothing bounds the product.  H5D__chunk_set_sizes then recomputes the same
-  product on OPEN (src/H5Dchunk.c:849-860, reached through the open_op branch at
-  :1179) and follows it with a guard that cannot fire:
+  product on OPEN (src/H5Dchunk.c:898-900, reached through the open_op branch at
+  :1226) and follows it with a guard that cannot fire:
     if ((uint64_t)dset->shared->layout.u.chunk.size != chunk_size)
         HGOTO_ERROR(... "chunk size too big to fit in hsize_t");
   Both sides are 64 bits wide, so the comparison is vacuous -- while the comment
@@ -64,21 +65,49 @@ defect: >-
   A wrapped product of ZERO is the dangerous landing point, because the
   library's own size guard is an upper bound:
     if (dset->shared->layout.u.chunk.size > (hsize_t)0xffffffff &&
-        dset->shared->layout.u.chunk.idx_type == H5D_CHUNK_IDX_BTREE)   -- :1185
+        dset->shared->layout.u.chunk.idx_type == H5D_CHUNK_IDX_BTREE)   -- :1233
   Zero passes it.  What remains is
-    assert(layout->u.chunk.size > 0);                                   -- :4638
+    assert(layout->u.chunk.size > 0);                                   -- :5213
   in H5D__chunk_lock, and the baseline build's libhdf5.settings records
   -DNDEBUG.  H5FL_blk_malloc(0) then returns an 8-byte free-list block
   (src/H5FL.c:773) and H5VM_memcpyvv indexes it with in-chunk offsets computed
   from the unwrapped dimensions.
   THE FIX IS A BOUND ON THE ACCUMULATION, in H5O__layout_decode and again in
   H5D__chunk_set_sizes: refuse when the running product would exceed
-  HSIZE_MAX / dim[u].  Promoting the assert at :4638 to an error would also stop
+  HSIZE_MAX / dim[u].  Promoting the assert at :5213 to an error would also stop
   the crash, but later than the invariant is knowable, and it would leave the
   wrapped size in the layout for everything else that reads it.
 
 # -- What was measured --------------------------------------------------------
 measured:
+  REMEASURED_2026_10_12: >-
+    2026-10-12, against the newest build available here: libhdf5 2.3.0, source
+    tree at develop 5933130b610, baseline RelWithDebInfo asserts off
+    (settings_sha256 9cc649d75c7f760b782a54500f5ccbfbc71163fc1dc97c6a2a0ed66daa53e2dd)
+    and the assert-free ASan candidate.
+    THE CRASH DOES NOT REPRODUCE.  `h5dump -d /d` and the offset read
+    `h5dump -d /d -s "1,0" -c "1,1"` on malformed/chunk_dim_product_wrap_v4.h5
+    both complete with exit 0 and NO sanitizer report, where this record records
+    a SIGSEGV on the baseline and a heap-buffer-overflow READ under ASan.  The
+    exact-build canary agrees: probe outcome `accepted`, no signal,
+    oracle_alignment `divergent` -- h5policy still rejects, libhdf5 now accepts
+    quietly.
+    WHY IS NOT ESTABLISHED, and is deliberately not guessed.  src/H5Dchunk.c has
+    been restructured since this record was pinned (develop 51b92ccee54):
+    H5D__chunk_lock moved from about line 4829 to :5168 and now has FOUR
+    H5D__chunk_mem_alloc call sites where the record describes two, and
+    H5D__chunk_set_sizes gained an overflow check at :906 that this record's
+    text does not mention.  The assert this record calls assert-only is still
+    assert-only (:5213, no runtime companion), so the containment it asks for
+    has NOT landed.
+    WHAT IS NOT MEASURED: the WRITE direction.  The read path is clean; nothing
+    was written on this build.
+    SO THIS RECORD NEEDS RE-TRIAGE, not a line edit.  The citations below were
+    re-pinned on 2026-10-12 to statements verified in the current tree, and the
+    historical ASan transcripts under `results` were left as recorded -- their
+    file/line pairs describe the run that produced them and are written without
+    a colon so they are not read as current citations.  Found while re-pinning
+    source citations, not from a report.
   builds:
     - role: baseline
       libhdf5_version: 2.3.0
@@ -103,7 +132,7 @@ measured:
       settings_sha256: bff2c7271e5415ae394ef5424d5ca64d8f386f977231038e9c92c98772204431
       note: >-
         built for this case in a temporary build directory.  The shipped ASan
-        build has asserts live, so it stops at H5Dchunk.c:4638 before the
+        build has asserts live, so it stops at the chunk-size assert before the
         access; turning them off is what lets the sanitizer reach and describe
         the real out-of-bounds.
     - role: baseline-i386
@@ -118,8 +147,8 @@ measured:
       abi: x86-64
       note: h5py 3.13.0 wheel; no settings file ships with it
   results:
-    - "candidate-asan-assert-free, read: heap-buffer-overflow, READ of size 4, 0 bytes after an 8-byte region; H5VM_memcpyvv (H5VM.c:1383) <- H5D__compact_readvv <- H5D__chunk_read <- H5Dread; region from H5FL_blk_malloc (H5FL.c:773) <- H5D__chunk_lock (H5Dchunk.c:4829)"
-    - "candidate-asan-assert-free, write: heap-buffer-overflow, WRITE of size 4 of caller data, same 8-byte region; H5VM_memcpyvv (H5VM.c:1426) <- H5D__compact_writevv <- H5D__chunk_write <- H5Dwrite; allocation site H5Dchunk.c:4887"
+    - "candidate-asan-assert-free, read: heap-buffer-overflow, READ of size 4, 0 bytes after an 8-byte region; H5VM_memcpyvv (H5VM.c:1383) <- H5D__compact_readvv <- H5D__chunk_read <- H5Dread; region from H5FL_blk_malloc (H5FL.c:773) <- H5D__chunk_lock (then at H5Dchunk.c line 4829)"
+    - "candidate-asan-assert-free, write: heap-buffer-overflow, WRITE of size 4 of caller data, same 8-byte region; H5VM_memcpyvv (H5VM.c:1426) <- H5D__compact_writevv <- H5D__chunk_write <- H5Dwrite; allocation site then at H5Dchunk.c line 4887"
     - "candidate-asan, either direction: H5D__chunk_lock: Assertion `layout->u.chunk.size > 0' failed -- which is what establishes the guard as assert-only rather than absent"
     - "baseline, read-only: SIGSEGV from a 479-byte file, including through h5dump -d /d -s \"1,0\" -c \"1,1\""
     - "baseline, write: SIGSEGV through H5Dwrite on the tracked fixtures malformed/chunk_dim_product_wrap_v4.h5 and _v5.h5, both of which h5dump -H opens with exit 0"

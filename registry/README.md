@@ -225,7 +225,7 @@ and `h5cve verification` renders it `absent`. An empty annotation set with no
 such declaration still renders `not_assessed`, so the mechanism cannot be used
 to tidy a column -- it can only record a review that actually happened.
 
-**68 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
+**70 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -377,7 +377,7 @@ more than the total:
 - Truncation is `met` for 12 families, `partial` for 4 whose seed exceeds the
   sweep budget, and `absent` for 0; see
   [`truncation-sweep.json`](truncation-sweep.json).
-- No-activation-on-failure is `met` for 8 families and `partial` for 8 because
+- No-activation-on-failure is `met` for 10 families and `partial` for 6 because
   the exact-build probe observes an activation or crash in those families.
   `external_file_list` joined that list on 2026-08-24 without libhdf5 changing:
   the probe's fallback single-element read moved from the origin to the last
@@ -387,7 +387,15 @@ more than the total:
   the EFL entry under [`cases/`](cases/). `message_envelope` joined on
   2026-09-02 for the same kind of reason -- not a libhdf5 change, but the
   regenerated matrix picking up `malformed/attr_gheap_free_undersized.h5`,
-  whose global-heap free-space sentinel never terminates.
+  whose global-heap free-space sentinel never terminates. `external_link` and
+  `chunk_index` LEFT the list on 2026-10-12. `external_link` left because
+  libhdf5 changed: `develop` now rejects a malformed external-link value in
+  `H5L__extern_traverse` before deriving a target name, so the two unterminated
+  fixtures no longer reach an external open -- an unreleased boundary, measured
+  here on a `develop` build and not present in any tag. `chunk_index` left
+  because its entry was stale rather than measured: the two chunk stored-size
+  fixtures the report cited are recorded as `enforced_on`, not as activating or
+  crashing, and the regenerated report drops them.
 
 `check_registry.py` enforces the report's structure — every manifest record
 present and every requirement scored — and derives the summary counts above.
