@@ -155,10 +155,11 @@ area during the same sweep — see **Adjacent findings**, below.
 
 ## V2 B-trees (`H5B2*.c`, 344 asserts across 9 files — complete)
 
-Three findings, all independently measured against a real fixture: two are
+Four findings, all independently measured against a real fixture: two are
 genuine `h5policy` coverage gaps (`merge_percent` thrashing; the by-index
-descent pin leak), one is a real, bounded hazard that turns out to already
-be covered (`node_size`). A fourth, differently-shaped finding —
+descent pin leak), two are real hazards that turn out to already be covered
+(`node_size`, a bounded resource spike; `rrec_size`, a divide-by-zero
+crash). A fifth, differently-shaped finding —
 `node_nrec` feeding a checksum-length computation with no bound against the
 real buffer size — is covered separately under **Adjacent findings**,
 below, since (like Extensible Arrays' `max_idx_set`) it is not literally
@@ -167,22 +168,67 @@ nine files (`H5B2internal.c`, `H5B2int.c`, `H5B2dbg.c`, `H5B2test.c`,
 `H5B2stat.c`) reconcile entirely to write-path bookkeeping, debug-tool-only,
 or test-only code, and contribute nothing.
 
-`node_size` and `merge_percent`/`split_percent` share one root cause:
-`H5B2__hdr_init` (`H5B2hdr.c:107-116`) asserts several properties of its
-`cparam` argument — this function runs both at B-tree-creation time
+`node_size`, `rrec_size` and `merge_percent`/`split_percent` share one root
+cause: `H5B2__hdr_init` (`H5B2hdr.c:107-116`) asserts several properties of
+its `cparam` argument — this function runs both at B-tree-creation time
 (trusted caller) and directly from the deserialize path
-(`H5B2cache.c:288`, right after `cparam.node_size`, `cparam.split_percent`
-and `cparam.merge_percent` are decoded raw at `H5B2cache.c:261,270-271`
-with no check at the decode site itself) — so its argument asserts are
-genuine deserializer invariants, not just internal contracts.
+(`H5B2cache.c:288`, right after `cparam.node_size`, `cparam.rrec_size`,
+`cparam.split_percent` and `cparam.merge_percent` are decoded raw at
+`H5B2cache.c:261,264,270-271` with no check at the decode site itself) — so
+its argument asserts (`H5B2hdr.c:112-116`) are genuine deserializer
+invariants, not just internal contracts.
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
 | 1 | `node_size` sanity | `H5B2cache.c:261` (shared, see above) | `H5B2hdr.c:112` (`assert(cparam->node_size > 0)`) | **Measured: real, bounded resource spike.** Patched to the field's own on-disk maximum (`0xFFFFFFFF`, a fixed 4-byte field). `H5B2__hdr_init` eagerly `malloc`s and `memset`s a `node_size`-sized scratch buffer *before any node is ever read* — ~898MB peak RSS, ~1.1s delay opening a 15KB file, no crash. Caught afterward, incidentally, by an unrelated addr-vs-end-of-allocation check when the same corrupted value is later used as a leaf's read length | Confirmed: dedicated check (`H5_CORRUPT_V2_BTREE_NODE_SIZE`, `h5_btree2.pk:72 (node_size > file_size)`) — not a gap |
-| 2 | `merge_percent < split_percent / 2` | `H5B2cache.c:270-271` (shared, see above) | `H5B2hdr.c:116` | **Measured: real tree-shape pathology, write-path only.** Violating the safety margin (`merge_percent=50` against `split_percent=100`) made both children of a fresh split land exactly on the corrupted merge threshold; the very next ordinary delete triggered a premature merge, collapsing a two-child, 46-record split straight back into one 45-record leaf. Every record stayed correctly tracked throughout — no data loss, no wrong content — just needless, repeated split-then-remerge churn on ordinary write traffic near the threshold | **None — confirmed coverage gap.** No pickle validates the header's own `split_percent`/`merge_percent` bytes at all (a same-named pair of fields elsewhere, in an unrelated message type, is checked, but not these) |
-| 3 | Internal node's per-child `all_nrec` consistency (by-index descent) | `H5B2cache.c:672-678` — `node_ptrs[].all_nrec` decoded raw, no check at the decode site itself | `H5B2.c:826` (`assert(0 && "Index off end of tree??")`) — the only thing standing between a corrupted per-child count and a broken descent | **Measured: metadata-cache resource leak, not a crash.** The internal node's `H5AC_unprotect` call is only reached in the sibling branch, so a masked failure here leaves it permanently protected; the stale, un-advanced node pointer gets reprocessed at the wrong depth, eventually failing a checksum check against what should be a leaf. On `H5Fclose`, the leaked pin makes `H5C__flush_invalidate_ring` report `"Pinned entry count not decreasing"`, followed by the library's own `"infinite loop closing library"` diagnostic — a real, malformed-shutdown malfunction, not a true hang | **None — confirmed coverage gap.** Accepts the crafted file outright |
+| 2 | `rrec_size > 0` | `H5B2cache.c:264` (shared, see above) | `H5B2hdr.c:113` (`assert(cparam->rrec_size > 0)`) | **Measured: crash (`SIGFPE`) on x86, read path.** `H5B2__hdr_init` divides by the record size while deriving leaf capacity (`H5B2hdr.c:140`, `H5B2_NUM_LEAF_REC`) — *before any node is ever read*. One field changed (`rrec_size` 0) on a dense-link group: the file and group open cleanly, then an ordinary `H5Gget_info` crashes. The x86 crash history (x86-64 and i386) is in `registry/cases/v2-btree-record-size-zero-assert-only.yml`. Architecture-dependent: on arm64 the divide returns 0 instead of trapping, so the same file does not crash there — measured separately at an earlier commit, and not part of that case record | Confirmed: dedicated check (`H5_CORRUPT_V2_BTREE_RECORD_SIZE`, `h5_btree2.pk:50 (record_size == 0UL)`) — not a gap |
+| 3 | `merge_percent < split_percent / 2` | `H5B2cache.c:270-271` (shared, see above) | `H5B2hdr.c:116` | **Measured: real tree-shape pathology, write-path only.** Violating the safety margin (`merge_percent=50` against `split_percent=100`) made both children of a fresh split land exactly on the corrupted merge threshold; the very next ordinary delete triggered a premature merge, collapsing a two-child, 46-record split straight back into one 45-record leaf. Every record stayed correctly tracked throughout — no data loss, no wrong content — just needless, repeated split-then-remerge churn on ordinary write traffic near the threshold | **None — confirmed coverage gap.** No pickle validates the header's own `split_percent`/`merge_percent` bytes at all (a same-named pair of fields elsewhere, in an unrelated message type, is checked, but not these) |
+| 4 | Internal node's per-child `all_nrec` consistency (by-index descent) | `H5B2cache.c:672-678` — `node_ptrs[].all_nrec` decoded raw, no check at the decode site itself | `H5B2.c:826` (`assert(0 && "Index off end of tree??")`) — the only thing standing between a corrupted per-child count and a broken descent | **Measured: metadata-cache resource leak, not a crash.** The internal node's `H5AC_unprotect` call is only reached in the sibling branch, so a masked failure here leaves it permanently protected; the stale, un-advanced node pointer gets reprocessed at the wrong depth, eventually failing a checksum check against what should be a leaf. On `H5Fclose`, the leaked pin makes `H5C__flush_invalidate_ring` report `"Pinned entry count not decreasing"`, followed by the library's own `"infinite loop closing library"` diagnostic — a real, malformed-shutdown malfunction, not a true hang | **None — confirmed coverage gap.** Accepts the crafted file outright |
 
-**Recommendation for finding 2, `merge_percent` (not implemented here):**
+**Finding 2's other half — a record size too wide for even one record —
+measured, already covered.** The divide in row 2 only faults on exactly zero.
+A non-zero `rrec_size` too large for a leaf to hold even one record
+(`node_size - 9` and up) divides cleanly to a leaf capacity of 0. The only
+guard against that is masked too: `assert(size > 0)` in `H5FL_fac_init`,
+reached from `H5B2hdr.c:147`, which asks for a
+`nrec_size * max_nrec` = 0-byte native-record factory. In the measured runs
+below, that zero-size factory is created on every open but never used:
+libhdf5 would only take a record buffer from it after a leaf passes its
+checksum, and here the leaf fails its checksum first. So these runs show
+nothing about what a zero-size factory does.
+
+What the file does in a Release build, measured on
+`h5policy/tests/malformed/v2_btree_leaf_capacity_zero.h5` (the same file as
+row 2's fixture except `rrec_size` 503, `node_size - 9`):
+
+- **No crash, but a heap overread hidden behind a clean error.** An ordinary
+  `H5Gget_info` succeeds (it reports 40 links straight from the header);
+  `H5Literate2` then fails with "incorrect metadata checksum". That error
+  is not a safety check doing its job: the overread happens inside the
+  checksum check itself, before it reports failure. Nor does it come from the
+  masked assert above; the cause is an unguarded check:
+  `H5B2__cache_leaf_verify_chksum` (`H5B2cache.c:970`) sizes its checksum as
+  `H5B2_LEAF_PREFIX_SIZE + nrec * rrec_size`, ignoring the real buffer length
+  it is passed — here 10 + 40 × 503 = 20,130 bytes over the node's 512-byte
+  image. Both halves of the comparison come from the wrong place — the
+  "stored" checksum is read from heap bytes past the buffer, and the computed
+  one spans them — so the leaf fails even though its own bytes and checksum
+  are intact. An instrumented run logged exactly that: a 20,130-byte checksum read
+  against a 520-byte heap block, ~19.6KB past the allocation. The overread
+  landed on mapped memory, so the mismatched checksum is what surfaces. Not
+  confirmed under ASan. This is the same unchecked checksum length as
+  **Adjacent findings → `node_nrec`**, below, driven by the record width
+  instead of the record count.
+- **A silently wrong answer from a shipped tool.** `h5ls -r` exits 0 and
+  lists `/group` as empty — all 40 of its links missing, no error. It hits
+  the same checksum failure; `h5ls` reports it only under
+  `--enable-error-stack`, and exits 0 either way.
+
+`h5policy` rejects the file with its node-capacity check
+(`H5_CORRUPT_V2_BTREE_NODE_SIZE`,
+`h5_btree2.pk:57 (record_size > node_size - 10UL)`) — not a gap.
+
+**Recommendation for finding 3, `merge_percent` (not implemented here):**
 the same two-fix shape as SOHM's finding #5. On the libhdf5 side, the three
 asserts on `cparam->split_percent`/`cparam->merge_percent`
 (`H5B2hdr.c:114-116`) could be promoted to a real, always-on check at
@@ -195,7 +241,7 @@ strengthen, so closing the gap needs a genuinely new check in
 `h5policy/pickles/h5_btree2.pk` for these two fields and their
 cross-relationship. Both left as recommendations, not changes, in this PR.
 
-**Recommendation for finding 3, the index-off-end pin leak (not
+**Recommendation for finding 4, the index-off-end pin leak (not
 implemented here):** on the libhdf5 side, the assert at `H5B2.c:826` could
 become a real, always-on error — but the fix isn't just swapping `assert`
 for `HGOTO_ERROR`: the branch would also need to release the
@@ -215,7 +261,7 @@ Left as a recommendation, not a change, in this PR.
 
 **Also checked, not a vulnerability:** `H5B2hdr.c:165`
 (`assert(hdr->max_nrec_size <= H5B2_SIZEOF_RECORDS_PER_NODE)`) looked like a
-candidate for the same shape of bug as row 3 — a silently-truncated width
+candidate for the same shape of bug as row 4 — a silently-truncated width
 misaligning every subsequent record decode — but tracing where
 `max_nrec_size` is actually consumed shows the downcast that follows it
 (`uint8_t`, range 0-255) has far more headroom than any real `node_size`
@@ -291,12 +337,12 @@ commit — closed on the `h5policy` side, still open in libhdf5 itself.
 **Not chased further this session:** a companion assert on the same
 by-index descent path, `H5B2.c:848` (`assert(idx < leaf->nrec)`, with a
 write-side twin at `H5B2leaf.c:866`) — the final bound check once descent
-reaches a leaf, rather than the internal-node "off end" check in row 3
-above. Reaching it (rather than row 3's failure mode) would need a more
+reaches a leaf, rather than the internal-node "off end" check in row 4
+above. Reaching it (rather than row 4's failure mode) would need a more
 surgical corruption that stays checksum-valid at every level while still
 landing a leaf with a too-large `idx` — real effort for what traces to a
 likely lower ceiling (an in-bounds but garbage native-record read, not an
-out-of-bounds one) than row 3's confirmed resource leak. Identified, not
+out-of-bounds one) than row 4's confirmed resource leak. Identified, not
 fixture-tested.
 
 ## Free-space managers (`H5FS*.c`, 348 asserts across 7 files — complete)
@@ -365,7 +411,9 @@ public-facing accessor — genuinely inert, not a finding.
 
 ## Metadata-cache images (`H5AC*.c`, `H5Cimage.c`, `H5Ocache_image.c`, 532 asserts across 6 files — complete)
 
-Zero assert-masked findings in this area — a first for this catalog.
+Two assert-masked invariants in `H5Cimage.c`'s cache-image entry decoder,
+tabulated below — both measured inert on a Release build, and both already
+covered by `h5policy`. The other files reconcile as follows.
 `H5AC.c` (116 asserts) is pure lifecycle/wrapper code around the generic
 cache layer, with real, always-on checks (not asserts) guarding the one
 application-supplied config struct it validates. `H5ACdbg.c` (16 asserts)
@@ -383,11 +431,41 @@ area's scope mid-sweep since it isn't named `H5AC*`) — its real
 hazard-relevant checks turned out to be genuine, always-on `HGOTO_ERROR`s
 (overflow and EOA-range checks), not masked asserts.
 
-`H5Cimage.c` (223 asserts) holds the one real result from this area — but
-it isn't assert-masked either, so it's written up under **Adjacent
-findings**, below, rather than tabulated here: a deliberate design choice,
-stated in the source's own comments, to skip checksum verification
-entirely for metadata delivered via a cache image.
+`H5Cimage.c` (223 asserts) holds both table rows. Its other real result
+isn't assert-masked, so it's written up under **Adjacent findings**, below,
+rather than tabulated here: a deliberate design choice, stated in the
+source's own comments, to skip checksum verification entirely for metadata
+delivered via a cache image.
+
+Each cache-image entry carries a flags byte whose bits restate two of its
+own fields: `H5C__MDCI_ENTRY_IS_FD_CHILD_FLAG` (the entry has
+flush-dependency parents, i.e. `fd_parent_count > 0`) and
+`H5C__MDCI_ENTRY_IN_LRU_FLAG` (the entry was in the cache's
+least-recently-used list, i.e. it has an `lru_rank`) — `IS_FD_CHILD` and
+`IN_LRU` below. libhdf5's encoder
+derives both flags from those fields (`H5Cimage.c:1648-1653`), so they always
+agree in a file libhdf5 wrote; on read, `H5C__reconstruct_cache_entry`
+checks that agreement only by `assert`.
+
+| # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
+|---|---|---|---|---|---|
+| 1 | An entry has flush-dependency parents exactly when its `IS_FD_CHILD` flag is set | `H5Cimage.c:2805` — `fd_parent_count` decoded raw, no check at the decode site itself | `H5Cimage.c:2806-2807` | **Measured: inert.** Both directions, each isolated on its own fixture: `IS_FD_CHILD` set with no parents, and a resolvable parent address on an entry not flagged as a child. A Release build opens the file and reads its dataset normally, read-only or read-write (a read-write open also drops the cache image on close) — in the second direction it simply sets up the flush dependency the entry names. An asserts-enabled build aborts at this assert on both. The child count one field earlier gets the treatment this one lacks: `fd_child_count` against `IS_FD_PARENT` is a real check (`H5Cimage.c:2788-2791`) | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_FLAGS`, `h5_messages.pk:1748 (parent_count > 0UL)`) — not a gap |
+| 2 | An entry has an LRU rank (≥ 0) exactly when its `IN_LRU` flag is set, and −1 otherwise | `H5Cimage.c:2812` — `lru_rank` decoded raw, no check at the decode site itself | `H5Cimage.c:2813` | **Measured: inert.** Both directions: `IN_LRU` clear with rank 5 (`h5policy/tests/malformed/mdci_entry_lru_inconsistent.h5`), and `IN_LRU` set with rank −1. A Release build opens the file and reads its dataset normally, read-only or read-write; an asserts-enabled build aborts at this assert on both. A Release reconstruction never reads the rank: entries join the LRU in image order (`H5Cimage.c:2517`), and every later read-path use is an assert or inside `#ifndef NDEBUG` | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT`, `h5_messages.pk:1766 (lru_raw == 0xffffffffUL)`) — not a gap |
+
+**Related, but not these findings' consequence.** A cache image whose
+flush-dependency parent cannot be resolved fails a real check
+(`H5Cimage.c:2533`, "fd parent not in cache") and unwinds through a
+memory-unsafe cleanup — a `SIGSEGV` or a double free on a Release build,
+per `registry/cases/mdci-reconstruct-cleanup-unsafe.yml`. That record's
+crash specimen also violates both invariants above, but the crash comes
+from the dangling parent: a mismatch of either kind on its own, measured
+above, does not reach the cleanup.
+
+**Recommendation (not implemented here):** promote both asserts to real,
+always-on `HGOTO_ERROR` checks, matching the `fd_child_count` checks two
+fields earlier. Since the encoder derives both flags from these fields, the
+change cannot reject a file libhdf5 itself wrote, and it needs no `h5policy`
+change.
 
 **Scope notes:** `H5Ocache_image.c` and the prefetched-entry-specific
 portions of `H5Centry.c` (the consumer of the Adjacent finding below) were
@@ -825,9 +903,10 @@ fixture-tested this round.
 
 When a metadata cache image (MDCI) is loaded, each entry's raw bytes are
 copied wholesale into an in-memory "prefetched" placeholder
-(`H5C__reconstruct_cache_entry`, `H5Cimage.c:2700-2899`) — bounds-checked
-against the cache-image block's own buffer (`H5_IS_BUFFER_OVERFLOW`, real,
-not the finding here). When the application later touches that address,
+(`H5C__reconstruct_cache_entry`, `H5Cimage.c:2700-2899` — the same function
+whose two assert-only flag checks are tabulated under **Metadata-cache
+images**, above) — bounds-checked against the cache-image block's own buffer
+(`H5_IS_BUFFER_OVERFLOW`, real, not the finding here). When the application later touches that address,
 `H5C__deserialize_prefetched_entry` (`H5Centry.c:1786`) converts the
 placeholder into a real typed entry. Its own comment states the design
 explicitly:
