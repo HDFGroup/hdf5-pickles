@@ -899,7 +899,7 @@ int main(int argc, char **argv)
                  *
                  * It mattered most for the metadata cache image, whose load is
                  * ONE-SHOT: H5C_protect clears load_image before calling
-                 * H5C__load_cache_image (H5Centry.c:3032), so the failing call
+                 * H5C__load_cache_image (H5Centry.c:3036), so the failing call
                  * consumes the attempt and every later access succeeds.  Seven
                  * mdci fixtures were recorded as libhdf5 divergences on that
                  * basis; six of them libhdf5 actually rejects.

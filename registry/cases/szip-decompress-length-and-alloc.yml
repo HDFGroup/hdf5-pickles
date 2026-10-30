@@ -13,7 +13,7 @@ id: szip-decompress-length-and-alloc
 title: the szip read path subtracts its 4-byte framing from the chunk length
   without a floor and allocates whatever the chunk's own first four bytes claim,
   before validating either
-status: draft            # oracle covers one arm; the other is outside its boundary
+status: draft            # oracle covers arm 1 (fixed on develop cdb13c4de9c); arm 2 live and outside the oracle's boundary
 disclosure: >-
   n/a -- local analysis only.  No advisory database was consulted, no advisory
   text was retrieved, and no identifier was looked up.
@@ -35,9 +35,9 @@ validation_closure: >-
 activation_before_validation:
   - native_construction
 entry_points:
-  - "libhdf5 H5Dread -> H5D__chunk_read -> H5D__chunk_lock -> H5Z_pipeline -> H5Z__filter_szip (src/H5Zszip.c:283-299)"
+  - "libhdf5 H5Dread -> H5D__chunk_read -> H5D__chunk_lock -> H5Z_pipeline -> H5Z__filter_szip (src/H5Zszip.c:317-340)"
   - "arm 1 fault site: SZ_BufftoBuffDecompress -> aec_buffer_decode -> aec_decode (libaec)"
-  - "arm 2 site: H5MM_malloc at src/H5Zszip.c:293, sized from src/H5Zszip.c:289"
+  - "arm 2 site: H5MM_malloc at src/H5Zszip.c:334, sized from src/H5Zszip.c:330"
   - "shipped consumers: h5dump with data, any H5Dread.  NOT h5dump -H."
 
 # -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
@@ -126,6 +126,34 @@ measured:
     accept_with_warnings (H5_ADVISORY_DECODE_FILTER only) on both amplification
     specimens, correctly.  The hostile number is chunk payload; reading it would
     put a metadata-only oracle inside the data it exists not to touch.
+  remeasured_2026_10_30: >-
+    Develop 6533bcc0f6a (2.3.0), szip via LIBAEC.  Specimens rebuilt from the
+    recipe above with the installed h5cc (20x20 int32, 10x10 chunks,
+    H5Pset_szip(NN, 8), earliest bounds; chunk 0 stored size 116, its leading
+    uncompressed length 400).  Builds: baseline RelWithDebInfo -DNDEBUG
+    (settings_sha256 cdefcaceb228e7fc542084b690e2c46680d5e44d264fc3acd4d0197a04e519fa)
+    and candidate RelWithDebInfo, asserts live, -fsanitize=address
+    (2973e495730f02c6610724acdd14adc587b720522aed1df5e12a4e19f3a80165).  The
+    ASan+NDEBUG install has NO szip filter (empty external-filter list), so it
+    cannot judge either arm.  Workstation-local installs; paths not recorded.
+    ARM 1 IS FIXED ON DEVELOP by cdb13c4de9c (2026-10-21, "Bound filter header
+    reads to the stored chunk length"): `if (nbytes <= SZIP_HEADER_LEN)` at
+    src/H5Zszip.c:325-326 rejects with "buffer too short" before UINT32DECODE
+    and before the subtraction (now `nbytes - SZIP_HEADER_LEN`, :339).  Stored
+    sizes 1, 2, 3: rc=1 under the ASan candidate, NO SEGV (was a libaec SEGV),
+    error stack ends at H5Zszip.c:326.  Stored size 0: the baseline also stops
+    at :326; the asserts-live candidate still aborts first at
+    `assert(lt_key->nbytes > 0)` (src/H5Dbtree.c:434), rc=134 -- debug-only,
+    unchanged.  No release contains cdb13c4de9c.
+    ARM 2 IS UNCHANGED.  The bracket repeated on the baseline, chunk stored size
+    left at 116 and only the leading uncompressed length rewritten:
+      claim 512 MiB, ulimit -v 256 MiB -> "memory allocation failed for szip decompression"
+      claim 512 MiB, ulimit -v   1 GiB -> "szip_filter: decompression failed" (allocation granted)
+      claim   2 GiB, ulimit -v   1 GiB -> allocation failed
+      claim   2 GiB, ulimit -v   3 GiB -> "szip_filter: decompression failed" (allocation granted)
+    The allocation is still H5MM_malloc(nalloc) on the decoded uint32 with no
+    bound (src/H5Zszip.c:333-334).  cdb13c4de9c bounds the HEADER READ, not the
+    length the header claims.  Never run uncapped.
   width: >-
     NOT measured at 32 bits.  Arm 1's wrap residue is width-dependent
     (SIZE_MAX-3 on LP64, 2**32-4 on ILP32) and arm 2's uint32 ceiling is not, so
@@ -242,6 +270,8 @@ sibling_audit: >-
 
 # -- Affected versions --------------------------------------------------------
 version_range:
+  fixed_in: >-
+    arm 1 only, on develop cdb13c4de9c (no release); arm 2 unfixed everywhere.
   affected: >-
     UNVERIFIED as a range.  Measured at 2.3.0 with LIBAEC.  Both arms are
     absences rather than defective checks, so they are presumably long-standing;
