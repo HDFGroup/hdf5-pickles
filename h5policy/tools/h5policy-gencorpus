@@ -68,8 +68,13 @@ def _h5cc_sanitizer_flags():
     return ["-fsanitize=address"] if "-fsanitize=address" in config else []
 
 
-def _build_and_run_h5cc_helper(source, helper, args):
-    """Build and run one cache-image helper with actionable diagnostics."""
+def _build_and_run_h5cc_helper(source, helper, args, cwd=None):
+    """Build and run one cache-image helper with actionable diagnostics.
+
+    ``cwd`` runs the helper in that directory, for helpers whose output embeds a
+    path they were given (an external reference stores its target file name):
+    passing bare names from inside the build directory keeps host paths out of
+    the fixture and the bytes reproducible."""
     flags = _h5cc_sanitizer_flags()
     try:
         subprocess.run(["h5cc", *flags, "-O2", "-o", helper, source],
@@ -80,7 +85,7 @@ def _build_and_run_h5cc_helper(source, helper, args):
                          f"{e.stderr or ''}".rstrip())
 
     try:
-        subprocess.run([helper, *args], check=True,
+        subprocess.run([helper, *args], check=True, cwd=cwd,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                        text=True)
     except subprocess.CalledProcessError as e:
@@ -283,6 +288,7 @@ def _gen_valid(root):
     _make_attr_vlen_array_heap_ids(f"{root}/valid/attr_vlen_array_heap_ids.h5")
     _make_attr_empty_vlen_heap_id(f"{root}/valid/attr_empty_vlen_heap_id.h5")
     _make_attr_stdref_region(f"{root}/valid/attr_stdref_region.h5")
+    _make_attr_ref_lengths(f"{root}/valid/attr_ref_lengths.h5")
     # The control for the attribute heap-ID invariants: a vlen string attribute
     # and a legacy dataset-region-reference attribute, both of which store a
     # global-heap ID in the object-header message.  Their whole point is to be
@@ -2071,6 +2077,14 @@ def _gen_malformed(root):
     _make_attr_stdref_sel_blocks_over(
         f"{root}/malformed/attr_stdref_sel_blocks_over.h5",
         f"{root}/valid/attr_stdref_region.h5")
+    _make_attr_ref_object_token_size(
+        f"{root}/malformed/attr_ref_object_token_size.h5")
+    _make_attr_ref_object_token_size_o4(
+        f"{root}/malformed/attr_ref_object_token_size_o4.h5")
+    _make_attr_ref_file_name_length(
+        f"{root}/malformed/attr_ref_file_name_length.h5")
+    _make_attr_ref_attr_name_length(
+        f"{root}/malformed/attr_ref_attr_name_length.h5")
     _make_attr_stdref_blob_token_size(
         f"{root}/malformed/attr_stdref_blob_token_size.h5",
         f"{root}/valid/attr_stdref_region.h5")
@@ -7459,6 +7473,163 @@ def _make_attr_stdref_blob_sel_bytes(path, base_path):
         struct.pack_into("<I", raw, blob + 1 + tsz, 0xFFFFFFFF)
     _attr_selection_variant(path, base_path, mutate,
                             "revised selection bytes", 2)
+
+
+def _ref_lengths_attr_base(offset_size=None):
+    """Raw bytes of a file whose attributes hold revised references carrying
+    the self-described lengths libhdf5's reference decoder trusts: `objs`, two
+    internal object references encoded inline, and `attrs`, two attribute
+    references whose second is EXTERNAL (its blob names a target file).
+
+    Built through the C helper -- h5py cannot write H5T_STD_REF -- and run from
+    inside the build directory with bare file names, because the external
+    reference stores the target name it was given.  See
+    h5policy/tools/probe/make_ref_lengths_attr.c, which also asserts the
+    internal/external regime itself.
+    """
+    source = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                          "probe", "make_ref_lengths_attr.c")
+    with tempfile.TemporaryDirectory() as build:
+        helper = os.path.join(build, "make_ref_lengths_attr")
+        args = ["ref_lengths.h5", "ext.h5"]
+        if offset_size is not None:
+            args.append(str(offset_size))
+        _build_and_run_h5cc_helper(source, helper, args, cwd=build)
+        with open(os.path.join(build, "ref_lengths.h5"), "rb") as f:
+            return bytearray(f.read())
+
+
+def _find_inline_object_refs(raw, what):
+    """Offsets of the two inline H5R_OBJECT2 elements of the `objs` attribute.
+
+    An internal object reference is not blob-backed: its element is
+    [type=2][flags=0][token_size=o][token:o][zero padding] in an element of
+    o + 10 bytes (H5T__ref_set_loc's MAX(4 + 2 + o + 4, 3 + o)).  Exactly two,
+    one element apart, padding zero -- so a layout change fails loudly.
+    """
+    o = _sizeof_offsets(raw)
+    width = o + 10
+    hits = [i for i in range(len(raw) - width)
+            if raw[i] == 2 and raw[i + 1] == 0 and raw[i + 2] == o
+            and not any(raw[i + 3 + o:i + width])]
+    pairs = [a for a, b in zip(hits, hits[1:]) if b - a == width]
+    if len(pairs) != 1:
+        raise RuntimeError(f"{what}: expected one pair of inline object references, found {len(pairs)}")
+    return pairs[0], pairs[0] + width
+
+
+def _find_attr_ref_name_lengths(raw, what):
+    """Offsets of the u16 length fields in the two H5R_ATTR global-heap blobs.
+
+    Each blob is [token_size][token] then, for an EXTERNAL reference only,
+    [file name len:2][file name], then [attr name len:2][attr name] -- the order
+    H5R__decode reads them.  Returns (internal name len, external file name
+    len, external name len), anchored on the attribute name and the target file
+    name the helper wrote, and required to be unique.
+    """
+    gcol = raw.find(b"GCOL")
+    if gcol < 0:
+        raise RuntimeError(f"{what}: no GCOL collection in the base file")
+    name = b"target_attribute"
+    ext = b"ext.h5"
+    lens = [i - 2 for i in range(gcol, len(raw) - len(name))
+            if raw[i:i + len(name)] == name
+            and int.from_bytes(raw[i - 2:i], "little") == len(name)]
+    if len(lens) != 2:
+        raise RuntimeError(f"{what}: expected two encoded attribute names, found {len(lens)}")
+    external = [n for n in lens if raw[n - len(ext):n] == ext
+                and int.from_bytes(raw[n - len(ext) - 2:n - len(ext)], "little") == len(ext)]
+    internal = [n for n in lens if n not in external]
+    if len(external) != 1 or len(internal) != 1:
+        raise RuntimeError(f"{what}: expected one internal and one external attribute reference")
+    return internal[0], external[0] - len(ext) - 2, external[0]
+
+
+def _ref_lengths_variant(path, mutate, offset_size=None):
+    """Apply ``mutate`` to the base and repair the object header it touches.
+
+    A global-heap blob carries no checksum; the inline object reference lives in
+    the attribute message, whose version-2 object header checksum must be
+    recomputed or the file is rejected before any message is decoded.
+    """
+    raw = _ref_lengths_attr_base(offset_size)
+    touched = mutate(raw)
+    if touched is not None:
+        ohdr = _enclosing_v2_ohdr(raw, touched)
+        _fix_v2_ohdr_checksum(raw, ohdr)
+    _patch(path, bytes(raw))
+
+
+def _make_attr_ref_lengths(path):
+    """A VALID attribute pair of revised references -- the control.
+
+    Proves the new length checks accept what libhdf5 writes, including the
+    external attribute reference whose file name must be stepped over before
+    the attribute name is reached.
+    """
+    raw = _ref_lengths_attr_base()
+    _find_inline_object_refs(raw, "reference lengths control")
+    _find_attr_ref_name_lengths(raw, "reference lengths control")
+    _patch(path, bytes(raw))
+
+
+def _make_attr_ref_object_token_size(path):
+    """An inline object reference whose token length overruns its element.
+
+    The second `objs` element's token length goes from sizeof_offsets to 16,
+    H5O_token_t's size and the largest libhdf5's own cap admits.  The element is
+    o + 10 bytes and H5R__decode_obj_token copies token_size bytes after the
+    3-byte header without bounding them by it, so libhdf5 reads
+    16 - (o + 7) bytes past the conversion buffer -- one byte at o = 8,
+    measured as an AddressSanitizer heap-buffer-overflow.
+    """
+    def mutate(raw):
+        o = _sizeof_offsets(raw)
+        second = _find_inline_object_refs(raw, "object token size")[1]
+        assert 16 > o + 7, "token length must overrun the element"
+        raw[second + 2] = 16
+        return second
+    _ref_lengths_variant(path, mutate)
+
+
+def _make_attr_ref_object_token_size_o4(path):
+    """The same overrun at a 4-byte offset size, where the token's room is
+    o + 7 = 11.  A length of 12 is over that and UNDER the 15 an 8-byte file
+    allows, so a bound hard-coded to the common width passes the o = 8 fixture
+    and fails this one -- the regime the other fixture cannot express.
+    libhdf5 reads 16 - 11 = 5 bytes past the buffer at length 16; 12 reads one.
+    """
+    def mutate(raw):
+        o = _sizeof_offsets(raw)
+        assert o == 4, f"expected a 4-byte offset size, got {o}"
+        second = _find_inline_object_refs(raw, "object token size, o=4")[1]
+        assert o + 7 < 12 <= 8 + 7, "length must separate the two widths' bounds"
+        raw[second + 2] = 12
+        return second
+    _ref_lengths_variant(path, mutate, offset_size=4)
+
+
+def _make_attr_ref_file_name_length(path):
+    """An external attribute reference whose file-name length overruns its blob.
+
+    H5R__decode_string copies the 16-bit length's worth of bytes after checking
+    only that the length field itself is present; its one other test is an
+    assert that a u16 is at most 1 << 16.  0xFFFF reads ~64 KiB past the blob.
+    """
+    def mutate(raw):
+        fname_len = _find_attr_ref_name_lengths(raw, "file name length")[1]
+        struct.pack_into("<H", raw, fname_len, 0xFFFF)
+    _ref_lengths_variant(path, mutate)
+
+
+def _make_attr_ref_attr_name_length(path):
+    """An external attribute reference whose ATTRIBUTE-name length overruns its
+    blob -- the field that follows the file name, so the fixture fails unless
+    the walker steps over the file name exactly as H5R__decode does."""
+    def mutate(raw):
+        name_len = _find_attr_ref_name_lengths(raw, "attribute name length")[2]
+        struct.pack_into("<H", raw, name_len, 0xFFFF)
+    _ref_lengths_variant(path, mutate)
 
 
 def _find_attr_heap_id(raw, what):

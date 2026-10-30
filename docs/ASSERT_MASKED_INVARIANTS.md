@@ -378,14 +378,14 @@ one of which vanishes under `-DNDEBUG`.
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | `tot_sect_count`/`serial_sect_count` vs. the real section-list walk | `H5FScache.c:258-265` (shared, see above) | `H5FScache.c:1045-1046` (`assert(old_tot_sect_count == fspace->tot_sect_count)`, `assert(old_serial_sect_count == ...)`) | **Measured, bidirectional.** Understated (3→2): the walk's own early-exit (`if (fspace->tot_sect_count == old_tot_sect_count) break;`) stops one real section short — a genuine, legitimately-free 4800-byte region silently vanishes from `h5stat -s`'s report, no crash, no error. Overstated (3→10): `h5policy` already catches this direction (see next column), but if it didn't, the same corrupted value would reach real applications first — `H5Fget_free_sections()`'s returned count (from `H5FS_sect_stats`, a bare accessor read *before* the correcting walk) decouples from how many entries it actually fills, observed as 7 zero-valued phantom sections via `h5stat -s`'s `calloc`-based buffer (a `malloc`-based caller would see stale heap contents instead) | **Understated: confirmed gap, accepts outright.** Overstated: **not a gap** — `h5policy_walk_fspace_sections` (`h5_messages.pk:1154 (while seen < serial_sect)`) also drives its own walk length from the header's declared count, but a *higher* declared count than the list actually holds runs the loop past the real records and trips `H5_CORRUPT_FSM_SECTION_OVERRUN` before it can finish — asymmetric coverage, not by design |
-| 2 | `tot_space` vs. the real section-list walk | `H5FScache.c:255-256` (`H5F_DECODE_LENGTH`, no check) | `H5FScache.c:1050` (`assert(old_tot_space == fspace->tot_space)`) | **Measured: unconditional, un-self-correcting silent misreporting.** `H5MF_get_freespace()` → `H5FS_sect_stats(fs_man, &tot_space, NULL)` never requests the section list at all, so there is no path — self-correcting or otherwise — back to the true value. A single corrupted header field (12480 → 99999999) made `h5stat`'s summary report 100002348 bytes free, 301066.8% of the file's own size, with zero error or warning | **Confirmed gap.** `h5policy_walk_fspace_manager` (`h5_messages.pk:1241-1360 (h5policy_walk_fspace_manager)`) never even decodes `tot_space` — no variable, no check exists to strengthen |
-| 3 | `node_count` (sections-per-size-group counter) | `H5FScache.c:995` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:996` (`assert(node_count)`) — nonzero only, no upper bound | **Measured: CPU-exhaustion DoS.** One byte, 1→200, turned an instant `h5stat -s` into a 2:54+ CPU-pinned hang (99%+ CPU, flat ~3.8MB RSS) before being killed, with no sign of completing | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1168-1175 (node_count > serial_sect - seen)`) already bounds it relationally against the remaining declared count |
-| 4 | `sect_size` (a section's own serialized size) | `H5FScache.c:998-1000` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:1000` (`assert(sect_size)`) — nonzero only | Pre-existing, not newly discovered this session — see `registry/cases/fsm-section-bin-range.yml`. Re-verified this session: the consumer-side hazard (`H5FS__sinfo_new`'s `sinfo->nbins = H5VM_log2_gen(fspace->max_sect_size)` sizing an array later indexed by `H5VM_log2_gen(sect->size)` with no bound, `H5FSsection.c:764,934`) is unchanged at this commit | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1185-1188 (H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX)`) has a dedicated relational check, `H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX` |
+| 1 | `tot_sect_count`/`serial_sect_count` vs. the real section-list walk | `H5FScache.c:258-265` (shared, see above) | `H5FScache.c:1045-1046` (`assert(old_tot_sect_count == fspace->tot_sect_count)`, `assert(old_serial_sect_count == ...)`) | **Measured, bidirectional.** Understated (3→2): the walk's own early-exit (`if (fspace->tot_sect_count == old_tot_sect_count) break;`) stops one real section short — a genuine, legitimately-free 4800-byte region silently vanishes from `h5stat -s`'s report, no crash, no error. Overstated (3→10): `h5policy` already catches this direction (see next column), but if it didn't, the same corrupted value would reach real applications first — `H5Fget_free_sections()`'s returned count (from `H5FS_sect_stats`, a bare accessor read *before* the correcting walk) decouples from how many entries it actually fills, observed as 7 zero-valued phantom sections via `h5stat -s`'s `calloc`-based buffer (a `malloc`-based caller would see stale heap contents instead) | **Understated: confirmed gap, accepts outright.** Overstated: **not a gap** — `h5policy_walk_fspace_sections` (`h5_messages.pk:1305 (while seen < serial_sect)`) also drives its own walk length from the header's declared count, but a *higher* declared count than the list actually holds runs the loop past the real records and trips `H5_CORRUPT_FSM_SECTION_OVERRUN` before it can finish — asymmetric coverage, not by design |
+| 2 | `tot_space` vs. the real section-list walk | `H5FScache.c:255-256` (`H5F_DECODE_LENGTH`, no check) | `H5FScache.c:1050` (`assert(old_tot_space == fspace->tot_space)`) | **Measured: unconditional, un-self-correcting silent misreporting.** `H5MF_get_freespace()` → `H5FS_sect_stats(fs_man, &tot_space, NULL)` never requests the section list at all, so there is no path — self-correcting or otherwise — back to the true value. A single corrupted header field (12480 → 99999999) made `h5stat`'s summary report 100002348 bytes free, 301066.8% of the file's own size, with zero error or warning | **Confirmed gap.** `h5policy_walk_fspace_manager` (`h5_messages.pk:1392-1511 (h5policy_walk_fspace_manager)`) never even decodes `tot_space` — no variable, no check exists to strengthen |
+| 3 | `node_count` (sections-per-size-group counter) | `H5FScache.c:995` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:996` (`assert(node_count)`) — nonzero only, no upper bound | **Measured: CPU-exhaustion DoS.** One byte, 1→200, turned an instant `h5stat -s` into a 2:54+ CPU-pinned hang (99%+ CPU, flat ~3.8MB RSS) before being killed, with no sign of completing | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1319-1326 (node_count > serial_sect - seen)`) already bounds it relationally against the remaining declared count |
+| 4 | `sect_size` (a section's own serialized size) | `H5FScache.c:998-1000` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:1000` (`assert(sect_size)`) — nonzero only | Pre-existing, not newly discovered this session — see `registry/cases/fsm-section-bin-range.yml`. Re-verified this session: the consumer-side hazard (`H5FS__sinfo_new`'s `sinfo->nbins = H5VM_log2_gen(fspace->max_sect_size)` sizing an array later indexed by `H5VM_log2_gen(sect->size)` with no bound, `H5FSsection.c:764,934`) is unchanged at this commit | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1336-1339 (H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX)`) has a dedicated relational check, `H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX` |
 
 **Recommendation for finding 1, `tot_sect_count` understated (not
 implemented here):** `h5policy_walk_fspace_sections`
-(`h5_messages.pk:1090-1235 (h5policy_walk_fspace_sections)`) drives its own walk length from the header's
+(`h5_messages.pk:1241-1386 (h5policy_walk_fspace_sections)`) drives its own walk length from the header's
 declared `serial_sect` the same way libhdf5 does, and never checks
 afterward that the walk actually reached the section list's checksum
 boundary (`limit`, computed at line 1152). Closing the gap needs one added
@@ -408,7 +408,7 @@ the same header cluster, decoded with equally zero validation. Patched 0→5
 (leaving `tot_sect_count`/`serial_sect_count` and the real section list
 untouched): `h5policy` rejects it via a different, already-existing
 cross-field check (`H5_CORRUPT_FSM_SECTION_COUNT`,
-`h5_messages.pk:1298 (serial_sect + ghost_sect != tot_sect)`, tripped even without touching the
+`h5_messages.pk:1449 (serial_sect + ghost_sect != tot_sect)`, tripped even without touching the
 other two fields), and the real build's `h5stat` output (default and `-s`)
 was byte-for-byte identical to the valid seed's. Unlike its three siblings,
 `ghost_sect_count` drives no loop-control condition and backs no
@@ -951,7 +951,7 @@ section counts and list untouched.
 
 - **`h5policy --profile untrusted-strict`: rejects outright** —
   `H5_CORRUPT_FSM_SECTION_OVERRUN` (`h5policy_walk_fspace_sections`,
-  `h5_messages.pk:1192 (cur + off_size + 1UL > limit)`, whose own `off_size` is computed the same way, via
+  `h5_messages.pk:1343 (cur + off_size + 1UL > limit)`, whose own `off_size` is computed the same way, via
   `h5policy_bytes_for_bits(max_addr_bits)`). **Not a coverage gap.**
 - **Stock build** (`h5stat -s`): does not crash, but produces visibly wrong
   output — 2 of 3 real sections in the corrupted manager replaced with
@@ -1063,7 +1063,7 @@ object headers).
 untrusted-strict` correctly rejects both mutants — the inner-entry
 corruption via `H5_CORRUPT_BAD_CHECKSUM`, "object-header checksum
 mismatch," at offset 48, `h5_validate.pk:1166 (checksum != stored_checksum)`; the outer-block corruption via the same code,
-"metadata cache image checksum mismatch," at offset 2766, `h5_messages.pk:1905 (image_checksum != stored_checksum)` — because
+"metadata cache image checksum mismatch," at offset 2766, `h5_messages.pk:2056 (image_checksum != stored_checksum)` — because
 `h5policy`'s own cache-image handling independently computes and verifies
 both the block's own checksum and each replayed entry's checksum against
 its logical address (its README: "replays all validated cached entry
@@ -1104,7 +1104,7 @@ anywhere. Attempted to weaponize this into an EOF/EOA overrun for a
 naturally-reachable entry: a naive size inflation was cleanly caught by a
 *different*, correctly-implemented check (`H5_IS_BUFFER_OVERFLOW` against
 the cache-image block's own buffer) in both `h5policy`
-(`H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE`, `h5_messages.pk:1826 (entry_span > image_size - cur)`) and the real build ("invalid
+(`H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE`, `h5_messages.pk:1977 (entry_span > image_size - cur)`) and the real build ("invalid
 entry size"). Because the cache-image block is always allocated last in a
 library-written file (at the then-current EOA), any naturally-reachable
 entry's real address is inherently smaller than the cache-image block's

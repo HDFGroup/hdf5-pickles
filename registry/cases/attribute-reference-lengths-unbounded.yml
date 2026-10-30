@@ -1,0 +1,145 @@
+# The self-described lengths inside an encoded revised reference -- the object
+# token length and the 16-bit file/attribute name lengths -- are copied by
+# libhdf5's reference decoder without being bounded by the reference buffer.
+# This record carries the ORACLE side: h5policy now bounds them wherever the
+# encoded reference is metadata, i.e. inside an attribute value.
+schema_version: 1
+
+id: attribute-reference-lengths-unbounded
+title: revised references in attribute values carry token and name lengths that libhdf5 copies without bounding them by the reference buffer
+status: oracle-enforced   # h5policy rejects in attribute values; libhdf5 unfixed
+disclosure: >-
+  n/a for this record.  The libhdf5 defect is the subject of an external private
+  report, still in upstream Triage when this was written (opened 2026-10-08);
+  its identifier is deliberately omitted.  Everything below was measured
+  locally on hand-built specimens; the report's own proof-of-concept was not
+  fetched.
+
+record: message_envelope
+root_cause_classification: local_decode
+violated_invariant: attribute.reference_blob_extent
+entry_points:
+  - h5policy (oracle) -- REJECTS in attribute values (H5_CORRUPT_REFERENCE_BLOB_EXTENT)
+  - "libhdf5 read: H5Aread / H5Dread of H5T_STD_REF data -> H5T__conv_ref (src/H5Tconv_reference.c:227) -> H5T__ref_mem_write (src/H5Tref.c:713) -> H5R__decode (src/H5Rint.c:956)"
+  - "-> H5R__decode_obj_token (src/H5Rint.c:1133, the token copy) and H5R__decode_string (src/H5Rint.c:1331, the name copy)"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0 @ develop 6533bcc0f6a) --
+defect: >-
+  H5R__decode_obj_token checks that the one-byte token length is present and
+  at most sizeof(H5O_token_t) (16), then copies that many bytes -- never checking
+  that the reference buffer holds them (src/H5Rint.c:1121-1133).
+  H5R__decode_string checks that its two length bytes are present, then copies
+  the u16 length's worth; its only other test, assert(string_len <=
+  H5R_MAX_STRING_LEN) with H5R_MAX_STRING_LEN == 1 << 16, cannot fire
+  (src/H5Rint.c:1323-1331).  The H5R_DECODE / H5R_DECODE_VAR macros then
+  subtract each claimed size from the remaining length unchecked
+  (src/H5Rint.c:72, :82), so one over-claim also wraps the bound every later
+  sub-decoder is given.
+  Two encodings carry these lengths.  An INTERNAL object reference is stored
+  inline in its element, [type][flags][token_size][token], in a
+  file-determined o + 10 bytes (src/H5Tref.c:312-313), and that width is the
+  buffer H5R__decode receives (src/H5Tref.c:892): the token's room is o + 7.
+  Every other revised reference is a global-heap blob,
+  [token_size][token] then [file name len:2][file name] when external, then
+  [attr name len:2][attr name] for H5R_ATTR or the region selection.
+
+boundary_note: >-
+  JURISDICTION.  The same bytes are raw data in a dataset and metadata in an
+  attribute: an attribute's value lives inside its object-header message, and a
+  reference blob reached from it is a structure libhdf5 decodes, not an opaque
+  value -- the argument registry/cases/attribute-selection-unvalidated.yml made
+  for region selections.  So h5policy bounds these lengths in attribute values
+  only.  A dataset carrying the identical corruption is out of a metadata-only
+  oracle's scope by design and is still accepted.
+  THE BOUND IS THE FILE'S, NOT A CONSTANT.  The inline token's room is o + 7:
+  15 at 8-byte offsets, 11 at 4, 9 at 2.  libhdf5 over-reads 16 - (o + 7) bytes
+  at the 16 cap -- 1, 5 and 7 bytes respectively, all three measured.
+  NOT HANDLED, and reported rather than fixed here: the existing region branch
+  locates a revised region reference's selection at 1 + token_size, which skips
+  no file name.  H5R__decode reads an EXTERNAL reference's file name BEFORE the
+  selection, so an external region reference in an attribute would have its
+  file name read as a selection header.  No fixture carries one.
+
+# -- Measured behaviour -------------------------------------------------------
+measured:
+  date: 2026-10-30
+  hdf5_build: >-
+    HDF5 2.3.0 from develop 6533bcc0f6a.  baseline: RelWithDebInfo, -DNDEBUG,
+    no sanitizers, settings_sha256
+    cdefcaceb228e7fc542084b690e2c46680d5e44d264fc3acd4d0197a04e519fa.
+    sanitizer arm: RelWithDebInfo, -DNDEBUG, -fsanitize=address, settings_sha256
+    043b55088c6eb16bd09aa4b09b28d66219ae0f05e4f9a3c3932615ad6ad21961.
+    Workstation-local installs; paths not recorded.
+  libhdf5: >-
+    H5Aread of each malformed fixture's attribute: AddressSanitizer
+    heap-buffer-overflow -- READ of size 16 (token, o = 8), 12 (token length 12,
+    o = 4), 65535 (file-name length), 65535 (attribute-name length).  The stock
+    build reads all four silently, rc = 0.  The control reads cleanly on both.
+  disclosure: >-
+    A stock build keeps the over-read bytes in the decoded token.  Measured on a
+    dataset carrier with 2-byte offsets: writing the read references into a new
+    file stored a 16-byte token whose bytes 13-14 changed from run to run
+    (`61 d1`, `81 d1`) -- process heap, persisted.  The name over-read was NOT
+    shown to disclose through H5Rget_attr_name (the copied tail follows a NUL).
+  oracle_before: >-
+    accept on every fixture: the walker skipped an internal object reference as
+    "no blob", and checked a blob's token only for region references.
+  oracle_after: >-
+    reject_corrupt, H5_CORRUPT_REFERENCE_BLOB_EXTENT, on each malformed fixture
+    and nothing else; the control accepts.
+  non_vacuity: >-
+    Each check reverted ALONE turns exactly its own fixture to accept: the inline
+    token bound (both token fixtures), the file-name bound, the attribute-name
+    bound, and the external file-name SKIP (the attribute-name fixture then reads
+    the file-name length in its place and accepts).  A bound hard-coded to 15
+    accepts the 4-byte-offset fixture -- the regime the 8-byte one cannot
+    express.
+  canary: >-
+    h5cve matrix on the baseline: `violation` on all four malformed fixtures
+    (libhdf5 accepts, the oracle rejects, alignment required), `verified` on the
+    control.
+
+reproducers:
+  generator: >-
+    h5policy-gencorpus _make_attr_ref_lengths / _make_attr_ref_object_token_size
+    / _make_attr_ref_object_token_size_o4 / _make_attr_ref_file_name_length /
+    _make_attr_ref_attr_name_length, over h5policy/tools/probe/make_ref_lengths_attr.c,
+    which asserts the internal/external regime before writing anything
+  fixtures:
+    - h5policy/tests/valid/attr_ref_lengths.h5
+    - h5policy/tests/malformed/attr_ref_object_token_size.h5
+    - h5policy/tests/malformed/attr_ref_object_token_size_o4.h5
+    - h5policy/tests/malformed/attr_ref_file_name_length.h5
+    - h5policy/tests/malformed/attr_ref_attr_name_length.h5
+
+containment:
+  status: oracle_only
+  description: >-
+    h5policy: enforced in attribute values.  libhdf5: bound the token length and
+    the string length by the bytes remaining, and make H5R_DECODE /
+    H5R_DECODE_VAR refuse a sub-decoder that reports consuming more than it was
+    given.  Such a patch was built and measured to reject every fixture cleanly
+    while upstream's `testhdf5 -o refer -o refer_deprec` passed; it is not
+    tracked here.
+
+systemic:
+  semantic_boundary: H5R__decode and its sub-decoders -- every self-described length inside an encoded reference
+  status: planned
+  owner: unassigned
+
+version_range:
+  affected: ">= 1.12.0"
+  fixed_in: none
+  label: >-
+    Measured on develop only.  H5R__decode_obj_token is textually identical at
+    1.14.6, 2.2.0 and develop, and at 1.12.0 lacks even the one-byte check;
+    revised references, and with them this decoder, arrived in 1.12.0.
+
+open_questions:
+  - >-
+    External region references: the region branch's selection offset ignores
+    the external file name (see boundary_note).  A fixture with one would show
+    whether that is a false positive on valid files.
+  - >-
+    The wrap path: a region or external reference whose token over-claims hands
+    the following sub-decoder a wrapped length.  Source-derived; unmeasured.
