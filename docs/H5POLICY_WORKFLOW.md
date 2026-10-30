@@ -259,8 +259,8 @@ and the family canary. The tracked exact-build evidence separately records that
 source-derived, its classification mapping is curated, and the corpus and
 exact-build outcomes are measured corroboration.
 
-Registry checks currently account for **332 finding codes** and **0 semantic-
-backlog entries**. Static enumeration resolves **1030 in-pickle message
+Registry checks currently account for **333 finding codes** and **0 semantic-
+backlog entries**. Static enumeration resolves **1031 in-pickle message
 variants**, with **0 unrouted** and **0 unanalyzable** variants. That is complete
 classification coverage for the current emission surface, not complete
 invariant coverage for the HDF5 format.
