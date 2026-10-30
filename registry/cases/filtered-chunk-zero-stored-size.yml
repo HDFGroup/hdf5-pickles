@@ -31,20 +31,20 @@ activation_before_validation:
   - native_construction
 entry_points:
   - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-08-22 (was: accept_with_warnings, advisory findings only)"
-  - "libhdf5 H5Dread -> H5D__read -> H5D__chunk_read (src/H5Dchunk.c:3141) -> H5D__chunk_lock (src/H5Dchunk.c:4850)"
-  - "-> H5Z_pipeline (src/H5Z.c:1467) -> H5Z__filter_fletcher32 (src/H5Zfletcher32.c:78)"
-  - "-> H5_checksum_fletcher32 (src/H5checksum.c:115)  <-- faults here"
+  - "libhdf5 H5Dread -> H5D__read -> H5D__chunk_read (src/H5Dchunk.c:3353, threaded build; :3356 otherwise) -> H5D__chunk_lock (src/H5Dchunk.c:5503)"
+  - "-> H5Z_pipeline (src/H5Z.c:1638) -> H5Z__filter_fletcher32 (src/H5Zfletcher32.c:112)"
+  - "-> H5_checksum_fletcher32 (src/H5checksum.c:117)  <-- faults here"
   - "shipped consumers: h5dump (data), h5ls with data, any H5Dread; NOT h5dump -H / h5ls -v / h5stat / h5debug, which never decode a chunk"
 
 # -- The defect, read out of the source tree (HDF5 2.3.0) ---------------------
 defect: >-
-  H5Z__filter_fletcher32's read branch (src/H5Zfletcher32.c:66-78) strips the
+  H5Z__filter_fletcher32's read branch (src/H5Zfletcher32.c:100-112) strips the
   trailing 4-byte checksum by subtracting from the length it was handed:
-    size_t src_nbytes = nbytes;                 -- :69
-    src_nbytes -= FLETCHER_LEN;                 -- :73  FLETCHER_LEN == 4
-    tmp_src = src + src_nbytes;                 -- :74
-    UINT32DECODE(tmp_src, stored_fletcher);     -- :75
-    fletcher = H5_checksum_fletcher32(src, src_nbytes);   -- :78
+    size_t src_nbytes = nbytes;                 -- :103
+    src_nbytes -= FLETCHER_LEN;                 -- :107  FLETCHER_LEN == 4
+    tmp_src = src + src_nbytes;                 -- :108
+    UINT32DECODE(tmp_src, stored_fletcher);     -- :109
+    fletcher = H5_checksum_fletcher32(src, src_nbytes);   -- :112
   `nbytes` is a size_t and comes from the chunk-index record; nothing floors it
   at FLETCHER_LEN.  With nbytes == 0, src_nbytes becomes 2**64-4 and there are
   TWO distinct out-of-bounds reads, in this order:
@@ -52,7 +52,7 @@ defect: >-
        reads four bytes through it.
     2. :78 then asks H5_checksum_fletcher32 to sum 2**64-4 bytes starting at
        src, which walks until it leaves the mapping.
-  MEASURED: the fault lands in (2), at src/H5checksum.c:115, with
+  MEASURED: the fault lands in (2), at src/H5checksum.c:117, with
   _len = 18446744073709551612 == (size_t)-4 -- so (1) happened to land on
   mapped memory and returned garbage rather than faulting.  That ordering is
   luck, not design: (1) is the more dangerous read of the two because its
@@ -92,19 +92,38 @@ measured:
   libhdf5_fixed: >-
     FIXED in develop a3cf1ea82cc (2026-09-25, "Fix CVE issues related to
     Nbit/Fletcher32 decode paths"), which added the nbytes < FLETCHER_LEN guard
-    at H5Zfletcher32.c:66-72 -- the exact strict tightening this case proposed.
+    (H5Zfletcher32.c line 66-72 at that commit) -- the exact strict tightening
+    this case proposed.
     RE-MEASURED 2026-10-01 on the post-fix release install (settings_sha256
     82e01d8a971540f0, build 2026-10-01): H5Dread now errors cleanly at
-    H5Zfletcher32.c:70 ("too small to contain checksum"), rc<0, no fault, on both
+    H5Zfletcher32.c line 70 ("too small to contain checksum"), rc<0, no fault, on both
     tracked fixtures.  CONFIRMED memory-safe under AddressSanitizer on the
     post-fix ASan build (settings_sha256 c25f66c178d1da0f, built 2026-10-02 from
-    develop 0761c9ee2bcc): H5Dread errors at the :70 guard with NO
+    develop 0761c9ee2bcc): H5Dread errors at the line-70 guard with NO
     stack/heap-buffer-overflow.  An earlier ASan build predating a3cf1ea
-    (measured 2026-08-30) reported the heap over-read at H5Zfletcher32.c:75 --
+    (measured 2026-08-30) reported the heap over-read at H5Zfletcher32.c:101 --
     which is the fault any build WITHOUT a3cf1ea still produces, and why the
     exact-build canary carries BOTH `violation` and `unexercised` (see
     registry/h5cve-matrix-policy.yml).  h5policy's chunk_record_size check is retained as
     defense in depth for those releases.
+  libhdf5_remeasured_2026_10_30: >-
+    STILL FIXED, AND THE GUARD WAS TIGHTENED.  develop cdb13c4de9c (2026-10-21,
+    "Bound filter header reads to the stored chunk length") replaced it with
+    `nbytes <= FLETCHER_LEN` (src/H5Zfletcher32.c:96-97, "buffer too short"), so
+    a chunk of exactly the 4-byte checksum is refused too.  Measured on develop
+    6533bcc0f6a (2.3.0) with `h5dump --enable-error-stack` on both tracked
+    fixtures (malformed/chunk_zero_stored_size.h5 and
+    malformed/chunk_stored_size_below_framing.h5): baseline (-DNDEBUG,
+    settings_sha256 cdefcaceb228e7fc...e519fa), ASan+NDEBUG (043b55088c6eb16b...
+    d21961) and i386 (-m32, c5c4d5580c7740cf...f3e1c9) all fail cleanly at
+    H5Zfletcher32.c:97, rc=1, ASan silent.
+    ONE ARM REMAINS, AND IT IS DEBUG-ONLY: on the asserts-live candidate
+    (ASan, settings_sha256 2973e495730f02c6...a80165) the stored-size-0 fixture
+    still aborts at `assert(lt_key->nbytes > 0)` in H5D__btree_found
+    (src/H5Dbtree.c:434), rc=134, before the filter is reached -- a reachable
+    assertion, not memory-unsafe; the below-framing fixture fails cleanly
+    there.  No release contains cdb13c4de9c; releases keep only the a3cf1ea
+    guard (2.3.0 is unreleased) or none.
   specimen_index: >-
     Enumerated with H5Dget_chunk_info rather than by hand (see
     coverage_gaps for why by hand was a mistake).  /Fletcher_float_data_be:
@@ -120,18 +139,18 @@ measured:
     2 (see the update block under coverage_gaps).  The residue IS
     width-dependent -- (size_t)-2 on LP64, 2**32-2 on ILP32 -- but the OUTCOME
     is not: the i386 build (HDF5 2.3.0, RelWithDebInfo, -m32, asserts off)
-    faults at the same site, H5_checksum_fletcher32 (src/H5checksum.c:115),
-    reached from H5Zfletcher32.c:78 with nbytes=2, rc=139.  Both residues exceed
+    faults at the same site, H5_checksum_fletcher32 (src/H5checksum.c:117),
+    reached from H5Zfletcher32.c:112 with nbytes=2, rc=139.  Both residues exceed
     their address space, so neither width is the safer one.
   asan: >-
     OBTAINED 2026-08-29, on the stored-size-2 specimen, and it pins read (1)
     exactly as this entry predicted:
       ERROR: AddressSanitizer: heap-buffer-overflow
       READ of size 1 at 0x504000002dce thread T0
-        #0 H5Z__filter_fletcher32  H5Zfletcher32.c:75
-        #1 H5Z_pipeline            H5Z.c:1467
-        #2 H5D__chunk_lock         H5Dchunk.c:4850
-        #3 H5D__chunk_read         H5Dchunk.c:3141
+        #0 H5Z__filter_fletcher32  H5Zfletcher32.c line 75
+        #1 H5Z_pipeline            H5Z.c line 1467
+        #2 H5D__chunk_lock         H5Dchunk.c line 4850
+        #3 H5D__chunk_read         H5Dchunk.c line 3141
         #4 H5D__read               H5Dio.c:398
         #5 H5VL__native_dataset_read H5VLnative_dataset.c:373
     That is the UINT32DECODE at :75 reading through `src + (2**64-2)`, i.e.
@@ -266,13 +285,13 @@ compatibility_backport_risks: >-
   rejects only records that name a chunk and give it no bytes.
 
 sibling_audit: >-
-  SWEPT the filter implementations 2026-08-22.  The second site,
-  src/H5Zszip.c:298, was MEASURED on 2026-08-23 and promoted to its own record:
+  SWEPT the filter implementations 2026-08-22.  The second site, H5Zszip.c
+  line 298 at f8f0379c7c5, was MEASURED on 2026-08-23 and promoted to its own record:
   registry/cases/szip-decompress-length-and-alloc.yml.
   Two things this entry got wrong from source alone, both worth keeping as a
   caution about auditing by reading:
     * It called the site "worse" mainly for the out-of-bounds header read at
-      :289.  The measured memory-safety fault is the WRAP, and it lands inside
+      :330.  The measured memory-safety fault is the WRAP, and it lands inside
       libaec (SEGV under the ASan build for stored sizes 1-3); the stock Release
       build returns a clean rc=1 on the same files, which looks like a guard and
       is only allocator luck.  Same "do not trust a Release return code" trap
@@ -285,10 +304,11 @@ sibling_audit: >-
   The oracle floor landed here does cover the szip wrap: chunk.stored_size counts
   szip's 4-byte framing, so sizes 0-3 are rejected and the wrap is unreachable
   through a file h5policy accepts.  The allocation arm is not.
-  NO FILTER IN THE TREE FLOORS nbytes: `grep -n 'if (nbytes' src/H5Z*.c` returns
-  nothing.  So the property "a fixed-overhead filter checks its input covers its
-  framing" is enforced nowhere, and the two sites above are the ones where that
-  currently bites.
+  NO FILTER IN THE TREE FLOORED nbytes when this was swept: `grep -n 'if (nbytes'
+  src/H5Z*.c` returned nothing.  ON DEVELOP THAT HAS CHANGED: cdb13c4de9c floors
+  both fixed-overhead filters (src/H5Zfletcher32.c:96, src/H5Zszip.c:325), and
+  the grep now finds those two plus scale-offset's own header floors
+  (src/H5Zscaleoffset.c:1245, :1276).  No release has the fletcher32/szip floors.
   NOT AUDITED: the 1.14.x and 1.10.x branches; whether H5Z_pipeline could
   enforce a per-filter minimum centrally; and the dynamically loaded filters,
   which are out of scope for a metadata oracle and cannot be audited from here.
@@ -324,8 +344,10 @@ coverage_gaps:
     its own valid-corpus measurement before landing (zero false positives across
     the corpus), which is what the item asked for.
   - >-
-    NO SZIP FIXTURE for the sibling site (src/H5Zszip.c:298).  See
-    sibling_audit; the local build's szip support was not confirmed.
+    NO SZIP FIXTURE for the sibling site (H5Zszip.c line 298 at f8f0379c7c5).
+    See sibling_audit.  The local baseline and asserts-live builds DO carry szip
+    (LIBAEC); the ASan+NDEBUG build does not.  The szip arm is re-measured in
+    registry/cases/szip-decompress-length-and-alloc.yml.
   - >-
     CLOSED 2026-08-29.  Both gaps this record left open -- "NO ASAN WITNESS" and
     "No 32-bit measurement" -- were measured on a SECOND specimen, a different

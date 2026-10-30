@@ -498,8 +498,8 @@ contribute nothing new.
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | A free-space section's class actually has a `deserialize` callback before it's called | `H5FScache.c:1013` — a section's on-disk type byte decoded raw; the real check that follows (`:1019-1020`) only confirms the value is *in-bounds*, not that the resulting class has a callback | `H5FScache.c:1024` (`assert(fspace->sect_cls[sect_type].deserialize)`) | **Measured: real crash, isolated to a single byte.** Fractal heap's `INDIRECT` free-space-section class is a valid, in-bounds registered class (index 3) whose `.deserialize` is `NULL` by design — its own comment states objects of this class "should never be in section manager." Nothing stops a corrupted file's section-type byte from claiming to be 3 anyway. One byte flipped (an existing section's type, `0→3`) on an otherwise-untouched real file: stock build `SIGSEGV`; the reused ASan build confirms a direct call through address 0 (pinned down without a debugger — attach is blocked at the OS level in this environment — by computing the address offset between the built binary and the running process from known symbols, then applying that offset to the crash's return-address register). Reachable via an ordinary write to the group (e.g. `H5Gcreate2`/`H5Lcreate` adding a link), when the heap's free-space manager is consulted for space and loads the on-disk section list — *not* via read/iterate (a read-only `H5Literate2`/`Group.keys()` over the same corrupted file completes cleanly, and `h5stat -s` never loads these sections; this corrects an earlier "reachable via read" phrasing). The sibling `NORMAL_ROW` class (index 2) has an equally `NULL` `.deserialize` slot, and the shared dispatch gives it no guard beyond the same in-bounds check, so a type byte of `2` reaches the identical masked `assert`. **Confirmed empirically (2026-10-06):** a one-byte fixture (an existing `SINGLE` section's type `0→2`, section-list checksum resealed) makes an asserts-live build abort at exactly `H5FScache.c:1024` (`H5FS__cache_sinfo_deserialize`, `Assertion 'fspace->sect_cls[sect_type].deserialize' failed`) on a link insert, while the same insert on the untouched seed exits 0; the type-`3` SIGSEGV above is the release-mode (`-DNDEBUG`) face of that same line, which type `2` reaches identically | **Confirmed gap.** The minimal, single-byte fixture is accepted with zero findings. Earlier rejections seen on more elaborate byte-surgery fixtures were confirmed *incidental* — an unrelated construction artifact, not real coverage — via a controlled isolation test (the identical recipe with a non-zero, still-nonsensical payload crashed identically) |
-| 2 | An indirect free-space section's `nentries` must be positive before it drives a span-size computation | `H5HFsection.c:3730-3731` — `nentries` decoded raw via `UINT16DECODE`, zero validation at the decode site, not even an assert | `H5HFdtable.c:278` (`assert(num_entries > 0)`, inside `H5HF__dtable_span_size`) | **Measured: real heap-buffer-overflow.** `nentries=0` underflows `end_entry = (start_entry+nentries)-1` (unsigned) to `0xFFFFFFFF`; `H5HF__dtable_span_size`'s row-accumulation loop then reads `row_block_size[row]` far past the real, `max_root_rows`-sized array. ASan: `heap-buffer-overflow READ of size 8, 0 bytes after a 176-byte region`, `H5HFdtable.c:303`. Reachable via an ordinary write (`H5Dcreate2` adding a link) — but only when the corrupted section is typed `FIRST_ROW`; the identical payload under type `INDIRECT` hits finding 1's null-callback crash first, before this arithmetic is ever reached | **Confirmed gap.** Verified with a controlled A/B test: the identical construction recipe with a valid, non-underflowing `nentries=4` is rejected *identically* — proving the rejection has nothing to do with `nentries` itself |
+| 1 | A free-space section's class actually has a `deserialize` callback before it's called | `H5FScache.c:1013` — a section's on-disk type byte decoded raw; the real check that follows (`:1019-1020`) only confirms the value is *in-bounds*, not that the resulting class has a callback | `H5FScache.c:1024` (`assert(fspace->sect_cls[sect_type].deserialize)`) | **Measured: real crash, isolated to a single byte.** Fractal heap's `INDIRECT` free-space-section class is a valid, in-bounds registered class (index 3) whose `.deserialize` is `NULL` by design — its own comment states objects of this class "should never be in section manager." Nothing stops a corrupted file's section-type byte from claiming to be 3 anyway. One byte flipped (an existing section's type, `0→3`) on an otherwise-untouched real file: stock build `SIGSEGV`; the reused ASan build confirms a direct call through address 0 (pinned down without a debugger — attach is blocked at the OS level in this environment — by computing the address offset between the built binary and the running process from known symbols, then applying that offset to the crash's return-address register). Reachable via an ordinary write to the group (e.g. `H5Gcreate2`/`H5Lcreate` adding a link), when the heap's free-space manager is consulted for space and loads the on-disk section list — *not* via read/iterate (a read-only `H5Literate2`/`Group.keys()` over the same corrupted file completes cleanly, and `h5stat -s` never loads these sections; this corrects an earlier "reachable via read" phrasing). The sibling `NORMAL_ROW` class (index 2) has an equally `NULL` `.deserialize` slot, and the shared dispatch gives it no guard beyond the same in-bounds check, so a type byte of `2` reaches the identical masked `assert`. **Confirmed empirically (2026-10-06):** a one-byte fixture (an existing `SINGLE` section's type `0→2`, section-list checksum resealed) makes an asserts-live build abort at exactly `H5FScache.c:1024` (`H5FS__cache_sinfo_deserialize`, `Assertion 'fspace->sect_cls[sect_type].deserialize' failed`) on a link insert, while the same insert on the untouched seed exits 0; the type-`3` SIGSEGV above is the release-mode (`-DNDEBUG`) face of that same line, which type `2` reaches identically | **Confirmed gap.** The minimal, single-byte fixture is accepted with zero findings. Earlier rejections seen on more elaborate byte-surgery fixtures were confirmed *incidental* — an unrelated construction artifact, not real coverage — via a controlled isolation test (the identical recipe with a non-zero, still-nonsensical payload crashed identically). Still open when re-measured on 2026-10-30: types 2 and 3 are accepted |
+| 2 | An indirect free-space section's `nentries` must be positive before it drives a span-size computation | `H5HFsection.c:3730-3731` — `nentries` decoded raw via `UINT16DECODE`, zero validation at the decode site, not even an assert | `H5HFdtable.c:278` (`assert(num_entries > 0)`, inside `H5HF__dtable_span_size`) | **Measured: real heap-buffer-overflow.** `nentries=0` underflows `end_entry = (start_entry+nentries)-1` (unsigned) to `0xFFFFFFFF`; `H5HF__dtable_span_size`'s row-accumulation loop then reads `row_block_size[row]` far past the real, `max_root_rows`-sized array. ASan: `heap-buffer-overflow READ of size 8, 0 bytes after a 176-byte region`, `H5HFdtable.c:303`. Reachable via an ordinary write (`H5Dcreate2` adding a link) — but only when the corrupted section is typed `FIRST_ROW`; the identical payload under type `INDIRECT` hits finding 1's null-callback crash first, before this arithmetic is ever reached | **Closed** by `666faff` (2026-10-04), which rejects it as `H5_CORRUPT_FHEAP_INDIRECT_SECTION_ROW`. When this row was written, a controlled A/B test showed the gap: the identical recipe with a valid `nentries=4` was rejected *identically*, so that rejection had nothing to do with `nentries`. Re-measured 2026-10-30: `nentries=0` is rejected and the `nentries=1` control is accepted |
 
 **Recommendation for finding 1, the null-deserialize-callback dispatch (not
 implemented here):** on the libhdf5 side, the assert at `H5FScache.c:1024`
@@ -507,15 +507,14 @@ could be promoted to a real, always-on check that rejects the file rather
 than calling through a `NULL` callback — safe unconditionally, since no
 legitimate writer ever serializes an `INDIRECT`-class section into a
 section list in the first place. On the `h5policy` side, the section-record
-loop in `h5policy_walk_frhp_fspace_sections`
-(`h5policy/pickles/h5_frhp_fspace.pk:137-160 (no further payload)`) currently treats the
-per-record `sect_type` byte as opaque and skips over it (`cur = cur + 1UL`,
-line 152) on the strength of a comment claiming "H5HF's section classes
-carry no further payload" — a claim that finding 2's own root cause (below)
-already shows is false for at least two of the four classes. Closing this
-gap needs decoding `sect_type` explicitly there and rejecting a value of 2
-(`NORMAL_ROW`) or 3 (`INDIRECT`) outright, mirroring what real libhdf5's own
-class table already knows: both classes' `deserialize` is intentionally
+loop in `h5policy_walk_frhp_fspace_sections` now decodes the per-record type
+byte (`h5policy/pickles/h5_frhp_fspace.pk:158 (var sect_type)`), but it
+validates only `FIRST_ROW` (`h5_frhp_fspace.pk:166 (sect_type == 1UL)`); any
+other value is skipped without a finding. Re-measured 2026-10-30: the
+`bad_frhp_indirect_section_row` surgery with the section typed 2 or 3 (with or
+without a payload) is still accepted. Closing this gap needs rejecting a value
+of 2 (`NORMAL_ROW`) or 3 (`INDIRECT`) outright, mirroring what real libhdf5's
+own class table already knows: both classes' `deserialize` is intentionally
 unreachable.
 
 **Recommendation for finding 2, the `nentries=0` underflow (not implemented
@@ -527,15 +526,14 @@ to the same function — so a `nentries == 0` check placed there, before
 `end_entry` is ever computed, would close both variants with one fix,
 rather than only patching the `assert(num_entries > 0)` deeper inside
 `H5HF__dtable_span_size` (`H5HFdtable.c:278`). On the `h5policy` side, this
-is the same blind spot as finding 1: the section-record loop
-(`h5_frhp_fspace.pk:137-160 (no further payload)`) never decodes `iblock_off`/`start_row`/
-`start_col`/`nentries` for `FIRST_ROW`/`NORMAL_ROW`/`INDIRECT`-typed
-records at all (confirmed against `H5HFsection.c:3722-3731`, the actual
-on-disk layout those classes serialize), so there is no existing check to
-strengthen — closing the gap needs decoding those four fields when
-`sect_type` warrants it and rejecting `nentries == 0` explicitly, the same
-way the list-level `node_count == 0` case is already rejected one level up
-(line 125). Both recommendations left undone in this PR.
+gap is closed: commit `666faff` (2026-10-04) decodes the `FIRST_ROW` payload
+(`iblock_off`/`start_row`/`start_col`/`nentries`, the layout in
+`H5HFsection.c:3722-3731`) and rejects `nentries == 0` together with an
+out-of-range row span (`h5_frhp_fspace.pk:187 (nentries == 0UL)`), as
+`H5_CORRUPT_FHEAP_INDIRECT_SECTION_ROW`. Re-measured 2026-10-30: a `FIRST_ROW`
+section with `nentries = 0` is rejected with that finding, while the same
+surgery with `nentries = 1` is accepted, so the rejection is the `nentries`
+check and not incidental. The libhdf5-side recommendation is still undone.
 
 **Also checked, ruled out — not independently exploitable.** Two further
 candidates share the same root shape (a fractal-heap-header field decoded
@@ -602,7 +600,7 @@ unconditionally):
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | A filtered chunk's stored `nbytes` must clear the pipeline's fixed framing before the chunk is read | `H5Olayout.c:401` (single-chunk, raw decode); the indexed forms decode the same field in their own record callbacks | `H5Dchunk.c:3038` asserts the chunk block is either address-defined with a positive length or address-undefined with zero length, which catches only the `nbytes == 0` case; `nbytes` of 1–3 passes that assert and reaches the filter unguarded | **Measured, both faces.** `nbytes == 0`: debug build `SIGABRT` at the `H5Dchunk.c:3038` assert (assert-masked — under `-DNDEBUG` it proceeds with a defined address and zero length into the filter path). `nbytes` of 1, 3: `SIGSEGV` — the fletcher32 `size − 4` underflow — which is *not* assert-masked and so reaches a Release build too. Both measured on a filtered single-chunk fixture (one chunk, fletcher32), object-header checksum resealed | **Not a gap.** `h5policy` rejects all three: `H5_CORRUPT_CHUNK_STORED_SIZE` "single-chunk chunk record has a zero stored size" for 0, and "filtered chunk record is smaller than the pipeline's fixed framing" (`h5policy/pickles/h5_validate.pk:623 (filtered chunk record is smaller than the pipeline's fixed framing)`) for 1 and 3 — the same framing floor the four indexed paths use |
+| 1 | A filtered chunk's stored `nbytes` must clear the pipeline's fixed framing before the chunk is read | `H5Olayout.c:401` (single-chunk, raw decode); the indexed forms decode the same field in their own record callbacks | `H5Dchunk.c:3116` asserts the chunk block is either address-defined with a positive length or address-undefined with zero length, which catches only the `nbytes == 0` case; `nbytes` of 1–3 passes that assert and reaches the filter unguarded | **Measured, both faces.** `nbytes == 0`: debug build `SIGABRT` at the `H5Dchunk.c:3116` assert (assert-masked — under `-DNDEBUG` it proceeds with a defined address and zero length into the filter path). `nbytes` of 1, 3: `SIGSEGV` — the fletcher32 `size − 4` underflow — which is *not* assert-masked and so reaches a Release build too. Both measured on a filtered single-chunk fixture (one chunk, fletcher32), object-header checksum resealed | **Not a gap.** `h5policy` rejects all three: `H5_CORRUPT_CHUNK_STORED_SIZE` "single-chunk chunk record has a zero stored size" for 0, and "filtered chunk record is smaller than the pipeline's fixed framing" (`h5policy/pickles/h5_validate.pk:623 (filtered chunk record is smaller than the pipeline's fixed framing)`) for 1 and 3 — the same framing floor the four indexed paths use |
 
 **This invariant bites filtered chunks specifically.** A non-filtered
 chunk takes its `chunk_block.length` from the *computed* layout chunk size
@@ -907,7 +905,7 @@ copied wholesale into an in-memory "prefetched" placeholder
 whose two assert-only flag checks are tabulated under **Metadata-cache
 images**, above) — bounds-checked against the cache-image block's own buffer
 (`H5_IS_BUFFER_OVERFLOW`, real, not the finding here). When the application later touches that address,
-`H5C__deserialize_prefetched_entry` (`H5Centry.c:1786`) converts the
+`H5C__deserialize_prefetched_entry` (`H5Centry.c:1792`) converts the
 placeholder into a real typed entry. Its own comment states the design
 explicitly:
 

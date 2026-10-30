@@ -12,7 +12,7 @@ id: cache-load-length-eoa-check-is-class-gated
 title: H5C__load_entry applies its end-of-address bound only to classes carrying
   the speculative-load flag, so most metadata cache clients pass an unchecked
   on-disk length to malloc
-status: oracle-hardened          # h5policy rejects; libhdf5 unfixed
+status: partially-fixed-upstream # develop 07129ce4eb9 bounds every non-SWMR load; SWMR readers still unbounded; no release fixed
 disclosure: >-
   n/a -- local analysis only.  No advisory database was consulted, no advisory
   text was retrieved, and no identifier was looked up.
@@ -41,7 +41,7 @@ entry_points:
      H5_CORRUPT_LENGTH_OVERFLOW on the size once the address is repaired)"
   - "libhdf5 H5Lvisit / H5Ovisit / H5Gopen -> H5G__stab_iterate (src/H5Gstab.c:488)"
   - "-> H5HL_protect (src/H5HL.c:341) -> H5AC_protect (src/H5AC.c:1302)"
-  - "-> H5C_protect (src/H5Centry.c:3149) -> H5C__load_entry (src/H5Centry.c:1055)"
+  - "-> H5C_protect (src/H5Centry.c:3153) -> H5C__load_entry (src/H5Centry.c:1060)"
   - "shipped consumers: h5dump (any mode), h5ls, h5stat"
   # THE SECOND ENTRY POINT, and the reason this record is not only about a
   # traversal: a superblock extension IS an object header, and H5F__super_read
@@ -52,16 +52,18 @@ entry_points:
   # measured.continuation_client.
   - "libhdf5 H5Fopen -> H5F_open (src/H5Fint.c:2117) -> H5F__super_read (src/H5Fsuper.c:670)"
   - "-> H5O_msg_exists (src/H5Omessage.c:790) -> H5O_protect -> H5AC_protect with H5AC_OHDR_CHK (src/H5Oint.c:1049)"
-  - "-> H5C_protect -> H5C__load_entry (src/H5Centry.c:1055)"
+  - "-> H5C_protect -> H5C__load_entry (src/H5Centry.c:1060)"
   - "shipped consumers on that path: EVERY tool, including header-only h5dump -H, h5ls, h5stat, h5debug"
 
 # -- The defect ---------------------------------------------------------------
 defect: >-
   H5C__load_entry obtains the image length from the client class's
   get_initial_load_size callback (src/H5Centry.c:1045) -- for most clients a
-  field decoded off disk -- and allocates that many bytes at :1055.  The bound
-  that would make this safe, H5C__verify_len_eoa (:949), is applied at :1050-1052
-  only when `type->flags & H5C__CLASS_SPECULATIVE_LOAD_FLAG`.
+  field decoded off disk -- and allocates that many bytes at :1060.  The bound
+  that would make this safe, H5C__verify_len_eoa (:949), was applied (develop
+  51b92ccee54, H5Centry.c line 1050-1052) only when `type->flags &
+  H5C__CLASS_SPECULATIVE_LOAD_FLAG`.  THIS IS THE PRE-FIX DESCRIPTION; develop
+  07129ce4eb9 changed the condition -- see remeasured_2026_10_30.
   So "is this record's size bounded?" is answered by a per-class behaviour flag,
   not by the record's decoder.  The flag exists to permit a speculative read past
   the end and TRIM it; the side effect is that the classes which are not
@@ -138,7 +140,7 @@ measured:
     ASan, stock develop b7b85e7abf9 with the sanitizer build:
       ERROR: AddressSanitizer: out of memory: allocator is trying to allocate
              0x8900000028 bytes
-        #1 H5C__load_entry   src/H5Centry.c:1055
+        #1 H5C__load_entry   src/H5Centry.c line 1055
         #4 H5O_protect       src/H5Oint.c:1049
         #5 H5O_msg_exists    src/H5Omessage.c:790
         #6 H5F__super_read   src/H5Fsuper.c:670
@@ -172,6 +174,45 @@ measured:
     should be carrying this.  A different route to a filled buffer is not ruled
     out; only this one was tried.
 
+  remeasured_2026_10_30: >-
+    RE-MEASURED ON DEVELOP 6533bcc0f6a (HDF5 2.3.0).  baseline: RelWithDebInfo,
+    -DNDEBUG, no sanitizers, settings_sha256
+    cdefcaceb228e7fc542084b690e2c46680d5e44d264fc3acd4d0197a04e519fa.  ASan arm:
+    RelWithDebInfo, -DNDEBUG, -fsanitize=address, settings_sha256
+    043b55088c6eb16bd09aa4b09b28d66219ae0f05e4f9a3c3932615ad6ad21961.  x86-64,
+    workstation-local installs; paths not recorded.
+    UPSTREAM FIXED THE ORDINARY PATH in 07129ce4eb9 (2026-10-20, "Validate
+    metadata cache load sizes before allocation"), develop-only -- no release tag
+    contains it.  The fix is the shape containment asked for: H5C__load_entry now
+    calls H5C__verify_len_eoa for every class (src/H5Centry.c:1052-1056), passing
+    `actual = !(speculative flag)`, so speculative loads are still TRIMMED to the
+    EOA and every other load is REFUSED ("actual len exceeds EOA",
+    src/H5Centry.c:976) before the allocation at :1060.
+    Specimens: the continuation witness (sha256 af8cd859...e6dcf84b9, as in
+    measured.continuation_client) and the local-heap shape this record describes
+    under reproducers.direct_fixture -- the tracked bad_heap_segment.h5 with ONLY
+    its data-segment address moved off prefix+32 to 1024 (sha256
+    26bf5a0fef1df44ae5f2e048039749f6e13e30ff577990532b5e60b6eaf41523, 1 TiB size),
+    plus the same with size 64 MiB and free-list head H5HL_FREE_NULL (sha256
+    1e3292354d0dde92bc89178498065dbf652b65ad83e8366e3bf95e38e2992c7a).
+    Driver: H5Fopen + H5Lvisit2, and h5dump -H.
+      ordinary open (H5F_ACC_RDONLY): all three refused cleanly on both builds,
+        "invalid len with respect to EOA" / "actual len exceeds EOA"; ASan
+        silent; the malloc interposer sees NO allocation >= 1 MiB (it saw the
+        64 MiB request granted before the fix).  h5dump -H on the continuation
+        witness: rc=1, clean error.
+      SWMR reader (H5F_ACC_RDONLY | H5F_ACC_SWMR_READ): STILL UNBOUNDED.  The fix
+        skips the check under H5F_ACC_SWMR_READ by design (a SWMR reader's EOA
+        can lag the writer), and these old-format files open in that mode.
+        ASan: "requested allocation size 0x10000000000" (local heap, 1 TiB) and
+        "out of memory: allocator is trying to allocate 0x8900000028"
+        (continuation, inside H5Fopen).  Baseline: "Can't allocate space".
+        Malloc interposer, 64 MiB specimen: 67108864 and 67108872 bytes GRANTED.
+    So the residual is exactly the SWMR exemption: any file an application opens
+    as a SWMR reader still turns a decoded length into an allocation request.
+    It is the same address-space cost as before (the read that follows still
+    fails at EOF), not a memory-safety defect.
+
 # -- Divergence ---------------------------------------------------------------
 divergence:
   oracle: reject_corrupt
@@ -189,7 +230,12 @@ containment:
   status: oracle_only
   description: >-
     h5policy: enforced; both the address and the size are covered.
-    libhdf5: make H5C__verify_len_eoa unconditional at H5Centry.c:1050.
+    libhdf5: DONE on develop by 07129ce4eb9 (src/H5Centry.c:1052-1056), with the
+    trim kept for speculative classes as this item asked.  Remaining: the
+    H5F_ACC_SWMR_READ exemption; a SWMR reader could at least be bounded by the
+    physical file size rather than by nothing.
+    Pre-fix, the recommendation read: make H5C__verify_len_eoa unconditional at
+    H5Centry.c line 1050 (develop 51b92ccee54).
     THE CAVEAT: for the six speculative classes the function TRIMS len to the
     EOA rather than refusing it, and a speculative read depends on that.  The fix
     must keep the trim for those and add a hard refusal for the rest -- not drop
@@ -219,6 +265,9 @@ reproducers:
     So the corpus pins the oracle and never exercises the library's missing
     bound, which is the fixture gap this record identifies.
   direct_fixture: >-
+    GENERATED since this was written: malformed/lheap_dblk_size_unbounded.h5
+    (h5policy-gencorpus _make_lheap_dblk_size_unbounded), which copies the real
+    segment so the declared size is the only defect.  The original plan read:
     to be generated by h5policy-gencorpus: the same shape as bad_heap_segment.h5
     but with the data-segment address OFF prefix+32, so the load routes through
     the unflagged data-block class.  A promotion must not add a tracked
@@ -259,7 +308,9 @@ sibling_audit: >-
   CONTINUATION, v1/v2 B-tree nodes, SNOD, extensible- and fixed-array blocks,
   fractal-heap indirect and direct blocks, free-space header and section info,
   SOHM table and list.
-  A per-client patch fixes one; the condition at H5Centry.c:1050 fixes all.
+  A per-client patch fixes one; the condition (develop 51b92ccee54, H5Centry.c
+  line 1050) fixes all -- and upstream fixed it there, for every client at once,
+  in 07129ce4eb9 (see measured.remeasured_2026_10_30).
   MEASURED: the local-heap data block and the object-header continuation (the
   latter added 2026-09-02; see measured.continuation_client).  This line
   previously read "NOT MEASURED: every unflagged client except the local-heap
@@ -290,7 +341,9 @@ compatibility_backport_risks: >-
 # -- Affected versions --------------------------------------------------------
 version_range:
   affected: ">= 1.10.0"
-  fixed_in: none
+  fixed_in: >-
+    none released.  develop 07129ce4eb9 (2026-10-20) bounds every non-SWMR load
+    (measured 2026-10-30); SWMR readers remain unbounded on develop.
   label: >-
     One build measured, the condition read at every tag between.  Behaviour is
     MEASURED only on 2.3.0 (develop b7b85e7abf9).  The gating condition itself --
@@ -310,6 +363,12 @@ version_range:
     statement about where this code shape begins, not a claim that 1.8 is safe.
 
 coverage_gaps:
+  - >-
+    OPENED 2026-10-30: the SWMR-reader exemption in the upstream fix.  Measured
+    with two clients (local-heap data block, object-header continuation); no
+    current-format SWMR file was built, so whether a file written for SWMR
+    reaches the same allocation was not checked -- these witnesses are
+    old-format files that happen to open with H5F_ACC_SWMR_READ.
   - >-
     NARROWED 2026-09-02.  Two unflagged clients are now measured -- the local-heap
     data block and the object-header continuation.  The remaining eleven are
