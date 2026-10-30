@@ -1559,6 +1559,8 @@ def _gen_malformed(root):
         f"{root}/malformed/bad_fsinfo_page_size_over_max.h5")
     _make_dtype_float_normalization(
         f"{root}/malformed/bad_dtype_float_normalization.h5")
+    _make_dtype_vax_float_size(
+        f"{root}/malformed/bad_dtype_vax_float_size.h5")
     _make_dtype_opaque_tag_unaligned(
         f"{root}/malformed/bad_dtype_opaque_tag_unaligned.h5")
     _make_dtype_float_overlap(
@@ -6385,6 +6387,55 @@ def _make_dtype_float_normalization(path):
     if (raw[dt + 1] >> 4) & 0x03 != 2:
         raise RuntimeError("expected the implied-normalization encoding")
     raw[dt + 1] = (raw[dt + 1] & 0xCF) | 0x30
+    _patch(path, bytes(raw))
+
+
+def _make_dtype_vax_float_size(path):
+    """A VAX-ordered float whose size, 9, is not a multiple of 4.
+
+    libhdf5 converts VAX data by reversing its 16-bit words four bytes at a
+    time (H5T__conv_f_f_loop, H5T__conv_f_i_loop) and guards the size only with
+    an assert.  At size % 4 == 1 the last iteration indexes one byte before and
+    one byte after the element, so reading this dataset into a native type is an
+    out-of-bounds read and write on a release build.
+
+    H5Tset_order accepts H5T_ORDER_VAX and H5Tset_size grows the float, but
+    only the predefined VAX types carry datatype version 3, and h5py exposes
+    neither.  libhdf5 writes the API-built type as a version-1 message with the
+    VAX bits set, which a reader decodes as big-endian because bit 6 means VAX
+    only from version 3 on.  So the one patch is the version nibble, 1 -> 3; a
+    float message has the same layout in both.  The earliest bound keeps the
+    object header at version 1, with no checksum to repair.  The data goes in
+    with the file type as the memory type, so writing it never enters the
+    conversion loop.
+    """
+    size = 9
+    assert size % 4 == 1, "size must be in the out-of-bounds class"
+
+    def build(h):
+        tid = h5py.h5t.IEEE_F64BE.copy()
+        tid.set_order(h5py.h5t.ORDER_VAX)
+        tid.set_size(size)
+        sid = h5py.h5s.create_simple((4,))
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_obj_track_times(False)
+        dsid = h5py.h5d.create(h.id, b"vax9", tid, sid, dcpl=dcpl)
+        data = np.frombuffer(bytes(0x11 * (i % 7 + 1) for i in range(4 * size)),
+                             dtype=f"V{size}")
+        dsid.write(h5py.h5s.ALL, h5py.h5s.ALL, data, mtype=tid)
+
+    raw = _base_bytes(build, libver="earliest")
+    # Regime assertions: a version-1 (unchecksummed) object header holding
+    # exactly one version-1 float datatype message with both VAX order bits set
+    # and a size in the out-of-bounds class, so a writer change fails here and
+    # not in the corpus.
+    assert b"OHDR" not in raw, "v2 object header: patching would need a checksum"
+    hits = [i for i in range(len(raw) - 8)
+            if raw[i] == 0x11 and raw[i + 1] & 0x41 == 0x41
+            and struct.unpack_from("<I", raw, i + 4)[0] == size]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected one {size}-byte VAX float datatype, found {len(hits)}")
+    raw[hits[0]] = 0x31
     _patch(path, bytes(raw))
 
 
