@@ -16,11 +16,17 @@ id: chunk-dim-product-64bit-overflow
 title: chunked layout dimensions multiply without an overflow check, so a
   product of 2**64 wraps to a zero chunk size and libhdf5 reads and writes past
   a zero-size chunk buffer
-status: oracle-hardened          # h5policy rejects as of 2026-08-24; libhdf5 NO LONGER FAULTS on develop 5933130b610 -- now a silent accept; needs re-triage, see measured.REMEASURED_2026_10_12
+status: oracle-hardened          # h5policy rejects as of 2026-08-24; libhdf5 still faults on develop 6533bcc0f6a (read AND write) -- see measured.RETRIAGED_2026_10_30
 disclosure: >-
-  n/a -- local analysis only.  Nothing was reported upstream from here, no
-  advisory database was consulted, and no identifier was looked up.  The
-  handoff draft lives outside the tracked tree.
+  Nothing was reported upstream from here, no advisory database was consulted,
+  and no identifier was looked up.  UPDATED 2026-10-30: an external reporter
+  has filed a private vulnerability report upstream for this defect (opened
+  2026-10-29, still in triage when last seen, no PoC file attached).  Its
+  identifier is deliberately not recorded; it was read from a locally saved
+  copy, not fetched.  Its example dimensions are wrong ({2**33, 2**31+1, 4}
+  wraps to 2**35, not 32 bytes), but its defect and proposed fix are right.
+  Disposition: accept that report rather than file a new one.  The handoff
+  draft lives outside the tracked tree.
 
 # -- Triage -------------------------------------------------------------------
 record: dataset_layout_filter_fill
@@ -38,8 +44,8 @@ activation_before_validation:
 entry_points:
   - "h5policy (oracle) -- REJECTS under untrusted-strict and forensic since 2026-08-24"
   - "libhdf5 H5Fopen -> H5Dopen2 -> H5D__chunk_init (src/H5Dchunk.c:1226) -> H5D__chunk_set_sizes (src/H5Dchunk.c:898-900)"
-  - "libhdf5 H5Dread -> H5D__chunk_read (src/H5Dchunk.c:2938) -> H5D__chunk_lock (src/H5Dchunk.c:5168) -> H5D__compact_readvv (src/H5Dcompact.c:409) -> H5VM_memcpyvv (src/H5VM.c:1383)  <-- OOB read, NOT reproduced on develop 5933130b610; see measured.REMEASURED_2026_10_12"
-  - "libhdf5 H5Dwrite -> H5D__chunk_write (src/H5Dchunk.c:3796) -> H5D__chunk_lock (src/H5Dchunk.c:5168) -> H5D__compact_writevv (src/H5Dcompact.c:467) -> H5VM_memcpyvv (src/H5VM.c:1426)  <-- OOB write, UNMEASURED since the restructure"
+  - "libhdf5 H5Dread -> H5D__chunk_read -> H5D__chunk_lock -> H5D__compact_readvv (src/H5Dcompact.c:409) -> H5VM_memcpyvv (src/H5VM.c:1469)  <-- OOB read when the chunk is ALLOCATED; measured on develop 6533bcc0f6a, see measured.RETRIAGED_2026_10_30"
+  - "libhdf5 H5Dwrite -> H5D__chunk_write -> H5D__chunk_lock -> H5D__compact_writevv (src/H5Dcompact.c:467) -> H5VM_memcpyvv (src/H5VM.c:1469)  <-- OOB write of caller data; measured on develop 6533bcc0f6a"
   - "shipped consumers: h5dump -d with a subset whose start coordinate is nonzero; any H5Dread or H5Dwrite. NOT h5dump -H / h5ls -v, which never materialize a chunk"
 
 # -- The defect, read out of the source tree (HDF5 2.3.0, develop 51b92ccee54;
@@ -80,7 +86,39 @@ defect: >-
 
 # -- What was measured --------------------------------------------------------
 measured:
+  RETRIAGED_2026_10_30: >-
+    2026-10-30, develop 6533bcc0f6a (2.3.0); baseline RelWithDebInfo asserts
+    off (settings_sha256
+    cdefcaceb228e7fc542084b690e2c46680d5e44d264fc3acd4d0197a04e519fa), ASan
+    with asserts live and off, and the i386 build.  Prompted by an external
+    report (see disclosure).
+    THE 2026-10-12 "DOES NOT REPRODUCE" WAS A FIXTURE ARTIFACT, NOT A FIX.  The
+    tracked wrap fixtures leave the Single Chunk UNALLOCATED, so a read returns
+    fill values and never touches the undersized buffer; the original crasher
+    pointed the chunk at bytes already in the file.  Allocate the chunk
+    (malformed/chunk_dim_product_wrap_alloc_v5.h5) and a read-only H5Dread of
+    element (1,0) SIGSEGVs the release build again, the assert-free ASan build
+    reports SEGV in H5VM_memcpyvv <- H5D__compact_readvv, and the asserted ASan
+    build aborts on the chunk_block length assert in H5D__chunk_read.  i386
+    returns fill on that geometry.  The WRITE direction, unmeasured on
+    2026-10-12, faults on the unallocated tracked fixtures too (SIGSEGV
+    release, SEGV assert-free ASan, `chunk.size > 0` assert on asserted ASan).
+    A NONZERO WRAP IS THE REGIME THIS RECORD DID NOT HAVE.  Dims 2527330632 x
+    1824726041 x 4 = 2**64 + 32 wrap to a 32-byte chunk, which PASSES
+    `assert(layout->u.chunk.size > 0)` (src/H5Dchunk.c:5275).  With the chunk
+    allocated (malformed/chunk_dim_product_wrap_small_alloc_v5.h5), read and
+    write fault on EVERY build: release, both ASan builds, and i386.  `h5dump
+    -d /d -s 1,0 -c 1,1` SIGSEGVs at both widths.  A layout-v4 encoding of the
+    same geometry SIGSEGVs h5py's bundled 1.14.5.
+    ACCESS SHAPE: ASan reports a wild SEGV, not heap-buffer-overflow.  With a
+    four-byte dimension encoding any wrapping pair has dim[1] >= 2**30, so a
+    non-origin element sits gigabytes past the buffer.  An adjacent overflow
+    needs an eight-byte encoding (for example dim[1] = 3); source-derived, not
+    built.
+    Probe canary: outcome `crashed` (signal 11) on both new fixtures under the
+    generic and dataset_layout exercises.
   REMEASURED_2026_10_12: >-
+    SUPERSEDED by RETRIAGED_2026_10_30 -- kept as the record of what was seen.
     2026-10-12, against the newest build available here: libhdf5 2.3.0, source
     tree at develop 5933130b610, baseline RelWithDebInfo asserts off
     (settings_sha256 9cc649d75c7f760b782a54500f5ccbfbc71163fc1dc97c6a2a0ed66daa53e2dd)
@@ -102,7 +140,7 @@ measured:
     has NOT landed.
     WHAT IS NOT MEASURED: the WRITE direction.  The read path is clean; nothing
     was written on this build.
-    SO THIS RECORD NEEDS RE-TRIAGE, not a line edit.  The citations below were
+    SO THIS RECORD NEEDS RE-TRIAGE, not a line edit.  (Done 2026-10-30.)  The citations below were
     re-pinned on 2026-10-12 to statements verified in the current tree, and the
     historical ASan transcripts under `results` were left as recorded -- their
     file/line pairs describe the run that produced them and are written without
@@ -153,7 +191,7 @@ measured:
     - "baseline, read-only: SIGSEGV from a 479-byte file, including through h5dump -d /d -s \"1,0\" -c \"1,1\""
     - "baseline, write: SIGSEGV through H5Dwrite on the tracked fixtures malformed/chunk_dim_product_wrap_v4.h5 and _v5.h5, both of which h5dump -H opens with exit 0"
     - "bundled-in-h5py (1.14.5), read-only: SIGSEGV on a v4-encoded specimen -- the product wraps in uint32_t and reaches zero by the same route"
-    - "baseline-i386: NO fault.  Returns fill values instead of the stored bytes on every wrapping specimen, on both the read and the single-element path.  Silent wrong data, not a memory-safety outcome; the mechanism was not traced"
+    - "baseline-i386: NO fault.  Returns fill values instead of the stored bytes on every wrapping specimen, on both the read and the single-element path.  Silent wrong data, not a memory-safety outcome; the mechanism was not traced.  SUPERSEDED 2026-10-30 for the NONZERO wrap: i386 2.3.0 SIGSEGVs on read and write of the 32-byte-wrap allocated fixture; the zero wrap still returns fill there"
   minimal_trigger: >-
     one element whose in-chunk byte offset is NONZERO.  Element (0,...,0) sits
     at offset 0 and reads 4 of the 8 bytes the allocator returned, so it does
@@ -196,12 +234,18 @@ backports: []
 
 # -- Reproducers --------------------------------------------------------------
 reproducers:
-  direct_fixture: h5policy/tests/malformed/chunk_dim_product_wrap_v5.h5
+  direct_fixture: h5policy/tests/malformed/chunk_dim_product_wrap_small_alloc_v5.h5
+  related_fixtures:
+    - h5policy/tests/malformed/chunk_dim_product_wrap_v5.h5        # zero wrap, unallocated: write path only
+    - h5policy/tests/malformed/chunk_dim_product_wrap_alloc_v5.h5  # zero wrap, allocated: read faults
   generator: >-
     h5policy/tools/h5policy-gencorpus, _layout_chunk_dim_product_wrap over
     _layout_chunk_enc4_2d: write a rank-2 single-chunk dataset whose chunk
     dimensions need four encoded bytes, patch two of them to 0x80000000, stamp
-    the layout version, and repair the object-header checksum.
+    the layout version, and repair the object-header checksum.  The allocated
+    fixtures add _layout_chunk_dim_product_wrap_small (2527330632 x
+    1824726041) and _layout_allocate_single_chunk (address 0), which asserts
+    the regime: Single Chunk index, unfiltered, unallocated before the patch.
   integration_poc: >-
     n/a as a tracked artifact.  An H5Fopen(RDONLY) + H5Dread of one element at a
     nonzero coordinate is the whole reproducer; the case bundle carries it.

@@ -1626,6 +1626,15 @@ def _gen_malformed(root):
     # that only gated the 32-bit bound on the layout version would accept this.
     _make_layout_version(f"{root}/malformed/chunk_dim_product_wrap_v5.h5",
                          _layout_chunk_enc4_2d, 5, _layout_chunk_dim_product_wrap)
+    # The same two wraps with the chunk ALLOCATED, so a read-only H5Dread faults.
+    # Layout version 5 only: h5py's bundled 1.14.x refuses v5, so the
+    # differential phase cannot crash on them, while a v4 sibling would.
+    _make_layout_version(f"{root}/malformed/chunk_dim_product_wrap_alloc_v5.h5",
+                         _layout_chunk_enc4_2d, 5,
+                         _layout_chunk_dim_product_wrap_alloc)
+    _make_layout_version(
+        f"{root}/malformed/chunk_dim_product_wrap_small_alloc_v5.h5",
+        _layout_chunk_enc4_2d, 5, _layout_chunk_dim_product_wrap_small_alloc)
     # The Single Chunk index keeps no records, so its one raw-data extent was
     # the only one that never reached the data/metadata disjointness check.
     _make_single_chunk_over_metadata(
@@ -3341,6 +3350,56 @@ def _layout_chunk_dim_product_wrap(raw, mbody):
     """
     _layout_set_chunk_dim(raw, mbody, 0, 0x80000000)
     _layout_set_chunk_dim(raw, mbody, 1, 0x80000000)
+
+
+def _layout_chunk_dim_product_wrap_small(raw, mbody):
+    """Make the dimension product 2**64 + 32, so it wraps to a NONZERO 32 bytes.
+
+    2527330632 * 1824726041 * 4: the two data dimensions are the factors of
+    2**62 + 8 (8*3*2833*37171 and the last prime factor of 2**59 + 1), so both
+    fit the four-byte encoding.  Unlike a wrap to zero, a small nonzero size
+    also passes ``assert(layout->u.chunk.size > 0)`` in H5D__chunk_lock, so it
+    faults assert-enabled builds as well.
+    """
+    dim0, dim1 = 2527330632, 1824726041
+    if (dim0 * dim1 * 4) % (1 << 64) != 32:
+        raise RuntimeError("wrapped chunk size is not 32 bytes")
+    _layout_set_chunk_dim(raw, mbody, 0, dim0)
+    _layout_set_chunk_dim(raw, mbody, 1, dim1)
+
+
+def _layout_allocate_single_chunk(raw, mbody):
+    """Give a Single Chunk index a defined address so a read materialises it.
+
+    The wrap fixtures above leave the chunk unallocated, and an unallocated
+    chunk is read as fill values without ever touching the undersized buffer:
+    the read path looked fixed on develop for that reason alone.  Pointing the
+    address at offset 0 (the superblock) allocates the chunk without adding
+    raw data; ``h5dump -d /d -s 1,0 -c 1,1`` then faults.
+    """
+    ndims, enc = raw[mbody + 3], raw[mbody + 4]
+    idx_type_off = mbody + 5 + ndims * enc
+    if raw[idx_type_off] != 1:
+        raise RuntimeError(
+            f"expected the single-chunk index, got type {raw[idx_type_off]}")
+    if raw[mbody + 2] & 0x02:
+        raise RuntimeError("expected an unfiltered single chunk")
+    addr_off = idx_type_off + 1
+    if struct.unpack_from("<Q", raw, addr_off)[0] != 0xFFFFFFFFFFFFFFFF:
+        raise RuntimeError("expected an unallocated chunk before the patch")
+    struct.pack_into("<Q", raw, addr_off, 0)
+
+
+def _layout_chunk_dim_product_wrap_alloc(raw, mbody):
+    """The zero wrap, with the chunk allocated so the READ path faults."""
+    _layout_chunk_dim_product_wrap(raw, mbody)
+    _layout_allocate_single_chunk(raw, mbody)
+
+
+def _layout_chunk_dim_product_wrap_small_alloc(raw, mbody):
+    """The 32-byte wrap, with the chunk allocated so the READ path faults."""
+    _layout_chunk_dim_product_wrap_small(raw, mbody)
+    _layout_allocate_single_chunk(raw, mbody)
 
 
 def _make_single_chunk_over_metadata(path, build, filtered):
