@@ -23,6 +23,11 @@ where a newer, non-`assert` initialization helper already performs a real,
 `NDEBUG`-surviving check; debug-only or test-only code paths not reachable
 from an ordinary application opening an untrusted file.
 
+In the metadata-cache code, an assert comparing an entry's count field with
+the cache's own state is not automatically internal: cache-image entries copy
+many such fields straight from the file (see Metadata-cache images, rows 1,
+2, 4 and 7).
+
 **How findings were verified.** Every finding below claiming a *measured*
 consequence was checked by building a real, byte-level fixture — one or two
 bytes changed in a valid seed file, its Jenkins-lookup3 checksum resealed —
@@ -180,7 +185,7 @@ invariants, not just internal contracts.
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | `node_size` sanity | `H5B2cache.c:261` (shared, see above) | `H5B2hdr.c:112` (`assert(cparam->node_size > 0)`) | **Measured: real, bounded resource spike.** Patched to the field's own on-disk maximum (`0xFFFFFFFF`, a fixed 4-byte field). `H5B2__hdr_init` eagerly `malloc`s and `memset`s a `node_size`-sized scratch buffer *before any node is ever read* — ~898MB peak RSS, ~1.1s delay opening a 15KB file, no crash. Caught afterward, incidentally, by an unrelated addr-vs-end-of-allocation check when the same corrupted value is later used as a leaf's read length | Confirmed: dedicated check (`H5_CORRUPT_V2_BTREE_NODE_SIZE`, `h5_btree2.pk:72 (node_size > file_size)`) — not a gap |
+| 1 | `node_size` sanity | `H5B2cache.c:261` (shared, see above) | `H5B2hdr.c:112` (`assert(cparam->node_size > 0)`) | **Measured: real, bounded resource spike.** Patched to the field's own on-disk maximum (`0xFFFFFFFF`, a fixed 4-byte field). `H5B2__hdr_init` eagerly `malloc`s and `memset`s a `node_size`-sized scratch buffer *before any node is ever read* — ~898MB peak RSS, ~1.1s delay opening a 15KB file, no crash. Caught afterward, incidentally, by an unrelated addr-vs-end-of-allocation check when the same corrupted value is later used as a leaf's read length. Full history in `registry/cases/v2-btree-node-size-unbounded-amplification.yml`, which measures how the resident cost scales with `node_size` | Confirmed: dedicated check (`H5_CORRUPT_V2_BTREE_NODE_SIZE`, `h5_btree2.pk:72 (node_size > file_size)`) — not a gap |
 | 2 | `rrec_size > 0` | `H5B2cache.c:264` (shared, see above) | `H5B2hdr.c:113` (`assert(cparam->rrec_size > 0)`) | **Measured: crash (`SIGFPE`) on x86, read path.** `H5B2__hdr_init` divides by the record size while deriving leaf capacity (`H5B2hdr.c:140`, `H5B2_NUM_LEAF_REC`) — *before any node is ever read*. One field changed (`rrec_size` 0) on a dense-link group: the file and group open cleanly, then an ordinary `H5Gget_info` crashes. The x86 crash history (x86-64 and i386) is in `registry/cases/v2-btree-record-size-zero-assert-only.yml`. Architecture-dependent: on arm64 the divide returns 0 instead of trapping, so the same file does not crash there — measured separately at an earlier commit, and not part of that case record | Confirmed: dedicated check (`H5_CORRUPT_V2_BTREE_RECORD_SIZE`, `h5_btree2.pk:50 (record_size == 0UL)`) — not a gap |
 | 3 | `merge_percent < split_percent / 2` | `H5B2cache.c:270-271` (shared, see above) | `H5B2hdr.c:116` | **Measured: real tree-shape pathology, write-path only.** Violating the safety margin (`merge_percent=50` against `split_percent=100`) made both children of a fresh split land exactly on the corrupted merge threshold; the very next ordinary delete triggered a premature merge, collapsing a two-child, 46-record split straight back into one 45-record leaf. Every record stayed correctly tracked throughout — no data loss, no wrong content — just needless, repeated split-then-remerge churn on ordinary write traffic near the threshold | **None — confirmed coverage gap.** No pickle validates the header's own `split_percent`/`merge_percent` bytes at all (a same-named pair of fields elsewhere, in an unrelated message type, is checked, but not these) |
 | 4 | Internal node's per-child `all_nrec` consistency (by-index descent) | `H5B2cache.c:672-678` — `node_ptrs[].all_nrec` decoded raw, no check at the decode site itself | `H5B2.c:826` (`assert(0 && "Index off end of tree??")`) — the only thing standing between a corrupted per-child count and a broken descent | **Measured: metadata-cache resource leak, not a crash.** The internal node's `H5AC_unprotect` call is only reached in the sibling branch, so a masked failure here leaves it permanently protected; the stale, un-advanced node pointer gets reprocessed at the wrong depth, eventually failing a checksum check against what should be a leaf. On `H5Fclose`, the leaked pin makes `H5C__flush_invalidate_ring` report `"Pinned entry count not decreasing"`, followed by the library's own `"infinite loop closing library"` diagnostic — a real, malformed-shutdown malfunction, not a true hang | **None — confirmed coverage gap.** Accepts the crafted file outright |
@@ -411,9 +416,12 @@ public-facing accessor — genuinely inert, not a finding.
 
 ## Metadata-cache images (`H5AC*.c`, `H5Cimage.c`, `H5Ocache_image.c`, 532 asserts across 6 files — complete)
 
-Two assert-masked invariants in `H5Cimage.c`'s cache-image entry decoder,
-tabulated below — both measured inert on a Release build, and both already
-covered by `h5policy`. The other files reconcile as follows.
+Seven assert-masked invariants in the cache-image load path, tabulated
+below. Five are inert or fail safely on a Release build; two cause heap
+memory errors — row 6 reads past the image buffer, and row 7 writes past a
+heap array. `h5policy` covers four; of the three it does not, rows 4–5 have
+no effect on a Release build (the value they check is never used there), and
+row 7 is a confirmed gap. The other files reconcile as follows.
 `H5AC.c` (116 asserts) is pure lifecycle/wrapper code around the generic
 cache layer, with real, always-on checks (not asserts) guarding the one
 application-supplied config struct it validates. `H5ACdbg.c` (16 asserts)
@@ -429,9 +437,12 @@ object — its own class registration sets `deserialize`/`verify_chksum`/
 image's `addr`/`size` fields (reached from `H5Fsuper.c`; added to this
 area's scope mid-sweep since it isn't named `H5AC*`) — its real
 hazard-relevant checks turned out to be genuine, always-on `HGOTO_ERROR`s
-(overflow and EOA-range checks), not masked asserts.
+(overflow and EOA-range checks), not masked asserts — except that both are
+skipped when the declared size is 0 (`H5Ocache_image.c:119`), which leaves
+only the assert in row 3.
 
-`H5Cimage.c` (223 asserts) holds both table rows. Its other real result
+`H5Cimage.c` (223 asserts) holds the decode site of all seven rows; row 7's
+main guards are in `H5Centry.c`'s prefetched-entry code. Its other real result
 isn't assert-masked, so it's written up under **Adjacent findings**, below,
 rather than tabulated here: a deliberate design choice, stated in the
 source's own comments, to skip checksum verification entirely for metadata
@@ -451,21 +462,34 @@ checks that agreement only by `assert`.
 |---|---|---|---|---|---|
 | 1 | An entry has flush-dependency parents exactly when its `IS_FD_CHILD` flag is set | `H5Cimage.c:2805` — `fd_parent_count` decoded raw, no check at the decode site itself | `H5Cimage.c:2806-2807` | **Measured: inert.** Both directions, each isolated on its own fixture: `IS_FD_CHILD` set with no parents, and a resolvable parent address on an entry not flagged as a child. A Release build opens the file and reads its dataset normally, read-only or read-write (a read-write open also drops the cache image on close) — in the second direction it simply sets up the flush dependency the entry names. An asserts-enabled build aborts at this assert on both. The child count one field earlier gets the treatment this one lacks: `fd_child_count` against `IS_FD_PARENT` is a real check (`H5Cimage.c:2788-2791`) | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_FLAGS`, `h5_messages.pk:1748 (parent_count > 0UL)`) — not a gap |
 | 2 | An entry has an LRU rank (≥ 0) exactly when its `IN_LRU` flag is set, and −1 otherwise | `H5Cimage.c:2812` — `lru_rank` decoded raw, no check at the decode site itself | `H5Cimage.c:2813` | **Measured: inert.** Both directions: `IN_LRU` clear with rank 5 (`h5policy/tests/malformed/mdci_entry_lru_inconsistent.h5`), and `IN_LRU` set with rank −1. A Release build opens the file and reads its dataset normally, read-only or read-write; an asserts-enabled build aborts at this assert on both. A Release reconstruction never reads the rank: entries join the LRU in image order (`H5Cimage.c:2517`), and every later read-path use is an assert or inside `#ifndef NDEBUG` | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT`, `h5_messages.pk:1766 (lru_raw == 0xffffffffUL)`) — not a gap |
+| 3 | The cache image's declared length is nonzero | `H5Ocache_image.c:117` — the message's size decoded raw; its overflow and end-of-file checks are skipped entirely when the size is 0 (`:119`) | `H5Cimage.c:640` | **Measured: fails safely.** A message declaring size 0: a Release build allocates a 1-byte buffer for the image and rejects the file at the first signature check. An asserts-enabled build aborts at this assert. History in `registry/cases/mdci-image-checksum-unverified.yml` | Confirmed: dedicated check (`H5_CORRUPT_MDCI_HEADER_TOO_SMALL`, `h5_messages.pk:1572 (image_size < image_header)`) — not a gap |
+| 4 | A flush-dependency parent is not in the LRU list (its `lru_rank` is −1) | `H5Cimage.c:2812` — `lru_rank` decoded raw | `H5Cimage.c:2537` | **Measured: inert.** A parent entry flagged in-LRU with rank 1 (consistent under row 2): a Release build opens the file and reads its dataset normally, since it never reads the rank (row 2). An asserts-enabled build aborts at this assert | **None — a gap, but harmless:** accepted, and a Release build never uses the value |
+| 5 | The prefetched entries' LRU ranks are well ordered: no rank 0, strictly increasing along the LRU list, bounded gaps | `H5Cimage.c:2812` — `lru_rank` decoded raw | `H5Cimage.c:2582-2613`, inside `#ifndef NDEBUG` (the same debug-only block also holds row 7's child-count check, `:2575`) | **Measured: inert.** An in-LRU entry with rank 0: a Release build reads normally. An asserts-enabled build aborts at `:2596`. History in `registry/cases/mdci-lru-rank-assert-only.yml` | **None — a gap, but harmless**, for the same reason as row 4 |
+| 6 | The image header leaves room for at least one entry | The header decoder checks the image length against the message's size and the entry count against zero, but never that the length exceeds the header itself | `H5Cimage.c:2473` | **Measured: heap over-read, then an error.** An image exactly as long as its header, declaring one entry: entry decoding starts at the end of the image buffer, and its bound is computed from the *full* image length instead of what remains (the defect in `registry/cases/mdci-entry-extent-rebased-after-header.yml`), so it reads past the buffer before a bound check trips and reports "ran off end of input buffer while decoding". With a guard page placed after the buffer, the read faults at `H5Cimage.c:2744`. An asserts-enabled build aborts at this assert | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_COUNT`, `h5_messages.pk:1628 (nentries > remaining / entry_header)`) — not a gap |
+| 7 | An entry's declared flush-dependency child count matches the number of entries that actually name it as a parent | `H5Cimage.c:2787` — `fd_child_count` decoded raw; the real checks that follow (`:2788-2791`) only require it to be nonzero exactly when `IS_FD_PARENT` is set | `H5Centry.c:1707,1743`, in `H5C__destroy_pf_entry_child_flush_deps`; and `H5Cimage.c:2575`, inside `#ifndef NDEBUG` | **Measured: heap overflow write, read path.** When a prefetched parent is first used, libhdf5 allocates a NULL-terminated array of `fd_child_count + 1` pointers (`H5Centry.c:1870-1871`), then stores into it every entry that names this parent, with no bound (`:1710`). With a parent declaring fewer children than actually name it, an ordinary open and dataset read crashes: `SIGSEGV` when it declares one too few, or 1 of 3 (the terminator is overwritten, so the loop that restores the dependencies, `:2060-2083`, runs past the array onto a garbage pointer), and glibc aborts with `malloc(): invalid size (unsorted)` (heap corruption) at 1 of 6. Matching counts are clean. An asserts-enabled build aborts on every mismatch | **None — confirmed coverage gap.** Accepts every mismatched file: it checks each entry's count only against its own `IS_FD_PARENT` flag (`h5_messages.pk:1747 (child_count > 0UL)`), never against how many entries name it |
 
-**Related, but not these findings' consequence.** A cache image whose
+**Related, but not caused by rows 1–2.** A cache image whose
 flush-dependency parent cannot be resolved fails a real check
 (`H5Cimage.c:2533`, "fd parent not in cache") and unwinds through a
 memory-unsafe cleanup — a `SIGSEGV` or a double free on a Release build,
 per `registry/cases/mdci-reconstruct-cleanup-unsafe.yml`. That record's
-crash specimen also violates both invariants above, but the crash comes
+crash specimen also violates the invariants in rows 1–2, but the crash comes
 from the dangling parent: a mismatch of either kind on its own, measured
 above, does not reach the cleanup.
 
-**Recommendation (not implemented here):** promote both asserts to real,
-always-on `HGOTO_ERROR` checks, matching the `fd_child_count` checks two
-fields earlier. Since the encoder derives both flags from these fields, the
-change cannot reject a file libhdf5 itself wrote, and it needs no `h5policy`
-change.
+**Recommendation (not implemented here):** for rows 1–2, promote both
+asserts to real, always-on `HGOTO_ERROR` checks, matching the `fd_child_count`
+checks two fields earlier. Since the encoder derives both flags from these
+fields, the change cannot reject a file libhdf5 itself wrote, and it needs no
+`h5policy` change. For row 3, reject a zero size in the message decoder
+alongside its existing checks. For row 6, fix the re-based extent so the entry
+decoder bounds against what remains after the header; that makes its own
+bound checks correct, while promoting `:2473` alone would cover only the
+header-only shape. Rows 4–5 have no effect on a Release build; promoting them is
+optional. For row 7, bound the children collected by the declared count in
+`H5C__destroy_pf_entry_child_flush_deps`, and reject a mismatch with a real
+error. On the `h5policy` side, count how many entries name each parent and
+compare that with its declared `fd_child_count`.
 
 **Scope notes:** `H5Ocache_image.c` and the prefetched-entry-specific
 portions of `H5Centry.c` (the consumer of the Adjacent finding below) were
@@ -478,28 +502,35 @@ to `H5C.c` in every prior area.
 
 ## Fractal heaps (`H5HF*.c`, 919 asserts across 16 files — complete)
 
-Five findings, all independently measured against real fixtures: two are
-literally assert-masked and appear in the table below. The other three are
-zero-guard — nothing checks them at all, not even an assert — and are
-covered separately under **Adjacent findings**, below: an unbounded
+Eight findings, all independently measured against real fixtures: four are
+assert-masked and appear in the table below — one of them, the
+doubling-table geometry, by `#ifndef NDEBUG` on the create path only. The
+other four are zero-guard — nothing checks them at all, not even an assert —
+and are covered separately under **Adjacent findings**, below: an unbounded
 row-lookup (`H5HF__dtable_lookup`), a write-only-reachable sibling in the
-same shape (`H5HF__man_iter_start_offset`), and a position-dependent
+same shape (`H5HF__man_iter_start_offset`), a position-dependent
 heap-buffer-overflow in how "tiny" objects are stored inline in their own
-heap ID. Of those three, only the latter two are actual `h5policy` gaps —
-the row-lookup one turned out, on tracing it, to already be caught by
-`h5policy`'s own independent reimplementation of the same row/column
-arithmetic (see its entry below). Two further candidates were chased and
-ruled out — see below, after the table. Ten of the sixteen files (`H5HFhdr.c`, `H5HFiblock.c`,
-`H5HFman.c`, `H5HFdblock.c`, `H5HFspace.c`, `H5HFbtree2.c`, `H5HF.c`,
+heap ID, and a filtered huge-object copy whose length and buffer size come
+from unrelated fields. Of those four, `h5policy` catches only the row-lookup
+one, through its own implementation of the same row/column arithmetic (it
+mirrors libhdf5's `H5HF__man_dblock_locate`, but adds the bound libhdf5
+lacks; see its entry below). It accepts the write-only sibling (writes are
+outside its scope) and declines the other two (`unsupported_coverage_gap`).
+Two further candidates were chased and
+ruled out — see below, after the table. Eight of the sixteen files (`H5HFiblock.c`,
+`H5HFdblock.c`, `H5HFspace.c`, `H5HFbtree2.c`, `H5HF.c`,
 `H5HFdbg.c`, `H5HFtest.c`, `H5HFstat.c`) reconcile entirely to write-path
 lifecycle management, the same generic ID-flags dispatch mechanism the
 findings below already cover, debug-tool-only, or test-only code, and
-contribute nothing new.
+contribute nothing new. `H5HFhdr.c` holds row 3; the rest of it is
+write-path lifecycle management. `H5HFman.c` holds row 4.
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | A free-space section's class actually has a `deserialize` callback before it's called | `H5FScache.c:1013` — a section's on-disk type byte decoded raw; the real check that follows (`:1019-1020`) only confirms the value is *in-bounds*, not that the resulting class has a callback | `H5FScache.c:1024` (`assert(fspace->sect_cls[sect_type].deserialize)`) | **Measured: real crash, isolated to a single byte.** Fractal heap's `INDIRECT` free-space-section class is a valid, in-bounds registered class (index 3) whose `.deserialize` is `NULL` by design — its own comment states objects of this class "should never be in section manager." Nothing stops a corrupted file's section-type byte from claiming to be 3 anyway. One byte flipped (an existing section's type, `0→3`) on an otherwise-untouched real file: stock build `SIGSEGV`; the reused ASan build confirms a direct call through address 0 (pinned down without a debugger — attach is blocked at the OS level in this environment — by computing the address offset between the built binary and the running process from known symbols, then applying that offset to the crash's return-address register). Reachable via an ordinary write to the group (e.g. `H5Gcreate2`/`H5Lcreate` adding a link), when the heap's free-space manager is consulted for space and loads the on-disk section list — *not* via read/iterate (a read-only `H5Literate2`/`Group.keys()` over the same corrupted file completes cleanly, and `h5stat -s` never loads these sections; this corrects an earlier "reachable via read" phrasing). The sibling `NORMAL_ROW` class (index 2) has an equally `NULL` `.deserialize` slot, and the shared dispatch gives it no guard beyond the same in-bounds check, so a type byte of `2` reaches the identical masked `assert`. **Confirmed empirically (2026-10-06):** a one-byte fixture (an existing `SINGLE` section's type `0→2`, section-list checksum resealed) makes an asserts-live build abort at exactly `H5FScache.c:1024` (`H5FS__cache_sinfo_deserialize`, `Assertion 'fspace->sect_cls[sect_type].deserialize' failed`) on a link insert, while the same insert on the untouched seed exits 0; the type-`3` SIGSEGV above is the release-mode (`-DNDEBUG`) face of that same line, which type `2` reaches identically | **Confirmed gap.** The minimal, single-byte fixture is accepted with zero findings. Earlier rejections seen on more elaborate byte-surgery fixtures were confirmed *incidental* — an unrelated construction artifact, not real coverage — via a controlled isolation test (the identical recipe with a non-zero, still-nonsensical payload crashed identically) |
-| 2 | An indirect free-space section's `nentries` must be positive before it drives a span-size computation | `H5HFsection.c:3730-3731` — `nentries` decoded raw via `UINT16DECODE`, zero validation at the decode site, not even an assert | `H5HFdtable.c:278` (`assert(num_entries > 0)`, inside `H5HF__dtable_span_size`) | **Measured: real heap-buffer-overflow.** `nentries=0` underflows `end_entry = (start_entry+nentries)-1` (unsigned) to `0xFFFFFFFF`; `H5HF__dtable_span_size`'s row-accumulation loop then reads `row_block_size[row]` far past the real, `max_root_rows`-sized array. ASan: `heap-buffer-overflow READ of size 8, 0 bytes after a 176-byte region`, `H5HFdtable.c:303`. Reachable via an ordinary write (`H5Dcreate2` adding a link) — but only when the corrupted section is typed `FIRST_ROW`; the identical payload under type `INDIRECT` hits finding 1's null-callback crash first, before this arithmetic is ever reached | **Confirmed gap.** Verified with a controlled A/B test: the identical construction recipe with a valid, non-underflowing `nentries=4` is rejected *identically* — proving the rejection has nothing to do with `nentries` itself |
+| 1 | A free-space section's class actually has a `deserialize` callback before it's called | `H5FScache.c:1013` — a section's on-disk type byte decoded raw; the real check that follows (`:1019-1020`) only confirms the value is *in-bounds*, not that the resulting class has a callback | `H5FScache.c:1024` (`assert(fspace->sect_cls[sect_type].deserialize)`) | **Measured: real crash, isolated to a single byte.** Fractal heap's `INDIRECT` free-space-section class is a valid, in-bounds registered class (index 3) whose `.deserialize` is `NULL` by design — its own comment states objects of this class "should never be in section manager." Nothing stops a corrupted file's section-type byte from claiming to be 3 anyway. One byte flipped (an existing section's type, `0→3`) on an otherwise-untouched real file: stock build `SIGSEGV`; the reused ASan build confirms a direct call through address 0 (pinned down without a debugger — attach is blocked at the OS level in this environment — by computing the address offset between the built binary and the running process from known symbols, then applying that offset to the crash's return-address register). Reachable via an ordinary write to the group (e.g. `H5Gcreate2`/`H5Lcreate` adding a link), when the heap's free-space manager is consulted for space and loads the on-disk section list — *not* via read/iterate (a read-only `H5Literate2`/`Group.keys()` over the same corrupted file completes cleanly, and `h5stat -s` never loads these sections; this corrects an earlier "reachable via read" phrasing). The sibling `NORMAL_ROW` class (index 2) has an equally `NULL` `.deserialize` slot, and the shared dispatch gives it no guard beyond the same in-bounds check, so a type byte of `2` reaches the identical masked `assert`. **Confirmed empirically (2026-10-06):** a one-byte fixture (an existing `SINGLE` section's type `0→2`, section-list checksum resealed) makes an asserts-live build abort at exactly `H5FScache.c:1024` (`H5FS__cache_sinfo_deserialize`, `Assertion 'fspace->sect_cls[sect_type].deserialize' failed`) on a link insert, while the same insert on the untouched seed exits 0; the type-`3` SIGSEGV above is the release-mode (`-DNDEBUG`) face of that same line, which type `2` reaches identically | **None — confirmed coverage gap.** A section whose type byte alone is changed to 2 (`NORMAL_ROW`) or 3 (`INDIRECT`) is accepted with zero findings: the section-record loop decodes the type but rejects neither value (see finding 1's recommendation) |
+| 2 | An indirect free-space section's `nentries` must be positive before it drives a span-size computation | `H5HFsection.c:3730-3731` — `nentries` decoded raw via `UINT16DECODE`, zero validation at the decode site, not even an assert | `H5HFdtable.c:278` (`assert(num_entries > 0)`, inside `H5HF__dtable_span_size`) | **Measured: real heap-buffer-overflow.** `nentries=0` underflows `end_entry = (start_entry+nentries)-1` (unsigned) to `0xFFFFFFFF`; `H5HF__dtable_span_size`'s row-accumulation loop then reads `row_block_size[row]` far past the real, `max_root_rows`-sized array. ASan: `heap-buffer-overflow READ of size 8, 0 bytes after a 176-byte region`, `H5HFdtable.c:303`. Reachable via an ordinary write (`H5Dcreate2` adding a link) — but only when the corrupted section is typed `FIRST_ROW`; the identical payload under type `INDIRECT` hits finding 1's null-callback crash first, before this arithmetic is ever reached | Confirmed: dedicated check (`H5_CORRUPT_FHEAP_INDIRECT_SECTION_ROW`, `h5_frhp_fspace.pk:187 (nentries == 0UL)`) — not a gap. Full history in `registry/cases/fheap-indirect-section-row.yml` |
+| 3 | The header's doubling-table geometry is legal: `width` nonzero and a power of two, block sizes nonzero and powers of two, maximum heap size nonzero | `H5HFcache.c:246` — `width` and the other geometry fields decoded raw, no check at the decode site itself | `H5HFhdr.c:314-337` — the rules exist only in `H5HF__hdr_create`, inside `#ifndef NDEBUG`, and are never applied on read | **Measured: crash (`SIGSEGV`), read path.** `width` set to 0, one field, on a dense-link heap and a dense-attribute heap: an ordinary `H5Literate2` / `H5Aiterate2` crashes, as does `h5dump -H`. With `width` 0 the free-space loop in `H5HF__hdr_compute_free_space` (`H5HFhdr.c:157-160`) can never reach its target, so it walks off the end of its row arrays until it faults. An asserts-enabled build stops earlier, at a different assert-only guard: `assert(POWER_OF_TWO(n))` in `H5VM_log2_of2`. Same shape as Extensible arrays' create-path-only geometry checks, above. Full history in `registry/cases/fractal-heap-doubling-table.yml` | Confirmed: dedicated checks (`H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE`, `h5_dense_links.pk:656 (table_width == 0UL)`) mirror the create-time zero and power-of-two rules — not a gap |
+| 4 | A direct block's stored heap offset (`block_off`) matches where the block actually sits, so every object it holds lies at or after it | `H5HFcache.c:1790` — `block_off` decoded raw in the direct-block deserializer and never compared with the block's real position | `H5HFman.c:387` (`assert((obj_off - dblock->block_off) < dblock_size)`); the two real checks that follow are defeated when the subtraction wraps | **Measured: heap under-read, then an error.** One field changed, the first direct block's stored `block_off` inflated by `d`, checksum resealed: for some `d` (28 and 56 here) the link decoder reads 7 bytes *before* the direct-block buffer — a guard page placed before the buffer faults at `H5Olink.c:121` — and a Release build then rejects the garbage version byte. Every other inflation fails with an ordinary error. In every case the group's links become unreadable | **None — confirmed coverage gap.** Accepts every inflated file: it computes block offsets from the heap geometry (`h5_dense_links.pk:993 (cur_block_off)`) and never checks the stored one |
 
 **Recommendation for finding 1, the null-deserialize-callback dispatch (not
 implemented here):** on the libhdf5 side, the assert at `H5FScache.c:1024`
@@ -507,16 +538,14 @@ could be promoted to a real, always-on check that rejects the file rather
 than calling through a `NULL` callback — safe unconditionally, since no
 legitimate writer ever serializes an `INDIRECT`-class section into a
 section list in the first place. On the `h5policy` side, the section-record
-loop in `h5policy_walk_frhp_fspace_sections`
-(`h5policy/pickles/h5_frhp_fspace.pk:137-160 (no further payload)`) currently treats the
-per-record `sect_type` byte as opaque and skips over it (`cur = cur + 1UL`,
-line 152) on the strength of a comment claiming "H5HF's section classes
-carry no further payload" — a claim that finding 2's own root cause (below)
-already shows is false for at least two of the four classes. Closing this
-gap needs decoding `sect_type` explicitly there and rejecting a value of 2
-(`NORMAL_ROW`) or 3 (`INDIRECT`) outright, mirroring what real libhdf5's own
-class table already knows: both classes' `deserialize` is intentionally
-unreachable.
+loop in `h5policy_walk_frhp_fspace_sections` decodes `sect_type`
+(`h5policy/pickles/h5_frhp_fspace.pk:158 (sect_type)`) but acts only on type 1
+(`h5_frhp_fspace.pk:166 (sect_type == 1UL)`). Its own comment says
+`NORMAL_ROW`/`INDIRECT` are never serialized, yet nothing rejects them:
+measured, a section rewritten as type 2 or type 3 is accepted with no
+findings. Closing this gap needs rejecting a value of 2 (`NORMAL_ROW`) or 3
+(`INDIRECT`) outright there, mirroring what real libhdf5's own class table
+already knows: both classes' `deserialize` is intentionally unreachable.
 
 **Recommendation for finding 2, the `nentries=0` underflow (not implemented
 here):** on the libhdf5 side, `H5HF__sect_indirect_deserialize`
@@ -526,16 +555,26 @@ the single site both `FIRST_ROW` and `INDIRECT` converge through —
 to the same function — so a `nentries == 0` check placed there, before
 `end_entry` is ever computed, would close both variants with one fix,
 rather than only patching the `assert(num_entries > 0)` deeper inside
-`H5HF__dtable_span_size` (`H5HFdtable.c:278`). On the `h5policy` side, this
-is the same blind spot as finding 1: the section-record loop
-(`h5_frhp_fspace.pk:137-160 (no further payload)`) never decodes `iblock_off`/`start_row`/
-`start_col`/`nentries` for `FIRST_ROW`/`NORMAL_ROW`/`INDIRECT`-typed
-records at all (confirmed against `H5HFsection.c:3722-3731`, the actual
-on-disk layout those classes serialize), so there is no existing check to
-strengthen — closing the gap needs decoding those four fields when
-`sect_type` warrants it and rejecting `nentries == 0` explicitly, the same
-way the list-level `node_count == 0` case is already rejected one level up
-(line 125). Both recommendations left undone in this PR.
+`H5HF__dtable_span_size` (`H5HFdtable.c:278`). On the `h5policy` side, the
+section-record loop decodes a `FIRST_ROW` section's
+`iblock_off`/`start_row`/`start_col`/`nentries` payload and rejects
+`nentries == 0` along with an out-of-range row span (see the table), so only
+the libhdf5 side remains. The libhdf5 sides of both recommendations, and
+finding 1's `h5policy` side, are left undone here.
+
+**Recommendation for finding 3 (not implemented here):** apply the
+create-time rules on read as well — move them out of `#ifndef NDEBUG` into a
+helper the header deserializer also calls. No legal file can fail them
+(every libhdf5 client hard-codes `width` 4), and `h5policy` needs no change.
+
+**Recommendation for finding 4 (not implemented here):** when a direct block
+is loaded, compare its stored `block_off` with the offset its position in the
+parent indirect block implies, and reject a mismatch — the deserializer
+already knows the parent and the entry (`H5HFcache.c`, direct-block
+deserialize). Promoting the assert at `H5HFman.c:387` alone would also stop
+the under-read, but later and only for that one use of the offset. On the
+`h5policy` side, read each direct block's stored offset and compare it with
+the one `h5policy_frhp_locate` computes.
 
 **Also checked, ruled out — not independently exploitable.** Two further
 candidates share the same root shape (a fractal-heap-header field decoded
@@ -561,11 +600,16 @@ survived direct measurement:
   check (the same one that rules out `curr_root_rows`) on a second,
   deliberately-targeted attempt.
 
+**Also checked, not a deserializer guard:** `H5HFhuge.c:291`
+(`assert(obj_size > hdr->max_man_size)`) checks the size a caller passes when
+*inserting* a huge object. Nothing on the read path compares a huge object's
+decoded size with the managed limit, so there is no masked check to promote;
+the read-side hazard is the filtered-copy finding under **Adjacent findings**.
+
 ## Dataset chunk records (`H5Dchunk/btree/btree2/farray/earray/single/none.c`, 940 asserts across 7 files — complete)
 
-No `h5policy` coverage gaps in this area, and the one genuine
-assert-masked libhdf5 invariant that surfaced is already covered — a shape
-closest to Metadata-cache images. What makes this area large (940 asserts)
+No `h5policy` coverage gaps in this area: both assert-masked libhdf5
+invariants, tabulated below, are already covered. What makes this area large (940 asserts)
 rather than deep is that a chunked dataset's on-disk records flow through
 one of **six index types**, and four of them reuse a generic structure the
 catalog has already swept:
@@ -593,8 +637,8 @@ fields are `nbytes`/`filter_mask`, covered as above. The variable-width
 `nbytes` encoding used by EA/FA/B2 is bounded by construction (the width is
 derived from the chunk size and capped at 8), not an untrusted read width.
 
-**The one assert-masked invariant, measured via the single-chunk index.**
-A filtered single chunk stores its one chunk's `nbytes` directly in the
+**Two assert-masked invariants.** Row 1 is measured via the single-chunk
+index: a filtered single chunk stores its one chunk's `nbytes` directly in the
 layout message (`H5Olayout.c:401`, raw `H5F_DECODE_LENGTH`), and that stored
 size feeds the same filter pipeline every chunk does — so a corrupted tiny
 value trips the pipeline's framing arithmetic (fletcher32 subtracts 4
@@ -603,6 +647,7 @@ unconditionally):
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
 | 1 | A filtered chunk's stored `nbytes` must clear the pipeline's fixed framing before the chunk is read | `H5Olayout.c:401` (single-chunk, raw decode); the indexed forms decode the same field in their own record callbacks | `H5Dchunk.c:3038` asserts the chunk block is either address-defined with a positive length or address-undefined with zero length, which catches only the `nbytes == 0` case; `nbytes` of 1–3 passes that assert and reaches the filter unguarded | **Measured, both faces.** `nbytes == 0`: debug build `SIGABRT` at the `H5Dchunk.c:3038` assert (assert-masked — under `-DNDEBUG` it proceeds with a defined address and zero length into the filter path). `nbytes` of 1, 3: `SIGSEGV` — the fletcher32 `size − 4` underflow — which is *not* assert-masked and so reaches a Release build too. Both measured on a filtered single-chunk fixture (one chunk, fletcher32), object-header checksum resealed | **Not a gap.** `h5policy` rejects all three: `H5_CORRUPT_CHUNK_STORED_SIZE` "single-chunk chunk record has a zero stored size" for 0, and "filtered chunk record is smaller than the pipeline's fixed framing" (`h5policy/pickles/h5_validate.pk:623 (filtered chunk record is smaller than the pipeline's fixed framing)`) for 1 and 3 — the same framing floor the four indexed paths use |
+| 2 | A chunk's size, the product of its dimensions, must be nonzero before a chunk buffer is sized from it | `H5Dchunk.c:897-900` — each dimension is checked, but their product is accumulated with no overflow check, so a product of exactly 2⁶⁴ wraps to 0. The check right after the loop (`H5Dchunk.c:906`) compares two 64-bit values, so it cannot detect the wrap | `H5Dchunk.c:5213` (`assert(layout->u.chunk.size > 0)`, in `H5D__chunk_lock`) — the only real size check (`H5Dchunk.c:1233`) is an upper bound, which 0 passes | **Measured: crash (`SIGSEGV`), write path.** Chunk dimensions whose product, with the element size, is exactly 2⁶⁴ (layout v4 and v5): reading the dataset is clean and returns the fill value, but an ordinary one-element `H5Dwrite` makes a wild write — `H5VM_memcpyvv` copies the caller's data to an offset computed from the real dimensions, into a buffer sized for a zero-byte chunk. An asserts-enabled build aborts at this assert instead. Full history in `registry/cases/chunk-dim-product-64bit-overflow.yml` | Confirmed: dedicated check (`H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW`, `h5_layout.pk:213 (dim > H5POLICY_CHUNK_SIZE_UNKNOWN / acc)`) — not a gap |
 
 **This invariant bites filtered chunks specifically.** A non-filtered
 chunk takes its `chunk_block.length` from the *computed* layout chunk size
@@ -636,8 +681,16 @@ against — the same "severe but already covered" shape as V2 B-trees'
 `node_nrec` and Free-space managers' `max_sect_addr`, below under
 **Adjacent findings** — not a new gap.
 
+**Recommendation for finding 2 (not implemented here):** bound the product
+where it is accumulated — in `H5O__layout_decode` and again in
+`H5D__chunk_set_sizes` (`H5Dchunk.c:897-900`), refusing when the running
+product would exceed `HSIZE_MAX / dim[u]` — rather than only promoting the
+assert at `H5Dchunk.c:5213`, which would stop the crash but leave the
+wrapped size in the layout for everything else that reads it. `h5policy`
+needs no change.
+
 **The Fixed Array header (`H5FA*`), the one never-swept backing
-structure, measured clean.** Unlike Extensible Arrays, a Fixed Array has
+structure: its own fields measured clean.** Unlike Extensible Arrays, a Fixed Array has
 **no super-block layer**, so Extensible Arrays' severe `nsblks`-underflow
 class (finding 1, above) has no analog here — there is no nested geometry
 formula to underflow. Its header has eight fields; the four identity/
@@ -654,6 +707,9 @@ EOA/length bound *before* any allocation — it never gets to allocate
 without the file actually being that large. The data block's own prefix
 adds a real self-consistency check (`H5FAcache.c`, "wrong fixed array
 header address") that ties each block back to its owning header.
+These tests cover the header's own fields, not whether the header agrees
+with the dataset it indexes: a Fixed Array whose capacity disagrees with the
+dataspace is written up under **Adjacent findings**, below.
 
 **The v1 B-tree node (`H5Bcache.c`) is real-checked at decode.** v1 B-tree
 nodes predate the checksum era and carry no per-node checksum, so V2
@@ -674,9 +730,8 @@ well-guarded.** The chunk dimensions every index depends on are decoded
 here with real, always-on checks — `ndims` (`H5Olayout.c:115`, "bad number
 of dimensions") and `enc_bytes_per_dim` (`H5Olayout.c:347`) — not asserts.
 The one genuine hazard in the layout message is the *product* of the
-individually-valid dimensions overflowing to a zero chunk size, which is
-already the oracle-hardened case
-`registry/cases/chunk-dim-product-64bit-overflow.yml`. `H5Dlayout.c`'s
+individually-valid dimensions overflowing to a zero chunk size — row 2 of
+the table above. `H5Dlayout.c`'s
 asserts on `ndims`/`enc_bytes_per_dim` (`H5Dlayout.c:190,204,208`) guard
 values the `H5Olayout.c` decode has already validated, so they reconcile
 out. The implicit (`H5Dnone.c`) index stores nothing: it computes each
@@ -699,6 +754,24 @@ assert-masked libhdf5 invariant, and belongs with `h5policy` rather than in
 this catalog.
 
 ## Adjacent findings (not literally assert-masked, same danger shape)
+
+One finding per row, in the order they appear below. None of these is
+literally assert-masked — nothing guards the value at all, or only a generic
+check catches the damage — but each has the same danger shape as the findings
+above.
+
+| Area | Finding | libhdf5 consequence (Release build) | `h5policy` |
+|---|---|---|---|
+| SOHM | — | — | — |
+| Extensible arrays | `max_idx_set` | Unbounded loop: CPU-exhaustion DoS through the public `H5Dchunk_iter()` | **Gap** — accepts |
+| V2 B-trees | `node_nrec` | Checksum computed past the node buffer (heap over-read); through a cache image, a heap over-write | Covered |
+| Free-space managers | `max_sect_addr` | Per-section address width read past the buffer (heap over-read); wrong `h5stat` output | Covered |
+| Metadata-cache images | Checksum verification skipped | Corrupted cached metadata is used silently | Covered |
+| Fractal heaps | `H5HF__dtable_lookup` row overflow | Heap over-read, `SIGSEGV` | Covered |
+| Fractal heaps | `H5HF__man_iter_start_offset` row search | Heap over-read, `SIGSEGV`; write path only | Accepts — writes are outside `h5policy`'s read-only scope |
+| Fractal heaps | Tiny-object extended-length over-read | Heap over-read; a stock build can leak adjacent heap memory into a link name | Declines (`unsupported_coverage_gap`) — not a false accept, not a targeted catch |
+| Fractal heaps | Filtered huge objects: copy length vs. buffer size | Heap over-write on an ordinary object open | Declines (`unsupported_coverage_gap`) |
+| Dataset chunk records | Fixed Array capacity vs. dataspace | A copy (`h5repack`, `H5Ocopy`) writes a 2.8 TB file from a 2.4 KB input | Covered |
 
 ### Extensible arrays — `max_idx_set` — unbounded loop, reachable via a public API, zero `h5policy` coverage
 
@@ -821,6 +894,17 @@ gap. Reachable via ordinary group/link iteration
   real allocation — hard enough to hit an unmapped page rather than merely
   tripping a heap-buffer-overflow report. The unmodified seed, run through
   the identical reproducer, completes cleanly every time.
+
+**A second, more serious path — a heap over-write.** The same oversized
+count on a leaf delivered through a metadata cache image skips the checksum
+step entirely (see **Metadata-cache images**, below), so the leaf
+deserializer decodes `nrec` records straight into a record buffer sized for
+the real capacity (`H5B2cache.c:1046-1055`). Measured: a count 14 records
+over capacity makes glibc abort with `malloc(): corrupted top size` on an
+ordinary link iteration, and a count of 65,535 crashes with `SIGSEGV` in the
+record decoder (`H5Gbtree2.c:293`). `h5policy` rejects both
+(`H5_CORRUPT_V2_BTREE_NODE_SIZE`). Full history in
+`registry/cases/v2-btree-nrec-unvalidated-against-node-capacity.yml`.
 
 **Why this sits here and not in the main table:** `h5policy` already
 independently rejects the corruption via a real, dedicated check on
@@ -946,7 +1030,10 @@ it, opens exactly as cleanly as the inner-entry test below. So libhdf5's
 own read path checks neither the block-level checksum nor any individual
 entry's checksum — only layer 1 (the message's own container checksum) is
 real, and it protects only the address/length declaration, not the
-block's actual content.
+block's actual content. The layer-2 half is recorded as
+`registry/cases/mdci-image-checksum-unverified.yml`, which also traces why
+layer 3 never runs: a prefetched entry's `verify_chksum` slot is a deliberate
+stub that is never called.
 
 **Measured, not assumed — with a direct control-vs-mutant contrast.** Used
 the tracked seed `h5policy/tests/valid/cache_image.h5` (root group +
@@ -1094,8 +1181,10 @@ if (row >= cur_nrows || col >= width) return 0xffffffffffffffffUL;   /* h5_dense
 That sentinel is what actually reaches the surface as
 `H5_CORRUPT_FRACTAL_HEAP_ID` above — a real, deliberate check, just one
 that happens to live on the `h5policy` side rather than in libhdf5 itself.
-So unlike every other finding in this table, there is nothing to recommend
-on the `h5policy` side here; the interesting direction runs the other way.
+So, as with rows 2 and 3 of the Fractal heaps table above, there is nothing
+to recommend on the `h5policy` side here; the recommendation instead runs
+from `h5policy` to libhdf5 — port its existing bound into
+`H5HF__dtable_lookup`, below.
 
 **Recommendation (not implemented here):** port `h5policy`'s own
 `row >= max_root_rows`-equivalent bound into libhdf5's
@@ -1234,6 +1323,84 @@ heap-header `id_len` (`H5HFcache.c:214`) reaches the overread more directly
 than the dense-link path does; whether an even larger claimed length can be
 pushed past a genuinely unmapped page rather than just past one ASan-tracked
 redzone.
+
+### Fractal heaps — filtered huge objects — copy length from the filter, buffer size from an unrelated field
+
+A filtered huge object's B-tree record carries two lengths: the stored
+(filtered) length, and the declared decoded size. libhdf5 reads the stored
+bytes, runs the filter pipeline, replaces the length with the filter's actual
+output (`H5HFhuge.c:753`), and copies that many bytes (`:761`) into the
+caller's buffer — which the caller sized from the *declared* decoded size
+(`H5HF__huge_get_obj_len`, `:520`). Nothing compares the two; there is no
+assert either.
+
+**Measured** on shared-message huge objects behind a genuine deflate stream,
+with the declared decoded size set below the real output (and still above the
+4096-byte managed limit): an ordinary `H5Fopen` + `H5Oopen`, or `h5dump -H`,
+overruns the heap buffer — glibc aborts with `malloc(): unaligned tcache chunk
+detected` (64 bytes short) or `double free or corruption (out)` (2,000 bytes
+short). One byte short overruns by one byte and then fails cleanly. The exact
+declared size opens all 48 objects cleanly.
+
+**`h5policy` coverage:** declines (`unsupported_coverage_gap`) rather than
+resolve a shared message from a filtered heap — not a false accept, and not a
+targeted catch. For scale-offset and n-bit it also compares the declared size
+with the output size the filter's own parameters imply
+(`H5_CORRUPT_SOHM_FILTERED_HUGE_DECODED_SIZE`,
+`h5_sohm.pk:203 (decoded != decode_extent)`); for deflate that size cannot
+be known without decompressing. Full history in
+`registry/cases/filtered-huge-object-decoded-size-unchecked.yml`.
+
+**Recommendation (not implemented here):** after the filter pipeline runs,
+require its output length to equal the record's declared decoded size before
+copying — `H5HF__huge_op_real` already holds both values.
+
+### Dataset chunk records — Fixed Array capacity vs. the dataspace — unchecked on read, a copy writes 2.8 TB, already caught by `h5policy`
+
+A Fixed Array chunk index is sized when the dataset is created: its capacity
+(`nelmts`) is the number of chunks the dataspace's maximum dimensions imply
+(`H5D__chunk_set_info_real`, `H5Dchunk.c:788-793`, passed to the Fixed Array
+at `H5Dfarray.c:850`), so in any file libhdf5 writes, the two agree. On
+read, nothing compares them: the stored capacity is used as found, and the
+maximum dimensions are never checked against it — not even by an assert.
+The only thing that ever objects is a generic metadata-cache assert on entry
+size, `assert(entry_ptr->size > 0 && entry_ptr->size < H5C_MAX_ENTRY_SIZE)`
+(`H5Centry.c:2208`, a 32 MB cap), compiled out under `-DNDEBUG`.
+
+**Measured** on `h5policy/tests/malformed/bad_fixed_array_extent_mismatch.h5`:
+one field changed in `valid/chunk_fixed_array.h5`, the dataspace's maximum
+dimension (10 → 867,583,393,802), leaving the Fixed Array's capacity at 4.
+
+- **Reading is clean.** Reads use the index as stored and never rebuild it.
+- **Copying rebuilds the index from the dataspace.** `h5repack` and `h5copy`
+  (`H5Ocopy`) create a new Fixed Array for the destination, sized from the
+  corrupted extent: about 347 billion slots. Its data block's
+  page-initialization bitmask alone is about 42 MB (`H5FAdblock.c:123-127`),
+  past the cache's 32 MB entry cap. A Release build has nothing left to stop
+  it: it writes those 42 MB, then extends the output to 2,777,664,825,817
+  bytes, a 2.8 TB (sparse) file from a 2.4 KB input, and reports success.
+  (Measured with the output size capped; the extend to that length was
+  logged and stopped.) An asserts-enabled build aborts at `H5Centry.c:2208`
+  instead.
+
+**`h5policy` coverage: not a gap.** It rejects the file by comparing the
+stored capacity with the one the extent implies
+(`H5_CORRUPT_FIXED_ARRAY_EXTENT_MISMATCH`,
+`h5_validate.pk:891 (expected_nelmts != h5policy_fixed_array_nelmts)`). Full
+history in `registry/cases/fixed-array-extent-mismatch.yml`.
+
+**Why this sits here and not in the main table:** the relationship that
+breaks has no guard at all, and the assert that catches the damage in a
+debug build is a generic cache-entry size cap, not a check on this
+invariant. Same shape as `node_nrec` and `max_sect_addr`, above.
+
+**Recommendation (not implemented here):** in `H5D__farray_idx_open`,
+compare the Fixed Array's stored capacity with the one the dataspace implies
+and reject a mismatch, the same comparison `h5policy` makes. Every use of the
+index opens it first, including the copy's setup before it creates the
+destination index, so this stops the copy before anything is written.
+libhdf5's own writer always makes the two equal, so no legitimate file is
+affected.
 
 ## Status: all seven named areas complete
 
