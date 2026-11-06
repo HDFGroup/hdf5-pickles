@@ -193,8 +193,11 @@ Current coverage includes:
 - Compact hard links, dense link storage, dense attribute storage, old-style
   group metadata, and every defined chunk-index representation. Dense storage
   covers both name indexes and recursive type-6/type-9 creation-order B-trees,
-  including checksums, subtree totals, managed fractal-heap-ID resolution, and
-  cross-index identity. Chunk coverage includes v1 and recursive raw-data v2
+  including checksums, subtree totals, managed and unfiltered-huge
+  fractal-heap-ID resolution, and cross-index identity. A dense link message
+  must also consume the whole fractal-heap object holding it, which is the only
+  place a message that was sized from one length and encoded from another
+  becomes visible. Chunk coverage includes v1 and recursive raw-data v2
   B-trees, fixed arrays, complete extensible-array block graphs, and the
   index-less single-chunk and implicit forms.
 - File-global Shared Object Header Message metadata: `SMTB` directories,
@@ -258,7 +261,8 @@ Checksum coverage includes the HDF5 Jenkins checksums used by:
 - chunk-index headers, v2 B-tree internal/leaf nodes, and extensible-array
   index/secondary/data blocks and initialized pages
 - dense metadata fractal heaps: `FRHP`, `FHDB`, `FHIB`
-- dense metadata v2 B-trees: `BTHD`, `BTLF`, `BTIN`
+- dense metadata v2 B-trees: `BTHD`, `BTLF`, `BTIN`, including a dense link
+  heap's huge-object index
 - SOHM master tables/lists (`SMTB`, `SMLI`), fractal-heap headers (`FRHP`),
   and type-7/huge-object v2 B-tree headers and internal/leaf nodes
 
@@ -296,10 +300,13 @@ final decision:
   pipeline, so message/link/attribute bodies inside compressed blocks remain
   uninspected. A defect visible only after decompression therefore remains an
   explicit refusal.
-- **Unresolved heap and shared-message forms.** Dense link/attribute indexes
-  resolve managed fractal-heap IDs; huge and tiny dense IDs remain unsupported.
-  SOHM resolves managed, tiny, and unfiltered huge IDs, but refuses a heap body
-  whose legal form cannot be resolved. Nested shared-message indirection is
+- **Unresolved heap and shared-message forms.** Dense LINK indexes resolve
+  managed and unfiltered huge fractal-heap IDs, walking the heap's huge-object
+  v2 B-tree to do so; tiny and directly addressed huge link IDs remain
+  unsupported. Dense ATTRIBUTE indexes resolve managed IDs only, so a long
+  attribute name or value is still an explicit refusal. SOHM resolves managed,
+  tiny, and unfiltered huge IDs, but refuses a heap body whose legal form
+  cannot be resolved. Nested shared-message indirection is
   also capped at 32 levels.
 - **Unreached cache-image clients.** A valid metadata cache image normally
   replays and accepts. If any serialized entry body cannot be reached through a

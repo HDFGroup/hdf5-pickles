@@ -157,6 +157,162 @@ def _write_cache_image(path, userblock=0):
         _build_and_run_h5cc_helper(source, helper, args)
 
 
+def _write_dense_huge_links(path, mode):
+    """Dense link storage holding a fractal-heap HUGE object.
+
+    h5py does not expose H5Pset_link_phase_change, and without max_compact 0 a
+    group needs nine links before it uses dense storage -- which makes the
+    fixture an order of magnitude larger and its walk far slower.  The helper
+    sets it from C instead; see h5policy/tools/probe/make_dense_huge_links.c.
+
+    ASSERTS ITS REGIME.  Both files exist for a structural property of the heap,
+    not for a value in it, and a base-fixture change that quietly restored a
+    managed root (or dropped the huge object) would leave two fixtures that
+    still pass and test nothing.
+    """
+    source = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                          "probe", "make_dense_huge_links.c")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with tempfile.TemporaryDirectory() as build:
+        helper = os.path.join(build, "make_dense_huge_links")
+        _build_and_run_h5cc_helper(source, helper, [path, mode])
+
+    raw = bytearray(open(path, "rb").read())
+    info = _frhp_huge_fields(raw, _sole_frhp(raw))
+    if info["nhuge"] != 1:
+        raise RuntimeError(
+            f"{path}: expected one huge object, header counts {info['nhuge']}")
+    if info["huge_bt2"] == info["undef"]:
+        raise RuntimeError(f"{path}: heap names no huge-object index")
+    if mode == "huge_only":
+        if info["root"] != info["undef"] or info["nmanaged"] != 0:
+            raise RuntimeError(
+                f"{path}: expected a heap with NO managed blocks, found "
+                f"{info['nmanaged']} and root {info['root']:#x}")
+    elif info["root"] == info["undef"] or info["nmanaged"] == 0:
+        raise RuntimeError(
+            f"{path}: expected a managed object beside the huge one, found "
+            f"{info['nmanaged']} with root {info['root']:#x}")
+
+
+def _frhp_huge_fields(raw, frhp):
+    """Fractal-heap header fields the huge-object layout turns on.
+
+    Offsets follow the format spec's header layout: heap ID length (2), I/O
+    filter length (2), flags (1), maximum managed object size (4), then the
+    length- and offset-sized counters, then the doubling table.
+    """
+    off_size = raw[9]
+    len_size = raw[10]
+    undef = (1 << (8 * off_size)) - 1
+    g = lambda rel, n: int.from_bytes(raw[frhp + rel:frhp + rel + n], "little")
+    dtable = 14 + 10 * len_size + 2 * off_size
+    return {
+        "id_len": g(5, 2),
+        "filter_len": g(7, 2),
+        "max_man": g(10, 4),
+        "huge_bt2": g(14 + len_size, off_size),
+        "nmanaged": g(14 + 5 * len_size + 2 * off_size, len_size),
+        "nhuge": g(14 + 7 * len_size + 2 * off_size, len_size),
+        "root": g(dtable + 6 + 2 * len_size, off_size),
+        "root_off": frhp + dtable + 6 + 2 * len_size,
+        "off_size": off_size,
+        "len_size": len_size,
+        "undef": undef,
+    }
+
+
+def _huge_object_extent(raw):
+    """(address, length) of the sole huge object, from the heap's index.
+
+    Record type 1 (indirect, unfiltered) is address, length, id -- the only
+    class a dense link heap produces, since its seven-byte heap ID is too
+    narrow to hold a direct locator.
+    """
+    info = _frhp_huge_fields(raw, _sole_frhp(raw))
+    bt2 = info["huge_bt2"]
+    if raw[bt2:bt2 + 4] != b"BTHD":
+        raise RuntimeError("huge-object index does not start with BTHD")
+    rec_type = raw[bt2 + 5]
+    rec_size = int.from_bytes(raw[bt2 + 10:bt2 + 12], "little")
+    depth = int.from_bytes(raw[bt2 + 12:bt2 + 14], "little")
+    root = int.from_bytes(raw[bt2 + 16:bt2 + 16 + info["off_size"]], "little")
+    nrec = int.from_bytes(raw[bt2 + 16 + info["off_size"]:
+                              bt2 + 18 + info["off_size"]], "little")
+    if rec_type != 1 or depth != 0 or nrec != 1:
+        raise RuntimeError(
+            f"expected a single-record type-1 huge index, found type {rec_type}"
+            f" depth {depth} nrec {nrec}")
+    if raw[root:root + 4] != b"BTLF":
+        raise RuntimeError("huge-object index root is not a leaf")
+    rec = root + 6
+    o, el = info["off_size"], info["len_size"]
+    if rec_size != o + 2 * el:
+        raise RuntimeError(f"unexpected huge record size {rec_size}")
+    return (int.from_bytes(raw[rec:rec + o], "little"),
+            int.from_bytes(raw[rec + o:rec + o + el], "little"))
+
+
+def _soft_link_value_len_offset(raw, obj):
+    """Offset of the two-byte soft-link value length inside a link message.
+
+    Layout: version, flags, [type], [creation order], [charset], a name length
+    whose width is flags bits 0-1, the name, then the value length.
+    """
+    flags = raw[obj + 1]
+    cur = obj + 2
+    if flags & 0x08:
+        if raw[cur] != 1:
+            raise RuntimeError("expected a SOFT link message")
+        cur += 1
+    else:
+        raise RuntimeError("expected an explicit link type")
+    if flags & 0x04:
+        cur += 8
+    if flags & 0x10:
+        cur += 1
+    width = 1 << (flags & 0x03)
+    name_len = int.from_bytes(raw[cur:cur + width], "little")
+    return cur + width + name_len
+
+
+# Kept in step with SLACK_BYTES in h5policy/tools/probe/make_dense_huge_links.c,
+# which creates a group at the SHORTENED path so the patched link still resolves.
+_SLACK_BYTES = 100
+
+
+def _make_dense_link_heap_object_slack(path, base_path):
+    """A link message that stops short of the heap object holding it.
+
+    This is the shape libhdf5 2.3.0 WRITES for a soft-link target of 65536
+    bytes or more: H5O__link_size reserves 2 + strlen(target) for the message
+    while H5O__link_encode stores 2 + (uint16_t)strlen(target)
+    (src/H5Olink.c:373), and H5G__dense_insert then hands H5HF_insert the FULL
+    reserved length -- so the heap object ends with bytes the encoder never
+    wrote and the allocator never cleared.
+
+    The defect is invisible from inside the message: the stored value length is
+    self-consistent and the target it describes is intact.  Only the container's
+    extent disagrees, which is why the guard shrinks the length field and leaves
+    everything else alone.  The object is an unfiltered huge object, so it
+    carries no checksum of its own and nothing else needs repairing.
+
+    The shortened target RESOLVES -- the base fixture creates a group at that
+    path on purpose -- so libhdf5 opens the link and silently follows a
+    different object, exactly as it does for a real over-long target.  That is
+    what makes this an invariant-A' guard rather than a file libhdf5 happens to
+    refuse for an unrelated reason.
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    obj, obj_len = _huge_object_extent(raw)
+    off = _soft_link_value_len_offset(raw, obj)
+    stored = int.from_bytes(raw[off:off + 2], "little")
+    if obj + (off - obj) + 2 + stored != obj + obj_len:
+        raise RuntimeError("base link message does not fill its heap object")
+    struct.pack_into("<H", raw, off, stored - _SLACK_BYTES)
+    _patch(path, bytes(raw))
+
+
 def _write_complex_base(path):
     """Write a valid class-11 (complex number) dataset via the installed 2.x
     h5cc.  h5py here bundles libhdf5 1.14.x, which has no complex class, so this
@@ -1007,6 +1163,21 @@ def _gen_resource(root):
                          _layout_v5_unfiltered, 5)
     _make_layout_version(f"{root}/valid/layout_v5_single_filtered.h5",
                          _layout_v5_single_filtered, 5)
+
+    # Dense link storage whose records are fractal-heap HUGE objects.  A link
+    # message over 4096 bytes (H5G_FHEAP_MAX_MAN_SIZE) is stored as a standalone
+    # file extent indexed by the heap's huge-object v2 B-tree, so the name
+    # index's heap ID is a B-tree key rather than a doubling-table offset.
+    #
+    # TWO fixtures because the REGIME differs, not the values: `mixed` keeps a
+    # managed object beside the huge one, so the doubling-table root stays
+    # defined; `huge_only` has no managed blocks at all, so its root address is
+    # UNDEFINED.  Reading that undefined root as "empty heap" is what used to
+    # make the whole layout fall out as H5_UNSUPPORTED_PICKLE_COVERAGE_GAP, and
+    # a fixture that always has a managed block cannot catch it coming back.
+    _write_dense_huge_links(f"{root}/valid/dense_links_huge.h5", "mixed")
+    _write_dense_huge_links(f"{root}/valid/dense_links_huge_only.h5",
+                            "huge_only")
 
     # Deep dense links: a group large enough that its dense-link name v2 B-tree
     # is several levels deep, exercising the recursive internal-node descent
@@ -2161,6 +2332,13 @@ def _gen_malformed(root):
     _make_frhp_width8(
         f"{root}/valid/sohm_frhp_width8.h5",
         f"{root}/valid/sohm_list.h5", _sohm_frhp)
+    # The guard for the tail-slack rule: a link message that no longer fills
+    # the fractal-heap object holding it.  Built from the huge-object fixture
+    # because that is the layout a real over-long soft-link target lands in.
+    _make_dense_link_heap_object_slack(
+        f"{root}/malformed/dense_link_heap_object_slack.h5",
+        f"{root}/valid/dense_links_huge.h5")
+
     _make_filtered_dense_link_no_dblock_checksum(
         f"{root}/malformed/filtered_dense_link_no_dblock_checksum.h5",
         f"{root}/valid/dense_links.h5")
