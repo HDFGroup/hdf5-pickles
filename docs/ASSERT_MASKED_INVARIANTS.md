@@ -542,7 +542,7 @@ survived direct measurement:
 
 - **`curr_root_rows`**, feeding an iblock read-size/malloc-size computation
   guarded only by `assert(nrows > 0)`. A real fixture (inflated 8→60,000)
-  is rejected outright by `h5policy` (`H5_CORRUPT_LENGTH_OVERFLOW`, `h5_dense_links.pk:849-851 (fractal heap indirect block)`) — not a
+  is rejected outright by `h5policy` (`H5_CORRUPT_LENGTH_OVERFLOW`, `h5_dense_links.pk:884-886 (fractal heap indirect block)`) — not a
   gap — and, measured directly at the libhdf5-C-API level (not just via
   h5py, where a SIGABRT reproduces but is a binding-layer issue out of this
   catalog's scope), a completely separate, generic, always-on check
@@ -799,7 +799,7 @@ two real fixtures — one where the root is directly a leaf, one where it's
 an internal node — reseal the node's own header checksum, nothing else
 touched. `h5policy --profile untrusted-strict` rejects both outright, with
 a *dedicated* check (`H5_CORRUPT_V2_BTREE_NODE_SIZE`, "used node bytes
-exceed its declared node size"; leaf: `h5_dense_links.pk:1412 (leaf_need > node_size)`, internal: `h5_dense_links.pk:2023 (node_need > node_size)`) — so the field itself is not an `h5policy`
+exceed its declared node size"; leaf: `h5_dense_links.pk:1611 (leaf_need > node_size)`, internal: `h5_dense_links.pk:2247 (node_need > node_size)`) — so the field itself is not an `h5policy`
 gap. Reachable via ordinary group/link iteration
 (`H5Literate2`/`h5py`'s `Group.keys()`). Real consequence:
 
@@ -1068,7 +1068,7 @@ checksum resealed). Triggered via ordinary `H5Literate2`.
   themselves do nothing.
 - **Header + corrupted heap ID**: `h5policy --profile untrusted-strict`
   rejects (`H5_CORRUPT_FRACTAL_HEAP_ID`, "cannot be resolved in file
-  bounds", `h5_dense_links.pk:1356 (H5_CORRUPT_FRACTAL_HEAP_ID)`) — but see below. Real libhdf5: stock `SIGSEGV`; ASan confirms
+  bounds", `h5_dense_links.pk:1531 (H5_CORRUPT_FRACTAL_HEAP_ID)`) — but see below. Real libhdf5: stock `SIGSEGV`; ASan confirms
   `heap-buffer-overflow READ of size 8` at `H5HF__dtable_lookup`
   (`H5HFdtable.c:156`), landing in the `row_block_size[]`/`row_block_off[]`
   region sized by the (shrunk) `max_root_rows`, via the exact predicted
