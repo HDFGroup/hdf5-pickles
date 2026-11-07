@@ -1369,9 +1369,16 @@ A Fixed Array chunk index is sized when the dataset is created: its capacity
 at `H5Dfarray.c:850`), so in any file libhdf5 writes, the two agree. On
 read, nothing compares them: the stored capacity is used as found, and the
 maximum dimensions are never checked against it — not even by an assert.
-The only thing that ever objects is a generic metadata-cache assert on entry
-size, `assert(entry_ptr->size > 0 && entry_ptr->size < H5C_MAX_ENTRY_SIZE)`
-(`H5Centry.c:2208`, a 32 MB cap), compiled out under `-DNDEBUG`.
+On the newest library **nothing objects at all**. Through 2.2.0 one thing
+did: a generic metadata-cache assert on entry size,
+`assert(entry_ptr->size > 0 && entry_ptr->size < H5C_MAX_ENTRY_SIZE)`
+(`H5Centry.c` line 2208 in 2.2.0, a 32 MB cap), compiled out under
+`-DNDEBUG`. Upstream `e170b318a1a` (2026-10-26, "Remove max cache entry size
+assertion") deleted `H5C_MAX_ENTRY_SIZE` and every assert on it — the ceiling
+was meant to detect corruption and was firing on legitimate files — leaving
+`assert(entry_ptr->size > 0)` alone (`H5Centry.c:2213`). The removal is
+develop-only: no release tag contains it, so an asserts-enabled build of
+2.2.0 or earlier still aborts where develop no longer does.
 
 **Measured** on `h5policy/tests/malformed/bad_fixed_array_extent_mismatch.h5`:
 one field changed in `valid/chunk_fixed_array.h5`, the dataspace's maximum
@@ -1382,12 +1389,20 @@ dimension (10 → 867,583,393,802), leaving the Fixed Array's capacity at 4.
   (`H5Ocopy`) create a new Fixed Array for the destination, sized from the
   corrupted extent: about 347 billion slots. Its data block's
   page-initialization bitmask alone is about 42 MB (`H5FAdblock.c:123-127`),
-  past the cache's 32 MB entry cap. A Release build has nothing left to stop
-  it: it writes those 42 MB, then extends the output to 2,777,664,825,817
-  bytes, a 2.8 TB (sparse) file from a 2.4 KB input, and reports success.
-  (Measured with the output size capped; the extend to that length was
-  logged and stopped.) An asserts-enabled build aborts at `H5Centry.c:2208`
-  instead.
+  which used to be past the cache's 32 MB entry cap. Nothing stops it: it
+  writes those 42 MB, then extends the output to 2,777,664,825,817 bytes, a
+  2.8 TB (sparse) file from a 2.4 KB input, and reports success.
+  **Re-measured 2026-11-06** against develop `c9fcf527773` (2.3.0): the
+  asserts-live build now does exactly what the Release build always did.
+  `h5repack` exits 0 with no abort, no diagnostic and no AddressSanitizer
+  report on all three local builds — Release (`settings_sha256`
+  `cdefcace…`), asserts-live + ASan (`2973e495…`) and i386
+  (`c5c4d558…`), workstation-local installs, paths not recorded — each
+  writing the same 2,777,664,825,817-byte output with 41.4 MiB (82,768
+  512-byte blocks) actually allocated. The three were built from develop
+  `6533bcc0f6a`, which differs from `c9fcf527773` only in
+  `src/CMakeLists.txt`, so the measurement is current. An asserts-enabled
+  build aborted at the 32 MB cap only through 2.2.0.
 
 **`h5policy` coverage: not a gap.** It rejects the file by comparing the
 stored capacity with the one the extent implies
@@ -1396,9 +1411,12 @@ stored capacity with the one the extent implies
 history in `registry/cases/fixed-array-extent-mismatch.yml`.
 
 **Why this sits here and not in the main table:** the relationship that
-breaks has no guard at all, and the assert that catches the damage in a
-debug build is a generic cache-entry size cap, not a check on this
-invariant. Same shape as `node_nrec` and `max_sect_addr`, above.
+breaks has no guard at all, and the assert that used to catch the damage in
+a debug build was a generic cache-entry size cap, not a check on this
+invariant — and since `e170b318a1a` not even that. Same shape as
+`node_nrec` and `max_sect_addr`, above, except that this one is no longer
+assert-masked on develop: it is simply unguarded, which makes the
+recommendation below the only thing that would stop it.
 
 **Recommendation (not implemented here):** in `H5D__farray_idx_open`,
 compare the Fixed Array's stored capacity with the one the dataspace implies
