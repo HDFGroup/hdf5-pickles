@@ -43,7 +43,7 @@ tolerances:
       The chunk dimension product is exactly 2**64, so libhdf5's unchecked
       accumulation (H5Olayout.c, and again in H5D__chunk_set_sizes on open)
       yields a chunk size of ZERO -- which then passes the library's own >4 GiB
-      guard at H5Dchunk.c:1185 precisely because it is zero.  The file therefore
+      guard at H5Dchunk.c:1250 precisely because it is zero.  The file therefore
       OPENS: nothing is allocated, so h5dump -H exits 0 and a read returns fill
       values, and no tool return code corroborates the rejection.
       The evidence this harness cannot observe is DIRECTIONAL, exactly as for
@@ -89,7 +89,7 @@ tolerances:
       The evidence this harness cannot observe is directional. The consequence
       is RDWR-ONLY: the admitted node reaches the write path and ASan reports
       heap-buffer-overflow WRITEs in H5HL__fl_serialize (H5HLcache.c:308) and
-      H5HL_insert (H5HL.c:690), the latter through an ordinary H5Gcreate2. The
+      H5HL_insert (H5HL.c:698), the latter through an ordinary H5Gcreate2. The
       differential opens read-only by construction, so it is structurally
       incapable of seeing this one -- not merely unlucky in what it measured.
       WHY A PER-FIXTURE ENTRY AND NOT A CODE-SCOPED A~ PREDICATE, which is the
@@ -150,7 +150,7 @@ tolerances:
       image really is loaded and replayed, confirmed by H5Fget_mdc_image_info
       reporting the identical image (addr=2080 len=690) for the fixture and the
       valid control, and by the body-corruption sibling faulting inside
-      H5C__deserialize_prefetched_entry (H5Centry.c:1891). Integrity-detection
+      H5C__deserialize_prefetched_entry (H5Centry.c:1897). Integrity-detection
       gap only; no memory-safety or exploitability claim is made.
       See registry/cases/mdci-image-checksum-unverified.yml.
 
@@ -167,8 +167,10 @@ tolerances:
       callback hands it back as the cache entry's allocation size. Every
       downstream EOA-relative test is satisfied by construction, including
       H5C__verify_len_eoa, whose entire purpose is to catch oversized entries.
-      The only size guard on the path is an assert against H5C_MAX_ENTRY_SIZE
-      that NDEBUG compiles out. So libhdf5 OPENS the file and reports success:
+      Through 2.2.0 the only size guard on the path was an assert against
+      H5C_MAX_ENTRY_SIZE that NDEBUG compiles out; develop e170b318a1a deleted it,
+      so there is now none (re-measured 2026-10-30: H5Fopen still requests
+      realloc(4235722264) on the case specimen). So libhdf5 OPENS the file and reports success:
       h5dump -H exits 0 and h5py lists it, and no tool return code corroborates
       the rejection.
       This is the LENGTH half of the case record and it is still live. The
@@ -347,6 +349,50 @@ tolerances:
       reports `rejected_in_traversal`.
       See registry/cases/attribute-selection-unvalidated.yml.
 
+  - fixture: malformed/attr_ref_object_token_size.h5
+    invariant: A
+    case: attribute-reference-lengths-unbounded
+    reason: >-
+      libhdf5 OPENS this file and READS the attribute: H5R__decode_obj_token
+      copies the 16-byte token length without bounding it by the 18-byte
+      element it was handed (src/H5Rint.c:1133), so H5Aread returns success
+      having read one byte past its conversion buffer.  No tool return code can
+      corroborate the rejection; the evidence is the AddressSanitizer build's
+      `heap-buffer-overflow READ of size 16` on H5Aread, measured on develop
+      6533bcc0f6a.  h5py cannot decode H5T_STD_REF, so the harness's own
+      consumers see nothing either.  A reference-library defect, not an
+      h5policy one.  See registry/cases/attribute-reference-lengths-unbounded.yml.
+
+  - fixture: malformed/attr_ref_object_token_size_o4.h5
+    invariant: A
+    case: attribute-reference-lengths-unbounded
+    reason: >-
+      The same unbounded token copy at a 4-byte offset size, where the element
+      is 14 bytes: H5Aread succeeds having over-read; the AddressSanitizer build
+      reports `READ of size 12`, measured on develop 6533bcc0f6a.  A separate
+      entry because it is a separate fixture -- it exists to pin the
+      width-dependent bound, which the 8-byte fixture cannot.
+      See registry/cases/attribute-reference-lengths-unbounded.yml.
+
+  - fixture: malformed/attr_ref_file_name_length.h5
+    invariant: A
+    case: attribute-reference-lengths-unbounded
+    reason: >-
+      libhdf5 OPENS this file and READS the attribute: H5R__decode_string copies
+      the 0xFFFF file-name length out of a 35-byte heap blob without bounding it
+      (src/H5Rint.c:1331), so H5Aread returns success; the AddressSanitizer
+      build reports `READ of size 65535`, measured on develop 6533bcc0f6a.
+      See registry/cases/attribute-reference-lengths-unbounded.yml.
+
+  - fixture: malformed/attr_ref_attr_name_length.h5
+    invariant: A
+    case: attribute-reference-lengths-unbounded
+    reason: >-
+      The same unbounded H5R__decode_string copy for the ATTRIBUTE name, the
+      field after the file name: H5Aread returns success; the AddressSanitizer
+      build reports `READ of size 65535`, measured on develop 6533bcc0f6a.
+      See registry/cases/attribute-reference-lengths-unbounded.yml.
+
   - fixture: malformed/nbit_atomic_offset_wrap.h5
     invariant: A
     case: nbit-atomic-precision-offset-wrap
@@ -397,3 +443,39 @@ tolerances:
       an unsettled classification deliberately deferred -- h5policy's acceptance
       is left unchanged and the gap is tracked rather than hardened.
       See registry/cases/enum-sort-tbuf-stack-oob.yml.
+
+  - fixture: malformed/dense_link_heap_object_slack.h5
+    invariant: A
+    case: soft-link-value-length-narrowed-on-write
+    reason: >-
+      A WRITE-path defect, so the differential is structurally incapable of
+      seeing it: libhdf5 produced this shape itself, and every READ of the file
+      succeeds.  H5O__link_size reserves 2 + strlen(target) bytes for a
+      soft-link message while H5O__link_encode stores
+      2 + (uint16_t)strlen(target) (src/H5Olink.c:373), and H5G__dense_insert
+      hands H5HF_insert the FULL reserved length -- so the fractal-heap object
+      is longer than the message inside it.  The file is self-consistent by
+      construction: the stored value length agrees with the bytes after it and
+      the target it describes is intact, so nothing on the read path can
+      disagree.  libhdf5 therefore OPENS it, h5ls exits 0, and the only visible
+      consequence is that the link resolves to a DIFFERENT object -- measured on
+      this fixture, whose shortened target resolves to a decoy group the writer
+      creates on purpose, with h5ls reporting a target length of 4100 where the
+      base fixture reports 4200.  No tool return code corroborates the
+      rejection, which is precisely the silent-wrong-data signature.
+      The evidence this harness cannot observe is on the WRITER'S side and in
+      UNINITIALISED memory.  An LD_PRELOAD that fills every large malloc with
+      0xAA shows exactly L - (L % 65536) never-written bytes reaching the file
+      (3,997,696 at a 4,000,000-byte target), and a first link whose 65535-byte
+      target carried a marker left 4,095 copies of it in a second file written
+      in the same process.  AddressSanitizer reports nothing, because the bytes
+      are allocated and merely never initialised; MemorySanitizer would, and no
+      MSan libhdf5 exists here.
+      WHY A PER-FIXTURE ENTRY AND NOT A CODE-SCOPED PREDICATE: the A~ family of
+      predicates keys on h5policy finding codes that describe a READ-side
+      disagreement libhdf5 tolerates.  This finding's whole content is that the
+      CONTAINER is larger than its contents, which is only decidable where the
+      container's extent is exact -- a fractal-heap object, never an
+      object-header message, whose version-1 padding makes slack normal.  There
+      is no class of files to generalize to beyond this one layout.
+      See registry/cases/soft-link-value-length-narrowed-on-write.yml.

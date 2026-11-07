@@ -155,6 +155,10 @@ ROLE_GLOBALS = {
     # (record type 6) and dense ATTRIBUTE (type 9) indexes, which belong to
     # different record families.
     "h5policy_dense_corder_role",
+    # h5_dense_links.pk: the fractal-heap huge-object index walker names the
+    # client whose heap it is walking, so the same walker can serve dense links
+    # and (later) dense attributes, which are different record families.
+    "h5policy_frhp_huge_role",
 }
 
 

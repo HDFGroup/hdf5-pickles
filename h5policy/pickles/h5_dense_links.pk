@@ -240,6 +240,21 @@ fun h5policy_classify_external_link_target = (int ios, H5PolicyProfile profile,
    the compiler can enforce that every call site names its role.  The phrasing
    has to match the grouped rules in registry/findings/routes/, and it prefixes
    the WHOLE message, so every message below reads "<role> link ...".  */
+/* How many payload bytes the last h5policy_validate_link_payload call decoded,
+   or 0xffff... when it gave up early (a finding was already emitted then, and
+   comparing a short count against the container would double-report it).
+
+   A GLOBAL rather than a return value: the decoder serves an object-header
+   message and a dense-index heap record, and only the second has a container
+   whose extent is EXACT.  A v1 object header pads its messages to an eight-byte
+   boundary, so "bytes left over" is normal there and is already handled by
+   h5policy_message_size_matches; a fractal-heap object is stored at exactly the
+   size H5O_msg_raw_size returned, so leftover bytes there are a real defect.
+   Keeping the comparison at the dense caller is what keeps the rule off the
+   padded path -- and keeps the finding out of the decoder's role-prefixed
+   message space, so it names one record family.  */
+var h5policy_link_payload_consumed = 0xffffffffffffffffUL;
+
 fun h5policy_validate_link_payload = (int ios,
                                       H5PolicyProfile profile,
                                       offset<uint<64>,B> payload_off,
@@ -247,6 +262,7 @@ fun h5policy_validate_link_payload = (int ios,
                                       string object,
                                       string role) void:
 {
+    h5policy_link_payload_consumed = 0xffffffffffffffffUL;
     if (!h5policy_payload_range_ok(msg_size, 0UL, 2UL,
                                    "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
                                    payload_off, object,
@@ -394,6 +410,8 @@ fun h5policy_validate_link_payload = (int ios,
                                               payload_off + cur#B,
                                               object);
                 }
+            h5policy_link_payload_consumed =
+                cur + (global_sizeof_offsets as uint<64>);
         }
     else if (link_type == 1UL)
         {
@@ -412,6 +430,7 @@ fun h5policy_validate_link_payload = (int ios,
                                            payload_off + cur#B, object,
                                            role + " soft link target overruns the link message"))
                 return;
+            h5policy_link_payload_consumed = cur + 2UL + soft_len;
         }
     else if (link_type == 64UL)
         {
@@ -437,6 +456,7 @@ fun h5policy_validate_link_payload = (int ios,
                 return;
             else
                 {
+                    h5policy_link_payload_consumed = cur + 2UL + ext_len;
                     /* The value is a version/flags byte, then a NUL-terminated
                        target file name and a NUL-terminated target object path.
                        libhdf5 runs strlen() over each, so a string that does not
@@ -495,7 +515,22 @@ fun h5policy_validate_link_payload = (int ios,
             /* 64 is external (handled above); 65..255 are genuine user-defined
                links, which libhdf5 decodes structurally and leaves to a
                registered class.  Following one means running third-party link
-               code, so this stays a policy decision.  */
+               code, so this stays a policy decision.  The udata is still
+               bounded: H5O__link_decode reads a two-byte length and copies
+               that many bytes, exactly as for an external link.  */
+            if (h5policy_payload_range_ok(msg_size, cur, 2UL,
+                                          "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                          payload_off + cur#B, object,
+                                          role + " user-defined link value length is missing"))
+                {
+                    var ud_len = h5policy_msg_u64_at(ios, profile,
+                                                     payload_off + cur#B, 2UL);
+                    if (h5policy_payload_range_ok(msg_size, cur + 2UL, ud_len,
+                                                  "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                                                  payload_off + cur#B, object,
+                                                  role + " user-defined link value overruns the link message"))
+                        h5policy_link_payload_consumed = cur + 2UL + ud_len;
+                }
             h5policy_emit_error("H5_POLICY_USER_DEFINED_LINK", "policy",
                                 payload_off, object,
                                 role + " user-defined link encountered; profile denies user-defined links");
@@ -1231,11 +1266,170 @@ fun h5policy_finish_dense_corder_matches = (off64 loc, string object) void:
         }
 }
 
-/* Dense link B-tree records carry a fractal-heap ID.  Managed IDs are decoded
-   and recorded for cross-index consistency; other classes are an explicit
-   coverage refusal rather than a silent skip. */
-/* Process one v2 B-tree leaf of dense-link (type-5) records: resolve each
-   fractal-heap object and validate/enqueue it as a link message.  */
+/* ---- fractal-heap HUGE objects ------------------------------------------
+   An object larger than the heap's `max_man_size` is not stored in a managed
+   direct block at all.  libhdf5 writes it as a standalone file extent and
+   records (address, length, id) in a SECOND v2 B-tree named by the heap
+   header's "v2 B-tree Address of Huge Objects" field, and the heap ID in the
+   client record then holds only the B-tree key.  Dense link storage reaches
+   this whenever one link message exceeds 4096 bytes -- H5G_FHEAP_MAX_MAN_SIZE
+   (src/H5Gdense.c) -- which a long soft-link target or external-link value does
+   on its own.  A group whose ONLY links are huge has no managed blocks, so its
+   doubling-table root address is undefined; that is a legal heap, not an empty
+   one, and reading it as empty is how this whole layout used to fall out as a
+   coverage gap.
+
+   The registry below is keyed by (heap header address, huge id) so a file with
+   several dense groups keeps its heaps apart.  It is filled by the huge-index
+   walk and read when a client record presents a huge heap ID.  */
+var h5policy_frhp_huge_heaps = uint<64>[]();
+var h5policy_frhp_huge_ids   = uint<64>[]();
+var h5policy_frhp_huge_addrs = uint<64>[]();
+var h5policy_frhp_huge_sizes = uint<64>[]();
+
+/* Set at the entry of the huge-index walk; concatenated onto its messages so
+   one walker can serve more than one client family (see ROLE_GLOBALS in
+   tools/message_routing.py).  "" is the not-in-a-walk placeholder.  */
+var h5policy_frhp_huge_role = "";
+
+/* Heap header address the current client walk belongs to; the registry key's
+   first half.  Separate from h5policy_frhp_owner_addr, which the block
+   verifiers reset as they descend.  */
+var h5policy_frhp_huge_owner = 0xffffffffffffffffUL;
+
+/* Width of an indirect huge ID in the heap currently being walked, 0 when the
+   heap has no huge-object index this walker decodes.  Set beside the owner. */
+var h5policy_frhp_huge_width = 0UL;
+
+fun h5policy_frhp_huge_reset = void:
+{
+    /* Clearing the OWNER is what keeps a client that does not walk a huge
+       index -- dense attributes today -- from resolving its own heap IDs
+       against the previous client's registry.  A huge id of 1 is the common
+       case, so a stale owner would collide rather than miss.  */
+    h5policy_frhp_huge_owner = 0xffffffffffffffffUL;
+    h5policy_frhp_huge_width = 0UL;
+    h5policy_frhp_huge_heaps = uint<64>[]();
+    h5policy_frhp_huge_ids   = uint<64>[]();
+    h5policy_frhp_huge_addrs = uint<64>[]();
+    h5policy_frhp_huge_sizes = uint<64>[]();
+}
+
+fun h5policy_frhp_huge_record = (uint<64> heap_addr, uint<64> id,
+                                 uint<64> addr, uint<64> size) void:
+{
+    h5policy_frhp_huge_heaps += [heap_addr];
+    h5policy_frhp_huge_ids   += [id];
+    h5policy_frhp_huge_addrs += [addr];
+    h5policy_frhp_huge_sizes += [size];
+}
+
+/* Index of the registered huge object, or -1.  Linear: a dense group's huge
+   objects are the links too big to manage, so the array is short, and the walk
+   budget bounds it in any case.  */
+fun h5policy_frhp_huge_find = (uint<64> heap_addr, uint<64> id) uint<64>:
+{
+    var i = 0UL;
+    while (i < h5policy_frhp_huge_ids'length)
+        {
+            if (h5policy_frhp_huge_heaps[i] == heap_addr
+                && h5policy_frhp_huge_ids[i] == id)
+                return i;
+            i = i + 1UL;
+        }
+    return 0xffffffffffffffffUL;
+}
+
+/* Does this heap address its huge objects DIRECTLY (address and length inside
+   the heap ID) or INDIRECTLY (the ID is a B-tree key)?  Transcribed from
+   H5HF__huge_init (src/H5HFhuge.c): the direct form is chosen only when the ID
+   is wide enough to hold the whole locator.  A dense link or attribute heap
+   asks for id_len 0, which libhdf5 resolves to 1 + heap_off_size +
+   heap_len_size -- seven bytes here -- so the direct form is unreachable from
+   those clients and is left as a coverage gap rather than guessed at.  */
+fun h5policy_frhp_huge_ids_direct = (uint<64> id_len, uint<64> filter_len) int:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    if (id_len < 1UL)
+        return 0;
+    if (filter_len > 0UL)
+        return (id_len - 1UL) >= (o + el + 4UL + el);
+    return (o + el) <= (id_len - 1UL);
+}
+
+/* Width of an INDIRECT huge ID -- the B-tree key stored in the client record
+   after the flags byte (H5HF__huge_init, same source).  */
+fun h5policy_frhp_huge_id_width = (uint<64> id_len) uint<64>:
+{
+    if (id_len < 1UL)
+        return 0UL;
+    return (id_len - 1UL) < 8UL ? id_len - 1UL : 8UL;
+}
+
+/* Decode ONE fractal-heap object as a dense-index link message and return the
+   link's creation order (0xffff... when it has none or could not be read).
+
+   Shared by the managed and huge arms of the name-index walk: the two differ
+   only in how the heap ID is resolved to (offset, length), never in what the
+   bytes mean.  The heap object's extent is EXACT -- H5G__dense_insert sizes the
+   buffer with H5O_msg_raw_size and H5HF_insert stores precisely that many bytes
+   (src/H5Gdense.c) -- so a link message that stops short leaves bytes in the
+   file that no reader will ever look at, and that no writer should have been
+   able to produce.  */
+fun h5policy_dense_link_heap_object = (int ios, H5PolicyProfile profile,
+                                       uint<64> obj_off, uint<64> obj_len,
+                                       off64 id_loc, string object) uint<64>:
+{
+    var link_corder = 0xffffffffffffffffUL;
+    if (obj_len >= 2UL)
+        {
+            var link_flags = h5policy_msg_u64_at(ios, profile,
+                                                 obj_off#B + 1#B, 1UL);
+            var link_cur = 2UL;
+            if ((link_flags & 8UL) != 0UL)
+                link_cur = link_cur + 1UL;
+            if ((link_flags & 4UL) != 0UL
+                && h5policy_payload_range_ok(
+                       obj_len, link_cur, 8UL,
+                       "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
+                       obj_off#B + link_cur#B, object,
+                       "dense link creation order overruns the link message"))
+                link_corder = h5policy_msg_u64_at(ios, profile,
+                                                  obj_off#B + link_cur#B, 8UL);
+        }
+    h5policy_validate_link_payload(ios, profile, obj_off#B, obj_len,
+                                   object, "dense-index");
+    /* THE TAIL-SLACK RULE.  Measured against libhdf5 2.3.0: H5O__link_size
+       reserves 2 + strlen(target) for a soft link while H5O__link_encode
+       writes 2 + (uint16_t)strlen(target) (src/H5Olink.c), so a target of
+       65536 bytes or more leaves the remainder of the heap object unwritten --
+       and H5HF_insert stores it anyway, uninitialised.  The stored length is
+       self-consistent, so nothing inside the message can show it; only the
+       container's extent can.  Silent when the decoder bailed early, because
+       the short count would then re-report a defect already named.  */
+    if (h5policy_link_payload_consumed != 0xffffffffffffffffUL
+        && h5policy_link_payload_consumed != obj_len)
+        h5policy_emit_error_ev(
+            "H5_CORRUPT_LINK_MESSAGE_TRAILING_BYTES", "corrupt",
+            obj_off#B + h5policy_link_payload_consumed#B, object,
+            "dense link message does not consume its fractal-heap object",
+            H5Evidence {
+                field = "dense.link_message_extent",
+                actual = h5policy_link_payload_consumed,
+                expected = obj_len,
+                comparison = "equal",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = obj_off#B, loc1_len = obj_len,
+                has_loc2 = 1, loc2_role = "expected",
+                loc2 = id_loc, loc2_len = 1UL,
+            });
+    return link_corder;
+}
+
+/* Dense link B-tree records carry a fractal-heap ID.  Managed IDs are resolved
+   through the doubling table, huge IDs through the heap's huge-object index;
+   any other class is an explicit coverage refusal rather than a silent skip. */
 /* Process nrec dense-link (type-5) records starting at rec_base (node prefix +
    6): resolve each heap object and validate/enqueue it as a link message.
    Used for both leaf and internal nodes -- in a v2 B-tree every node stores
@@ -1330,28 +1524,9 @@ fun h5policy_dense_link_records = (int ios, H5PolicyProfile profile,
                             if (obj_off != 0xffffffffffffffffUL
                                 && obj_off < file_size
                                 && heap_obj_len <= file_size - obj_off)
-                                {
-                                    if (heap_obj_len >= 2UL)
-                                        {
-                                            var link_flags = h5policy_msg_u64_at(
-                                                ios, profile, obj_off#B + 1#B, 1UL);
-                                            var link_cur = 2UL;
-                                            if ((link_flags & 8UL) != 0UL)
-                                                link_cur = link_cur + 1UL;
-                                            if ((link_flags & 4UL) != 0UL
-                                                && h5policy_payload_range_ok(
-                                                    heap_obj_len, link_cur, 8UL,
-                                                    "H5_CORRUPT_LINK_MESSAGE_TOO_SMALL",
-                                                    obj_off#B + link_cur#B, object,
-                                                    "dense link creation order overruns the link message"))
-                                                link_corder = h5policy_msg_u64_at(
-                                                    ios, profile,
-                                                    obj_off#B + link_cur#B, 8UL);
-                                        }
-                                    h5policy_validate_link_payload(
-                                        ios, profile, obj_off#B, heap_obj_len,
-                                        object, "dense-index");
-                                }
+                                link_corder = h5policy_dense_link_heap_object(
+                                    ios, profile, obj_off, heap_obj_len,
+                                    id_off#B, object);
                             else
                                 h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID",
                                                     "corrupt", id_off#B, object,
@@ -1360,6 +1535,30 @@ fun h5policy_dense_link_records = (int ios, H5PolicyProfile profile,
                                 heap_obj_off, heap_obj_len, link_corder,
                                 id_off#B, object);
                         }
+                }
+            else if (((id_flags .>> 4) & 3UL) == 1UL
+                     && h5policy_frhp_huge_width != 0UL)
+                {
+                    /* Huge ID form: flags byte, then the huge-object index key.
+                       The locator is the B-tree record registered by
+                       h5policy_walk_frhp_huge_index, not the doubling table.  */
+                    var huge_id = h5policy_msg_u64_at(ios, profile,
+                                                      id_off#B + 1#B,
+                                                      h5policy_frhp_huge_width);
+                    var slot = h5policy_frhp_huge_find(h5policy_frhp_huge_owner,
+                                                       huge_id);
+                    var link_corder = 0xffffffffffffffffUL;
+                    if (slot == 0xffffffffffffffffUL)
+                        h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_ID", "corrupt",
+                                            id_off#B, object,
+                                            "dense link name-index huge heap ID names no record in the heap's huge-object index");
+                    else
+                        link_corder = h5policy_dense_link_heap_object(
+                            ios, profile, h5policy_frhp_huge_addrs[slot],
+                            h5policy_frhp_huge_sizes[slot], id_off#B, object);
+                    h5policy_record_dense_name_heap_id(
+                        0x8000000000000000UL | huge_id, 0UL, link_corder,
+                        id_off#B, object);
                 }
             else if (!h5policy_dense_name_nonmanaged_reported)
                 {
@@ -1577,8 +1776,33 @@ fun h5policy_dense_corder_records = (int ios, H5PolicyProfile profile,
                     (rec_off + 8UL)#B, object);
 
             var id_flags = h5policy_msg_u64_at(ios, profile, id_off#B, 1UL);
-            if (((id_flags .>> 4) & 3UL) != 0UL)
+            var huge_slot = 0xffffffffffffffffUL;
+            if (((id_flags .>> 4) & 3UL) == 1UL
+                && h5policy_frhp_huge_width != 0UL
+                && h5policy_frhp_huge_owner != 0xffffffffffffffffUL)
+                huge_slot = h5policy_frhp_huge_find(
+                    h5policy_frhp_huge_owner,
+                    h5policy_msg_u64_at(ios, profile, id_off#B + 1#B,
+                                        h5policy_frhp_huge_width));
+            if (huge_slot != 0xffffffffffffffffUL)
                 {
+                    /* Same synthetic key the name index recorded, so the two
+                       indexes cross-check for huge objects exactly as they do
+                       for managed ones.  */
+                    h5policy_match_dense_corder_heap_id(
+                        0x8000000000000000UL | h5policy_frhp_huge_ids[huge_slot],
+                        0UL, corder, id_off#B, object);
+                    var huge_ok = h5policy_checked_addr_range(
+                        h5policy_frhp_huge_addrs[huge_slot],
+                        h5policy_frhp_huge_sizes[huge_slot], file_size,
+                        h5policy_dense_corder_role + " heap object outside file",
+                        id_off#B, object);
+                }
+            else if (((id_flags .>> 4) & 3UL) != 0UL)
+                {
+                    /* Still unresolved: a tiny ID, a direct huge ID, or a huge
+                       ID whose index this client does not walk (dense
+                       attributes).  A refusal, not an accept.  */
                     if (!h5policy_dense_corder_nonmanaged_reported)
                         {
                             h5policy_emit_error("H5_UNSUPPORTED_PICKLE_COVERAGE_GAP",
@@ -2104,6 +2328,375 @@ fun h5policy_dense_links_node = (int ios, H5PolicyProfile profile,
    descends the B-tree records to recover link-message payloads from the heap.
    Unsupported filtered heaps or unexpected record types return 0 so the link
    info validator can emit a coverage-gap finding.  */
+/* Records of a fractal-heap huge-object index.  Only the INDIRECT, UNFILTERED
+   layout (v2 B-tree record type 1: address, length, id) is decoded; the caller
+   has already established that this heap uses it, so any other stored type is a
+   mismatch with the heap header rather than a layout this walker declines --
+   the same reasoning as the name index's client-id check above, and for the
+   same reason: H5B2__cache_hdr_deserialize takes the class from the FILE.  */
+fun h5policy_frhp_huge_records = (int ios, H5PolicyProfile profile,
+                                  uint<64> heap_addr, uint<64> rec_base,
+                                  uint<64> nrec, uint<64> record_size,
+                                  uint<64> max_man_size, uint<64> file_size,
+                                  string object) void:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var i = 0UL;
+    var prev_id = 0UL;
+    var have_prev = 0;
+    while (i < nrec)
+        {
+            h5policy_walk_tick(1UL);
+            var r = rec_base + (i * record_size);
+            var addr_raw = h5policy_msg_bytes(ios, profile, r#B, o);
+            var addr = hdf5_addr_to_file_u64(bytes_to_u64_le(addr_raw));
+            var len = h5policy_msg_u64_at(ios, profile, r#B + o#B, el);
+            var id = h5policy_msg_u64_at(ios, profile, r#B + (o + el)#B, el);
+
+            /* The index is ordered by id and ids are unique -- H5HF__huge_bt2_indir_compare
+               subtracts the two (src/H5HFbtree2.c) -- so libhdf5's binary search
+               silently misses a record the moment the order breaks.  */
+            if (have_prev && id <= prev_id)
+                h5policy_emit_error_ev(
+                    "H5_CORRUPT_V2_BTREE_RECORD_ORDER", "corrupt",
+                    r#B + (o + el)#B, object,
+                    h5policy_frhp_huge_role + " huge-object index records are not ordered by id",
+                    H5Evidence {
+                        field = "huge.id",
+                        actual = id,
+                        expected = prev_id + 1UL,
+                        comparison = "at_least",
+                        has_loc1 = 1, loc1_role = "actual",
+                        loc1 = r#B + (o + el)#B, loc1_len = el,
+                    });
+            prev_id = id;
+            have_prev = 1;
+
+            if (h5policy_msg_addr_is_undef(addr_raw))
+                h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_HUGE_OBJECT",
+                                    "corrupt", r#B, object,
+                                    h5policy_frhp_huge_role + " huge object has an undefined address");
+            else if (len == 0UL)
+                h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_HUGE_OBJECT",
+                                    "corrupt", r#B + o#B, object,
+                                    h5policy_frhp_huge_role + " huge object has a zero length");
+            else if (h5policy_checked_addr_range(
+                         addr, len, file_size,
+                         h5policy_frhp_huge_role + " huge object outside file",
+                         r#B, object))
+                {
+                    /* An object is huge BECAUSE the heap would not manage it:
+                       H5HF_insert routes to H5HF__huge_insert only above
+                       max_man_size (src/H5HF.c), and nothing on the read path
+                       checks it again.  A record below the threshold therefore
+                       describes an object that could not have been written
+                       through this index.  */
+                    if (max_man_size != 0UL && len <= max_man_size)
+                        h5policy_emit_error_ev(
+                            "H5_CORRUPT_FRACTAL_HEAP_HUGE_OBJECT", "corrupt",
+                            r#B + o#B, object,
+                            h5policy_frhp_huge_role + " huge object is not larger than the heap's maximum managed size",
+                            H5Evidence {
+                                field = "huge.length",
+                                actual = len,
+                                expected = max_man_size + 1UL,
+                                comparison = "at_least",
+                                has_loc1 = 1, loc1_role = "actual",
+                                loc1 = r#B + o#B, loc1_len = el,
+                                has_loc2 = 1, loc2_role = "expected",
+                                loc2 = heap_addr#B + 10#B, loc2_len = 4UL,
+                            });
+                    h5policy_frhp_huge_record(heap_addr, id, addr, len);
+                }
+            i = i + 1UL;
+        }
+}
+
+/* One node of a huge-object index, and its subtree.  Same envelope as the
+   creation-order walker above: bounds, signature, version/type, checksum,
+   records, then the child pointers with their subtree counts.  */
+fun h5policy_frhp_huge_node = (int ios, H5PolicyProfile profile,
+                               uint<64> heap_addr, uint<64> node_addr,
+                               uint<64> node_depth, uint<64> nrec,
+                               uint<64> node_size, uint<64> record_size,
+                               uint<64> record_type, uint<64> max_man_size,
+                               uint<64> file_size, string object) uint<64>:
+{
+    if (!h5policy_mark_visited_btree(node_addr))
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_CYCLE", "corrupt",
+                                node_addr#B, object,
+                                h5policy_frhp_huge_role + " huge-object index node is referenced more than once");
+            return 0xffffffffffffffffUL;
+        }
+    if (node_depth > profile.resources.max_btree_depth)
+        {
+            h5policy_emit_error("H5_RESOURCE_BTREE_DEPTH", "resource",
+                                node_addr#B, object,
+                                h5policy_frhp_huge_role + " huge-object index depth exceeds the selected profile limit");
+            return 0xffffffffffffffffUL;
+        }
+
+    var o = global_sizeof_offsets as uint<64>;
+    var nrec_bytes = h5policy_bt2_nrec_bytes(node_size, record_size);
+    var sub_bytes = node_depth > 1UL
+                    ? h5policy_bt2_subtree_bytes(node_size, record_size,
+                                                 node_depth - 1UL)
+                    : 0UL;
+    var ptr_size = node_depth == 0UL ? 0UL : o + nrec_bytes + sub_bytes;
+    var recs = h5policy_checked_mul_u64(
+        nrec, record_size, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        h5policy_frhp_huge_role + " huge-object index node size overflow");
+    var ptrs = node_depth == 0UL ? 0UL : h5policy_checked_mul_u64(
+        nrec + 1UL, ptr_size, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        h5policy_frhp_huge_role + " huge-object index node size overflow");
+    var node_need = h5policy_checked_add_u64(
+        10UL, recs, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        h5policy_frhp_huge_role + " huge-object index node size overflow");
+    node_need = h5policy_checked_add_u64(
+        node_need, ptrs, 0xffffffffffffffffUL,
+        "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", node_addr#B, object,
+        h5policy_frhp_huge_role + " huge-object index node size overflow");
+    if (node_need > node_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_SIZE", "corrupt",
+                                node_addr#B, object,
+                                h5policy_frhp_huge_role + " huge-object index used node bytes exceed its declared node size");
+            return 0xffffffffffffffffUL;
+        }
+    if (!h5policy_checked_addr_range(
+            node_addr, node_need, file_size,
+            h5policy_frhp_huge_role + " huge-object index node outside file",
+            node_addr#B, object))
+        return 0xffffffffffffffffUL;
+
+    var expected_signature = node_depth == 0UL
+                             ? H5_FORMAT_BTLF_SIGNATURE
+                             : H5_FORMAT_BTIN_SIGNATURE;
+    if (h5policy_msg_bytes(ios, profile, node_addr#B, 4UL)
+        != expected_signature)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                node_addr#B, object,
+                                h5policy_frhp_huge_role + " huge-object index node signature mismatch");
+            return 0xffffffffffffffffUL;
+        }
+    h5policy_mark_reached(node_addr, node_depth == 0UL ? "BTLF" : "BTIN");
+    var version = h5policy_msg_u64_at(ios, profile, node_addr#B + 4#B, 1UL);
+    var stored_type = h5policy_msg_u64_at(ios, profile, node_addr#B + 5#B, 1UL);
+    if (version != 0UL || stored_type != record_type)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_NODE_HEADER", "corrupt",
+                                node_addr#B, object,
+                                h5policy_frhp_huge_role + " huge-object index node version or record type is invalid");
+            return 0xffffffffffffffffUL;
+        }
+    h5policy_dense_verify_trailing_checksum(
+        ios, profile, node_addr, node_need, file_size, object,
+        h5policy_frhp_huge_role + " huge-object index node");
+    h5policy_frhp_huge_records(ios, profile, heap_addr, node_addr + 6UL, nrec,
+                               record_size, max_man_size, file_size, object);
+
+    var total = nrec;
+    if (node_depth == 0UL)
+        return total;
+
+    var ptr_base = node_addr + 6UL + recs;
+    var valid_total = 1;
+    var j = 0UL;
+    while (j < nrec + 1UL)
+        {
+            var ptr_off = ptr_base + (j * ptr_size);
+            var child_raw = h5policy_msg_bytes(ios, profile, ptr_off#B, o);
+            var child_nrec = h5policy_msg_u64_at(ios, profile,
+                                                 ptr_off#B + o#B, nrec_bytes);
+            if (h5policy_msg_addr_is_undef(child_raw) || child_nrec == 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_V2_BTREE_CHILD_POINTER",
+                                        "corrupt", ptr_off#B, object,
+                                        h5policy_frhp_huge_role + " huge-object index internal node has an empty child pointer");
+                    valid_total = 0;
+                }
+            else
+                {
+                    var child_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(child_raw));
+                    if (child_addr >= file_size)
+                        {
+                            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE",
+                                                "corrupt", ptr_off#B, object,
+                                                h5policy_frhp_huge_role + " huge-object index child address outside file");
+                            valid_total = 0;
+                        }
+                    else
+                        {
+                            var child_total = h5policy_frhp_huge_node(
+                                ios, profile, heap_addr, child_addr,
+                                node_depth - 1UL, child_nrec, node_size,
+                                record_size, record_type, max_man_size,
+                                file_size, object);
+                            if (child_total == 0xffffffffffffffffUL)
+                                valid_total = 0;
+                            else
+                                {
+                                    if (sub_bytes != 0UL)
+                                        {
+                                            var declared_total = h5policy_msg_u64_at(
+                                                ios, profile,
+                                                ptr_off#B + (o + nrec_bytes)#B,
+                                                sub_bytes);
+                                            if (declared_total != child_total)
+                                                h5policy_emit_error(
+                                                    "H5_CORRUPT_V2_BTREE_SUBTREE_COUNT",
+                                                    "corrupt", ptr_off#B, object,
+                                                    h5policy_frhp_huge_role + " huge-object index child subtree count is inconsistent");
+                                        }
+                                    if (child_total > 0xffffffffffffffffUL - total)
+                                        valid_total = 0;
+                                    else
+                                        total = total + child_total;
+                                }
+                        }
+                }
+            j = j + 1UL;
+        }
+    return valid_total ? total : 0xffffffffffffffffUL;
+}
+
+/* Validate a fractal heap's huge-object index and register every object it
+   names.  Returns 1 when the layout was decoded (whatever it found), 0 when it
+   is outside the supported subset, so the caller can keep ONE coverage finding
+   at the client message instead of accepting unseen records.  */
+fun h5policy_walk_frhp_huge_index = (int ios, H5PolicyProfile profile,
+                                     uint<64> heap_addr, uint<64> btree_addr,
+                                     uint<64> expected_type,
+                                     uint<64> max_man_size,
+                                     uint<64> expected_nhuge,
+                                     uint<64> file_size, off64 loc,
+                                     string object) int:
+{
+    var o = global_sizeof_offsets as uint<64>;
+    var el = global_sizeof_lengths as uint<64>;
+    var hdr_size = 22UL + o + el;
+    if (!h5policy_checked_addr_range(
+            btree_addr, hdr_size, file_size,
+            h5policy_frhp_huge_role + " huge-object index header outside file",
+            loc, object))
+        return 1;
+    if (h5policy_msg_bytes(ios, profile, btree_addr#B, 4UL)
+        != H5_FORMAT_BTHD_SIGNATURE)
+        {
+            h5policy_emit_error("H5_CORRUPT_BAD_SIGNATURE", "corrupt",
+                                btree_addr#B, object,
+                                h5policy_frhp_huge_role + " huge-object index header signature mismatch");
+            return 1;
+        }
+    h5policy_mark_reached(btree_addr, "BTHD");
+    var version = h5policy_msg_u64_at(ios, profile, btree_addr#B + 4#B, 1UL);
+    if (version != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_UNSUPPORTED_V2_BTREE_VERSION",
+                                "corrupt", btree_addr#B, object,
+                                h5policy_frhp_huge_role + " huge-object index header has an unsupported version");
+            return 1;
+        }
+    h5policy_dense_verify_trailing_checksum(
+        ios, profile, btree_addr, hdr_size, file_size, object,
+        h5policy_frhp_huge_role + " huge-object index header");
+
+    var record_type = h5policy_msg_u64_at(ios, profile, btree_addr#B + 5#B, 1UL);
+    var node_size = h5policy_msg_u64_at(ios, profile, btree_addr#B + 6#B, 4UL);
+    var record_size = h5policy_msg_u64_at(ios, profile, btree_addr#B + 10#B, 2UL);
+    var depth = h5policy_msg_u64_at(ios, profile, btree_addr#B + 12#B, 2UL);
+    var root_raw = h5policy_msg_bytes(ios, profile, btree_addr#B + 16#B, o);
+    var root_addr = hdf5_addr_to_file_u64(bytes_to_u64_le(root_raw));
+    var num_root = h5policy_msg_u64_at(ios, profile,
+                                       btree_addr#B + (16UL + o)#B, 2UL);
+    var total_nrec = h5policy_msg_u64_at(ios, profile,
+                                         btree_addr#B + (18UL + o)#B, el);
+
+    /* The heap header decides which huge-object class this tree must be; the
+       tree stores its own.  libhdf5 opens the tree with the STORED id, so a
+       disagreement runs a different record class over these bytes.  */
+    if (record_type != expected_type)
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_TYPE", "corrupt",
+                                btree_addr#B + 5#B, object,
+                                h5policy_frhp_huge_role + " huge-object index has the wrong record type");
+            return 1;
+        }
+    if (!h5policy_validate_v2_btree_geometry(
+            node_size, record_size, file_size, btree_addr#B, object,
+            h5policy_frhp_huge_role + " huge-object index"))
+        return 1;
+    if (record_size != o + (2UL * el))
+        {
+            h5policy_emit_error("H5_CORRUPT_V2_BTREE_RECORD_LAYOUT", "corrupt",
+                                btree_addr#B + 10#B, object,
+                                h5policy_frhp_huge_role + " huge-object index record size is invalid");
+            return 1;
+        }
+    if (h5policy_msg_addr_is_undef(root_raw))
+        {
+            if (num_root != 0UL || total_nrec != 0UL)
+                h5policy_emit_error("H5_CORRUPT_V2_BTREE_ROOT_COUNT", "corrupt",
+                                    btree_addr#B + 16#B, object,
+                                    h5policy_frhp_huge_role + " nonempty huge-object index has an undefined root");
+            return 1;
+        }
+    if (root_addr >= file_size)
+        {
+            h5policy_emit_error("H5_CORRUPT_OFFSET_OUT_OF_FILE", "corrupt",
+                                btree_addr#B + 16#B, object,
+                                h5policy_frhp_huge_role + " huge-object index root address outside file");
+            return 1;
+        }
+
+    var walked = h5policy_frhp_huge_node(ios, profile, heap_addr, root_addr,
+                                         depth, num_root, node_size,
+                                         record_size, record_type,
+                                         max_man_size, file_size, object);
+    if (walked != 0xffffffffffffffffUL)
+        {
+            if (walked != total_nrec)
+                h5policy_emit_error_ev(
+                    "H5_CORRUPT_V2_BTREE_TOTAL_COUNT", "corrupt",
+                    btree_addr#B + (18UL + o)#B, object,
+                    h5policy_frhp_huge_role + " huge-object index total record count is inconsistent with its node graph",
+                    H5Evidence {
+                        field = "huge.total_nrec",
+                        actual = total_nrec,
+                        expected = walked,
+                        comparison = "equal",
+                        has_loc1 = 1, loc1_role = "actual",
+                        loc1 = btree_addr#B + (18UL + o)#B, loc1_len = el,
+                    });
+            /* The heap header keeps its own count of huge objects, and
+               H5HF__huge_delete trusts it while the B-tree supplies the
+               records -- two numbers, never compared.  */
+            else if (walked != expected_nhuge)
+                h5policy_emit_error_ev(
+                    "H5_CORRUPT_V2_BTREE_TOTAL_COUNT", "corrupt",
+                    heap_addr#B + (14UL + (7UL * el) + (2UL * o))#B, object,
+                    h5policy_frhp_huge_role + " huge object count differs between the heap header and its index",
+                    H5Evidence {
+                        field = "huge.nobjs",
+                        actual = expected_nhuge,
+                        expected = walked,
+                        comparison = "equal",
+                        has_loc1 = 1, loc1_role = "actual",
+                        loc1 = heap_addr#B + (14UL + (7UL * el) + (2UL * o))#B,
+                        loc1_len = el,
+                        has_loc2 = 1, loc2_role = "expected",
+                        loc2 = btree_addr#B + (18UL + o)#B, loc2_len = el,
+                    });
+        }
+    return 1;
+}
+
 fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
                                  uint<64> fheap_addr, uint<64> btree_addr,
                                  uint<64> corder_btree_addr,
@@ -2111,6 +2704,8 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
 {
     h5policy_dense_link_frhp_trusted = 0;
     h5policy_frhp_owner_addr = 0xffffffffffffffffUL;
+    h5policy_frhp_huge_reset;
+    h5policy_frhp_huge_role = "dense link";
     var o = global_sizeof_offsets as uint<64>;
     var el = global_sizeof_lengths as uint<64>;
     var file_size = h5policy_ceiling(ios);
@@ -2136,6 +2731,7 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
             return 1;
         }
 
+    var id_len = h5policy_msg_u64_at(ios, profile, fheap_addr#B + 5#B, 2UL);
     var filter_len = h5policy_msg_u64_at(ios, profile, fheap_addr#B + 7#B, 2UL);
     var flags = h5policy_msg_u64_at(ios, profile, fheap_addr#B + 9#B, 1UL);
     var frhp_size = h5policy_frhp_header_size(filter_len, fheap_addr#B, object);
@@ -2208,7 +2804,53 @@ fun h5policy_walk_dense_links = (int ios, H5PolicyProfile profile,
                                                max_heap_bits, object,
                                                "dense link heap"))
         return 1;
-    if (h5policy_msg_addr_is_undef(root_raw))
+
+    /* ---- huge-object index ----
+       Objects above max_man_size live outside the doubling table entirely, in a
+       second v2 B-tree named here.  Walk it BEFORE the name index so a record
+       presenting a huge heap ID can be resolved; a heap whose links are ALL
+       huge has no managed blocks at all, which is why the undefined-root test
+       below has to come after this and not before it.  */
+    var huge_raw = h5policy_msg_bytes(ios, profile,
+                                      fheap_addr#B + (14UL + el)#B, o);
+    var huge_defined = !h5policy_msg_addr_is_undef(huge_raw);
+    var nhuge = h5policy_msg_u64_at(ios, profile,
+                                    fheap_addr#B + (14UL + (7UL * el) + (2UL * o))#B,
+                                    el);
+    if (huge_defined)
+        {
+            /* Only the indirect, unfiltered class is decoded.  A dense link or
+               attribute heap asks libhdf5 for id_len 0, which resolves to
+               1 + off_size + len_size -- too narrow for a direct locator -- and
+               a filtered heap has already returned above, so this is the whole
+               reachable set for these clients.  Anything else is declined, not
+               accepted.  */
+            if (h5policy_frhp_huge_ids_direct(id_len, filter_len))
+                return 0;
+            if (h5policy_frhp_huge_id_width(id_len) == 0UL)
+                return 0;
+            if (!h5policy_walk_frhp_huge_index(ios, profile, fheap_addr,
+                                               hdf5_addr_to_file_u64(
+                                                   bytes_to_u64_le(huge_raw)),
+                                               1UL, max_man_size, nhuge,
+                                               file_size, loc, object))
+                return 0;
+            h5policy_frhp_huge_owner = fheap_addr;
+            h5policy_frhp_huge_width = h5policy_frhp_huge_id_width(id_len);
+        }
+    else if (nhuge != 0UL)
+        {
+            h5policy_emit_error("H5_CORRUPT_FRACTAL_HEAP_HUGE_OBJECT", "corrupt",
+                                fheap_addr#B + (14UL + (7UL * el) + (2UL * o))#B,
+                                object,
+                                "dense link heap counts huge objects but names no huge-object index");
+            return 1;
+        }
+
+    /* An undefined doubling-table root means the heap has no MANAGED blocks.
+       With huge objects present that is an ordinary heap and the walk goes on;
+       with none it is an empty heap this walker still does not model.  */
+    if (h5policy_msg_addr_is_undef(root_raw) && !huge_defined)
         return 0;
     if (1UL + off_size + len_size > 7UL)
         {
