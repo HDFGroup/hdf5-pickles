@@ -1,6 +1,7 @@
 # Assert-masked deserializer invariants
 
-**Status: all seven areas complete (first pass).** This catalogs GitHub issue #87: places
+**Status: all seven areas complete (first pass), plus one finding outside
+them.** This catalogs GitHub issue #87: places
 where a value decoded from untrusted HDF5 file bytes is validated only by
 `assert()` — or by ordinary `if (...) HGOTO_ERROR(...)` code wrapped in
 `#ifndef NDEBUG` — rather than a real, always-on check. Both mechanisms
@@ -9,7 +10,10 @@ so both count as "assert-masked" here.
 
 All seven of the issue's named areas are now complete (SOHM, Extensible
 arrays, V2 B-trees, Free-space managers, Metadata-cache images, Fractal
-heaps, Dataset chunk records).
+heaps, Dataset chunk records). One further finding, in the multi/split
+virtual file driver, is recorded at the end: it was found while triaging an
+unrelated report rather than by sweeping that file, so the VFD sources are
+catalogued here but NOT swept.
 
 ## Scope
 
@@ -378,14 +382,14 @@ one of which vanishes under `-DNDEBUG`.
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | `tot_sect_count`/`serial_sect_count` vs. the real section-list walk | `H5FScache.c:258-265` (shared, see above) | `H5FScache.c:1045-1046` (`assert(old_tot_sect_count == fspace->tot_sect_count)`, `assert(old_serial_sect_count == ...)`) | **Measured, bidirectional.** Understated (3→2): the walk's own early-exit (`if (fspace->tot_sect_count == old_tot_sect_count) break;`) stops one real section short — a genuine, legitimately-free 4800-byte region silently vanishes from `h5stat -s`'s report, no crash, no error. Overstated (3→10): `h5policy` already catches this direction (see next column), but if it didn't, the same corrupted value would reach real applications first — `H5Fget_free_sections()`'s returned count (from `H5FS_sect_stats`, a bare accessor read *before* the correcting walk) decouples from how many entries it actually fills, observed as 7 zero-valued phantom sections via `h5stat -s`'s `calloc`-based buffer (a `malloc`-based caller would see stale heap contents instead) | **Understated: confirmed gap, accepts outright.** Overstated: **not a gap** — `h5policy_walk_fspace_sections` (`h5_messages.pk:1305 (while seen < serial_sect)`) also drives its own walk length from the header's declared count, but a *higher* declared count than the list actually holds runs the loop past the real records and trips `H5_CORRUPT_FSM_SECTION_OVERRUN` before it can finish — asymmetric coverage, not by design |
-| 2 | `tot_space` vs. the real section-list walk | `H5FScache.c:255-256` (`H5F_DECODE_LENGTH`, no check) | `H5FScache.c:1050` (`assert(old_tot_space == fspace->tot_space)`) | **Measured: unconditional, un-self-correcting silent misreporting.** `H5MF_get_freespace()` → `H5FS_sect_stats(fs_man, &tot_space, NULL)` never requests the section list at all, so there is no path — self-correcting or otherwise — back to the true value. A single corrupted header field (12480 → 99999999) made `h5stat`'s summary report 100002348 bytes free, 301066.8% of the file's own size, with zero error or warning | **Confirmed gap.** `h5policy_walk_fspace_manager` (`h5_messages.pk:1392-1511 (h5policy_walk_fspace_manager)`) never even decodes `tot_space` — no variable, no check exists to strengthen |
-| 3 | `node_count` (sections-per-size-group counter) | `H5FScache.c:995` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:996` (`assert(node_count)`) — nonzero only, no upper bound | **Measured: CPU-exhaustion DoS.** One byte, 1→200, turned an instant `h5stat -s` into a 2:54+ CPU-pinned hang (99%+ CPU, flat ~3.8MB RSS) before being killed, with no sign of completing | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1319-1326 (node_count > serial_sect - seen)`) already bounds it relationally against the remaining declared count |
-| 4 | `sect_size` (a section's own serialized size) | `H5FScache.c:998-1000` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:1000` (`assert(sect_size)`) — nonzero only | Pre-existing, not newly discovered this session — see `registry/cases/fsm-section-bin-range.yml`. Re-verified this session: the consumer-side hazard (`H5FS__sinfo_new`'s `sinfo->nbins = H5VM_log2_gen(fspace->max_sect_size)` sizing an array later indexed by `H5VM_log2_gen(sect->size)` with no bound, `H5FSsection.c:764,934`) is unchanged at this commit | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1336-1339 (H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX)`) has a dedicated relational check, `H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX` |
+| 1 | `tot_sect_count`/`serial_sect_count` vs. the real section-list walk | `H5FScache.c:258-265` (shared, see above) | `H5FScache.c:1045-1046` (`assert(old_tot_sect_count == fspace->tot_sect_count)`, `assert(old_serial_sect_count == ...)`) | **Measured, bidirectional.** Understated (3→2): the walk's own early-exit (`if (fspace->tot_sect_count == old_tot_sect_count) break;`) stops one real section short — a genuine, legitimately-free 4800-byte region silently vanishes from `h5stat -s`'s report, no crash, no error. Overstated (3→10): `h5policy` already catches this direction (see next column), but if it didn't, the same corrupted value would reach real applications first — `H5Fget_free_sections()`'s returned count (from `H5FS_sect_stats`, a bare accessor read *before* the correcting walk) decouples from how many entries it actually fills, observed as 7 zero-valued phantom sections via `h5stat -s`'s `calloc`-based buffer (a `malloc`-based caller would see stale heap contents instead) | **Understated: confirmed gap, accepts outright.** Overstated: **not a gap** — `h5policy_walk_fspace_sections` (`h5_messages.pk:1338 (while seen < serial_sect)`) also drives its own walk length from the header's declared count, but a *higher* declared count than the list actually holds runs the loop past the real records and trips `H5_CORRUPT_FSM_SECTION_OVERRUN` before it can finish — asymmetric coverage, not by design |
+| 2 | `tot_space` vs. the real section-list walk | `H5FScache.c:255-256` (`H5F_DECODE_LENGTH`, no check) | `H5FScache.c:1050` (`assert(old_tot_space == fspace->tot_space)`) | **Measured: unconditional, un-self-correcting silent misreporting.** `H5MF_get_freespace()` → `H5FS_sect_stats(fs_man, &tot_space, NULL)` never requests the section list at all, so there is no path — self-correcting or otherwise — back to the true value. A single corrupted header field (12480 → 99999999) made `h5stat`'s summary report 100002348 bytes free, 301066.8% of the file's own size, with zero error or warning | **Confirmed gap.** `h5policy_walk_fspace_manager` (`h5_messages.pk:1425-1544 (h5policy_walk_fspace_manager)`) never even decodes `tot_space` — no variable, no check exists to strengthen |
+| 3 | `node_count` (sections-per-size-group counter) | `H5FScache.c:995` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:996` (`assert(node_count)`) — nonzero only, no upper bound | **Measured: CPU-exhaustion DoS.** One byte, 1→200, turned an instant `h5stat -s` into a 2:54+ CPU-pinned hang (99%+ CPU, flat ~3.8MB RSS) before being killed, with no sign of completing | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1352-1359 (node_count > serial_sect - seen)`) already bounds it relationally against the remaining declared count |
+| 4 | `sect_size` (a section's own serialized size) | `H5FScache.c:998-1000` (`UINT64DECODE_VAR`, no check) | `H5FScache.c:1000` (`assert(sect_size)`) — nonzero only | Pre-existing, not newly discovered this session — see `registry/cases/fsm-section-bin-range.yml`. Re-verified this session: the consumer-side hazard (`H5FS__sinfo_new`'s `sinfo->nbins = H5VM_log2_gen(fspace->max_sect_size)` sizing an array later indexed by `H5VM_log2_gen(sect->size)` with no bound, `H5FSsection.c:764,934`) is unchanged at this commit | **Not a gap.** `h5policy_walk_fspace_sections` (`h5_messages.pk:1369-1372 (H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX)`) has a dedicated relational check, `H5_CORRUPT_FSM_SECTION_SIZE_OVER_MAX` |
 
 **Recommendation for finding 1, `tot_sect_count` understated (not
 implemented here):** `h5policy_walk_fspace_sections`
-(`h5_messages.pk:1241-1386 (h5policy_walk_fspace_sections)`) drives its own walk length from the header's
+(`h5_messages.pk:1274-1419 (h5policy_walk_fspace_sections)`) drives its own walk length from the header's
 declared `serial_sect` the same way libhdf5 does, and never checks
 afterward that the walk actually reached the section list's checksum
 boundary (`limit`, computed at line 1152). Closing the gap needs one added
@@ -408,7 +412,7 @@ the same header cluster, decoded with equally zero validation. Patched 0→5
 (leaving `tot_sect_count`/`serial_sect_count` and the real section list
 untouched): `h5policy` rejects it via a different, already-existing
 cross-field check (`H5_CORRUPT_FSM_SECTION_COUNT`,
-`h5_messages.pk:1449 (serial_sect + ghost_sect != tot_sect)`, tripped even without touching the
+`h5_messages.pk:1482 (serial_sect + ghost_sect != tot_sect)`, tripped even without touching the
 other two fields), and the real build's `h5stat` output (default and `-s`)
 was byte-for-byte identical to the valid seed's. Unlike its three siblings,
 `ghost_sect_count` drives no loop-control condition and backs no
@@ -460,13 +464,13 @@ checks that agreement only by `assert`.
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | An entry has flush-dependency parents exactly when its `IS_FD_CHILD` flag is set | `H5Cimage.c:2805` — `fd_parent_count` decoded raw, no check at the decode site itself | `H5Cimage.c:2806-2807` | **Measured: inert.** Both directions, each isolated on its own fixture: `IS_FD_CHILD` set with no parents, and a resolvable parent address on an entry not flagged as a child. A Release build opens the file and reads its dataset normally, read-only or read-write (a read-write open also drops the cache image on close) — in the second direction it simply sets up the flush dependency the entry names. An asserts-enabled build aborts at this assert on both. The child count one field earlier gets the treatment this one lacks: `fd_child_count` against `IS_FD_PARENT` is a real check (`H5Cimage.c:2788-2791`) | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_FLAGS`, `h5_messages.pk:1899 (parent_count > 0UL)`) — not a gap |
-| 2 | An entry has an LRU rank (≥ 0) exactly when its `IN_LRU` flag is set, and −1 otherwise | `H5Cimage.c:2812` — `lru_rank` decoded raw, no check at the decode site itself | `H5Cimage.c:2813` | **Measured: inert.** Both directions: `IN_LRU` clear with rank 5 (`h5policy/tests/malformed/mdci_entry_lru_inconsistent.h5`), and `IN_LRU` set with rank −1. A Release build opens the file and reads its dataset normally, read-only or read-write; an asserts-enabled build aborts at this assert on both. A Release reconstruction never reads the rank: entries join the LRU in image order (`H5Cimage.c:2517`), and every later read-path use is an assert or inside `#ifndef NDEBUG` | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT`, `h5_messages.pk:1917 (lru_raw == 0xffffffffUL)`) — not a gap |
-| 3 | The cache image's declared length is nonzero | `H5Ocache_image.c:117` — the message's size decoded raw; its overflow and end-of-file checks are skipped entirely when the size is 0 (`:119`) | `H5Cimage.c:640` | **Measured: fails safely.** A message declaring size 0: a Release build allocates a 1-byte buffer for the image and rejects the file at the first signature check. An asserts-enabled build aborts at this assert. History in `registry/cases/mdci-image-checksum-unverified.yml` | Confirmed: dedicated check (`H5_CORRUPT_MDCI_HEADER_TOO_SMALL`, `h5_messages.pk:1723 (image_size < image_header)`) — not a gap |
+| 1 | An entry has flush-dependency parents exactly when its `IS_FD_CHILD` flag is set | `H5Cimage.c:2805` — `fd_parent_count` decoded raw, no check at the decode site itself | `H5Cimage.c:2806-2807` | **Measured: inert.** Both directions, each isolated on its own fixture: `IS_FD_CHILD` set with no parents, and a resolvable parent address on an entry not flagged as a child. A Release build opens the file and reads its dataset normally, read-only or read-write (a read-write open also drops the cache image on close) — in the second direction it simply sets up the flush dependency the entry names. An asserts-enabled build aborts at this assert on both. The child count one field earlier gets the treatment this one lacks: `fd_child_count` against `IS_FD_PARENT` is a real check (`H5Cimage.c:2788-2791`) | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_FLAGS`, `h5_messages.pk:1932 (parent_count > 0UL)`) — not a gap |
+| 2 | An entry has an LRU rank (≥ 0) exactly when its `IN_LRU` flag is set, and −1 otherwise | `H5Cimage.c:2812` — `lru_rank` decoded raw, no check at the decode site itself | `H5Cimage.c:2813` | **Measured: inert.** Both directions: `IN_LRU` clear with rank 5 (`h5policy/tests/malformed/mdci_entry_lru_inconsistent.h5`), and `IN_LRU` set with rank −1. A Release build opens the file and reads its dataset normally, read-only or read-write; an asserts-enabled build aborts at this assert on both. A Release reconstruction never reads the rank: entries join the LRU in image order (`H5Cimage.c:2517`), and every later read-path use is an assert or inside `#ifndef NDEBUG` | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_LRU_INCONSISTENT`, `h5_messages.pk:1950 (lru_raw == 0xffffffffUL)`) — not a gap |
+| 3 | The cache image's declared length is nonzero | `H5Ocache_image.c:117` — the message's size decoded raw; its overflow and end-of-file checks are skipped entirely when the size is 0 (`:119`) | `H5Cimage.c:640` | **Measured: fails safely.** A message declaring size 0: a Release build allocates a 1-byte buffer for the image and rejects the file at the first signature check. An asserts-enabled build aborts at this assert. History in `registry/cases/mdci-image-checksum-unverified.yml` | Confirmed: dedicated check (`H5_CORRUPT_MDCI_HEADER_TOO_SMALL`, `h5_messages.pk:1756 (image_size < image_header)`) — not a gap |
 | 4 | A flush-dependency parent is not in the LRU list (its `lru_rank` is −1) | `H5Cimage.c:2812` — `lru_rank` decoded raw | `H5Cimage.c:2537` | **Measured: inert.** A parent entry flagged in-LRU with rank 1 (consistent under row 2): a Release build opens the file and reads its dataset normally, since it never reads the rank (row 2). An asserts-enabled build aborts at this assert | **None — a gap, but harmless:** accepted, and a Release build never uses the value |
 | 5 | The prefetched entries' LRU ranks are well ordered: no rank 0, strictly increasing along the LRU list, bounded gaps | `H5Cimage.c:2812` — `lru_rank` decoded raw | `H5Cimage.c:2582-2613`, inside `#ifndef NDEBUG` (the same debug-only block also holds row 7's child-count check, `:2575`) | **Measured: inert.** An in-LRU entry with rank 0: a Release build reads normally. An asserts-enabled build aborts at `:2596`. History in `registry/cases/mdci-lru-rank-assert-only.yml` | **None — a gap, but harmless**, for the same reason as row 4 |
-| 6 | The image header leaves room for at least one entry | The header decoder checks the image length against the message's size and the entry count against zero, but never that the length exceeds the header itself | `H5Cimage.c:2473` | **Measured: heap over-read, then an error.** An image exactly as long as its header, declaring one entry: entry decoding starts at the end of the image buffer, and its bound is computed from the *full* image length instead of what remains (the defect in `registry/cases/mdci-entry-extent-rebased-after-header.yml`), so it reads past the buffer before a bound check trips and reports "ran off end of input buffer while decoding". With a guard page placed after the buffer, the read faults at `H5Cimage.c:2744`. An asserts-enabled build aborts at this assert | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_COUNT`, `h5_messages.pk:1779 (nentries > remaining / entry_header)`) — not a gap |
-| 7 | An entry's declared flush-dependency child count matches the number of entries that actually name it as a parent | `H5Cimage.c:2787` — `fd_child_count` decoded raw; the real checks that follow (`:2788-2791`) only require it to be nonzero exactly when `IS_FD_PARENT` is set | `H5Centry.c:1713,1749`, in `H5C__destroy_pf_entry_child_flush_deps`; and `H5Cimage.c:2575`, inside `#ifndef NDEBUG` | **Measured: heap overflow write, read path.** When a prefetched parent is first used, libhdf5 allocates a NULL-terminated array of `fd_child_count + 1` pointers (`H5Centry.c:1876-1877`), then stores into it every entry that names this parent, with no bound (`:1716`). With a parent declaring fewer children than actually name it, an ordinary open and dataset read crashes: `SIGSEGV` when it declares one too few, or 1 of 3 (the terminator is overwritten, so the loop that restores the dependencies, `:2065-2092`, runs past the array onto a garbage pointer), and glibc aborts with `malloc(): invalid size (unsorted)` (heap corruption) at 1 of 6. Matching counts are clean. An asserts-enabled build aborts on every mismatch | **None — confirmed coverage gap.** Accepts every mismatched file: it checks each entry's count only against its own `IS_FD_PARENT` flag (`h5_messages.pk:1898 (child_count > 0UL)`), never against how many entries name it |
+| 6 | The image header leaves room for at least one entry | The header decoder checks the image length against the message's size and the entry count against zero, but never that the length exceeds the header itself | `H5Cimage.c:2473` | **Measured: heap over-read, then an error.** An image exactly as long as its header, declaring one entry: entry decoding starts at the end of the image buffer, and its bound is computed from the *full* image length instead of what remains (the defect in `registry/cases/mdci-entry-extent-rebased-after-header.yml`), so it reads past the buffer before a bound check trips and reports "ran off end of input buffer while decoding". With a guard page placed after the buffer, the read faults at `H5Cimage.c:2744`. An asserts-enabled build aborts at this assert | Confirmed: dedicated check (`H5_CORRUPT_MDCI_ENTRY_COUNT`, `h5_messages.pk:1812 (nentries > remaining / entry_header)`) — not a gap |
+| 7 | An entry's declared flush-dependency child count matches the number of entries that actually name it as a parent | `H5Cimage.c:2787` — `fd_child_count` decoded raw; the real checks that follow (`:2788-2791`) only require it to be nonzero exactly when `IS_FD_PARENT` is set | `H5Centry.c:1713,1749`, in `H5C__destroy_pf_entry_child_flush_deps`; and `H5Cimage.c:2575`, inside `#ifndef NDEBUG` | **Measured: heap overflow write, read path.** When a prefetched parent is first used, libhdf5 allocates a NULL-terminated array of `fd_child_count + 1` pointers (`H5Centry.c:1876-1877`), then stores into it every entry that names this parent, with no bound (`:1716`). With a parent declaring fewer children than actually name it, an ordinary open and dataset read crashes: `SIGSEGV` when it declares one too few, or 1 of 3 (the terminator is overwritten, so the loop that restores the dependencies, `:2065-2092`, runs past the array onto a garbage pointer), and glibc aborts with `malloc(): invalid size (unsorted)` (heap corruption) at 1 of 6. Matching counts are clean. An asserts-enabled build aborts on every mismatch | **None — confirmed coverage gap.** Accepts every mismatched file: it checks each entry's count only against its own `IS_FD_PARENT` flag (`h5_messages.pk:1931 (child_count > 0UL)`), never against how many entries name it |
 
 **Related, but not caused by rows 1–2.** A cache image whose
 flush-dependency parent cannot be resolved fails a real check
@@ -652,7 +656,7 @@ unconditionally):
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | A filtered chunk's stored `nbytes` must clear the pipeline's fixed framing before the chunk is read | `H5Olayout.c:401` (single-chunk, raw decode); the indexed forms decode the same field in their own record callbacks | `H5Dchunk.c:3116` asserts the chunk block is either address-defined with a positive length or address-undefined with zero length, which catches only the `nbytes == 0` case; `nbytes` of 1–3 passes that assert and reaches the filter unguarded | **Measured, both faces.** `nbytes == 0`: debug build `SIGABRT` at the `H5Dchunk.c:3116` assert (assert-masked — under `-DNDEBUG` it proceeds with a defined address and zero length into the filter path). `nbytes` of 1, 3: `SIGSEGV` — the fletcher32 `size − 4` underflow — which is *not* assert-masked and so reaches a Release build too. Both measured on a filtered single-chunk fixture (one chunk, fletcher32), object-header checksum resealed | **Not a gap.** `h5policy` rejects all three: `H5_CORRUPT_CHUNK_STORED_SIZE` "single-chunk chunk record has a zero stored size" for 0, and "filtered chunk record is smaller than the pipeline's fixed framing" (`h5policy/pickles/h5_validate.pk:623 (filtered chunk record is smaller than the pipeline's fixed framing)`) for 1 and 3 — the same framing floor the four indexed paths use |
+| 1 | A filtered chunk's stored `nbytes` must clear the pipeline's fixed framing before the chunk is read | `H5Olayout.c:401` (single-chunk, raw decode); the indexed forms decode the same field in their own record callbacks | `H5Dchunk.c:3116` asserts the chunk block is either address-defined with a positive length or address-undefined with zero length, which catches only the `nbytes == 0` case; `nbytes` of 1–3 passes that assert and reaches the filter unguarded | **Measured, both faces.** `nbytes == 0`: debug build `SIGABRT` at the `H5Dchunk.c:3116` assert (assert-masked — under `-DNDEBUG` it proceeds with a defined address and zero length into the filter path). `nbytes` of 1, 3: `SIGSEGV` — the fletcher32 `size − 4` underflow — which is *not* assert-masked and so reaches a Release build too. Both measured on a filtered single-chunk fixture (one chunk, fletcher32), object-header checksum resealed | **Not a gap.** `h5policy` rejects all three: `H5_CORRUPT_CHUNK_STORED_SIZE` "single-chunk chunk record has a zero stored size" for 0, and "filtered chunk record is smaller than the pipeline's fixed framing" (`h5policy/pickles/h5_validate.pk:687 (filtered chunk record is smaller than the pipeline's fixed framing)`) for 1 and 3 — the same framing floor the four indexed paths use |
 | 2 | A chunk's size, the product of its dimensions, must be nonzero before a chunk buffer is sized from it | `H5Dchunk.c:916-918` — each dimension is checked, but their product is accumulated with no overflow check, so a product of exactly 2⁶⁴ wraps to 0. The check right after the loop (`H5Dchunk.c:924`) compares two 64-bit values, so it cannot detect the wrap | `H5Dchunk.c:5275` (`assert(layout->u.chunk.size > 0)`, in `H5D__chunk_lock`) — the only real size check (`H5Dchunk.c:1250`) is an upper bound, which 0 passes | **Measured: crash (`SIGSEGV`), write path.** Chunk dimensions whose product, with the element size, is exactly 2⁶⁴ (layout v4 and v5): reading the dataset is clean and returns the fill value, but an ordinary one-element `H5Dwrite` makes a wild write — `H5VM_memcpyvv` copies the caller's data to an offset computed from the real dimensions, into a buffer sized for a zero-byte chunk. An asserts-enabled build aborts at this assert instead. Full history in `registry/cases/chunk-dim-product-64bit-overflow.yml` | Confirmed: dedicated check (`H5_CORRUPT_CHUNK_SIZE_PRODUCT_OVERFLOW`, `h5_layout.pk:213 (dim > H5POLICY_CHUNK_SIZE_UNKNOWN / acc)`) — not a gap |
 
 **This invariant bites filtered chunks specifically.** A non-filtered
@@ -956,7 +960,7 @@ section counts and list untouched.
 
 - **`h5policy --profile untrusted-strict`: rejects outright** —
   `H5_CORRUPT_FSM_SECTION_OVERRUN` (`h5policy_walk_fspace_sections`,
-  `h5_messages.pk:1343 (cur + off_size + 1UL > limit)`, whose own `off_size` is computed the same way, via
+  `h5_messages.pk:1376 (cur + off_size + 1UL > limit)`, whose own `off_size` is computed the same way, via
   `h5policy_bytes_for_bits(max_addr_bits)`). **Not a coverage gap.**
 - **Stock build** (`h5stat -s`): does not crash, but produces visibly wrong
   output — 2 of 3 real sections in the corrupted manager replaced with
@@ -1067,8 +1071,8 @@ object headers).
 **`h5policy` coverage: not a gap for either layer.** `--profile
 untrusted-strict` correctly rejects both mutants — the inner-entry
 corruption via `H5_CORRUPT_BAD_CHECKSUM`, "object-header checksum
-mismatch," at offset 48, `h5_validate.pk:1166 (checksum != stored_checksum)`; the outer-block corruption via the same code,
-"metadata cache image checksum mismatch," at offset 2766, `h5_messages.pk:2056 (image_checksum != stored_checksum)` — because
+mismatch," at offset 48, `h5_validate.pk:1230 (checksum != stored_checksum)`; the outer-block corruption via the same code,
+"metadata cache image checksum mismatch," at offset 2766, `h5_messages.pk:2089 (image_checksum != stored_checksum)` — because
 `h5policy`'s own cache-image handling independently computes and verifies
 both the block's own checksum and each replayed entry's checksum against
 its logical address (its README: "replays all validated cached entry
@@ -1109,7 +1113,7 @@ anywhere. Attempted to weaponize this into an EOF/EOA overrun for a
 naturally-reachable entry: a naive size inflation was cleanly caught by a
 *different*, correctly-implemented check (`H5_IS_BUFFER_OVERFLOW` against
 the cache-image block's own buffer) in both `h5policy`
-(`H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE`, `h5_messages.pk:1977 (entry_span > image_size - cur)`) and the real build ("invalid
+(`H5_CORRUPT_MDCI_ENTRY_OVERRUNS_IMAGE`, `h5_messages.pk:2010 (entry_span > image_size - cur)`) and the real build ("invalid
 entry size"). Because the cache-image block is always allocated last in a
 library-written file (at the then-current EOA), any naturally-reachable
 entry's real address is inherently smaller than the cache-image block's
@@ -1407,7 +1411,7 @@ dimension (10 → 867,583,393,802), leaving the Fixed Array's capacity at 4.
 **`h5policy` coverage: not a gap.** It rejects the file by comparing the
 stored capacity with the one the extent implies
 (`H5_CORRUPT_FIXED_ARRAY_EXTENT_MISMATCH`,
-`h5_validate.pk:891 (expected_nelmts != h5policy_fixed_array_nelmts)`). Full
+`h5_validate.pk:955 (expected_nelmts != h5policy_fixed_array_nelmts)`). Full
 history in `registry/cases/fixed-array-extent-mismatch.yml`.
 
 **Why this sits here and not in the main table:** the relationship that
@@ -1426,9 +1430,65 @@ destination index, so this stops the copy before anything is written.
 libhdf5's own writer always makes the two equal, so no legitimate file is
 affected.
 
+## Virtual file drivers (`H5FDmulti.c` — outside the seven areas above)
+
+Found while triaging an externally reported driver-info defect, not by sweeping
+this file; one finding, measured. It is listed here rather than under
+"Adjacent findings" because it *is* literally assert-masked, which is this
+document's in-scope definition.
+
+| Area | Invariant | Guard | libhdf5 consequence (Release build) | `h5policy` |
+|---|---|---|---|---|
+| Multi/split VFD | Member-map byte < `H5FD_MEM_NTYPES` | `assert()` only | Out-of-bounds **stack write** | Covered |
+
+### Multi/split VFD — member-map byte — assert-only index into a 7-element stack array
+
+The driver-info body for the multi and split VFDs opens with six bytes, one per
+member type. `H5FD_multi_sb_decode` copies them into `map[1..6]` and then counts
+unique members with `UNIQUE_MEMBERS`, whose expansion
+(`UNIQUE_MEMBERS_CORE`, `src/H5FDmulti.c:46-58`) reads:
+
+```c
+unsigned SEEN[H5FD_MEM_NTYPES];                 /* 7 entries, on the stack */
+...
+LOOPVAR = MAP[ITER];
+if (H5FD_MEM_DEFAULT == LOOPVAR) LOOPVAR = ITER;
+assert(LOOPVAR > 0 && LOOPVAR < H5FD_MEM_NTYPES);
+if (SEEN[LOOPVAR]++) continue;
+```
+
+The `assert` is the only bound, and the value it guards comes straight from the
+file. Under `-DNDEBUG` a map byte of 7 or more indexes `SEEN[]` past its end and
+**increments** it — a write, not a read, at an attacker-chosen offset up to
+`255 * sizeof(unsigned)` bytes beyond a stack array.
+
+**Measured** (develop `91f1dccfc74`, ASan + `NDEBUG` build, via a real split
+file set opened with `H5Pset_fapl_split` whose first map byte was set to
+`0xFF`): out-of-bounds stack access reported at `src/H5FDmulti.c:785`. The
+assert-live build aborts on the assert instead, which is why the `NDEBUG` arm is
+the one that witnesses it — the usual shape where a live assert hides the defect
+it was meant to document.
+
+`h5policy` rejects the file at superblock preflight with
+`H5_CORRUPT_DRVINFO_MEMBER_MAP` on both driver-info carriers, guarded by
+`malformed/drvinfo_block_member_map_undefined.h5`. The fixture sizes its body
+for the three members its map selects, so the body-length bound cannot fire and
+shadow the map check. See
+`registry/cases/drvinfo-body-shorter-than-driver-minimum.yml`, which also
+carries the separate read-side defect found in the same function.
+
+**Recommendation.** Promote the assert to a real check: reject any map byte
+outside `[1, H5FD_MEM_NTYPES)` before the counting loop. No conforming writer
+emits one — libhdf5's own encoder writes member types it got from
+`H5Pset_fapl_multi`, which validates them — so the compatibility risk is nil.
+
 ## Status: all seven named areas complete
 
-Every area named in issue #87 has now been swept (the sections above).
+Every area named in issue #87 has now been swept (the sections above). The
+virtual-file-driver section is not a swept area -- it holds a single finding
+that arrived from elsewhere, and `H5FDmulti.c`'s remaining asserts, along
+with every other VFD, are unexamined.
+
 This remains a first pass: most findings are measured, a few are marked
 "traced, not yet measured", and the recommendations are left as
 recommendations rather than changes.

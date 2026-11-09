@@ -1,0 +1,186 @@
+# The superblock's driver-info body has an attacker-controlled LENGTH, and this
+# repository already tracks that length being too LARGE
+# (registry/cases/driver-info-block-fields-unbounded.yml, still live upstream).
+# Nothing bounded the other end.  H5FD_sb_load hands the VFD callback no extent
+# at all, so a body SHORTER than the named driver reads unconditionally is an
+# out-of-bounds read -- and because libhdf5 dispatches on the 8-byte driver
+# name, the minimum is knowable without modelling the member files.
+#
+# This record also carries a SECOND, independent defect found in the same
+# function while deriving that minimum: the multi driver's 6 member-map bytes
+# index a 7-element stack array under an assert only.  That one is a WRITE.
+#
+# PROVENANCE.  The family and multi read sinks were described to us in an
+# external report received 2026-11-09, reviewed locally on that date.  That
+# material is deliberately not identified here -- a third party's own numbering
+# is not authoritative in this repository, the same reason advisory identifiers
+# are excluded -- and nothing in this record rests on it: every claim below was
+# re-derived from the source tree and re-measured locally.  Recording what the
+# external account did NOT establish is the part that matters for anyone
+# reconciling the two later.  It was static only, with no dynamic witness
+# claimed; it cited only the v0/v1 block carrier, missing the v2/v3 extension
+# message path that is the default modern format and the tighter allocation;
+# and it placed the multi overflow at the memcpy (H5FDmulti.c:793) when the
+# first out-of-bounds read is the member-map read at :780.  The member-map
+# stack-write defect does not appear in it at all.
+schema_version: 1
+
+id: drvinfo-body-shorter-than-driver-minimum
+title: the driver-info body's length is unbounded BELOW, so a body shorter than
+  the named VFD's fixed prefix is read out of bounds -- and the multi driver's
+  member-map bytes index a stack array with no runtime bound
+status: contained                # h5policy rejects both shapes at superblock preflight; libhdf5 unfixed on develop
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The external report that
+  overlaps this record was supplied by the user as a local file.
+
+# -- Triage -------------------------------------------------------------------
+record: validation_controls
+versions: [0]                    # driver-info encoding version, both carriers
+root_cause_classification: local_decode
+violated_invariant:
+  - control.driver_info_body_minimum
+  - control.driver_info_member_map
+validation_closure: >-
+  the driver-info envelope alone closes both: the 8-byte driver name selects the
+  minimum, the declared body length is compared against it, and for the multi
+  driver the first six body bytes are range-checked.  No member file has to be
+  opened or modelled, which is what makes this checkable inside an oracle whose
+  stated position on multi/split member structure is an explicit coverage gap.
+activation_before_validation:
+  - native_construction          # H5Fopen itself, before any object is touched
+entry_points:
+  - "h5policy (oracle) -- reject_corrupt, H5_CORRUPT_DRVINFO_BODY_TOO_SHORT / H5_CORRUPT_DRVINFO_MEMBER_MAP, at superblock preflight on both carriers"
+  - "libhdf5 v2/v3 carrier: H5Fopen -> H5F__super_read (src/H5Fsuper.c:681) -> H5FD_sb_load -> H5FD__sb_decode -> the driver callback; the buffer is H5MM_malloc(mesg->len) from H5Odrvinfo.c, re-copied in H5O__drvinfo_copy (src/H5Odrvinfo.c:193)"
+  - "libhdf5 v0/v1 carrier: H5Fopen -> H5F__cache_drvrinfo_deserialize (src/H5Fsuper_cache.c:951); the buffer is the cache image sized 16 + len at :908"
+  - "requires the caller to have selected the family or multi/split VFD -- H5FD_sb_load (src/H5FD.c:689-694) refuses an NCSAfami/NCSAmult payload under any other driver"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0, develop 91f1dccfc74) -
+defect: >-
+  H5FD_sb_load (src/H5FD.c:680) and H5FD__sb_decode (:644) pass the VFD callback
+  `(file, name, buf)`.  THERE IS NO LENGTH PARAMETER, so no driver can bound its
+  own read, and the declared body length is the only thing that decides whether
+  the bytes it reads exist.
+  FAMILY: H5FD__family_sb_decode (src/H5FDfamily.c:602) runs an unconditional
+  8-byte `UINT64DECODE(buf, msize)`.  A declared length of 1 reads 7 bytes past
+  the allocation, and the result becomes memb_size/pmem_size.
+  MULTI: H5FD_multi_sb_decode reads 6 map bytes (:780), advances `buf += 8`,
+  `memcpy(x, buf, nseen * 2 * 8)` -- up to 96 bytes (:793) -- and then walks one
+  NUL-terminated, 8-byte-aligned name template per unique member with an
+  unbounded `strlen` (:807).  Its true floor is 8 + nseen*16 + nseen*8, which is
+  exactly the 56 bytes H5Pset_fapl_split writes for two members.
+  MEMBER MAP (separate defect): UNIQUE_MEMBERS_CORE (src/H5FDmulti.c:46-58)
+  asserts `LOOPVAR > 0 && LOOPVAR < H5FD_MEM_NTYPES` and then executes
+  `SEEN[LOOPVAR]++` into a 7-element stack array.  With NDEBUG the assert is
+  gone and a map byte >= 7 is an out-of-bounds stack WRITE.
+boundary_note: >-
+  The name-template `strlen` at :807 is NOT closed by a length bound: a body
+  that is long enough can still end without a NUL.  Bounding that needs the
+  body's CONTENT, which is the subject of
+  registry/cases/multi-vfd-name-template-format-string.yml, and it stays open.
+  This record closes the extent question and the map-value question only.
+
+# -- Measurement --------------------------------------------------------------
+measured:
+  libhdf5_version: 2.3.0          # develop 91f1dccfc74, 2026-11-07
+  fixtures: >-
+    malformed/drvinfo_block_body_short_family.h5 (flat floor),
+    malformed/drvinfo_block_body_short_multi.h5 (map-derived minimum) and
+    malformed/drvinfo_block_member_map_undefined.h5 (map value), all generated
+    by h5policy-gencorpus on the v0/v1 block carrier, which is the only one h5py
+    can be made to produce.  The v2/v3 message carrier is covered by
+    h5policy/tests/unit_messages.pk, which drives the payload validator directly
+    -- that is also where the non-false-reject controls live, because a
+    well-formed NCSAmult block cannot be a valid/ fixture: libhdf5 refuses the
+    name under sec2 regardless of the body.
+  oracle: >-
+    h5policy rejects all three reject_corrupt.  Each was proven non-vacuous by
+    reverting ONE fix at a time: with the map-derived minimum reverted and the
+    flat floor kept, drvinfo_block_body_short_multi.h5 returns
+    unsupported_coverage_gap while its family sibling still rejects; with the
+    map check reverted alone, drvinfo_block_member_map_undefined.h5 returns
+    unsupported_coverage_gap while both length fixtures still reject.
+  libhdf5_stock: >-
+    MULTI, body length 1: the RelWithDebInfo build OPENS THE FILE AND REPORTS
+    NOTHING, having taken out-of-bounds heap bytes as its member map -- silent
+    disclosure steering member-file selection, not a crash.
+    FAMILY, body length 1: the leaked 8 bytes become the member size and, when
+    they disagree with the fapl, are printed into the error message -- observed
+    as "Family member size should be 139884291365632", a heap pointer rendered
+    as a decimal size.
+    Both measured through real family/split file sets opened with
+    H5Pset_fapl_family / H5Pset_fapl_split.
+  libhdf5_asan: >-
+    heap-buffer-overflow READ at src/H5FDfamily.c:602 (family) and
+    src/H5FDmulti.c:780 (multi), on BOTH carriers: via H5Fsuper.c:681 out of the
+    H5MM_malloc(len) made in H5O__drvinfo_copy, and via H5Fsuper_cache.c:951 out
+    of the 16 + len cache image.  The member-map defect reports separately on the
+    asan-ndebug build as an out-of-bounds stack access at src/H5FDmulti.c:785;
+    the assert-live build aborts on the assert instead, which is why the NDEBUG
+    arm is the one that witnesses it.
+  width: >-
+    UNMEASURED at 32 bits.  No width-dependent arithmetic is involved -- the
+    declared length is a u32 (block) or u16 (message) compared against small
+    constants, and the overflow distance is fixed by the driver's prefix, not by
+    pointer width -- so the defect is expected to be width-independent.  Recorded
+    as inferred, not measured.
+  canary: >-
+    MEASURED `unexercised` for all three fixtures: the validation_controls canary
+    is free_space (H5Fget_free_sections) and none of these files has a free-space
+    manager, so the canary cannot reach the defect.  The probe's own outcome is
+    `rejected_at_open` on all three, which is why require_oracle_alignment is set
+    -- but see the weak-agreement note in each expectation: libhdf5 refuses these
+    files at the driver-name check before reading a single body byte, so the
+    agreement is real and the REASON is not shared.
+
+containment:
+  h5policy: closed_in_bounded_path
+  libhdf5: >-
+    OUTSTANDING on develop.  Minimal fix: give H5FD_sb_load and the sb_decode
+    callback signature the buffer length, and have each driver reject a body
+    below its own prefix.  Short of the signature change, both call sites already
+    know the length and can enforce a per-driver minimum before dispatching.
+    Independently, promote the UNIQUE_MEMBERS_CORE assert to a runtime error --
+    it guards a stack array index with attacker-controlled data, and
+    registry/cases/ already carries the general case for assert-only index
+    guards.  Low compatibility risk in both directions: no conforming writer
+    emits a body below the prefix its own driver writes, and no conforming writer
+    emits a member type outside H5FD_MEM_NTYPES.
+
+systemic:
+  semantic_boundary: >-
+    the driver-info body validated as a sized record against the requirements of
+    the driver its own name selects, before any VFD callback is dispatched.
+  status: closed_in_bounded_path
+  owner: h5policy (bounded decoder); libhdf5 callback signature still open
+  landed_changes:
+    - h5policy/pickles/h5_walk.pk (driver minimum + member-map helpers)
+    - h5policy/pickles/h5_messages.pk (v2/v3 superblock-extension carrier)
+    - h5policy/pickles/h5_validate.pk (v0/v1 driver-info block carrier)
+    - registry/findings/catalog/validation_controls.yml
+    - registry/validation-coverage.yml (control.driver_info_body_minimum, control.driver_info_member_map)
+
+open_questions:
+  - >-
+    The name-template strlen at src/H5FDmulti.c:807 remains unbounded even for a
+    correctly sized body; closing it needs content validation, tracked in
+    registry/cases/multi-vfd-name-template-format-string.yml.
+  - >-
+    32-bit behaviour is inferred rather than measured; see measured.width.
+  - >-
+    Other sb_decode implementations (onion, splitter, subfiling) take the same
+    length-free callback.  H5FDsubfiling.c:1026 even passes `p + 9` into it from
+    a buffer it has already indexed.  None was audited here.
+
+method: >-
+  Derived from the external report's static claims, then re-measured locally
+  against develop 91f1dccfc74 with the asan and asan-ndebug builds.  Real family
+  and split file sets were created through the public API, their driver-info
+  length field patched, and the enclosing v2 object-header checksum repaired;
+  the v0/v1 carrier was reached by creating the same sets with
+  H5F_LIBVER_EARLIEST.  The h5policy rejection was first observed to be
+  INCIDENTAL -- H5_CORRUPT_DRVINFO_LENGTH fires on an equality test against the
+  enclosing message size -- and the specimen was rebuilt with a consistent
+  length before any coverage claim was made; that unmasked specimen returned
+  unsupported_coverage_gap, which is what established the gap this record closes.

@@ -1704,6 +1704,185 @@ def _make_drvinfo_block_header_truncated(path):
     _patch(path, bytes(raw))
 
 
+# The multi driver's 6-byte member map, as a real two-member split file encodes
+# it: slots 1..6 select member types 1 and 3, so UNIQUE_MEMBERS counts 2.  Taken
+# from a file written by H5Pset_fapl_split rather than invented, because the
+# minimum these fixtures test is derived from this count.
+_MULTI_MAP_SPLIT = bytes([1, 1, 3, 3, 1, 1])
+_MULTI_NTYPES = 7          # H5FD_MEM_NTYPES
+
+
+def _multi_body(map6, nseen):
+    """A driver-specific body of exactly the length the multi driver reads.
+
+    8 bytes of map + padding, then one 16-byte address/EOA pair per unique
+    member, then one 8-byte-aligned name template per unique member.  This is
+    the floor, not a typical size: a bare NUL name still occupies a full slot.
+    """
+    body = bytes(map6) + b"\x00" * (8 - len(map6))
+    body += b"\x00" * (nseen * 16)
+    body += (b"-m.h5\x00\x00\x00" * nseen)[:nseen * 8]
+    assert len(body) == 8 + nseen * 16 + nseen * 8
+    return body
+
+
+def _make_drvinfo_block_body_short_family(path):
+    """A driver-info block naming the FAMILY driver and carrying one body byte.
+
+    THE DIRECTION NO OTHER drvinfo FIXTURE TESTS.  Its siblings all claim MORE
+    than the file holds (_len_past_eof) or cannot fit their header
+    (_header_truncated).  This one is internally consistent -- the declared
+    length matches the bytes actually present and the whole extent is inside the
+    file -- and is still fatal, because the length is below what the NAMED
+    driver reads unconditionally.
+
+    H5FD_sb_load (src/H5FD.c:680) passes its callback `(file, name, buf)` and no
+    extent, so H5FD__family_sb_decode (src/H5FDfamily.c:602) runs an 8-byte
+    UINT64DECODE over a body of 1.  Measured on develop 91f1dccfc74: ASan
+    heap-buffer-overflow READ at that line, out of the 16 + len cache allocation
+    made at src/H5Fsuper_cache.c:951.
+
+    Unlike valid/drvinfo_block.h5 this fixture MUST name a real driver -- the
+    minimum exists only because libhdf5 dispatches on the name -- so libhdf5
+    under sec2 refuses it early with "family driver should be used".  That makes
+    the agreement here a weak one, and the measured witness above rather than
+    this fixture is what establishes the defect; the fixture's job is to stop
+    h5policy's bound from regressing.
+    """
+    _drvinfo_assemble(path, _drvinfo_block(drv_id=b"NCSAfami", body=b"\x00"))
+
+
+def _make_drvinfo_block_body_short_multi(path):
+    """A driver-info block naming the MULTI driver whose body stops after the
+    member map.
+
+    The regime its family sibling cannot express: 8 bytes clears the flat floor
+    both drivers share, so this file can only be rejected by computing the
+    multi-specific minimum from the map it carries -- 8 + nseen*16 + nseen*8,
+    which is 56 for the two members this map selects.  A bound that only checked
+    the floor would accept it and still leave the `memcpy(x, buf, nseen*2*8)` at
+    src/H5FDmulti.c:793 reading 32 bytes past the body.
+    """
+    body = bytes(_MULTI_MAP_SPLIT) + b"\x00" * 2
+    assert len(body) == 8, "must clear the shared floor, or this tests nothing"
+    _drvinfo_assemble(path, _drvinfo_block(drv_id=b"NCSAmult", body=body))
+
+
+def _make_drvinfo_block_member_map_undefined(path):
+    """A driver-info block naming the MULTI driver whose first map byte is 7.
+
+    ONE DEFECT, ISOLATED.  The body is exactly the length the map implies, so
+    the length bound cannot fire and the map value is the only thing wrong --
+    without that, a rejection here would prove nothing about the map check.
+
+    7 is H5FD_MEM_NTYPES itself, the first out-of-range value, so the fixture
+    pins the comparison as `>=` rather than `>`.  libhdf5 guards the member-type
+    index with an assert only (UNIQUE_MEMBERS_CORE, src/H5FDmulti.c:56-57) and
+    then does `SEEN[LOOPVAR]++` into a 7-element stack array.  Measured on an
+    ASan + NDEBUG build of develop 91f1dccfc74: out-of-bounds stack access at
+    src/H5FDmulti.c:785.
+    """
+    map6 = bytes([_MULTI_NTYPES]) + _MULTI_MAP_SPLIT[1:]
+    # slots select {7, 1, 3}: three unique members, so the body must be sized
+    # for three or the length bound would fire first and shadow the map value.
+    nseen = len({(v if v else i + 1) for i, v in enumerate(map6)})
+    assert nseen == 3, nseen
+    _drvinfo_assemble(path, _drvinfo_block(drv_id=b"NCSAmult",
+                                           body=_multi_body(map6, nseen)))
+
+
+def _v1_ohdr_chunks(raw, addr):
+    """Walk a v1 object header, returning [(chunk_start, chunk_end)] and nmesgs.
+
+    v1 headers carry no checksum, which is why these fixtures use `earliest`
+    libver: the same surgery on a v2 header would have to rewrite a Jenkins sum
+    over every edited chunk.
+    """
+    assert raw[addr] == 1, f"object header at {addr} is version {raw[addr]}"
+    nmesgs = struct.unpack_from("<H", raw, addr + 2)[0]
+    chunks = [(addr + 16, addr + 16 + struct.unpack_from("<I", raw, addr + 8)[0])]
+    i = 0
+    while i < len(chunks):
+        start, end = chunks[i]
+        p = start
+        while p + 8 <= end:
+            mtype, msize = struct.unpack_from("<HH", raw, p)
+            if mtype == 0x0010:          # continuation: [addr][len]
+                caddr, clen = struct.unpack_from("<QQ", raw, p + 8)
+                chunks.append((caddr, caddr + clen))
+            p += 8 + msize
+        assert p == end, f"chunk {start:#x} message walk ended at {p:#x}, not {end:#x}"
+        i += 1
+    return chunks, nmesgs
+
+
+def _make_name_message_empty(path):
+    """A v1 object header whose name message (0x0D) declares size 0.
+
+    H5O__name_decode (src/H5Oname.c:89) is the only `p_size - 1` site in libhdf5
+    that feeds a LENGTH rather than computing a p_end pointer, so a zero-size
+    message makes H5MM_strndup scan with SIZE_MAX.  The message is admitted
+    because H5_IS_BUFFER_OVERFLOW short-circuits on `(size) != 0`
+    (src/H5private.h:347) and 0 satisfies the alignment test at
+    src/H5Ocache.c:1280.
+
+    THE REGIME THAT DECIDES WHETHER THIS FIXTURE TESTS ANYTHING.  The scan must
+    begin at the END of the chunk image, or it finds a NUL among the bytes still
+    inside the allocation and reads nothing out of bounds.  So the 0x0D header is
+    moved to the last 8 bytes of its chunk -- body offset == chunk size -- and a
+    NULL message absorbs the space it vacated, filled with non-NUL bytes so the
+    disclosure is visible rather than silently zero.  A first attempt that left
+    the message where it was printed an empty comment and proved nothing.
+
+    Measured on develop 91f1dccfc74: `h5dump -H` exits 0 and prints the leaked
+    heap byte as the COMMENT value; under ASan, heap-buffer-overflow READ in the
+    strndup interceptor, 0 bytes past the H5FL_blk_malloc chunk image.
+    """
+    comment = b"a comment whose bytes are overwritten"
+
+    # A GROUP, not a dataset.  h5py puts a group's comment last in a freshly
+    # grown continuation chunk, while a dataset's is followed by the NULL
+    # message that pads chunk 0 -- and the surgery below needs the tail of the
+    # chunk to be free.  The assertion keeps that a checked property rather than
+    # an assumption, so a layout change fails the build instead of quietly
+    # producing a fixture that tests nothing.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with h5py.File(path, "w", libver="earliest") as h:
+        g = h.create_group("g")
+        h5py.h5o.set_comment(g.id, comment)
+        oh_addr = h5py.h5o.get_info(g.id).addr
+    raw = bytearray(open(path, "rb").read())
+
+    chunks, nmesgs = _v1_ohdr_chunks(raw, oh_addr)
+    hdr = raw.find(comment)
+    assert hdr > 8, "comment text not found in the file"
+    hdr -= 8
+    mtype, _msize = struct.unpack_from("<HH", raw, hdr)
+    assert mtype == 0x000D, f"expected a name message, got {mtype:#06x}"
+
+    start, end = next(c for c in chunks if c[0] <= hdr < c[1])
+    # Everything from the name message to the end of the chunk is rewritten, so
+    # nothing but NULL padding may be in the way.
+    replaced, p_walk = 0, hdr
+    while p_walk < end:
+        t, sz = struct.unpack_from("<HH", raw, p_walk)
+        assert p_walk == hdr or t == 0x0000, (
+            f"message {t:#06x} follows the name message in chunk "
+            f"{start:#x}..{end:#x}; it would have to be relocated, not absorbed")
+        replaced += 1
+        p_walk += 8 + sz
+    assert p_walk == end, "message walk overran the chunk"
+
+    null_size = end - hdr - 16
+    assert null_size >= 0 and null_size % 8 == 0, null_size
+
+    struct.pack_into("<HHB3x", raw, hdr, 0x0000, null_size, 0)   # NULL message
+    raw[hdr + 8:end - 8] = b"\xAA" * null_size                   # no NUL inside
+    struct.pack_into("<HHB3x", raw, end - 8, 0x000D, 0, 0)       # name, size 0
+    struct.pack_into("<H", raw, oh_addr + 2, nmesgs + 2 - replaced)
+    _patch(path, bytes(raw))
+
+
 def _gen_malformed(root):
     # ---- malformed/ : expected `reject_corrupt`, byte-patched from a base --
     base = f"{root}/valid/empty.h5"
@@ -1718,6 +1897,14 @@ def _gen_malformed(root):
         f"{root}/malformed/drvinfo_block_aliases_root_symtab.h5")
     _make_drvinfo_block_aliases_root_btree(
         f"{root}/malformed/drvinfo_block_aliases_root_btree.h5")
+    _make_drvinfo_block_body_short_family(
+        f"{root}/malformed/drvinfo_block_body_short_family.h5")
+    _make_drvinfo_block_body_short_multi(
+        f"{root}/malformed/drvinfo_block_body_short_multi.h5")
+    _make_drvinfo_block_member_map_undefined(
+        f"{root}/malformed/drvinfo_block_member_map_undefined.h5")
+    _make_name_message_empty(
+        f"{root}/malformed/name_message_empty.h5")
     _make_complex_size_not_twice_base(
         f"{root}/malformed/complex_size_not_twice_base.h5")
     _patch(f"{root}/malformed/bad_signature.h5",

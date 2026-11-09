@@ -1198,6 +1198,112 @@ fun h5policy_msg_u64_at = (int ios, H5PolicyProfile profile,
    its cache-load udata carries for the same reason. */
 var H5POLICY_BTREE_LEVEL_UNKNOWN = 0xffffffffffffffffUL;
 
+/* ---- driver-info body: the lower bound a VFD name implies ---------------- *
+
+   The driver-specific body is opaque to h5policy -- member files are not
+   modelled, and both driver-info decoders end in an explicit coverage refusal
+   saying exactly that.  A LOWER bound on its length is still soundly checkable
+   without modelling it, and the reason is structural: H5FD_sb_load
+   (src/H5FD.c:680) hands the VFD callback only `(file, name, buf)`.  There is
+   no length parameter, so a driver reads its fixed prefix unconditionally and
+   the declared body length is the only thing that decides whether those bytes
+   exist.  Both call sites size their allocation from that same length --
+   src/H5Fsuper_cache.c:951 (v0/v1 block, 16 + len) and src/H5Fsuper.c:681
+   (v2+ extension message, an H5MM_malloc(len) copied again in
+   H5O__drvinfo_copy) -- so a body SHORTER than the named driver reads is an
+   out-of-bounds read in libhdf5, measured on develop 91f1dccfc74 at both sites.
+
+   This is the opposite direction from control.driver_info_extent, which bounds
+   a body that claims MORE than the file holds.  Nothing bounded the other end,
+   and every existing drvinfo fixture tests only the too-large direction.
+
+   Only the two names libhdf5 itself dispatches on get a minimum.  Any other
+   driver id reaches a VFD with no sb_decode callback (or none at all), so there
+   is no prefix to require and the bound stays 0 -- that keeps this check from
+   inventing a constraint for drivers h5policy does not model. */
+var H5POLICY_DRVINFO_NAME_FAMILY = 0x696d61664153434eUL;   /* "NCSAfami", LE */
+var H5POLICY_DRVINFO_NAME_MULTI  = 0x746c756d4153434eUL;   /* "NCSAmult", LE */
+
+/* H5FD_MEM_NTYPES.  Each of the multi driver's 6 map bytes selects a member
+   type, and libhdf5 indexes a 7-element stack array with the value under an
+   assert only (UNIQUE_MEMBERS_CORE, src/H5FDmulti.c:56-57), so a byte >= 7 is
+   an out-of-bounds stack access once NDEBUG is set -- measured. */
+var H5POLICY_DRVINFO_MULTI_NTYPES = 7UL;
+
+fun h5policy_drvinfo_driver_known = (uint<64> name) int:
+{
+    return (name == H5POLICY_DRVINFO_NAME_FAMILY
+            || name == H5POLICY_DRVINFO_NAME_MULTI) ? 1 : 0;
+}
+
+/* 1-based index of the first map byte outside H5FD_MEM_NTYPES, or 0 when all
+   six are in range. */
+fun h5policy_drvinfo_multi_bad_map = (byte[] map6) uint<64>:
+{
+    var i = 0UL;
+    while (i < 6UL)
+        {
+            if ((map6[i] as uint<64>) >= H5POLICY_DRVINFO_MULTI_NTYPES)
+                return i + 1UL;
+            i = i + 1UL;
+        }
+    return 0UL;
+}
+
+/* Distinct member types the map selects, counted exactly as UNIQUE_MEMBERS
+   does: slot i (1..6) selects map[i-1], or i itself when map[i-1] is
+   H5FD_MEM_DEFAULT (0).  Written as a nested scan rather than a seen[] array
+   because six entries do not justify one, and because a `seen` array indexed
+   by the map byte is the very construct whose missing bound is the defect
+   above. */
+fun h5policy_drvinfo_multi_nseen = (byte[] map6) uint<64>:
+{
+    var n = 0UL;
+    var i = 0UL;
+    while (i < 6UL)
+        {
+            var vi = (map6[i] == 0UB) ? (i + 1UL) : (map6[i] as uint<64>);
+            var dup = 0;
+            var j = 0UL;
+            while (j < i)
+                {
+                    var vj = (map6[j] == 0UB) ? (j + 1UL) : (map6[j] as uint<64>);
+                    if (vj == vi)
+                        dup = 1;
+                    j = j + 1UL;
+                }
+            if (!dup)
+                n = n + 1UL;
+            i = i + 1UL;
+        }
+    return n;
+}
+
+/* Bytes the named driver reads before it consults anything it has decoded.
+   `map6` must hold the first six body bytes; the caller establishes that by
+   requiring H5POLICY_DRVINFO_BODY_FLOOR first.
+
+   family: one UINT64DECODE of the member size (src/H5FDfamily.c:602).
+   multi:  6 map bytes then `buf += 8`, then nseen address/EOA pairs copied
+           with a single memcpy (src/H5FDmulti.c:780,793), then one
+           NUL-terminated name template per unique member, each padded to an
+           8-byte boundary (:807).  A bare NUL still occupies a full slot, so
+           8 bytes per member is the true floor, not a guess -- a two-member
+           split file encodes exactly 8 + 2*16 + 2*8 = 56. */
+var H5POLICY_DRVINFO_BODY_FLOOR = 8UL;
+
+fun h5policy_drvinfo_body_minimum = (uint<64> name, byte[] map6) uint<64>:
+{
+    if (name == H5POLICY_DRVINFO_NAME_FAMILY)
+        return H5POLICY_DRVINFO_BODY_FLOOR;
+    if (name == H5POLICY_DRVINFO_NAME_MULTI)
+        {
+            var nseen = h5policy_drvinfo_multi_nseen(map6);
+            return H5POLICY_DRVINFO_BODY_FLOOR + nseen * 16UL + nseen * 8UL;
+        }
+    return 0UL;
+}
+
 /* Does a NUL byte appear anywhere in `size` bytes at `off`?
 
    The question every fixed-width on-disk string raises, because libhdf5 reaches
