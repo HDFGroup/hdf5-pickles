@@ -313,6 +313,70 @@ fun h5policy_validate_drvinfo_block = (int ios, H5PolicyProfile profile,
             return;
         }
 
+    /* The body's lower bound -- the direction control.driver_info_extent does
+       not cover.  The block's header is [version:1][reserved:3][len:4][id:8],
+       so the driver id sits at loc+8 and the body at loc+16.  libhdf5 sizes the
+       cache entry 16 + len (src/H5Fsuper_cache.c:908) and then hands
+       H5FD_sb_load a pointer just past the header with no extent
+       (src/H5Fsuper_cache.c:951), so a body shorter than the named driver's
+       fixed prefix is read out of that allocation. */
+    var drv_name = h5policy_read_u64_le_at(ios, profile, loc + 8#B, 8UL);
+    if (h5policy_drvinfo_driver_known(drv_name))
+        {
+            if (body_len < H5POLICY_DRVINFO_BODY_FLOOR)
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_DRVINFO_BODY_TOO_SHORT", "corrupt", loc + 4#B, object,
+                        "driver-info block body is shorter than the named driver reads",
+                        H5Evidence {
+                            field = "control.driver_info_body_minimum",
+                            actual = body_len,
+                            expected = H5POLICY_DRVINFO_BODY_FLOOR,
+                            comparison = "at_least",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = loc + 4#B, loc1_len = 4UL
+                        });
+                    return;
+                }
+            var map6 = h5policy_map_bytes(ios, profile, loc + 16#B, 6UL);
+            if (drv_name == H5POLICY_DRVINFO_NAME_MULTI)
+                {
+                    var bad = h5policy_drvinfo_multi_bad_map(map6);
+                    if (bad != 0UL)
+                        {
+                            h5policy_emit_error_ev(
+                                "H5_CORRUPT_DRVINFO_MEMBER_MAP", "corrupt",
+                                loc + 16#B + (bad - 1UL)#B, object,
+                                "driver-info block member map selects an undefined member type",
+                                H5Evidence {
+                                    field = "control.driver_info_member_map",
+                                    actual = map6[bad - 1UL] as uint<64>,
+                                    expected = H5POLICY_DRVINFO_MULTI_NTYPES - 1UL,
+                                    comparison = "at_most",
+                                    has_loc1 = 1, loc1_role = "actual",
+                                    loc1 = loc + 16#B + (bad - 1UL)#B, loc1_len = 1UL
+                                });
+                            return;
+                        }
+                }
+            var need = h5policy_drvinfo_body_minimum(drv_name, map6);
+            if (body_len < need)
+                {
+                    h5policy_emit_error_ev(
+                        "H5_CORRUPT_DRVINFO_BODY_TOO_SHORT", "corrupt", loc + 4#B, object,
+                        "driver-info block body is shorter than the named driver reads",
+                        H5Evidence {
+                            field = "control.driver_info_body_minimum",
+                            actual = body_len,
+                            expected = need,
+                            comparison = "at_least",
+                            has_loc1 = 1, loc1_role = "actual",
+                            loc1 = loc + 4#B, loc1_len = 4UL
+                        });
+                    return;
+                }
+        }
+
     /* The driver identification and the driver-specific bytes after it are
        consumed by a VFD and can name other files.  As on the message path, an
        opaque body that decodes cleanly is not a validated one, so a well-formed
@@ -609,9 +673,9 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
 
     /* A filtered chunk must be at least as large as the fixed framing its own
        pipeline consumes.  fletcher32 and szip each strip four bytes by plain
-       subtraction on a size_t (H5Zfletcher32.c:73, H5Zszip.c:298), so a stored
-       size of 1, 2 or 3 wraps the length to near SIZE_MAX exactly as 0 does --
-       all four values were measured to SIGSEGV the shipped build.  The zero case
+       subtraction on a size_t (H5Zfletcher32.c:107, H5Zszip.c:339); a stored size
+       of 0-3 wraps it to near SIZE_MAX -- measured to SIGSEGV every release (develop
+       floors both since cdb13c4de9c, H5Zfletcher32.c:96, H5Zszip.c:325).  The zero case
        is reported at the record itself, since it is invalid with or without
        filters; this is the rest of the rule, and it has to be here because the
        pipeline message and the chunk index arrive in either order.  */
@@ -634,7 +698,7 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
 
     /* The chunk's filter mask, against the pipeline it indexes.  A set bit says
        filter i was not applied to this chunk, and libhdf5 honours it: H5Z_pipeline
-       (H5Z.c:1404-1410) tests the bit per index and `continue`s, leaving *nbytes
+       (H5Z.c:1596-1602) tests the bit per index and `continue`s, leaving *nbytes
        at the size read from disk.
 
        A fully set mask is legitimate on its own -- libhdf5 sets it when the
@@ -648,7 +712,7 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
        MEASURED, h5py/libhdf5 1.14.5, chunk 5x5 int32 with fletcher32, mask 1 and
        stored size 8: H5Dread returns rc=0 and hands back 92 bytes of heap --
        including what decodes as a live pointer -- as dataset values.  2.3.0
-       rejects it, at the post-unfilter size check H5Dchunk.c:4855 added by
+       rejects it, at the post-unfilter size check H5Dchunk.c:5508 added by
        d926e3cbd0b (first released in 2.2.0); every earlier version has no such
        check anywhere in the function.
 
@@ -713,8 +777,8 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
 
     /* The parameterised filters copy four more words out of this object's own
        datatype and fill-value messages when the file is written, and compare
-       none of them back on read (H5Zscaleoffset.c:1146-1151 believes the
-       descriptor outright; H5Znbit.c:1105 and :1417 guard the second byte-order
+       none of them back on read (H5Zscaleoffset.c:1176-1181 believes the
+       descriptor outright; H5Znbit.c:1178 and :1547 guard the second byte-order
        arm with an assert, which is a no-op in a release build).  Each rule below
        is a strict tightening: the writer DERIVED the value from the message it
        is being compared against, so a conforming file always agrees.
@@ -785,7 +849,7 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
        version is a FALSE POSITIVE on files libhdf5 writes by default.
 
        (a) The word is an enumeration with exactly two members, 0 and 1
-           (H5Zscaleoffset.c:124-125).  The filter only ever tests it for
+           (H5Zscaleoffset.c:149-150).  The filter only ever tests it for
            equality with 1, so any other value silently means "no fill value"
            instead of being refused.
        (b) A 0 (FILL_UNDEFINED) contradicts an object header that carries an
@@ -841,10 +905,10 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
        Nothing re-derives that agreement on the read path.  A dataset whose
        dataspace declares a maximum extent the index was not sized for makes
        libhdf5 recompute a capacity from the file's own bytes and build native
-       state from it: H5Ocopy sizes a fresh destination data block that way and
-       aborts the process inside the metadata cache
-       (assert(entry_ptr->size < H5C_MAX_ENTRY_SIZE), H5Centry.c) once the
-       recomputed bitmask alone exceeds the 32 MB per-entry ceiling.
+       state from it: H5Ocopy sizes a fresh destination data block that way --
+       h5repack writes a 2.8 TB sparse file from a 2.4 KB one; asserts-live
+       builds before develop e170b318a1a instead aborted on the 32 MB per-entry
+       ceiling (H5C_MAX_ENTRY_SIZE, deleted by that commit).
 
        Note the invariant is the index CAPACITY, not curr_dims == max_dims: a
        bounded-but-growable dataset (maxshape (100,10), shape (10,10)) is

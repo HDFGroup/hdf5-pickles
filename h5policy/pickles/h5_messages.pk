@@ -238,6 +238,32 @@ fun h5policy_validate_fill_payload = (int ios,
  * writes address 0 and H5VL__native_blob_specific reports such an element as
  * null -- so it is skipped rather than flagged.  Flagging it would reject valid
  * files.  */
+/* A 16-bit-length-prefixed string inside a revised reference's heap blob --
+   the external file name or the attribute name.  H5R__decode_string checks only
+   that the two length bytes are present, then copies `length` bytes; its one
+   other test, assert(string_len <= H5R_MAX_STRING_LEN), compares a u16 with
+   1 << 16 and can never fire.  So the bound is taken here: the string must fit
+   the bytes left in the blob.
+   Measures only; the caller reports, so every message stays a literal the
+   registry can route.  Returns the blob-relative position after the string,
+   blob_size + 1 when the two length bytes themselves do not fit, or
+   blob_size + 2 when the string overruns -- with its declared length left in
+   h5policy_attr_ref_string_len for the evidence.  */
+var h5policy_attr_ref_string_len = 0UL;
+
+fun h5policy_attr_ref_string_end = (int ios, H5PolicyProfile profile,
+                                    offset<uint<64>,B> blob_off,
+                                    uint<64> blob_size, uint<64> pos) uint<64>:
+{
+    if (pos > blob_size || blob_size - pos < 2UL)
+        return blob_size + 1UL;
+    h5policy_attr_ref_string_len =
+        h5policy_msg_u64_at(ios, profile, blob_off + pos#B, 2UL);
+    if (h5policy_attr_ref_string_len > blob_size - pos - 2UL)
+        return blob_size + 2UL;
+    return pos + 2UL + h5policy_attr_ref_string_len;
+}
+
 var H5_ATTR_HEAP_ID_SWEEP_LIMIT = 64UL;
 
 fun h5policy_validate_attr_heap_ids = (int ios,
@@ -330,6 +356,42 @@ fun h5policy_validate_attr_heap_ids = (int ios,
                             eflags = h5policy_msg_u64_at(ios, profile,
                                                          value_off + (elem + slot + 1UL)#B,
                                                          1UL);
+                            /* A direct-copied type 2 has no blob: its element
+                               IS the encoding, [type][flags][token_size][token],
+                               and H5T__ref_disk_getsize hands H5R__decode the
+                               element's file-determined width -- o + 10, the
+                               MAX(4 + 2 + o + 4, 3 + o) of H5T__ref_set_loc --
+                               as the buffer size.  H5R__decode_obj_token bounds
+                               the token length only by H5O_token_t (16), never
+                               by that buffer, and copies it: at o = 8 a length
+                               of 16 reads one byte past the conversion buffer
+                               (measured, AddressSanitizer), at o = 2 seven.  In
+                               an attribute these bytes are metadata.  */
+                            if (etype == H5_DTYPE_REF_TYPE_OBJECT2
+                                && (eflags & H5_DTYPE_REF_FLAG_EXTERNAL) == 0UL)
+                                {
+                                    var inline_room = o + H5_DTYPE_REF_REVISED_ID_OFFSET
+                                                      + 4UL - 3UL;
+                                    var itsz = h5policy_msg_u64_at(
+                                        ios, profile,
+                                        value_off + (elem + slot + 2UL)#B, 1UL);
+                                    if (itsz > inline_room)
+                                        h5policy_emit_error_ev(
+                                            "H5_CORRUPT_REFERENCE_BLOB_EXTENT",
+                                            "corrupt",
+                                            value_off + (elem + slot + 2UL)#B,
+                                            object,
+                                            "attribute object reference token does not fit its element",
+                                            H5Evidence {
+                                                field = "attribute.reference_token_size",
+                                                actual = itsz,
+                                                expected = inline_room,
+                                                comparison = "at_most",
+                                                has_loc1 = 1, loc1_role = "actual",
+                                                loc1 = value_off + (elem + slot + 2UL)#B,
+                                                loc1_len = 1UL,
+                                            });
+                                }
                             /* Type 0 is the null-ish encoding libhdf5's isnull
                                routes to the blob check; a direct-copied type 2
                                has no blob.  Neither names a heap object.  */
@@ -443,6 +505,95 @@ fun h5policy_validate_attr_heap_ids = (int ios,
                                 loc1 = value_off + (elem + slot + 2UL)#B,
                                 loc1_len = 4UL,
                             });
+
+                    /* THE LENGTHS INSIDE A BLOB-BACKED REVISED REFERENCE, in
+                       the order H5R__decode reads them: [token_size][token],
+                       then the file name if H5R_IS_EXTERNAL, then the
+                       attribute name for H5R_ATTR.  Each length is copied by
+                       its decoder without being bounded by the blob
+                       (H5R__decode_obj_token, H5R__decode_string), and
+                       H5R_DECODE subtracts the claimed size unchecked, so one
+                       over-claim also disables the bounds that follow.  A
+                       region reference's token is bounded below, with its
+                       selection header, and is not reported twice.  */
+                    if (ref.found != 0UB && revised != 0 && kind == 7UL
+                        && etype != H5_DTYPE_REF_TYPE_REGION2)
+                        {
+                            var btsz = ref.data_size < 1UL ? 0UL
+                                       : h5policy_msg_u64_at(ios, profile,
+                                                             ref.data_off, 1UL);
+                            if (ref.data_size < 1UL || btsz > ref.data_size - 1UL)
+                                h5policy_emit_error_ev(
+                                    "H5_CORRUPT_REFERENCE_BLOB_EXTENT", "corrupt",
+                                    ref.data_off, object,
+                                    "attribute reference token does not fit its heap object",
+                                    H5Evidence {
+                                        field = "attribute.reference_token_size",
+                                        actual = btsz,
+                                        expected = ref.data_size > 1UL
+                                                   ? ref.data_size - 1UL : 0UL,
+                                        comparison = "at_most",
+                                        has_loc1 = 1, loc1_role = "actual",
+                                        loc1 = ref.data_off, loc1_len = 1UL,
+                                    });
+                            else
+                                {
+                                    var bpos = 1UL + btsz;
+                                    if ((eflags & H5_DTYPE_REF_FLAG_EXTERNAL) != 0UL)
+                                        {
+                                            var fstart = bpos;
+                                            bpos = h5policy_attr_ref_string_end(
+                                                ios, profile, ref.data_off,
+                                                ref.data_size, bpos);
+                                            if (bpos > ref.data_size)
+                                                h5policy_emit_error_ev(
+                                                    "H5_CORRUPT_REFERENCE_BLOB_EXTENT",
+                                                    "corrupt",
+                                                    ref.data_off + fstart#B, object,
+                                                    "attribute reference file name overruns its heap object",
+                                                    H5Evidence {
+                                                        field = "attribute.reference_string_length",
+                                                        actual = bpos == ref.data_size + 1UL
+                                                                 ? fstart + 2UL
+                                                                 : h5policy_attr_ref_string_len,
+                                                        expected = bpos == ref.data_size + 1UL
+                                                                   ? ref.data_size
+                                                                   : ref.data_size - fstart - 2UL,
+                                                        comparison = "at_most",
+                                                        has_loc1 = 1, loc1_role = "actual",
+                                                        loc1 = ref.data_off + fstart#B,
+                                                        loc1_len = 2UL,
+                                                    });
+                                        }
+                                    if (etype == H5_DTYPE_REF_TYPE_ATTR
+                                        && bpos <= ref.data_size)
+                                        {
+                                            var astart = bpos;
+                                            bpos = h5policy_attr_ref_string_end(
+                                                ios, profile, ref.data_off,
+                                                ref.data_size, bpos);
+                                            if (bpos > ref.data_size)
+                                                h5policy_emit_error_ev(
+                                                    "H5_CORRUPT_REFERENCE_BLOB_EXTENT",
+                                                    "corrupt",
+                                                    ref.data_off + astart#B, object,
+                                                    "attribute reference attribute name overruns its heap object",
+                                                    H5Evidence {
+                                                        field = "attribute.reference_string_length",
+                                                        actual = bpos == ref.data_size + 1UL
+                                                                 ? astart + 2UL
+                                                                 : h5policy_attr_ref_string_len,
+                                                        expected = bpos == ref.data_size + 1UL
+                                                                   ? ref.data_size
+                                                                   : ref.data_size - astart - 2UL,
+                                                        comparison = "at_most",
+                                                        has_loc1 = 1, loc1_role = "actual",
+                                                        loc1 = ref.data_off + astart#B,
+                                                        loc1_len = 2UL,
+                                                    });
+                                        }
+                                }
+                        }
 
                     /* Index 0 is the collection's free-space object and is
                        never handed out (H5HG_read refuses it outright), so the
@@ -1051,6 +1202,39 @@ fun h5policy_validate_drvinfo_payload = (int ios,
                                 "driver-info body length does not match the message size");
             return;
         }
+    /* The body's lower bound.  See h5policy_drvinfo_body_minimum in h5_walk.pk
+       for why a name implies one and why only two names get it: libhdf5 passes
+       its sb_decode callbacks no length at all, so the declared body length is
+       the only thing standing between the driver's fixed prefix and the end of
+       the H5MM_malloc(len) this message's body is copied into. */
+    var drv_name = h5policy_msg_u64_at(ios, profile, payload_off + 1#B, 8UL);
+    if (h5policy_drvinfo_driver_known(drv_name))
+        {
+            if (body_size < H5POLICY_DRVINFO_BODY_FLOOR)
+                {
+                    h5policy_emit_error("H5_CORRUPT_DRVINFO_BODY_TOO_SHORT", "corrupt",
+                                        payload_off + 9#B, object,
+                                        "driver-info message body is shorter than the named driver reads");
+                    return;
+                }
+            var map6 = h5policy_msg_bytes(ios, profile, payload_off + 11#B, 6UL);
+            if (drv_name == H5POLICY_DRVINFO_NAME_MULTI
+                && h5policy_drvinfo_multi_bad_map(map6) != 0UL)
+                {
+                    h5policy_emit_error("H5_CORRUPT_DRVINFO_MEMBER_MAP", "corrupt",
+                                        payload_off + 11#B, object,
+                                        "driver-info message member map selects an undefined member type");
+                    return;
+                }
+            if (body_size < h5policy_drvinfo_body_minimum(drv_name, map6))
+                {
+                    h5policy_emit_error("H5_CORRUPT_DRVINFO_BODY_TOO_SHORT", "corrupt",
+                                        payload_off + 9#B, object,
+                                        "driver-info message body is shorter than the named driver reads");
+                    return;
+                }
+        }
+
     if (object != "/<superblock-extension>")
         {
             h5policy_emit_error("H5_CORRUPT_DRVINFO_PLACEMENT", "corrupt",
@@ -1307,8 +1491,8 @@ fun h5policy_walk_fspace_manager = (
          if (fspace->nclasses > 0 && nclasses > fspace->nclasses)
              HGOTO_ERROR(... "section class count mismatch")   H5FScache.c:270
        -- where fspace->nclasses is the count the client registered: THREE for
-       the file client (H5MF_FSPACE_SECT_CLS_SIMPLE/SMALL/LARGE, src/H5MF.c:292
-       and :366) and FOUR for the fractal-heap client (SINGLE/FIRST_ROW/
+       the file client (H5MF_FSPACE_SECT_CLS_SIMPLE/SMALL/LARGE, src/H5MF.c:345
+       and :419) and FOUR for the fractal-heap client (SINGLE/FIRST_ROW/
        NORMAL_ROW/INDIRECT, src/H5HFspace.c:84).
        Found as a measured invariant-A' gap: libhdf5's H5Fget_free_sections
        refuses a header declaring 32515 classes while h5policy accepted the file
@@ -1850,7 +2034,7 @@ fun h5policy_validate_mdci_payload = (int ios,
                                present, it is merely this entry's own -- so
                                parent_addr_resolvable can never catch it, and the
                                entry's address is already in scope here.  libhdf5
-                               rejects the same shape at H5Centry.c:3836
+                               rejects the same shape at H5Centry.c:3839
                                ("Child entry flush dependency parent can't be
                                itself"), reached from H5Cimage.c:2547; a longer
                                cycle cannot be built, because parents resolve

@@ -453,7 +453,7 @@ records:
       # families that own those messages.
       - {id: datatype.single_value_budget, finding: H5_RESOURCE_SINGLE_VALUE_BYTES}
       - id: datatype.float_byte_order
-        finding: H5_CORRUPT_DATATYPE_FLOAT_BYTE_ORDER
+        finding: [H5_CORRUPT_DATATYPE_FLOAT_BYTE_ORDER, H5_CORRUPT_DATATYPE_VAX_FLOAT_SIZE]
       - id: datatype.float_normalization
         finding: H5_CORRUPT_DATATYPE_FLOAT_NORMALIZATION
       - id: datatype.opaque_tag_alignment
@@ -551,6 +551,10 @@ records:
       # registry/cases/complex-size-not-twice-base.yml.
       - {path: h5policy/tests/expected/valid-complex_dataset.yml, asserts: datatype.complex_encoding}
       - {path: h5policy/tests/expected/malformed-complex_size_not_twice_base.yml, asserts: datatype.complex_encoding}
+      # A VAX float whose size is not a multiple of 4: libhdf5 opens it and
+      # its word-swap conversion loop reads and writes one byte outside the
+      # element; the exact-build canary reads via the native type to reach it.
+      - {path: h5policy/tests/expected/malformed-bad_dtype_vax_float_size.yml, asserts: datatype.float_byte_order}
       - {path: h5policy/tests/unit_datatype.pk, asserts: [datatype.float_byte_order, datatype.message_complete, datatype.array_shape, datatype.enum_encoding, datatype.complex_encoding, datatype.float_fields, datatype.reference_type]}
       - {path: h5policy/tests/unit_limits.pk, asserts: datatype.single_value_budget}
     validators: {h5policy: enforced, hdf5: partial}
@@ -687,8 +691,8 @@ records:
         finding: H5_CORRUPT_FILTER_NELMTS_MISMATCH
       # The count itself, before any cd_values are read: libhdf5's own first
       # argument check in each decoder.  scale-offset requires exactly
-      # H5Z_SCALEOFFSET_TOTAL_NPARMS == 20 (H5Zscaleoffset.c:1122); n-bit is
-      # self-describing and requires cd_nelmts == cd_values[0] (H5Znbit.c:935).
+      # H5Z_SCALEOFFSET_TOTAL_NPARMS == 20 (H5Zscaleoffset.c:1152); n-bit is
+      # self-describing and requires cd_nelmts == cd_values[0] (H5Znbit.c:979).
       # libhdf5 refuses the read either way, so a file failing these was one
       # h5policy accepted and no reader could use.
       - id: layout.filter_param_count
@@ -857,13 +861,15 @@ records:
       - {path: h5policy/tests/expected/policy-chunk_4gib_layout_v4.yml, asserts: layout.chunk_size_version_advisory}
       - {path: h5policy/tests/expected/malformed-chunk_dim_product_wrap_v4.yml, asserts: layout.chunk_size_product}
       - {path: h5policy/tests/expected/malformed-chunk_dim_product_wrap_v5.yml, asserts: layout.chunk_size_product}
+      - {path: h5policy/tests/expected/malformed-chunk_dim_product_wrap_alloc_v5.yml, asserts: layout.chunk_size_product}
+      - {path: h5policy/tests/expected/malformed-chunk_dim_product_wrap_small_alloc_v5.yml, asserts: layout.chunk_size_product}
       - {path: h5policy/tests/expected/malformed-single_chunk_over_metadata.yml, asserts: layout.single_chunk_data_disjoint_from_metadata}
       - {path: h5policy/tests/expected/malformed-single_chunk_filtered_over_metadata.yml, asserts: layout.single_chunk_data_disjoint_from_metadata}
       - {path: h5policy/tests/expected/malformed-bad_layout_rank_mismatch.yml, asserts: layout.rank_match}
       - {path: h5policy/tests/expected/resource-tiny_chunks.yml, asserts: layout.chunk_size_budget}
       - {path: h5policy/tests/expected/malformed-filtered_dense_link_no_dblock_checksum.yml, asserts: layout.filtered_heap_checksum}
       # Class 3 is legal only from layout version 4 on, and libhdf5 refuses it
-      # below that through two different doors (H5Olayout.c:123 and :530).
+      # below that through two different doors (H5Olayout.c:124 and :531).
       - {path: h5policy/tests/expected/malformed-layout_virtual_version_v3.yml, asserts: layout.virtual_version}
       - {path: h5policy/tests/expected/malformed-layout_virtual_version_v1.yml, asserts: layout.virtual_version}
       # Negative control: the STORED size past EOF is a warning, never corrupt.
@@ -970,7 +976,7 @@ records:
       - {id: mdci.parent_addr_resolvable, finding: H5_CORRUPT_MDCI_PARENT_ADDR_UNRESOLVED}
       # A parent address that names the entry's OWN address is a distinct defect:
       # it always resolves, so parent_addr_resolvable can never see it. libhdf5
-      # rejects it one layer later, at H5Centry.c:3836 ("Child entry flush
+      # rejects it one layer later, at H5Centry.c:3839 ("Child entry flush
       # dependency parent can't be itself") via H5Cimage.c:2547 -- a different
       # diagnostic from the dangling case, hence a separate invariant. Longer
       # cycles need no invariant: parents resolve only against entries already
@@ -1218,7 +1224,7 @@ records:
       # chunk size; measured on 1.14.5, a record that claims the skip while
       # declaring a smaller size returns bytes past the chunk allocation as
       # dataset values at rc=0.  Fixed in 2.2.0 by the post-unfilter size check
-      # at H5Dchunk.c:4855.  The comparison is against the SAME object's
+      # at H5Dchunk.c:5508.  The comparison is against the SAME object's
       # pipeline, datatype and chunk dimensions, so a conforming file always
       # agrees: the writer built the mask from the pipeline it had just run.
       - {id: chunk.filter_mask_consistent, finding: H5_CORRUPT_CHUNK_FILTER_MASK}
@@ -1441,6 +1447,26 @@ records:
       # H5HF__hdr_compute_free_space loop with no reachable exit while indexing
       # three heap arrays.  See registry/cases/fractal-heap-doubling-table.yml.
       - {id: dense.fractal_doubling_table, finding: H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE}
+      # ---- fractal-heap HUGE objects ----
+      # A link message over H5G_FHEAP_MAX_MAN_SIZE (4096, src/H5Gdense.c) is not
+      # in a managed direct block at all: libhdf5 writes it as a standalone file
+      # extent and indexes it in a SECOND v2 B-tree, so the name index's heap ID
+      # is that tree's key rather than a doubling-table offset.  A long
+      # soft-link target or external-link value reaches this on its own, and a
+      # group whose links are ALL huge has no managed blocks, so its
+      # doubling-table root address is legitimately undefined.  The whole regime
+      # used to leave this family at dense.decode_coverage.
+      - {id: dense.btree_root_count, finding: H5_CORRUPT_V2_BTREE_ROOT_COUNT}
+      - {id: dense.huge_object_locator, finding: H5_CORRUPT_FRACTAL_HEAP_HUGE_OBJECT}
+      # The heap object's extent is EXACT -- H5G__dense_insert sizes the buffer
+      # with H5O_msg_raw_size and H5HF_insert stores precisely that many bytes
+      # -- so a link message that stops short leaves bytes no reader looks at.
+      # That is the on-disk signature of the H5Olink.c encode/size disagreement:
+      # H5O__link_size reserves 2 + strlen(target) while H5O__link_encode writes
+      # 2 + (uint16_t)strlen(target), and the unwritten remainder of the buffer
+      # reaches the file uninitialised.  Nothing INSIDE the message can show it;
+      # only the container's extent can.
+      - {id: dense.link_message_extent, finding: H5_CORRUPT_LINK_MESSAGE_TRAILING_BYTES}
     backlog:
       validator: h5policy dense-link/index validators (existing implementation; slice pending)
       stable_findings: [H5_CORRUPT_DENSE_INDEX_COUNT_MISMATCH, H5_CORRUPT_DENSE_NAME_INDEX_DUPLICATE_ID, H5_CORRUPT_FRACTAL_HEAP_ID]
@@ -1451,6 +1477,14 @@ records:
       ci_checks: count consistency, ID uniqueness, heap bounds, and no-crash assertions
     tests:
       - {path: h5policy/tests/expected/valid-dense_links.yml, asserts: dense.count_match}
+      # The huge-object regime.  Two valid fixtures, because the difference is
+      # structural: dense_links_huge keeps a MANAGED object beside the huge one
+      # (so the doubling-table root stays defined), dense_links_huge_only has no
+      # managed blocks at all (so the root is legitimately UNDEFINED, which is
+      # the path that used to return the whole file as a coverage gap).
+      - {path: h5policy/tests/expected/valid-dense_links_huge.yml, asserts: dense.huge_object_locator}
+      - {path: h5policy/tests/expected/valid-dense_links_huge_only.yml, asserts: dense.huge_object_locator}
+      - {path: h5policy/tests/expected/malformed-dense_link_heap_object_slack.yml, asserts: dense.link_message_extent}
       # dense.btree_record_type had NO test at all until these two: the rule was
       # declared here and in the heap family, and nothing pinned it.  Two
       # fixtures because the link and attribute walkers hardcode different
@@ -1763,7 +1797,7 @@ records:
       # The sibling arm: two lengths live in one filtered huge record -- the
       # stored length the pipeline consumes and the decoded size that sizes the
       # caller's buffer -- and libhdf5 never relates them
-      # (src/H5HFhuge.c:749-761).  Decidable without decoding wherever the
+      # (src/H5HFhuge.c:750-762).  Decidable without decoding wherever the
       # filter's output extent is a function of its client data; silent, by
       # design, where it is not.
       - {id: sohm.filtered_huge_decoded_size, finding: H5_CORRUPT_SOHM_FILTERED_HUGE_DECODED_SIZE}
@@ -1985,7 +2019,7 @@ records:
       # a file-supplied count.  In an ATTRIBUTE those bytes are metadata, so the
       # same sizer the VDS layout uses is applied here -- one validator, two
       # roles (h5policy_selection_size, ROLE_PARAMS in tools/message_routing.py).
-      - {id: attribute.reference_blob_extent, strategy: '§5 — a reference blob''s token width and declared selection size fit its heap object', finding: 'H5_CORRUPT_REFERENCE_BLOB_EXTENT'}
+      - {id: attribute.reference_blob_extent, strategy: '§5 — every self-described length in an attribute''s revised reference fits its buffer: the inline object token its o + 10-byte element, a blob''s token width, file and attribute name lengths and declared selection size its heap object', finding: 'H5_CORRUPT_REFERENCE_BLOB_EXTENT'}
       - {id: attribute.selection_extent, strategy: '§5 — the serialized selection sizes exactly within the heap object that holds it', finding: ['H5_CORRUPT_SELECTION', 'H5_CORRUPT_LENGTH_OVERFLOW']}
       - {id: attribute.selection_rank, strategy: '§5 — the serialized selection rank is 1..H5S_MAX_RANK', finding: 'H5_CORRUPT_SELECTION_RANK'}
       - {id: attribute.selection_flags, strategy: '§5 — the serialized selection sets no unknown flag bits', finding: 'H5_CORRUPT_SELECTION_FLAGS'}
@@ -2028,6 +2062,15 @@ records:
       - {path: h5policy/tests/expected/malformed-attr_region_sel_enc_size.yml, asserts: attribute.selection_enc_size}
       - {path: h5policy/tests/expected/malformed-attr_stdref_blob_token_size.yml, asserts: attribute.reference_blob_extent}
       - {path: h5policy/tests/expected/malformed-attr_stdref_blob_sel_bytes.yml, asserts: attribute.reference_blob_extent}
+      # The lengths libhdf5's reference decoder copies without bounding them by
+      # the reference buffer (H5R__decode_obj_token, H5R__decode_string); each
+      # fixture is an AddressSanitizer heap over-read on the exact build.  See
+      # registry/cases/attribute-reference-lengths-unbounded.yml.
+      - {path: h5policy/tests/expected/malformed-attr_ref_object_token_size.yml, asserts: attribute.reference_blob_extent}
+      - {path: h5policy/tests/expected/malformed-attr_ref_object_token_size_o4.yml, asserts: attribute.reference_blob_extent}
+      - {path: h5policy/tests/expected/malformed-attr_ref_file_name_length.yml, asserts: attribute.reference_blob_extent}
+      - {path: h5policy/tests/expected/malformed-attr_ref_attr_name_length.yml, asserts: attribute.reference_blob_extent}
+      - {path: h5policy/tests/expected/valid-attr_ref_lengths.yml, asserts: attribute.reference_blob_extent}
       - {path: h5policy/tests/expected/valid-attr_heap_ids.yml, asserts: [attribute.selection_extent, attribute.reference_blob_extent]}
       - {path: h5policy/tests/expected/valid-attr_stdref_region.yml, asserts: [attribute.selection_extent, attribute.reference_blob_extent]}
       # One fixture per target class and per encoding: the class decides the
@@ -2054,6 +2097,12 @@ records:
       # The empty-name check applies to a SOFT LINK entry too: libhdf5 resolves
       # every entry's name before it looks at the cache type (H5Gent.c:379-385).
       - {path: h5policy/tests/expected/malformed-softlink_empty_name.yml, asserts: envelope.link_name_nonempty}
+      # envelope.name_nonempty had a CHECK and a non-false-reject control but no
+      # malformed fixture until this one: unit_datatype.pk exercised it at the
+      # pickle level and valid/object_comment.h5 guarded the accept side, so
+      # nothing drove a real file through the rejection end to end.
+      - {path: h5policy/tests/expected/malformed-name_message_empty.yml, asserts: envelope.name_nonempty}
+      - {path: h5policy/tests/expected/valid-object_comment.yml, asserts: envelope.name_nonempty}
       - {path: h5policy/tests/expected/malformed-stab_heap_addr_undefined.yml, asserts: envelope.symbol_table_addresses_defined}
       - {path: h5policy/tests/expected/malformed-stab_btree_addr_undefined.yml, asserts: envelope.symbol_table_addresses_defined}
       # Positive control: defined addresses with no SNOD yet must accept.
@@ -2167,6 +2216,23 @@ records:
       - {id: control.btree_k_placement, finding: H5_CORRUPT_BTREEK_PLACEMENT}
       - {id: control.driver_info_encoding, finding: [H5_CORRUPT_DRVINFO_LENGTH, H5_CORRUPT_DRVINFO_MESSAGE_TOO_SMALL, H5_CORRUPT_UNSUPPORTED_DRVINFO_VERSION]}
       - {id: control.driver_info_placement, finding: H5_CORRUPT_DRVINFO_PLACEMENT}
+      # The LOWER bound on the driver-specific body, which is a different
+      # invariant from control.driver_info_extent above: that one bounds a body
+      # claiming MORE than the file holds, and nothing bounded the other end.
+      # H5FD_sb_load (src/H5FD.c:680) hands the VFD callback no extent at all,
+      # so the declared length is the only thing deciding whether the bytes a
+      # driver reads unconditionally exist. Only the two names libhdf5
+      # dispatches on carry a minimum; any other driver id reaches a VFD with no
+      # sb_decode callback, so inventing a bound for it would be unsound.
+      - {id: control.driver_info_body_minimum, finding: H5_CORRUPT_DRVINFO_BODY_TOO_SHORT}
+      # The multi driver's 6 map bytes each select a member type and libhdf5
+      # indexes a 7-element stack array with the value under an assert only
+      # (UNIQUE_MEMBERS_CORE, src/H5FDmulti.c:46-58), so a byte >= H5FD_MEM_NTYPES
+      # is an out-of-bounds stack WRITE once NDEBUG is set. This is the first
+      # invariant h5policy carries over multi/split member-map CONTENT; the name
+      # templates in the same body remain uncovered -- see
+      # registry/cases/multi-vfd-name-template-format-string.yml.
+      - {id: control.driver_info_member_map, finding: H5_CORRUPT_DRVINFO_MEMBER_MAP}
       # v0/v1 files carry driver info in a standalone block at the superblock's
       # driver-info address rather than in a superblock-extension message, so
       # its length has no containing object header to be bounded against. The
@@ -2231,12 +2297,15 @@ records:
       - {path: h5policy/tests/expected/malformed-bad_superblock_v0_status_flags_high.yml, asserts: control.superblock_status_flags_width}
       - {path: h5policy/tests/expected/malformed-drvinfo_block_bad_version.yml, asserts: control.driver_info_encoding}
       - {path: h5policy/tests/expected/malformed-drvinfo_block_len_past_eof.yml, asserts: control.driver_info_extent}
+      - {path: h5policy/tests/expected/malformed-drvinfo_block_body_short_family.yml, asserts: control.driver_info_body_minimum}
+      - {path: h5policy/tests/expected/malformed-drvinfo_block_body_short_multi.yml, asserts: control.driver_info_body_minimum}
+      - {path: h5policy/tests/expected/malformed-drvinfo_block_member_map_undefined.yml, asserts: control.driver_info_member_map}
       - {path: h5policy/tests/expected/malformed-bad_signature.yml, asserts: control.signature_valid}
       - {path: h5policy/tests/expected/integration-deep_link-strict.yml, asserts: control.link_depth}
       - {path: h5policy/tests/expected/integration-walk_operation_budget.yml, asserts: control.walk_operations}
       - {path: h5policy/tests/expected/integration-invalid_profile_before_io.yml, asserts: control.profile_valid}
       - {path: h5policy/tests/expected/integration-metadata_ratio-warning.yml, asserts: control.metadata_ratio_advisory}
-      - {path: h5policy/tests/unit_messages.pk, asserts: [control.btree_k_encoding, control.driver_info_encoding]}
+      - {path: h5policy/tests/unit_messages.pk, asserts: [control.btree_k_encoding, control.driver_info_encoding, control.driver_info_body_minimum, control.driver_info_member_map]}
       - {path: h5policy/tests/unit_fsinfo.pk, asserts: [control.fsinfo_complete, control.fsinfo_version_supported, control.free_space_page_size]}
       - {path: h5policy/tests/unit_limits.pk, asserts: [control.object_count, control.attribute_count, control.walk_operations, control.walk_time]}
       - {path: h5policy/tests/unit_consumer.pk, asserts: control.finding_limit}

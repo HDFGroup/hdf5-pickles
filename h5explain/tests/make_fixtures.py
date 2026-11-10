@@ -40,15 +40,53 @@ except ImportError:  # pragma: no cover
 from h5py import h5f, h5p
 
 
+def _loaded_libhdf5():
+    """The libhdf5 image already mapped into this process, or None.
+
+    h5py has been imported by the time this runs, so the library it is linked
+    against is mapped and /proc/self/maps names it exactly -- including when
+    the distribution renamed it (Debian's python3-h5py links
+    libhdf5_serial.so.310 out of /lib/<triplet>, which neither
+    find_library("hdf5") nor a search of the h5py package directory finds).
+    Returns None off Linux, where the caller falls back to searching by name.
+    """
+    try:
+        with open("/proc/self/maps", encoding="utf-8", errors="replace") as maps:
+            for line in maps:
+                fields = line.split(maxsplit=5)
+                if len(fields) < 6:
+                    continue
+                path = fields[5].strip()
+                base = os.path.basename(path)
+                if not base.startswith("libhdf5") or ".so" not in base:
+                    continue
+                # Only the core library: the companion wrappers (HL, C++,
+                # Fortran, tools) are mapped alongside it and share the prefix,
+                # and Debian spells the HL one libhdf5_serial_hl.so.310.
+                stem = base.split(".so", 1)[0]
+                if any(mark in stem for mark in ("_hl", "hl_", "_cpp", "_fortran",
+                                                 "_java", "_tools")):
+                    continue
+                if os.path.exists(path):
+                    return path
+    except OSError:
+        return None
+    return None
+
+
 def _find_libhdf5():
     """Locate the libhdf5 shared library that h5py itself is linked against.
 
     h5py's public API has no binding for H5Pset_shared_mesg_index() (used to
     build the SOHM fixture below), so that one property is set through a raw
-    ctypes call instead.  There is no portable way to ask h5py for the path
-    of the library it loaded, so this tries the same places h5py itself
-    would find it.
+    ctypes call instead.  Reading the already-mapped image is exact and comes
+    first; the name-based searches after it are fallbacks for platforms with
+    no /proc, and may name a *different* libhdf5 than the loaded one.
     """
+    loaded = _loaded_libhdf5()
+    if loaded:
+        return loaded
+
     found = ctypes.util.find_library("hdf5")
     if found:
         return found
@@ -64,7 +102,9 @@ def _find_libhdf5():
                 if name.startswith("libhdf5") and (".so" in name or name.endswith(".dylib")):
                     return os.path.join(dirpath, name)
 
-    for name in ("libhdf5.so", "libhdf5.dylib"):
+    # Distributions rename the library: Debian's python3-h5py links
+    # libhdf5_serial.so.310, which carries no plain libhdf5.so alias.
+    for name in ("libhdf5.so", "libhdf5.dylib", "libhdf5_serial.so"):
         try:
             ctypes.CDLL(name)
             return name

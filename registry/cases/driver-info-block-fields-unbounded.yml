@@ -20,7 +20,7 @@ schema_version: 1
 id: driver-info-block-fields-unbounded
 title: the driver-info block's address and length are both unbounded, and the
   decoder extends the EOA to cover whatever they claim
-status: partially-fixed-upstream # address half fixed in 2.3.0; length half live
+status: partially-fixed-upstream # address half fixed in 2.3.0; length half live and, since develop e170b318a1a, unguarded even by an assert
                                  # -- see address_trigger_fixed_upstream
 disclosure: >-
   n/a -- local analysis only.  No advisory database was consulted, no advisory
@@ -82,8 +82,11 @@ defect: >-
   applied by an independent check, because the value authorises itself and
   sizes the allocation within one callback.  `*actual_len` is what
   H5C__load_entry allocates.
-  Nothing between :254 and :908 bounds drvrinfo.len.  The only size guard on the
-  whole path remains the NDEBUG-compiled-out assert at src/H5Centry.c:3206.
+  Nothing between :254 and :908 bounds drvrinfo.len.  Until develop
+  e170b318a1a (2026-10-26) the only size guard on the whole path was an
+  NDEBUG-compiled-out assert against H5C_MAX_ENTRY_SIZE (H5Centry.c line 3206 at
+  44426bfc7d5); that commit deleted the constant and every assert using it, so
+  on develop there is no size guard at all, debug or release.
   THE ADDRESS is the other input to :279 and is equally unbounded.  A
   driver_addr past the end of the file is dereferenced rather than rejected:
   the 981f08d8 specimen sets byte 55 so the address becomes
@@ -91,12 +94,13 @@ defect: >-
   ZERO-FILLS past EOF (src/H5FDsec2.c), and the resulting all-zero prefix
   decodes as a valid EMPTY driver-info block.  The file is then accepted
   silently.  Measured identically under sec2, stdio and core.
-  THE ONLY SIZE GUARD ANYWHERE ON THIS PATH IS AN ASSERT.
-  src/H5Centry.c:3206 asserts against H5C_MAX_ENTRY_SIZE (32 MiB) and is
-  compiled out under NDEBUG -- so on a release build nothing limits the
-  allocation at all.  This is the "assert-only" explanation of invariant A for
-  the length, and the "unguarded" explanation for the address; the pair is
-  unusual in carrying both.
+  THE ONLY SIZE GUARD ANYWHERE ON THIS PATH WAS AN ASSERT, and it is gone.
+  Through 2.2.0 and develop before e170b318a1a, H5Centry.c (line 3206 at
+  44426bfc7d5) asserted against H5C_MAX_ENTRY_SIZE (32 MiB), compiled out under
+  NDEBUG -- so on a release build nothing limited the allocation.  This was the
+  "assert-only" explanation of invariant A for the length, and the "unguarded"
+  explanation for the address.  On develop both halves are now "unguarded":
+  the assert was deleted with the constant, not promoted.
 
 why_one_record: >-
   Line 279 is the argument.  `min_eoa = driver_addr + HDR_SIZE + len` takes
@@ -107,7 +111,8 @@ why_one_record: >-
   semantic boundary is the driver-info prefix AS A WHOLE against file geometry,
   which is one check in one place covering both fields.
   They differ in impact -- silent acceptance versus memory-amplification DoS --
-  and in guard status -- none versus assert-only -- which is why the record
+  and in guard status -- none versus assert-only (through 2.2.0; on develop
+  both are now none) -- which is why the record
   keeps them as separate `triggers` rather than merging their evidence.
 
 # -- The two fields -----------------------------------------------------------
@@ -148,15 +153,18 @@ triggers:
       MEMORY-AMPLIFICATION DoS.  ~3.95 GiB allocated during H5Fopen, before any
       object is materialised, from a small input.  Behaviour is build-dependent:
       an uncapped LP64 release build over-allocates and SUCCEEDS; the ASan build
-      aborts on the debug assert; 32-bit and address-space-capped runs reject
-      via allocation failure.
+      aborted on the debug assert (before develop e170b318a1a deleted it); 32-bit
+      and address-space-capped runs reject via allocation failure.
     oracle_finding: >-
       H5_CORRUPT_MAPPING_FAILED @ 0, object metadata.  NOTE the bundle's own
       caveat: the registry route to shared_messages_legacy/legacy.mapping is a
       mechanical mis-route, and the real defect is the driver-info length.  Not
       a false-accept -- h5policy is stricter at the superblock and refuses
       before the length is ever reached.
-    guard_status: assert-only (src/H5Centry.c:3206, H5C_MAX_ENTRY_SIZE, NDEBUG-out)
+    guard_status: >-
+      none on develop since e170b318a1a, which deleted H5C_MAX_ENTRY_SIZE and its
+      asserts; assert-only through 2.2.0 (H5Centry.c line 3206 at 44426bfc7d5,
+      NDEBUG-out).
 
 measurement_trap: >-
   READ THIS BEFORE RE-MEASURING THE LENGTH TRIGGER.  h5policy-probe applies a
@@ -247,6 +255,32 @@ length_trigger_status: >-
     verdict -- :908 leaves no room for one -- but the record would prefer
     measured to derived, and this is the one claim in it that is derived.
 
+length_trigger_remeasured_2026_10_30: >-
+    STILL LIVE ON DEVELOP, AND NOW WITH NO GUARD.  Measured on develop
+    6533bcc0f6a (2.3.0): baseline RelWithDebInfo, -DNDEBUG, no sanitizers,
+    settings_sha256 cdefcaceb228e7fc542084b690e2c46680d5e44d264fc3acd4d0197a04e519fa;
+    i386 arm RelWithDebInfo, -DNDEBUG, -m32, settings_sha256
+    c5c4d5580c7740cf908b6ac488a93b33fa922cf947f2e5670b85ddf1c7f3e1c9.
+    Workstation-local installs; paths not recorded.
+    A bare H5Fopen on the length specimen (sha256 2f739e35...feb404792), under
+    the same malloc/realloc size-logging interposer and a safe `ulimit -v`
+    (1.9 GB), reports `realloc(4235722264)` -- the identical request measured
+    2026-09-04 -- refused only by the cap, followed by the open failing.  The
+    i386 build makes the same request and fails on address space.
+    WHAT CHANGED UPSTREAM SINCE, and why neither change helps:
+      07129ce4eb9 (2026-10-20) made H5C__verify_len_eoa apply to every class.
+        The driver-info block was already a checked (speculative) class, and
+        its length extends the EOA to cover itself before the check runs, so
+        the check passes by construction -- exactly as length_trigger_status
+        predicted.
+      e170b318a1a (2026-10-26) deleted H5C_MAX_ENTRY_SIZE and every assert on
+        it, including the one this record called the only guard.  An asserts-
+        live build therefore no longer catches this either.
+    NOT MEASURED, deliberately: the uncapped success case.  sec2 zero-fills a
+    read past EOF, so a granted 3.95 GiB buffer would likely be fully touched;
+    with ~5 GB available on this host that is the run measurement_trap forbids.
+    No ASan run, for the reason given in length_trigger_followup_2026_09_04.
+
 length_trigger_followup_2026_09_04: >-
     CLOSED, PARTIALLY: RLIMIT_AS IS SETTABLE AGAIN.  This is exactly the kind
     of environmental block length_trigger_status names as transient rather
@@ -286,7 +320,7 @@ length_trigger_followup_2026_09_04: >-
     confirmation of the assert-only guard.  Both require an UNCAPPED run --
     ASan cannot run under ulimit -v at all (its shadow-memory reservation
     needs the address space), and the H5C_MAX_ENTRY_SIZE assert
-    (H5Centry.c:3206) fires only AFTER H5C__load_entry has already completed
+    (H5Centry.c line 3206 then) fires only AFTER H5C__load_entry has already completed
     the allocation, so an assert-live run pays the same cost before catching
     anything.  This host had only 4.6 GiB available (`free -h`) at
     measurement time -- too tight to risk either safely, per
@@ -298,7 +332,7 @@ length_trigger_followup_2026_09_04: >-
     src/H5Fsuper_cache.c:254" is now at :256 in the current tree
     (44426bfc7d5, the same revision the fsm-section-bin-range.yml addenda
     were checked against this session) -- checked directly. `:278-282`,
-    `:908`, and H5Centry.c:3206 all still match verbatim.
+    `:908`, and H5Centry.c line 3206 all still matched verbatim then.
 
 address_trigger_fixed_upstream: >-
     RESOLVED 2026-08-15: THE ADDRESS HALF IS FIXED UPSTREAM.  This was found
@@ -330,8 +364,9 @@ address_trigger_fixed_upstream: >-
       min_eoa = udata->driver_addr + H5F_DRVINFOBLOCK_HDR_SIZE + drvrinfo->len;
     `drvrinfo->len` is still decoded unchecked at :254 and still extends the
     EOA to cover itself, so it still self-authorises and still defeats
-    H5C__verify_len_eoa.  The only size guard remains the NDEBUG-compiled-out
-    assert at src/H5Centry.c:3206.
+    H5C__verify_len_eoa.  The only size guard was then the NDEBUG-compiled-out
+    assert at H5Centry.c line 3206 (44426bfc7d5); develop e170b318a1a has since
+    deleted it -- see length_trigger_remeasured_2026_10_30.
     THIS IS WHAT THE JOINT FRAMING PREDICTED.  why_one_record argued that
     bounding either field alone leaves :279 attacker-controlled, and named
     "bound the address alone and a 4 GiB length still moves the EOA" as the
@@ -414,9 +449,10 @@ containment:
     OUTSTANDING.  In H5F__drvrinfo_prefix_decode, before the extend_eoa block at
     src/H5Fsuper_cache.c:268-284, require that
     driver_addr + H5F_DRVINFOBLOCK_HDR_SIZE + drvrinfo->len lies within the
-    PHYSICAL file size, computed with checked arithmetic, and additionally that
-    drvrinfo->len does not exceed H5C_MAX_ENTRY_SIZE.  The second part is
-    promoting the existing assert at src/H5Centry.c:3206 to a real error.
+    PHYSICAL file size, computed with checked arithmetic.  This record
+    previously also proposed promoting the H5C_MAX_ENTRY_SIZE assert (H5Centry.c
+    line 3206 at 44426bfc7d5) to a real error; upstream went the other way and
+    deleted it in e170b318a1a, so the physical-size bound is now the whole fix.
     The ordering is still the point: the check must precede H5FD_set_eoa, or
     the length continues to authorise itself and every downstream EOA-relative
     test remains satisfied by construction.

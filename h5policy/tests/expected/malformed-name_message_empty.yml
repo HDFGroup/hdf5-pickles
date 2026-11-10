@@ -1,0 +1,62 @@
+# A v1 object header whose name message (type 0x0D) declares a size of 0.
+#
+# H5O__name_decode (src/H5Oname.c:89) is the only `p_size - 1` site in libhdf5
+# that feeds a LENGTH rather than computing a p_end pointer:
+#     H5MM_strndup((const char *)p, p_size - 1)
+# With p_size == 0 that argument is SIZE_MAX, so strndup scans forward from the
+# message body until it happens to find a NUL. The ~30 sibling sites that write
+# `p + p_size - 1` are safe by accident -- their p_end underflows to p - 1 and
+# H5_IS_BUFFER_OVERFLOW's `(ptr) > (buffer_end)` arm then rejects any nonzero
+# read.
+#
+# WHY THE MESSAGE IS ADMITTED IN THE FIRST PLACE. H5_IS_BUFFER_OVERFLOW
+# short-circuits on `((size) != 0)` (src/H5private.h:347), so the size-0 bounds
+# check at src/H5Ocache.c:1319 passes trivially, and 0 satisfies the alignment
+# test at :1280. The chunk loop is byte-driven, not count-driven, so nothing
+# else objects.
+#
+# THE REGIME THAT DECIDES WHETHER THIS FIXTURE TESTS ANYTHING. The scan must
+# begin at the END of the chunk image, or it finds a NUL among bytes still
+# inside the allocation and reads nothing out of bounds. The generator moves the
+# 0x0D header into the last 8 bytes of its chunk -- body offset == chunk size --
+# and asserts that nothing but NULL padding followed it. A first attempt that
+# left the message in place printed an empty comment and proved nothing.
+#
+# Measured on develop 91f1dccfc74: h5dump -H exits 0 and h5py opens and lists
+# the file, so this is a genuine invariant-A divergence and not a weak agreement
+# like its drvinfo neighbours. Under ASan, heap-buffer-overflow READ of size 11
+# in the strndup interceptor, 0 bytes past the H5FL_blk_malloc chunk image from
+# H5O__chunk_deserialize. Reached by plain `h5dump -H` and `h5ls -v` with no
+# special VFD and no API misuse.
+#
+# WHAT THE STOCK BUILD PRINTS IS HEAP-LAYOUT DEPENDENT, so this file does not
+# assert it. On a hand-built specimen of the same shape it printed COMMENT "1" --
+# a byte not present anywhere in the file. On this fixture the bytes past the
+# allocation happened to begin with a NUL and h5dump printed no COMMENT line at
+# all. The disclosure is real; its visible content is not deterministic, and
+# only the sanitized build makes the read itself visible.
+#
+# valid/object_comment.h5 is the paired non-false-reject control: a well-formed,
+# NUL-terminated comment must still be accepted.
+file: malformed/name_message_empty.h5
+profile: untrusted-strict
+expected_decision: reject_corrupt
+expected_exit: 2
+required_findings: [H5_CORRUPT_NAME_MESSAGE_EMPTY]
+forbidden_findings: [H5_CORRUPT_OFFSET_OUT_OF_FILE, H5_CORRUPT_MESSAGE_OVERRUN]
+h5cve:
+  # Deliberately NO require_oracle_alignment: libhdf5 accepts this file, so the
+  # divergence is by design and is tracked in registry/h5policy-diff-tolerances.yml
+  # against the case record rather than asserted here.
+  #
+  # MEASURED `verified`, which is the correct status and not a contradiction to
+  # fix. The message_envelope canary opens the file and walks it with H5Ovisit3;
+  # libhdf5 COMPLETES that exercise (2 of 2 objects) precisely because it accepts
+  # the corruption, and the out-of-bounds bytes come back as the comment string
+  # rather than as an error. A `verified` row on a malformed fixture is the
+  # normal signature of a silent-wrong-data defect. `unexercised` was written
+  # here first by analogy with the drvinfo neighbours, whose files libhdf5
+  # refuses at open; running the probe is what corrected it.
+  family: message_envelope
+  allowed_statuses: [verified]
+forbidden: [accept, unsupported_coverage_gap, crash, timeout, external_open, plugin_load, write]
