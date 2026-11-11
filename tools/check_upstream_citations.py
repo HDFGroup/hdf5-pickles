@@ -73,7 +73,15 @@ ROOT = Path(__file__).resolve().parents[1]
 # because both spellings are in use; the line range is optional and only its
 # first number is checked (the last line of a range is routinely a closing
 # brace, which is exactly what this checker rejects for a single citation).
-CITATION = re.compile(r"\b(?:src/)?(?P<file>H5[A-Za-z0-9_]*\.c):(?P<lo>\d+)(?:-(?P<hi>\d+))?")
+#
+# ONE directory segment is allowed before the file name, because the VFDs that
+# live in their own subdirectory -- `src/H5FDsubfiling/H5FDsubfiling.c`,
+# `src/H5FDonion/...`, `src/H5FDsplitter/...` -- are cited like any other
+# upstream file, and without this they matched as the bare `H5FDsubfiling.c`
+# and were reported as a file that does not exist.  Measured when this was
+# widened: exactly one citation in the tracked set newly matched, and it passed.
+CITATION = re.compile(
+    r"\b(?:src/)?(?P<file>(?:[A-Za-z0-9_]+/)?H5[A-Za-z0-9_]*\.c):(?P<lo>\d+)(?:-(?P<hi>\d+))?")
 
 # A line that carries no statement.  A citation landing here is drift: nobody
 # points a reader at a blank line or at the `*/` that ends a comment banner.

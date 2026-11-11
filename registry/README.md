@@ -191,8 +191,8 @@ Current verdicts, against libhdf5 2.3.0:
 
 | verdict | families |
 |---|---|
-| `enforced` | 7 |
-| `partial` — some invariants enforced, some not | 9 |
+| `enforced` | 6 |
+| `partial` — some invariants enforced, some not | 10 |
 
 Only `reject_corrupt` specimens count toward a verdict. Activation events
 (`external_open`), crashes and hangs are recorded separately, since a build can
