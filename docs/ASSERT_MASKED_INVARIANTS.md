@@ -1071,7 +1071,7 @@ object headers).
 **`h5policy` coverage: not a gap for either layer.** `--profile
 untrusted-strict` correctly rejects both mutants — the inner-entry
 corruption via `H5_CORRUPT_BAD_CHECKSUM`, "object-header checksum
-mismatch," at offset 48, `h5_validate.pk:1230 (checksum != stored_checksum)`; the outer-block corruption via the same code,
+mismatch," at offset 48, `h5_validate.pk:1283-1287 (checksum != stored_checksum)`; the outer-block corruption via the same code,
 "metadata cache image checksum mismatch," at offset 2766, `h5_messages.pk:2089 (image_checksum != stored_checksum)` — because
 `h5policy`'s own cache-image handling independently computes and verifies
 both the block's own checksum and each replayed entry's checksum against
@@ -1411,7 +1411,7 @@ dimension (10 → 867,583,393,802), leaving the Fixed Array's capacity at 4.
 **`h5policy` coverage: not a gap.** It rejects the file by comparing the
 stored capacity with the one the extent implies
 (`H5_CORRUPT_FIXED_ARRAY_EXTENT_MISMATCH`,
-`h5_validate.pk:955 (expected_nelmts != h5policy_fixed_array_nelmts)`). Full
+`h5_validate.pk:1009 (expected_nelmts != h5policy_fixed_array_nelmts)`). Full
 history in `registry/cases/fixed-array-extent-mismatch.yml`.
 
 **Why this sits here and not in the main table:** the relationship that

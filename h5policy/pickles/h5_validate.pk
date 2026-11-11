@@ -696,6 +696,60 @@ fun h5policy_finalize_ohdr_dataset = (H5WalkContext ctx,
                 loc2 = h5policy_pipeline_framing_offset#B, loc2_len = 1UL,
             });
 
+    /* THE N-BIT PACKED FLOOR.  n-bit writes the significant bits of every
+       element end to end, so a chunk's compressed stream is exactly
+       ceil(d_nelmts * bits_per_element / 8) bytes -- derived, not estimated,
+       which is what puts it inside a metadata-only oracle's reach.  A stored
+       size below that leaves the decompressor reading past its input buffer:
+       released libhdf5 hands the bytes it finds back as element values
+       (measured through h5py's bundled 1.14.5 -- uninitialized heap returned as
+       data, exit 0, no error), while develop refuses since a3cf1ea82cc (#6497,
+       in no tag yet) now that H5Z__nbit_decompress_one_byte bounds `*j` against
+       buffer_size.  So this rejects what every RELEASE still reads.
+
+       The floor is compared against the SMALLEST stored size in the object for
+       the same reason the framing floor is: one undersized record is enough.
+       A chunk whose mask disables n-bit stores raw bytes, which are wider than
+       the packed form, so it cannot trip this; the mask rule below is what
+       judges that case.
+
+       IT IS A FLOOR AND IS DELIBERATELY NOT TIGHTENED BY ONE.  libhdf5 ends the
+       compressed stream with `*buffer_size = new_size + 1` (H5Znbit.c), so every
+       chunk this rule evaluates stores exactly one byte more than the packed
+       bits require -- measured on seven compressing regimes: atomic at precision
+       16, 20 and 24, a two-member compound, and compounds carrying arrays of 2,
+       3 and 5 elements.  That byte is an artifact of one writer's loop, not a
+       format requirement, and a conforming writer may store more; a floor+1 rule
+       would be fitted to libhdf5's implementation rather than to the format.
+       The minimum a READER must be given is what the format fixes, and that is
+       what this compares.  Under-stating by one byte costs nothing -- the defect
+       this catches understates by the whole stream, not by a byte.  */
+    if (h5policy_pipeline_has_nbit_bits != 0UB
+        && h5policy_pipeline_has_decode_nelmts != 0UB
+        && h5policy_chunk_has_stored != 0UB)
+        {
+            var packed_bits = h5policy_checked_mul_u64(
+                h5policy_pipeline_decode_nelmts, h5policy_pipeline_nbit_bits,
+                0xffffffffffffffffUL - 7UL,
+                "H5_CORRUPT_LENGTH_OVERFLOW", "corrupt", loc, object,
+                "n-bit packed chunk extent overflows");
+            var packed_bytes = (packed_bits + 7UL) / 8UL;
+            if (h5policy_chunk_min_stored < packed_bytes)
+                h5policy_emit_error_ev(
+                    "H5_CORRUPT_CHUNK_STORED_SIZE", "corrupt", loc, object,
+                    "filtered chunk record is smaller than the n-bit packed element extent",
+                    H5Evidence {
+                        field = "chunk.stored_size",
+                        actual = h5policy_chunk_min_stored,
+                        expected = packed_bytes,
+                        comparison = "at_least",
+                        has_loc1 = 1, loc1_role = "actual",
+                        loc1 = h5policy_chunk_min_stored_offset#B, loc1_len = 4UL,
+                        has_loc2 = 1, loc2_role = "expected",
+                        loc2 = h5policy_pipeline_nbit_offset#B, loc2_len = 1UL,
+                    });
+        }
+
     /* The chunk's filter mask, against the pipeline it indexes.  A set bit says
        filter i was not applied to this chunk, and libhdf5 honours it: H5Z_pipeline
        (H5Z.c:1596-1602) tests the bit per index and `continue`s, leaving *nbytes
@@ -1134,6 +1188,9 @@ fun h5policy_validate_ohdr_raw = (int ios,
     h5policy_pipeline_chunk_framing = 0UL;
     h5policy_pipeline_has_framing = 0UB;
     h5policy_pipeline_framing_offset = 0UL;
+    h5policy_pipeline_nbit_bits = 0UL;
+    h5policy_pipeline_has_nbit_bits = 0UB;
+    h5policy_pipeline_nbit_offset = 0UL;
     h5policy_chunk_min_stored = 0UL;
     h5policy_chunk_min_stored_offset = 0UL;
     h5policy_chunk_has_stored = 0UB;

@@ -57,7 +57,7 @@ So the citation has to say what it points at, and the checker holds it to that:
 
 ```
 h5_datatype.pk:1243 (member_off > elm_size)
-h5_walk.pk:945 (H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS)
+h5_walk.pk:963 (H5_CORRUPT_SUPERBLOCK_EXTENSION_ALIAS)
 h5_group.pk:194-262 (h5policy_local_heap_data_addr, data_seg_addr)
 ```
 
@@ -225,7 +225,7 @@ and `h5cve verification` renders it `absent`. An empty annotation set with no
 such declaration still renders `not_assessed`, so the mechanism cannot be used
 to tidy a column -- it can only record a review that actually happened.
 
-**68 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
+**66 of 176 requirement-slots are currently `met`.** None is `not_assessed`. The distribution matters
 more than the total:
 
 - OSS-Fuzz integration is the only requirement still `absent` for every family.
@@ -377,7 +377,7 @@ more than the total:
 - Truncation is `met` for 12 families, `partial` for 4 whose seed exceeds the
   sweep budget, and `absent` for 0; see
   [`truncation-sweep.json`](truncation-sweep.json).
-- No-activation-on-failure is `met` for 8 families and `partial` for 8 because
+- No-activation-on-failure is `met` for 6 families and `partial` for 10 because
   the exact-build probe observes an activation or crash in those families.
   `external_file_list` joined that list on 2026-08-24 without libhdf5 changing:
   the probe's fallback single-element read moved from the origin to the last
