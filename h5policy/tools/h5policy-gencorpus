@@ -2335,6 +2335,8 @@ def _gen_malformed(root):
     _make_btree_v1_child_level(
         f"{root}/malformed/bad_btree_v1_child_level.h5",
         f"{root}/valid/chunked_v1_btree_deep.h5")
+    _make_group_btree_back_edge(
+        f"{root}/malformed/group_btree_back_edge.h5")
     _make_bad_group_btree_declared_size(
         f"{root}/malformed/bad_group_btree_declared_size.h5",
         f"{root}/valid/compact_layout.h5")
@@ -2710,6 +2712,114 @@ def _make_bad_group_btree_child_address(path, base_path):
     len_size = raw[14]
     child0 = tree + 8 + (2 * off_size) + len_size
     struct.pack_into("<Q", raw, child0, 0x2000_0000_0000_0430)
+    _patch(path, bytes(raw))
+
+
+def _type0_btree_nodes(raw, off_size, len_size):
+    """Every type-0 (group) v1 B-tree node: address -> (level, child addresses).
+
+    A type-0 node is signature(4) + type(1) + level(1) + entries(2) + two
+    sibling addresses, then `entries` repetitions of key(len_size) and
+    child(off_size).  Scanning for the signature finds the nodes without
+    walking object headers, and the node type byte keeps chunk (type 1) trees
+    out.
+    """
+    hdr = 8 + 2 * off_size
+    pair = len_size + off_size
+    out = {}
+    i = raw.find(b"TREE")
+    while i >= 0:
+        if raw[i + 4] == 0:
+            used = struct.unpack_from("<H", raw, i + 6)[0]
+            out[i] = (raw[i + 5],
+                      [struct.unpack_from("<Q", raw, i + hdr + k * pair + len_size)[0]
+                       for k in range(used)])
+        i = raw.find(b"TREE", i + 1)
+    return out
+
+
+def _make_group_btree_back_edge(path, links=4096):
+    """An old-style group whose v1 B-tree has a two-node CYCLE: an internal node
+    points back at its own ancestor.
+
+    THE REGIME IS THE POINT, which is why this generator builds its own base
+    instead of patching a small one.  A cycle in a version-1 B-tree needs a tree
+    at least three levels deep: the back edge has to leave a node whose level is
+    above 0 (so the child slot is read as a node pointer and not as a symbol
+    table) and land on a node that is not its own parent (a self-pointer is the
+    one shape libhdf5 already catches, at src/H5B.c:386).  A shallow group tree
+    cannot express that at all -- with a level-1 root the only node above leaf
+    level IS the root, so every back edge degenerates into a self-pointer.  The
+    links are hard links to one dataset, which cost a heap name and a symbol
+    table entry each rather than an object header, so the depth is reached in
+    ~400 KiB.
+
+    EVERY STORED LEVEL STAYS SELF-CONSISTENT.  Nothing is forged: the ancestor
+    still declares its own level, the node still declares one below it, and the
+    only thing wrong with the file is that one child address names a node
+    already on the path.  That is what separates this fixture from
+    bad_btree_v1_child_level.h5, where a level byte is rewritten and the
+    parent/child relation is visibly broken at the first decode.  Here the
+    relation is broken only on the ARRIVAL THAT IS NEVER DECODED -- the target
+    is already in the reader's cache -- so a level check cannot see it and only
+    a repeated-address rule can.
+
+    Measured on libhdf5 2.3.0 (develop 78c25cf819f): H5Fopen succeeds, and a
+    by-name open of a link under the affected subtree recurses between the two
+    nodes until the stack is exhausted (SIGSEGV; AddressSanitizer reports
+    stack-overflow with alternating H5B_find_helper frames).  h5stat crashes the
+    same way through H5B__get_info_helper, h5dump -H rejects the file on the
+    iterate path, and h5ls -r exits 0 while silently omitting the subtree.
+    """
+    fd, base = tempfile.mkstemp(suffix=".h5")
+    os.close(fd)
+    try:
+        with h5py.File(base, "w", libver="earliest") as h:
+            g = h.create_group("g")
+            # track_times=False keeps the fixture byte-reproducible; old-style
+            # group headers carry no modification time of their own.
+            g.create_dataset("d", data=np.arange(2, dtype="i4"), track_times=False)
+            target = g["d"]
+            for i in range(links):
+                g["m%x" % i] = target
+        raw = bytearray(open(base, "rb").read())
+    finally:
+        os.unlink(base)
+
+    if raw[8] != 0:
+        raise RuntimeError("expected a v0 superblock")
+    off_size, len_size = raw[13], raw[14]
+    nodes = _type0_btree_nodes(raw, off_size, len_size)
+
+    # Regime assertions.  A base-file or h5py change that makes the tree
+    # shallower must fail loudly here rather than quietly produce a fixture that
+    # tests nothing: with no node above level 1 there is no non-degenerate back
+    # edge to write.
+    deep = sorted(a for a, (level, kids) in nodes.items() if level >= 2 and kids)
+    if not deep:
+        raise RuntimeError(
+            "regime: no populated type-0 B-tree node at level 2 or above; "
+            f"levels present: {sorted({lv for lv, _ in nodes.values()})} "
+            f"({links} links)")
+    ancestor = deep[0]
+    anc_level = nodes[ancestor][0]
+    node = next((c for c in nodes[ancestor][1]
+                 if nodes.get(c, (None, []))[0] == anc_level - 1 and nodes[c][1]), None)
+    if node is None:
+        raise RuntimeError("regime: the level-%d node has no populated child one "
+                           "level below it" % anc_level)
+    if nodes[node][0] < 1:
+        raise RuntimeError("regime: the back edge must leave a node above leaf "
+                           "level, or its child slot is a symbol table and not a "
+                           "node pointer")
+    if node == ancestor:
+        raise RuntimeError("regime: a two-node cycle, not the self-pointer shape "
+                           "libhdf5 already rejects")
+
+    child0 = node + 8 + (2 * off_size) + len_size
+    if struct.unpack_from("<Q", raw, child0)[0] != nodes[node][1][0]:
+        raise RuntimeError("regime: node layout does not match the parsed child list")
+    struct.pack_into("<Q", raw, child0, ancestor)
     _patch(path, bytes(raw))
 
 

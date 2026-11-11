@@ -130,7 +130,7 @@ by a loop that writes every slot.
 
 **Measured:** one byte changed in a 2208-byte valid seed file
 (`max_nelmts_bits` 32→1). `h5policy --profile untrusted-strict` rejects it
-instantly, zero memory (`H5_CORRUPT_EXTENSIBLE_ARRAY_GEOMETRY`, `h5_chunkindex.pk:1456-1463 (max_nelmts_bits > 64UL)`, a
+instantly, zero memory (`H5_CORRUPT_EXTENSIBLE_ARRAY_GEOMETRY`, `h5_chunkindex.pk:1465-1472 (max_nelmts_bits > 64UL)`, a
 deliberate, comprehensive geometry check covering all six fields and their
 cross-relationships). A real build (h5py 3.14.0 / HDF5 1.14.6, arm64 macOS)
 opens the file fine, then an *ordinary* `dataset[...]` read causes:
@@ -755,7 +755,7 @@ turned up: for `page_bits == 0`, libhdf5 treats the array as paged
 (`nelmts > (1 << page_bits)` → `10 > 1`) and safely rejects the
 unpaged-on-disk data via a checksum mismatch, while `h5policy`'s
 `is_paged` test adds a `page_bits > 0` guard
-(`h5policy/pickles/h5_chunkindex.pk:786 (is_paged)`) and treats it as
+(`h5policy/pickles/h5_chunkindex.pk:795 (is_paged)`) and treats it as
 unpaged, accepting the file. Chased and ruled out as a coverage gap:
 `h5policy` is merely *more lenient* than libhdf5 here, which defends
 itself — no harmful file passes. It is an `h5policy` precision matter (the

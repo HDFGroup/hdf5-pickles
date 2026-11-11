@@ -1,0 +1,226 @@
+# A version-1 B-tree node address reached twice is a CYCLE, and the rule that
+# would catch it -- the child/parent level relation -- is skipped on exactly the
+# arrival that breaks it, in libhdf5 and in this oracle alike, for two different
+# reasons that amount to the same ordering mistake.
+#
+#   libhdf5   the level check lives in the metadata-cache DESERIALIZER
+#             (src/H5Bcache.c:174-176), so it runs on a cache miss.  A back edge
+#             names a node the walk already loaded -> cache hit -> no check.
+#   h5policy  the walk returned at the visited-B-tree set (h5_group.pk:456)
+#             before reaching its own level comparison at :497 -> no finding.
+#
+# Promoted from one working bundle (gitignored h5cve scratch; the specimen is
+# identified by provenance.input_sha256 below).  The tracked fixture is
+# generated, not the bundle's specimen: malformed/group_btree_back_edge.h5,
+# built by _make_group_btree_back_edge in h5policy/tools/h5policy-gencorpus.
+schema_version: 1
+
+id: v1-btree-node-address-repeats
+title: a version-1 B-tree node address reached twice was reported by nobody --
+  libhdf5 recurses between the two nodes to stack exhaustion because its level
+  check runs only on a cache miss, and h5policy returned silently at its
+  visited set before its own level check could fire
+status: oracle-hardened          # h5policy rejects; libhdf5 unfixed on find/get_info
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The triage that prompted
+  this case came from a locally saved third-party report; none of its version or
+  disclosure statements is reproduced here as a claim, and nothing about
+  affected releases should be inferred from this record.
+
+# -- Triage -------------------------------------------------------------------
+record: btree_heap_index
+versions: [1]                    # version-1 B-tree node format
+root_cause_classification: aggregate_object
+violated_invariant:
+  - btree.no_cycle
+  - chunk.btree_no_cycle         # same finding, chunk-index role, route-sharded
+validation_closure: >-
+  the set of version-1 B-tree node addresses already reached in the current tree
+  walk, together with each node's stored level and the level its parent implies.
+  Either closes the back edge and neither is redundant: the address set names the
+  structure, the level names the one edge that disagrees -- and that edge is the
+  one no decoder visits twice.  A single node does not close it; every node in
+  the specimen is self-consistent.
+activation_before_validation:
+  # The cache loads and deserializes each node image before any consumer compares
+  # its level with what its parent implied, and on a cache hit not even that.
+  - native_construction
+entry_points:
+  - h5policy (oracle) -- untrusted-strict now rejects; accepted before this change
+  - "libhdf5 public API: H5Fopen -> H5Gopen2 on a name below the subtree -> H5B_find_helper (SIGSEGV)"
+  - "libhdf5 public API: H5Gget_info -> H5B__get_info_helper (SIGSEGV; reached by h5stat)"
+  - "shipped tools: h5stat crashes; h5ls -r exits 0 with the subtree silently absent; h5dump -H rejects"
+  - h5policy-probe --exercise btree -- does NOT reach it, see probe_blind_spot
+
+# -- The defect, read out of the source tree (HDF5 2.3.0, develop 78c25cf819f) -
+defect: >-
+  Five call sites in src/H5B.c set cache_udata.exp_level.  Only two pass a real
+  expectation: H5B_find_helper (:355) and H5B__iterate_helper (:1139).  The
+  other four -- insert, remove, copy/delete and H5B__get_info_helper (:1861) --
+  pass H5B_UNKNOWN_NODELEVEL, so for them no level is ever checked at all.
+  The check itself is in the deserializer:
+    if (udata->exp_level != H5B_UNKNOWN_NODELEVEL)              /* H5Bcache.c:174 */
+        if (bt->level != (unsigned)udata->exp_level)            /* :175 */
+            HGOTO_ERROR(..., "level is not as expected, possibly corrupted");
+  H5AC_protect calls the deserializer only when the entry is not resident, and a
+  back edge by construction names a resident node, so this never executes for
+  the edge that is wrong.  The one cycle guard on the find path compares a child
+  against the current node only:
+    if (bt->child[idx] == addr)                                 /* H5B.c:386 */
+        HGOTO_ERROR(..., "cyclic B-tree detected");
+  Its own comment names the caching problem -- "thus bypassing the expected node
+  level check during deserialization and in the future if the node was cached" --
+  and then guards only the one-node shape of it.  Any cycle of length two or more
+  passes.
+  THE FIX ALREADY EXISTS ONE FUNCTION AWAY, which is the useful part for an
+  upstream proposal: H5B__iterate_helper repeats the comparison AFTER the protect,
+    if (exp_level != H5B_UNKNOWN_NODELEVEL && bt->level != (unsigned)exp_level)
+        HGOTO_ERROR(..., "B-tree node level is not as expected, possibly corrupted");
+  at src/H5B.c:1153, where a cache hit cannot bypass it.  That is why h5dump -H
+  rejects the specimen while an ordinary by-name open crashes on it.
+
+upstream_state: >-
+  Three partial fixes, none complete, dated by `git log -S` in the local tree:
+    a8ceb1d95bb  self-pointer guard, H5B_find_helper        tags 2.0.0 .. 2.2.0
+    5bdd379a645  deserialize-time level check               tags 2.0.0 .. 2.2.0
+    5933130b610  post-protect level check, iterate path     NO TAG (develop only)
+  The find and get_info paths carry no complete guard in any build measured here.
+  FIX BOUNDARY IS UNMEASURED: no older release was built, so "first affected
+  version" is not stated.  The unguarded recursion predates every commit above,
+  but that is source-derived, not measured.
+
+# -- Measurement --------------------------------------------------------------
+measured:
+  date: 2026-11-11
+  h5policy_commit: ee1073b                 # before this change landed
+  libhdf5: 2.3.0, develop 78c25cf819f      # newest build available here
+  baseline_settings_sha256: ab4429a32a5fc47719a0539f9e1fd58a9469393f29ecff0e0eb7fc1393b1c58e
+  candidate_settings_sha256: 5b5670f0444ed45dfb13605d07db5b0213de3ea3ce3bfc100b27c4740a0e0d2c
+  i386_settings_sha256: 55e677535b1f564ab4e4cfdbc8ea5ae7afc811bae5d5a0b0653d7d09385f5124
+  # Workstation-local installs; paths not recorded.  Baseline is RelWithDebInfo
+  # with asserts off; candidate is the same build mode with AddressSanitizer and
+  # NDEBUG; the i386 build is RelWithDebInfo, asserts off, ABI i386 against the
+  # other two's x86-64.
+  oracle_before: accept, 0 findings in untrusted-strict, forensic, and
+    untrusted-strict --continue-after-rejection
+  oracle_after: reject_corrupt, H5_CORRUPT_BTREE_CYCLE
+  libhdf5_by_name_open: >-
+    SIGSEGV, exit 139 (baseline and i386); the candidate reports
+    "AddressSanitizer: stack-overflow" with alternating H5B_find_helper frames
+  libhdf5_h5stat: SIGSEGV, exit 139
+  libhdf5_h5dump_H: exit 1, rejected on the iterate path
+  libhdf5_h5ls_r: exit 0, subtree silently absent
+  h5py_bundled_1_14_5: SIGSEGV on every access mode, including iteration -- it
+    predates all three partial fixes, so the differential's child process
+    crashes and is read as opens=False
+
+platform: >-
+  Measured on x86-64 and on i386 (-m32): SIGSEGV on both, control resolves on
+  both.  A recursion-depth defect, so pointer width changes the frame size and
+  therefore the depth at which the stack is exhausted, not whether it is.  No
+  32-bit AddressSanitizer libhdf5 exists here, so the i386 arm is a stock-build
+  crash observation and not a sanitizer report.
+
+probe_blind_spot: >-
+  h5cve verify --exercise btree reports outcome=rejected_in_traversal,
+  violations=none, canary status=unexercised for BOTH build roles, and that is a
+  blind spot rather than a safe rejection.  The exercise enters through
+  H5Lvisit2 (h5policy/tools/probe/h5probe.c:877) and only then opens each name
+  from btree_link_cb (:678).  H5Lvisit2 is the iterate path -- the one path
+  upstream hardened -- so it fails at src/H5B.c:1153, the per-name open never
+  runs, and the probe records a clean rejection for a file that crashes the same
+  library one API call later.  The tracked fixture declares
+  allowed_statuses: [unexercised] for this reason; read the verdict from the
+  bundle's by-name witness instead.  This is the shape where a probe's
+  accepted/rejected verdict is a false negative without a canary that exercises
+  the path.
+
+# -- Containment --------------------------------------------------------------
+containment:
+  status: implemented
+  description: >-
+    Both version-1 B-tree walkers now report a repeated node address instead of
+    returning silently: h5policy/pickles/h5_group.pk:456 (group role) and
+    h5policy/pickles/h5_chunkindex.pk:217 (chunk role), one finding
+    H5_CORRUPT_BTREE_CYCLE routed apart by message in
+    registry/findings/routes/H5_CORRUPT_BTREE_CYCLE.yml.  The emit costs
+    nothing: the membership test was already being performed for bounding, and
+    only its silent branch changed, so no walk operation is added.
+  rejected_alternative: >-
+    Moving the level comparison ahead of the visited-set short-circuit would
+    also reject this specimen, and was not chosen.  It names the symptom at one
+    edge rather than the structure, it would mis-attribute a cycle as a level
+    error, and it would still say nothing for a repeat that does not happen to
+    break the level relation.
+
+systemic:
+  semantic_boundary: >-
+    a node address reachable twice from one tree root is corruption, not
+    sharing: in a version-1 B-tree every node has exactly one parent.  This is
+    what distinguishes B-trees from the shared structures (SOHM, fractal-heap
+    blocks) where a second arrival can be legitimate.
+  status: closed
+  owner: unassigned
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  tracked_fixture: h5policy/tests/malformed/group_btree_back_edge.h5
+  generator: _make_group_btree_back_edge, h5policy/tools/h5policy-gencorpus
+  expectation: h5policy/tests/expected/malformed-group_btree_back_edge.yml
+  regime_assertions: >-
+    The generator refuses to emit unless a populated type-0 node exists at level
+    2 or above, the back edge leaves a node above leaf level, and the edge is not
+    a self-pointer.  All three are regime, not value: a shallower tree cannot
+    express a non-degenerate cycle at all, because with a level-1 root the only
+    node above leaf level is the root itself and every back edge collapses into
+    the self-pointer shape libhdf5 already rejects.  ~4096 hard links to one
+    dataset reach depth 3 in ~400 KiB; hard links cost a heap name and a symbol
+    table entry each rather than an object header.
+  non_vacuous: >-
+    MEASURED, not argued.  On the same fixture bytes with the emit absent,
+    h5policy returned accept with zero findings in all three profiles.  There is
+    exactly one fix in this change and reverting it alone restores that
+    acceptance, so the fixture cannot be passing for an unrelated reason.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+
+sibling_audit: >-
+  THE SELF-POINTER SHAPE: the same fixture with the child pointer rewritten to
+  the node's own address is REJECTED by libhdf5 (src/H5B.c:386) and was also
+  accepted with zero findings by h5policy before this change -- so the oracle gap
+  covered both cycle shapes while only the back-edge shape crashes.  Both are
+  rejected now, by the same rule.
+  CHUNK-INDEX (type 1) version-1 B-trees share H5B_find_helper and should carry
+  the same back edge; the oracle role is implemented and the invariant declared,
+  but NO chunk fixture was built, so the chunk role is unexercised by the corpus.
+  THE SNOD WALKER (h5_group.pk:272) still returns silently on a repeated
+  symbol-table-node address.  A repeated SNOD is duplication rather than a
+  cycle -- libhdf5 reads it twice and terminates -- so it is deliberately left
+  alone and recorded here rather than fixed blind.
+
+not_this_record: >-
+  A FORGED LEVEL byte is a different defect with its own fixture
+  (malformed/bad_btree_v1_child_level.h5, invariant chunk.btree_node_level): the
+  parent/child relation is visibly broken on the FIRST decode, and libhdf5's
+  deserialize-time check catches it from 2.0.0 on.  This record is about the
+  relation being broken only where no decode happens.  The two rules are
+  complementary and neither subsumes the other.
+
+coverage_manifest_change: >-
+  one new malformed fixture and one new finding code; no accept-side fixture
+  changes verdict (measured by rerunning the corpus, not assumed).
+
+compatibility_backport_risks: >-
+  low.  A repeated node address in a version-1 B-tree has no legitimate reading,
+  and object headers are deduplicated before their trees are walked, so hard
+  links to one chunked dataset do not walk its index twice.
+
+provenance:
+  input_sha256: 94affbc706b435b31d83d06d951eab76313504773827ebcfd2b514aced94fe5c
+  h5policy_commit: ee1073b
+  poke_version: GNU poke 4.3
