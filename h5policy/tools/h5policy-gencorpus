@@ -2337,6 +2337,8 @@ def _gen_malformed(root):
         f"{root}/valid/chunked_v1_btree_deep.h5")
     _make_group_btree_back_edge(
         f"{root}/malformed/group_btree_back_edge.h5")
+    _make_chunk_btree_back_edge(
+        f"{root}/malformed/chunk_btree_back_edge.h5")
     _make_bad_group_btree_declared_size(
         f"{root}/malformed/bad_group_btree_declared_size.h5",
         f"{root}/valid/compact_layout.h5")
@@ -2736,6 +2738,115 @@ def _type0_btree_nodes(raw, off_size, len_size):
                        for k in range(used)])
         i = raw.find(b"TREE", i + 1)
     return out
+
+
+def _type1_btree_nodes(raw, off_size, rank):
+    """Every type-1 (chunk) v1 B-tree node: address -> (level, child addresses).
+
+    A type-1 node interleaves nrec+1 keys with nrec children, and a chunk key is
+    chunk size(4) + filter mask(4) + (rank+1) eight-byte offsets -- the extra
+    offset is the element-size dimension libhdf5 appends to the chunk rank.  The
+    caller passes the dataset rank because the stride cannot be recovered from
+    the node itself.
+    """
+    key = 4 + 4 + (rank + 1) * 8
+    hdr = 8 + 2 * off_size
+    out = {}
+    i = raw.find(b"TREE")
+    while i >= 0:
+        if raw[i + 4] == 1:
+            used = struct.unpack_from("<H", raw, i + 6)[0]
+            out[i] = (raw[i + 5],
+                      [struct.unpack_from("<Q", raw, i + hdr + key + k * (key + off_size))[0]
+                       for k in range(used)])
+        i = raw.find(b"TREE", i + 1)
+    return out
+
+
+def _make_chunk_btree_back_edge(path, chunks=4200, chunk_elems=4096):
+    """A chunked dataset whose version-1 chunk index has a two-node CYCLE.
+
+    The chunk-index twin of group_btree_back_edge.h5, and it exists because the
+    same H5B_find_helper serves both: one rule, two roles, and a role with no
+    fixture is a rule nothing exercises.
+
+    THREE CONSTRAINTS FIX THE SHAPE, and they very nearly exclude each other:
+
+      depth     A back edge must leave a node above level 0, because a level-0
+                chunk node holds chunk RECORDS, not child pointers.  With a
+                level-1 root the only node above leaf level is the root, so
+                every back edge degenerates into the self-pointer libhdf5
+                already rejects (src/H5B.c:386).  Reaching level 2 takes more
+                than ~4096 chunks.
+      resource  untrusted-strict refuses a dataset with more than 4096 chunks
+                whose logical chunk is under 4 KiB (H5_RESOURCE_CHUNK_TOO_SMALL,
+                profile heuristics min_logical_chunk_bytes).  So the chunks must
+                be at least 4 KiB each -- and 4096+ chunks of 4 KiB is 16 MiB of
+                logical data.
+      size      which deflate removes: the data is all zeros, so each chunk
+                stores ~30 bytes and the fixture is ~330 KiB.
+
+    The back edge goes on the FIRST child of the first level-1 node, i.e. the
+    leftmost descent.  That is deliberate: a chunk lookup descends by offset, so
+    where the defect sits decides which reads reach it, and the leftmost descent
+    is the one a last-coordinate read never takes.
+
+    Measured on libhdf5 2.3.0 (develop 78c25cf819f): `h5dump -H` exits 0 --
+    the header path never walks the index -- while `h5dump -d /d` takes SIGSEGV.
+    """
+    fd, base = tempfile.mkstemp(suffix=".h5")
+    os.close(fd)
+    try:
+        with h5py.File(base, "w", libver="earliest") as h:
+            h.create_dataset("d", shape=(chunks * chunk_elems,),
+                             chunks=(chunk_elems,), dtype="u1",
+                             compression="gzip", compression_opts=1,
+                             data=np.zeros(chunks * chunk_elems, dtype="u1"),
+                             track_times=False)
+        raw = bytearray(open(base, "rb").read())
+    finally:
+        os.unlink(base)
+
+    if raw[8] != 0:
+        raise RuntimeError("expected a v0 superblock")
+    off_size, rank = raw[13], 1
+    nodes = _type1_btree_nodes(raw, off_size, rank)
+
+    # Regime assertions: without a level-2 node there is no non-degenerate back
+    # edge to write, and a base-file change that flattens the index must fail
+    # loudly rather than emit a fixture that tests nothing.
+    deep = sorted(a for a, (level, kids) in nodes.items() if level >= 2 and kids)
+    if not deep:
+        raise RuntimeError(
+            "regime: no populated type-1 B-tree node at level 2 or above; "
+            f"levels present: {sorted({lv for lv, _ in nodes.values()})} "
+            f"({chunks} chunks of {chunk_elems} elements)")
+    ancestor = deep[0]
+    anc_level = nodes[ancestor][0]
+    node = next((c for c in nodes[ancestor][1]
+                 if nodes.get(c, (None, []))[0] == anc_level - 1 and nodes[c][1]), None)
+    if node is None:
+        raise RuntimeError("regime: the level-%d node has no populated child one "
+                           "level below it" % anc_level)
+    if node == ancestor:
+        raise RuntimeError("regime: a two-node cycle, not the self-pointer shape "
+                           "libhdf5 already rejects")
+    # Every internal child must itself be a node, or the key stride is wrong and
+    # the "child pointer" being patched is really key bytes.
+    for addr, (level, kids) in nodes.items():
+        if level > 0:
+            for c in kids:
+                if raw[c:c + 4] != b"TREE":
+                    raise RuntimeError(
+                        f"regime: child {c} of node {addr} is not a B-tree node; "
+                        "the type-1 key stride does not match this file")
+
+    key = 4 + 4 + (rank + 1) * 8
+    child0 = node + 8 + 2 * off_size + key
+    if struct.unpack_from("<Q", raw, child0)[0] != nodes[node][1][0]:
+        raise RuntimeError("regime: node layout does not match the parsed child list")
+    struct.pack_into("<Q", raw, child0, ancestor)
+    _patch(path, bytes(raw))
 
 
 def _make_group_btree_back_edge(path, links=4096):

@@ -299,6 +299,8 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
     if (rank < 0) { st->call_errors++; goto done; }
     hsize_t nsel = 1;          /* elements in the selection (and in the buffer) */
     int swept = 0;             /* the selection covers every chunk */
+    int fallback_rank = 0;     /* >0: a single-element fallback ran, so
+                                * the origin still needs its own read */
     if (rank > 0) {
         hsize_t dims[H5S_MAX_RANK];
         if (rank > H5S_MAX_RANK ||
@@ -311,21 +313,41 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
             swept = nsel > 0;
         }
         if (!swept) {
-            /* One element, at the LAST coordinate rather than the origin.
+            /* BOTH ENDS: the origin and the last coordinate.
              *
-             * A calloc'd coordinate array selects element (0,...,0), whose byte
-             * offset within its chunk -- and within any record the element sits
-             * in -- is zero.  That is the one element an offset arithmetic
-             * defect cannot reach past: measured on a chunked dataset whose
-             * dimension product wraps to zero, reading the origin lands inside
-             * the (8-byte) allocation and returns cleanly, while reading
-             * element (1,0) segfaults, so the canary reported outcome=accepted
-             * on a specimen that segfaults h5dump.  See
-             * registry/cases/chunk-dim-product-64bit-overflow.yml.
+             * The last coordinate alone is not enough, and neither is the
+             * origin alone -- each misses what the other finds, so the
+             * selection carries both.
              *
-             * The last coordinate reaches the same code with a nonzero offset
-             * and costs nothing: the selection is still a single element, so
-             * the memory and file bounds are unchanged.
+             * WHY NOT THE ORIGIN ALONE.  A calloc'd coordinate array selects
+             * element (0,...,0), whose byte offset within its chunk -- and
+             * within any record the element sits in -- is zero.  That is the
+             * one element an offset arithmetic defect cannot reach past:
+             * measured on a chunked dataset whose dimension product wraps to
+             * zero, reading the origin lands inside the (8-byte) allocation and
+             * returns cleanly, while reading element (1,0) segfaults, so the
+             * canary reported outcome=accepted on a specimen that segfaults
+             * h5dump.  See registry/cases/chunk-dim-product-64bit-overflow.yml.
+             *
+             * WHY NOT THE LAST ALONE.  A chunk lookup descends the index by
+             * offset, so the element chosen decides which branch is walked: the
+             * last coordinate takes the RIGHTMOST descent and never sees a
+             * defect on the leftmost one.  This matters most exactly where the
+             * sweep gives up, because the two thresholds collide -- a version-1
+             * chunk B-tree needs MORE than PROBE_MAX_CHUNK_SAMPLES chunks
+             * before its tree is deep enough to hold a non-degenerate cycle, so
+             * every deep-tree defect lands in this branch by construction.
+             * Measured on malformed/chunk_btree_back_edge.h5: h5dump -d
+             * segfaults, while a last-coordinate read returns cleanly.
+             *
+             * TWO SEPARATE READS, not one two-point selection.  A selection
+             * spanning both ends couples them: one unreadable element fails the
+             * whole H5Dread, and the other end is never reached.  Measured when
+             * this was first written as a single 2-point selection:
+             * malformed/overflowing_efl_segment.h5 stopped recording its
+             * external_open activation entirely, because the origin read failed
+             * and took the last-coordinate read down with it.  The second read
+             * is issued separately, below, so each end stands on its own.
              */
             nsel = 1;
             coord = (hsize_t *)calloc((size_t)rank, sizeof *coord);
@@ -334,6 +356,7 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
                 st->chunk_sweep_skipped++;
             for (int i = 0; i < rank; i++)
                 coord[i] = dims[i] ? dims[i] - 1 : 0;
+            fallback_rank = rank;          /* the origin pass below is enabled */
         }
         if (H5Sselect_elements(space, H5S_SELECT_SET, (size_t)nsel, coord) < 0) {
             entry_point_result(st, EP_H5SSELECT_ELEMENTS, 0);
@@ -363,6 +386,31 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
      * coverage. */
     if (io >= 0 && st->exercise_chunk_index && chunked && swept)
         st->family_completed++;
+
+    /* THE OTHER END.  The fallback above read the last coordinate; this reads
+     * the origin, as its own selection and its own H5Dread so that neither end
+     * can suppress the other.  A chunk lookup descends by offset, so the two
+     * ends take different branches of the index -- and the branch that matters
+     * is the one the sweep cannot cover, because a version-1 chunk B-tree only
+     * grows deep enough to hold a cycle ABOVE PROBE_MAX_CHUNK_SAMPLES chunks.
+     * Measured on malformed/chunk_btree_back_edge.h5: the last coordinate reads
+     * cleanly while the origin segfaults. */
+    if (fallback_rank > 0) {
+        int origin_differs = 0;
+        for (int i = 0; i < fallback_rank; i++)
+            if (coord[i] != 0) { origin_differs = 1; break; }
+        if (origin_differs) {
+            memset(coord, 0, (size_t)fallback_rank * sizeof *coord);
+            if (H5Sselect_elements(space, H5S_SELECT_SET, 1, coord) >= 0) {
+                herr_t io0 = H5Dread(dset, dtype, memspace, space, H5P_DEFAULT, buf);
+                entry_point_result(st, EP_H5DREAD, io0 >= 0);
+                if (io0 < 0)
+                    st->call_errors++;
+                else
+                    st->data_reads++;
+            }
+        }
+    }
 
     /* Datatype canary: the read above uses the file's own type as the memory
      * type, so no datatype conversion runs.  A type the decoder accepts but
