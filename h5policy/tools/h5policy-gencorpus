@@ -1968,6 +1968,8 @@ def _gen_malformed(root):
         f"{root}/malformed/scaleoffset_fill_unavailable.h5")
     _make_scaleoffset_fill_avail_undefined(
         f"{root}/malformed/scaleoffset_fill_avail_undefined.h5")
+    _make_nbit_array_base_size_zero(
+        f"{root}/malformed/nbit_array_base_size_zero.h5")
     _make_nbit_byte_order_mismatch(
         f"{root}/malformed/nbit_byte_order_mismatch.h5")
     _make_nbit_chunk_stored_short(
@@ -3529,6 +3531,78 @@ def _make_nbit_chunk_stored_short(path):
             "(25 elements x 20 bits); the base file's precision or chunk shape "
             "changed and the floor this fixture violates is no longer 63")
     struct.pack_into("<I", raw, node + hdr, 1)
+    _patch(path, bytes(raw))
+
+
+def _build_nbit_array(h):
+    """A chunked n-bit dataset whose datatype is an ARRAY of reduced-precision
+    int32, which is the regime the atomic bases above cannot express.
+
+    H5Z__nbit_decompress dispatches on the TOP-LEVEL class word, and only the
+    ARRAY and COMPOUND arms enter H5Z__nbit_decompress_one_array -- the arm that
+    divides.  A dataset of plain atomics never reaches the division at all,
+    which is why the existing n-bit fixtures, all atomic, cannot carry this
+    defect.  The base keeps the 20-bit precision at offset 4 that makes the
+    filter do real work, so the pipeline is not a pass-through.
+
+    h5py has no high-level spelling for n-bit, an array datatype with a
+    reduced-precision base, or a write through one, so the datatype, the
+    pipeline and the memory type all go through the low-level API."""
+    base = h5py.h5t.STD_I32LE.copy()
+    base.set_precision(20)
+    base.set_offset(4)
+    atype = h5py.h5t.array_create(base, (3,))
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_chunk((5,))
+    dcpl.set_filter(5, 0, ())                    # 5 == H5Z_FILTER_NBIT
+    # The low-level creation path has no `track_times=False`, and _pin_ohdr_times
+    # only repairs VERSION 2 headers -- this file is libver="earliest", so its v1
+    # header carries an unsigned modification-time message with no signature to
+    # find it by.  Measured: without this the fixture drifted by one byte at
+    # offset 1020 between two regenerations in the same minute.
+    dcpl.set_obj_track_times(False)
+    sid = h5py.h5s.create_simple((20,))
+    d = h5py.h5d.create(h.id, b"d", atype, sid, dcpl=dcpl)
+    mtype = h5py.h5t.array_create(h5py.h5t.NATIVE_INT32, (3,))
+    d.write(h5py.h5s.ALL, h5py.h5s.ALL,
+            np.arange(60, dtype="i4").reshape(20, 3), mtype=mtype)
+
+
+def _make_nbit_array_base_size_zero(path):
+    """Zero the base-element size of an n-bit ARRAY node: a divide by zero on
+    libhdf5's read path, and on its write path too.
+
+    H5Z__nbit_decompress_one_array reads total_size and base_class, then takes
+    the next word as the base's size and computes `n = total_size / size`
+    (H5Znbit.c:1229 for an ATOMIC base, :1242 and :1259 for ARRAY and COMPOUND
+    bases).  Only the ATOMIC arm guards anything, and the guard it has --
+    `p.precision > p.size * 8 || (p.precision + p.offset) > p.size * 8` -- reads
+    `0 > 0` once the size is zero, so zeroing the precision and offset with it
+    walks straight past.  MEASURED on develop 2.3.0 (78c25cf819f): h5dump -d
+    dies with SIGFPE, exit 136.
+
+    The regime assertion below is the point of this fixture: it pins the whole
+    client-data array, so a change to the base's shape, precision or chunking
+    fails loudly instead of emitting a file whose patched word is no longer the
+    divisor the comment names."""
+    raw = _base_bytes(_build_nbit_array, libver="earliest")
+    off = _pipeline_cd_nelmts_offset(raw, 5)
+    nelmts = struct.unpack_from("<H", raw, off)[0]
+    name_len = struct.unpack_from("<H", raw, off - 4)[0]
+    cd = off + 2 + name_len
+    have = list(struct.unpack_from("<%dI" % nelmts, raw, cd))
+    #        nparms  need_not_compress  d_nelmts  class=ARRAY  total  base=ATOMIC
+    #        size    order              precision offset
+    want = [10,      0,                 5,        2,           12,    1,
+            4,       0,                 20,       4]
+    if have != want:
+        raise RuntimeError(
+            f"n-bit array base file changed: cd_values are {have}, expected "
+            f"{want}; this fixture would patch a word it was not written for")
+    for index, value in ((6, 0),      # base element size -> the zero divisor
+                         (8, 0),      # precision, so the one guard reads 0 > 0
+                         (9, 0)):     # offset, likewise
+        struct.pack_into("<I", raw, cd + 4 * index, value)
     _patch(path, bytes(raw))
 
 

@@ -1,0 +1,191 @@
+# The n-bit filter derives an ARRAY node's element count by DIVIDING one file
+# field by another, and nothing checks the divisor.  Zeroing it kills every
+# reader that decodes the data -- the shipped tools and the Python interpreter
+# alike -- with SIGFPE, on the newest build available.
+#
+# This is the sibling that registry/cases/nbit-chunk-stored-extent-unchecked.yml
+# recorded as noted-but-not-investigated.  It is now measured.
+schema_version: 1
+
+id: nbit-array-base-size-zero-divisor
+title: an n-bit array node's base element size is the divisor of libhdf5's own
+  element-count arithmetic, is read unchecked from the file, and may be zero
+status: oracle-hardened          # h5policy now rejects; libhdf5 is NOT fixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  This case was derived
+  from the local source tree and measured against local builds; it did not come
+  from any third-party report.
+
+# -- Triage -------------------------------------------------------------------
+record: dataset_layout_filter_fill
+versions: [2, 3]                 # filter-pipeline message versions
+root_cause_classification: local_decode
+violated_invariant:
+  - layout.nbit_array_base_size_nonzero
+validation_closure: >-
+  the n-bit descriptor's client-data array alone.  The divisor and the dividend
+  are adjacent words in the same message, so the check needs nothing else --
+  no chunk record, no datatype message, no dataspace.  That is what makes this
+  a pure parameter bound rather than a cross-record one, unlike the packed
+  extent in nbit-chunk-stored-extent-unchecked.
+activation_before_validation:
+  - decompression
+
+entry_points:
+  - h5policy (oracle) -- accept_with_warnings before this change, reject_corrupt now
+  - "libhdf5 H5Dread -> H5Z_pipeline -> H5Z__filter_nbit -> H5Z__nbit_decompress
+     -> H5Z__nbit_decompress_one_array"
+  - "shipped tools: h5dump -d, h5ls -d; NOT h5dump -H / h5ls / h5stat / h5debug"
+  - h5policy-probe --exercise dataset_layout -- outcome=crashed, signal=8
+
+# -- The defect ---------------------------------------------------------------
+defect: >-
+  H5Z__nbit_decompress_one_array reads an ARRAY node's total size and its base
+  class, then takes the next word as the base element's size and derives the
+  repeat count as a quotient of the two.  All three base-class arms divide:
+  `n = total_size / p.size` for an ATOMIC base (src/H5Znbit.c:1229) and
+  `n = total_size / base_size` for an ARRAY or a COMPOUND base (:1242, :1259).
+  The ARRAY and COMPOUND arms have no guard on the divisor at all.  The ATOMIC
+  arm has exactly one guard,
+    if (p.precision > p.size * 8 || (p.precision + p.offset) > p.size * 8)
+  which does not mention zero and passes trivially once the precision and
+  offset are zero as well, because it then evaluates `0 > 0`.  Every one of
+  those words is filter client data, so every one of them is a file field an
+  attacker writes.
+  THE SAME THREE DIVISIONS APPEAR ON THE WRITE PATH, in H5Z__nbit_compress's
+  helpers (:1578, :1585, :1596), equally unguarded.  That is why the bound is
+  stated on the parameters rather than on one direction of travel.
+
+reachability: >-
+  H5Z__nbit_decompress dispatches on the TOP-LEVEL class word, and its ATOMIC
+  arm loops d_nelmts times without dividing; only the ARRAY and COMPOUND arms
+  enter the dividing helper.  So the defect needs a dataset whose datatype is an
+  array, or a compound with an array member -- a regime no previous n-bit
+  fixture in this corpus expressed, all of them being atomic.  The gap was a
+  structural regime, not an untested value.
+
+upstream_state: >-
+  NOT FIXED, on develop or in any release.  a3cf1ea82cc (#6497, 2026-09-25)
+  hardened the n-bit decode path by threading a `buffer_size` through the
+  helpers and bounding the compressed-buffer index; it does not touch the
+  divisor, and the divisions above are quoted from the local develop checkout
+  AT 78c25cf819f, i.e. after that commit.  No separate guard was found anywhere
+  on either path.  Whether to report this upstream is the user's decision and
+  nothing here has been sent.
+
+# -- Measurement --------------------------------------------------------------
+measured:
+  date: 2026-11-11
+  libhdf5: 2.3.0, develop 78c25cf819f       # newest build available here
+  baseline_settings_sha256: ab4429a32a5fc47719a0539f9e1fd58a9469393f29ecff0e0eb7fc1393b1c58e
+  # Workstation-local install; path not recorded.  RelWithDebInfo, asserts off.
+  oracle_before: accept_with_warnings (H5_ADVISORY_DECODE_FILTER only)
+  oracle_after: reject_corrupt, H5_CORRUPT_NBIT_ZERO_BASE_SIZE
+  develop_2_3_0: >-
+    h5dump -d /d  -> SIGFPE, exit 136.  h5ls -d -> SIGFPE, exit 136.
+    h5dump -H, h5ls, h5stat and h5debug all exit 0: the metadata decodes
+    cleanly and only a reader that asks for the DATA divides.
+  h5py_bundled_1_14_5: >-
+    SIGFPE, exit 136.  The Python process dies inside the read; there is no
+    exception to catch and no partial result.  A library that opens untrusted
+    HDF5 files on behalf of a service loses the process on this file.
+  probe: >-
+    h5policy-probe --exercise dataset_layout: outcome=crashed, signal=8,
+    timed_out=false, activation counters all zero.
+
+platform: >-
+  Width-independent, and not merely assumed so: an integer division by zero
+  traps on both ILP32 and LP64 x86, and the divisor is a 32-bit file field on
+  either.  No width-dependent wrap is involved, so no -m32 witness adds
+  anything; none was built.
+
+# -- Containment --------------------------------------------------------------
+containment:
+  status: implemented
+  description: >-
+    h5policy/pickles/h5_layout.pk, h5policy_nbit_walk_params, ARRAY arm: the
+    base element's size word is already read there to derive the packed width,
+    and is now rejected when it is zero, before the recursion that would walk
+    the base type.  One check covers all three divisions, because all three
+    read the same index -- the word one past the base's class word -- whatever
+    the base class turns out to be.
+  why_not_the_existing_rule: >-
+    The walk ALREADY noticed a zero base size and declined to derive a width
+    from it (h5policy_nbit_bits_valid = 0), which is why the file was accepted
+    with warnings rather than mis-measured.  Declining to compute is not the
+    same as rejecting, and the difference is the whole finding: the oracle knew
+    the value was impossible and said nothing.
+  new_invariant_rather_than_nbit_parameters: >-
+    layout.nbit_parameters is about the parameter TREE -- classes known,
+    indices inside cd_nelmts, members inside their parent.  Every one of those
+    holds in this file.  This is a semantic bound on a single word, the same
+    distinction that already separates layout.nbit_atomic_bounds from the tree
+    invariant, so it gets its own id for the same reason.
+  false_positives_checked: >-
+    MEASURED: the full corpus and the external CVE specimen corpus were rerun
+    after the change.  No accept-side fixture changed verdict and no specimen
+    moved, which is the check that matters here -- libhdf5's own writer never
+    emits a zero base size, so a regime this rule could over-reject would have
+    to come from a real file rather than from a fixture.
+
+systemic:
+  semantic_boundary: >-
+    a divisor taken from a file must be proven non-zero before the division.
+    This is the n-bit instance; the same shape recurs wherever a decoder
+    derives a count by dividing one stored extent by another.
+  status: open
+  owner: unassigned
+  note: >-
+    NOT AUDITED HERE: the other stored-extent quotients in the filter and
+    datatype decode paths.  This record claims only the n-bit array arms.
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  tracked_fixture: h5policy/tests/malformed/nbit_array_base_size_zero.h5
+  fixture_sha256: 865863970a8c86e6f6c494e8f7d599d91cc4c6dca206e65ea267f6a19286eff7
+  generator: _make_nbit_array_base_size_zero, h5policy/tools/h5policy-gencorpus
+  base_builder: _build_nbit_array, same file
+  expectation: h5policy/tests/expected/malformed-nbit_array_base_size_zero.yml
+  regime_assertions: >-
+    The generator pins the ENTIRE client-data array of the base file --
+    [10, 0, 5, 2, 12, 1, 4, 0, 20, 4] -- and refuses to emit if any word
+    differs.  A change to the base's datatype, precision, array shape or chunk
+    shape therefore fails loudly instead of producing a file whose patched word
+    is no longer the divisor this record names.  The base also pins its object
+    times (set_obj_track_times(False)): the low-level creation path has no
+    track_times argument and _pin_ohdr_times only repairs version-2 headers,
+    and without the pin the fixture drifted by one byte between regenerations.
+  non_vacuous: >-
+    MEASURED: with this one emit disabled and nothing else changed, h5policy
+    returned accept_with_warnings on the same bytes, carrying only
+    H5_ADVISORY_DECODE_FILTER.  Every other parameter in the file is
+    consistent, so no neighbouring rule fires on it.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+
+sibling_audit: >-
+  THE WRITE PATH carries the identical three divisions (H5Znbit.c:1578, :1585,
+  :1596) and is reached by h5repack -f NBIT and by any application writing
+  through a pipeline whose parameters came from a file.  The parameter bound
+  implemented here covers both directions because it is stated on the
+  parameters, but no write-path reproducer was built and no write-path
+  behaviour was measured.
+  THE COMPRESSED-BUFFER OVER-READ in the same filter is a different defect with
+  its own record, registry/cases/nbit-chunk-stored-extent-unchecked.yml: that
+  one is fixed on develop and live in every release, this one is live
+  everywhere.  Neither rule can see the other's file.
+
+not_this_record: >-
+  A ZERO ATOMIC SIZE AT THE TOP LEVEL is not this defect and is not caught by
+  this rule.  H5Z__nbit_decompress's own ATOMIC arm does not divide; it
+  memsets d_nelmts * parms[4] bytes and loops.  Whether a zero there is
+  reachable and what it does was NOT measured.
+
+provenance:
+  h5policy_commit: b77fcb1
+  poke_version: GNU poke 4.3
