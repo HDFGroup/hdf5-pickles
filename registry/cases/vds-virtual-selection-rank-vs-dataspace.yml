@@ -1,0 +1,228 @@
+# A VDS mapping's VIRTUAL selection selects inside the virtual dataset, so its
+# stored rank is a claim about that dataset's dataspace.  libhdf5 never compares
+# the two -- it OVERWRITES the stored extent with the dataset's on every open,
+# so the file says one thing and the library reports another, with nothing
+# surfaced to the caller.
+#
+# READ THE SCOPE LINE FIRST.  The upstream report that pointed here claimed an
+# uninitialized-stack read in H5D__virtual_init_all.  That claim is NOT
+# established by this record -- see unmeasured.  What IS measured is narrower
+# and is what the finding reports: a stored field libhdf5 discards.
+schema_version: 1
+
+id: vds-virtual-selection-rank-vs-dataspace
+title: a VDS mapping's virtual-selection rank is never reconciled with the
+  dataset's dataspace rank; libhdf5 silently replaces it with the dataset's
+status: oracle-hardened   # h5policy warns as of 2026-11-12; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  An upstream report in
+  the local advisory working set named H5D__virtual_init_all and
+  unlim_dim_virtual; its claim was NOT reproduced here and is carried below as
+  unmeasured rather than as a conclusion.
+
+record: virtual_dataset
+versions: [4, 5]
+root_cause_classification: aggregate_object
+violated_invariant:
+  - vds.virtual_selection_rank
+validation_closure: >-
+  the dataset object as a whole -- the VDS layout message's mapping block and
+  the dataspace message, judged together.  Neither message alone can establish
+  the rule, which is why the check is deferred to the walk context and fires
+  whichever of the two is parsed second, the same shape as
+  control.layout_rank_mismatch for legacy chunked layouts.
+activation_before_validation:
+  - native_construction
+entry_points:
+  - h5policy (oracle) -- warns under every profile that permits VDS
+  - "libhdf5 H5Dopen2 -> H5D__virtual_init (src/H5Dvirtual.c:2740) -- where the
+     stored extent is discarded"
+  - "libhdf5 H5Dopen2 -> H5D__virtual_load_layout (src/H5Dvirtual.c:881) --
+     where unlim_dim_virtual is derived, BEFORE that patch"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0 @78c25cf819f) --------
+defect: >-
+  Three places could have reconciled the mapping's virtual-selection rank with
+  the dataset's dataspace rank, and none does.
+    H5D__virtual_load_layout (src/H5Dvirtual.c:843-856) deserializes the source
+      and virtual selections with no reference to the dataset's dataspace --
+      the dataset's space is not even in scope at that point.
+    H5D_virtual_check_mapping_pre (src/H5Dvirtual.c:192-251) compares selection
+      TYPES (refusing point selections) and element COUNTS.  It never compares
+      ranks, and the element-count rule is satisfied by a wider selection whose
+      extra dimensions are degenerate.
+    H5D_virtual_check_min_dims (src/H5Dvirtual.c:391-421) iterates `i < rank`
+      where rank is the DATASET's, so a wider mapping's surplus min_dims
+      entries are never examined.
+  What happens instead is replacement.  H5D__virtual_init patches the extent:
+      H5S_extent_copy(storage->list[i].source_dset.virtual_select,
+                      dset->shared->space)          /* src/H5Dvirtual.c:2740 */
+  on every open.  The stored rank is therefore discarded rather than checked,
+  and no error, warning or return code reports the disagreement.
+
+# -- Measured behaviour ------------------------------------------------------
+measured:
+  measured_on: >-
+    2026-11-12, repository worktree clean at the commit this record lands on.
+    libhdf5 2.3.0, source tree at develop 78c25cf819f5a214d1a765a7e7e198dfc4fac75c
+    -- the newest build available here.  Baseline Release/-DNDEBUG build;
+    workstation-local install, path not recorded.
+  oracle_before: >-
+    accept_with_warnings carrying only H5_ADVISORY_VDS_ABSOLUTE_SOURCE -- the
+    rank disagreement was invisible.
+  oracle_after: >-
+    accept_with_warnings, now also carrying
+    H5_ADVISORY_VDS_VIRTUAL_SELECTION_RANK at offset 2153, evidence field
+    vds.virtual_selection_rank actual 3 expected 2.  The untouched base
+    policy/vds_hyperslab.h5 -- identical in every other byte -- does NOT carry
+    it, which is what makes the guard non-vacuous.
+  libhdf5_reads_it_silently: >-
+    THE CENTRAL MEASUREMENT.  On the rank-widened fixture (stored virtual
+    selection rank 3, dataspace rank 2):
+      h5dump -H                            exits 0, output identical to the base
+      H5Dopen2 + H5Pget_virtual_vspace     reports vspace rank 2
+    The library reports the DATASET's rank for a mapping the file stores at
+    rank 3, with no diagnostic.  That is the H5S_extent_copy patch above,
+    observed rather than inferred.
+  api_cannot_write_it: >-
+    MEASURED, and it reverses the assumption this work started from.  A C
+    program passing a rank-3 vspace for a rank-2 dataset gets
+    H5Pset_virtual rc=0 and H5Dcreate2 rc=0 -- the API accepts it -- but the
+    file that comes back reads as rank 2 through H5Pget_virtual_vspace, because
+    the same patch runs before the layout is written.  (The first attempt at
+    this measurement was refused for a different reason -- "different numbers of
+    elements" from H5D_virtual_check_mapping_pre -- which is the element-count
+    rule, not a rank rule; the widened selection has to keep the element count
+    equal for the rank question to be reached at all.)
+    So no libhdf5 writer path found here produces this file, and the fixture is
+    built by byte surgery.
+  width: >-
+    Not width-dependent and not measured per width: the rule compares two
+    decoded 32-bit rank fields, and the measured consequence is a silent
+    substitution with no arithmetic in it.
+
+# -- What this record does NOT establish -------------------------------------
+unmeasured:
+  uninitialized_stack_read: >-
+    The upstream claim is that H5D__virtual_init_all (src/H5Dvirtual.c:2406)
+    fills `hsize_t virtual_dims[H5S_MAX_RANK]` only to the DATASET's rank and
+    then indexes it with `unlim_dim_virtual`, a dimension index taken from the
+    MAPPING's selection, so a wider mapping reads an uninitialized element.
+    The SOURCE supports the ordering the claim needs: unlim_dim_virtual is
+    assigned at src/H5Dvirtual.c:881, inside H5D__virtual_load_layout, which
+    runs BEFORE the H5D__virtual_init extent patch, so the index can outlive the
+    extent it came from.
+    IT WAS NOT REPRODUCED.  Two things are missing, and both are named rather
+    than worked around:
+      (1) the fixture here widens the rank with a DEGENERATE dimension (count 1)
+          and no unlimited dimension, so H5S_get_select_unlim_dim returns -1 and
+          the guarded branch at :2429 is never entered.  A carrier needs an
+          UNLIMITED count in the surplus dimension.
+      (2) even with that carrier, an uninitialized stack READ is invisible to
+          every instrument installed here.  AddressSanitizer does not detect it;
+          MemorySanitizer would, and no MSan libhdf5 build exists in this
+          repository.  Building one is a new build dependency.
+    So the memory-safety half is OPEN, and the finding's severity below does not
+    rest on it.
+  unlimited_carrier_variant: >-
+    Not built.  It is the obvious next step and the fixture generator is already
+    the right shape for it -- _vds_selection_widen_rank would take the surplus
+    dimension's count as a parameter.  Deliberately left out of this change
+    rather than added untested.
+
+# -- Why this is a WARNING ---------------------------------------------------
+severity_rationale: >-
+  Corruption was considered and rejected on the evidence, in both directions.
+  FOR corrupt: no libhdf5 writer path found here can produce the file
+  (api_cannot_write_it), so rejecting it would not obviously be an
+  invariant-A false positive.
+  AGAINST, and decisive: only ONE writer path was measured -- H5Pset_virtual +
+  H5Dcreate2 through the C API at 2.3.0.  h5py, older release lines and
+  third-party writers were not checked, and this repository's own history has
+  the cautionary case: registry/cases/vds-selection-rank-oracle-false-positive.yml
+  records h5policy rejecting a VALID rank-3 VDS and calls that the most damaging
+  kind of oracle defect.  With no demonstrated harm (see unmeasured) and
+  incomplete knowledge of what writers emit, a warning surfaces the file without
+  being able to cause that failure mode.  The evidence for promoting it later is
+  in this record; what it needs is the unlimited carrier and a second writer
+  survey.
+
+# -- Divergence from the selected build --------------------------------------
+divergence:
+  oracle: accept_with_warnings
+  libhdf5: accepts, and silently reports the dataset's rank instead of the file's
+  libhdf5_version: 2.3.0
+  classification: >-
+    genuine -- libhdf5 never validates the relationship on any path; it replaces
+    one side of it
+  note: >-
+    No differential tolerance is needed or present: the oracle accepts the file,
+    so neither side rejects and nothing is failing that a tolerance would carry.
+
+# -- Containment vs systemic remediation (strategy doc §11.5) ----------------
+containment:
+  status: planned
+  description: >-
+    In H5D__virtual_load_layout, after each mapping's virtual selection is
+    deserialized, compare H5S_GET_EXTENT_NDIMS(virtual_select) with the
+    dataset's rank and reject on inequality -- or, at minimum, derive
+    unlim_dim_virtual only after the H5D__virtual_init extent patch, so the
+    index and the extent it indexes cannot disagree.  Replacing the extent
+    without checking it first is the shape of the defect.
+  libhdf5: not proposed upstream
+systemic:
+  semantic_boundary: >-
+    the virtual-dataset aggregate -- the dataspace message and every mapping's
+    selections validated as one object before any mapping state is derived, so
+    that no index survives the extent it was computed from.
+  status: planned
+  owner: n/a
+
+# -- Reproducers -------------------------------------------------------------
+reproducers:
+  direct_fixture: h5policy/tests/policy/vds_virtual_rank_wider.h5
+  valid_control: h5policy/tests/policy/vds_hyperslab.h5
+  generator: >-
+    h5policy-gencorpus _vds_selection_widen_rank, applied through the existing
+    _vds_rewrite_virtual_selection harness -- appends one degenerate dimension
+    (start 0, stride 1, count 1, block 1) to the version-3 REGULAR hyperslab and
+    bumps its rank field.  The element count is unchanged, so the only rule the
+    fixture breaks is the rank one; the file stays the same length as its base,
+    the growth coming out of the global heap's trailing free object.
+    Regime asserts: the base selection must be a REGULAR v3 hyperslab, and the
+    widened rank must stay inside H5S_MAX_RANK so the fixture tests
+    dataspace agreement rather than the format range vds.selection_rank covers.
+  expectation: h5policy/tests/expected/policy-vds_virtual_rank_wider.yml
+  exact_build_commands: >-
+    h5dump -H <fixture>; and H5Dopen2 + H5Pget_virtual_count +
+    H5Pget_virtual_vspace, run against the fixture and the control.
+
+sibling_audit: >-
+  NOT AUDITED, named so they are not mistaken for covered:
+  (1) The SOURCE selection's rank against the source dataset's rank.  It is the
+  mirror rule and this record does not touch it -- the source dataset is in
+  another file, which puts it outside this oracle's no-source-open boundary, so
+  if it is checkable at all it is checkable only when the source is absent.
+  (2) H5D__virtual_set_extent_unlim (src/H5Dvirtual.c:1923) indexes the same
+  dataset-rank-sized arrays with unlim_dim_virtual and unlim_dim_source at
+  :2178-:2204; whether it is reachable with a surplus index was not traced.
+  (3) The unlimited carrier variant -- see unmeasured.
+
+coverage_manifest_change: >-
+  validation-coverage.yml virtual_dataset gains vds.virtual_selection_rank;
+  findings/catalog/virtual_dataset.yml gains
+  H5_ADVISORY_VDS_VIRTUAL_SELECTION_RANK (scope aggregate_object, non-shared, so
+  no route rule).
+
+provenance:
+  found_by: >-
+    Triage of an upstream report in the local advisory working set naming
+    H5D__virtual_init_all and unlim_dim_virtual, reviewed 2026-11-12.  The
+    report's mechanism was checked against the source and its memory-safety
+    conclusion was NOT reproduced; what this record keeps is the invariant the
+    investigation established on its own evidence.
+  hdf5_build: >-
+    HDF5 2.3.0, source develop 78c25cf819f5a214d1a765a7e7e198dfc4fac75c.
+    baseline = Release-style RelWithDebInfo, -DNDEBUG, no sanitizers.
+    Workstation-local install; path not recorded.

@@ -1,0 +1,184 @@
+# A region reference whose object token resolves to a GROUP or a COMMITTED
+# DATATYPE.  H5Ropen_region opens the target, never asks what it opened, and
+# calls the DATASET dataspace callback on it.
+#
+# WHY THIS RECORD EXISTS WITH NO NEW CHECK: the oracle side was already built
+# and fixtured (H5_ADVISORY_REGION_REFERENCE_TARGET_NOT_DATASET, four policy
+# fixtures).  What was missing was a case record, so nothing tracked the libhdf5
+# half, the legacy/revised split, or the reason the finding is a WARNING rather
+# than a corruption.  An upstream report in the local advisory working set was
+# triaged against this code and found to be the same defect; this record is what
+# makes that conclusion durable instead of being re-derived.
+schema_version: 1
+
+id: region-reference-target-type-unchecked
+title: H5Ropen_region calls the dataset dataspace callback on whatever object
+  the reference token resolves to, without checking it is a dataset
+status: oracle-covered   # h5policy warns (pre-existing); libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.
+
+record: message_envelope
+versions: [1, 2, 3]
+root_cause_classification: reference_graph
+violated_invariant:
+  - attribute.region_reference_target
+validation_closure: >-
+  one attribute-value region reference, judged after the object walk against the
+  CLASS libhdf5 itself would assign to the object header the token names.  It is
+  a reference-graph invariant, not a local-decode one: no part of the reference
+  blob states the target's type, so nothing but the resolved object answers it.
+  A target the walk never reached is not judged.
+activation_before_validation:
+  - native_construction   # the object is opened and registered before any type question is asked
+entry_points:
+  - h5policy (oracle) -- warns; the file is still accepted
+  - "libhdf5 H5Ropen_region -> H5R__open_region_api_common (src/H5R.c:687)
+     -> H5VL_dataset_get -> H5VL__native_dataset_get -> H5D__get_space"
+  - "shipped tools: h5dump -A on an attribute holding such a reference --
+     measured SIGSEGV"
+
+# -- The defect, read out of the source tree (HDF5 2.3.0 @78c25cf819f) --------
+defect: >-
+  H5R__open_region_api_common (src/H5R.c:624-700) opens the referenced object by
+  token and DOES capture its type:
+      if (NULL == (opened_obj = H5VL_object_open(*vol_obj_ptr, &loc_params,
+                                                 &opened_type, ...)))
+  `opened_type` is then used for exactly one thing -- H5VL_register -- and never
+  compared against H5I_DATASET.  The function proceeds unconditionally to
+      vol_cb_args.op_type = H5VL_DATASET_GET_SPACE;
+      H5VL_dataset_get(opened_obj, &vol_cb_args, ...)        /* src/H5R.c:687 */
+  so when the token names a group, an H5G_t * reaches H5D__get_space as an
+  H5D_t * and the dataset's shared-struct pointer is read out of group state.
+  Nothing upstream of this constrains the token's target: H5Rcreate_region
+  itself will write a reference to any object, and the token carries no type
+  tag, so the type question cannot be answered until the target is opened --
+  which is one statement before it is needed and never asked.
+
+# -- Measured behaviour ------------------------------------------------------
+measured:
+  measured_on: >-
+    2026-11-12, repository worktree clean at the commit this record lands on.
+    libhdf5 2.3.0, source tree at develop 78c25cf819f5a214d1a765a7e7e198dfc4fac75c
+    -- the newest build available here.  Builds named by role and pinned by
+    build_mode/sanitizers; workstation-local installs, paths not recorded.
+  oracle: >-
+    accept_with_warnings on all four policy fixtures, each carrying
+    H5_ADVISORY_REGION_REFERENCE_TARGET_NOT_DATASET.  Pre-existing coverage,
+    re-confirmed at this promotion rather than assumed.
+  libhdf5_baseline: >-
+    SPLIT BY REFERENCE FLAVOUR, and the split is the part worth having measured.
+    `h5dump -A` on the baseline Release/-DNDEBUG build:
+      policy/attr_region_ref_to_group.h5             SIGSEGV (139)
+      policy/attr_region_ref_to_named_datatype.h5    SIGSEGV (139)
+      policy/attr_dsetreg_ref_to_group.h5            exits 0
+      policy/attr_dsetreg_ref_to_named_datatype.h5   exits 0
+    A valid control (valid/dense_attribute.h5) exits 0 under the same command.
+    So the REVISED reference (H5R_ref_t, "standard reference") reaches the
+    defect and the LEGACY H5T_STD_REF_DSETREG element does not -- the legacy
+    element is decoded and rendered on a different path that never calls
+    H5Ropen_region.  A conclusion drawn from one flavour alone would have been
+    wrong in whichever direction it was drawn.
+  libhdf5_asan_ndebug: >-
+    The shipped-configuration witness names the defect exactly:
+      AddressSanitizer: SEGV on unknown address 0x00000000f8
+        #0 H5D__get_space              src/H5Dint.c:3957
+        #1 H5VL__native_dataset_get    src/H5VLnative_dataset.c:455
+        #3 H5VL_dataset_get            src/H5VLcallback.c:2456
+        #4 H5R__open_region_api_common src/H5R.c:687
+        #5 H5Ropen_region              src/H5R.c:729
+        #6 h5tools_dump_reference      tools/lib/h5tools_dump.c:4262
+        #9 dump_attr_cb                tools/src/h5dump/h5dump_ddl.c:138
+    0xf8 is a small struct offset read off a null `shared` pointer, i.e. group
+    state read as dataset state -- not an attacker-chosen address.
+  width: >-
+    UNMEASURED on i386 for this case.  The path has no attacker-controlled
+    arithmetic -- it is a type confusion between two struct layouts -- so the
+    expected i386 behaviour is the same fault at a different fixed offset.
+    Recorded as inferred, not measured.
+
+# -- Why this is a WARNING and not a corruption ------------------------------
+severity_rationale: >-
+  libhdf5's own H5Rcreate_region writes a reference to any object the caller
+  names, so a file carrying a group-targeted region reference can be produced by
+  the documented API without corrupting anything.  Rejecting it would be an
+  invariant-A false positive on a file the library itself wrote -- the hazard
+  recorded in registry/cases/vds-selection-rank-oracle-false-positive.yml, where
+  an oracle rejecting valid input is called the most damaging kind of defect.
+  So the finding is a warning about a hazardous file, and the fault belongs to
+  the CONSUMER that dereferences without checking, not to the file.
+
+# -- Divergence from the selected build --------------------------------------
+divergence:
+  oracle: accept_with_warnings
+  libhdf5: crashes on the revised-reference fixtures, completes on the legacy ones
+  libhdf5_version: 2.3.0
+  classification: >-
+    legitimate on the oracle side (the file is well-formed), genuine on the
+    libhdf5 side (no path validates the target's type)
+  note: >-
+    No differential tolerance is needed or present: the oracle accepts, and the
+    fixtures are policy fixtures rather than malformed ones.
+
+# -- Containment vs systemic remediation (strategy doc §11.5) ----------------
+containment:
+  status: planned
+  description: >-
+    In H5R__open_region_api_common, reject when `opened_type != H5I_DATASET`
+    before the H5VL_dataset_get call at src/H5R.c:687.  The value is already in
+    hand one statement earlier, so the fix is a comparison, not new plumbing.
+    H5R__open_attr_api_common should be audited for the same shape at the same
+    time -- see sibling_audit.
+  libhdf5: not proposed upstream
+systemic:
+  semantic_boundary: >-
+    every token-resolved open in the reference API -- the resolved object's
+    H5I type must be reconciled with the operation about to be performed on it
+    before any type-specific callback is dispatched.
+  status: planned
+  owner: n/a
+
+# -- Reproducers -------------------------------------------------------------
+reproducers:
+  direct_fixtures:
+    - h5policy/tests/policy/attr_region_ref_to_group.h5
+    - h5policy/tests/policy/attr_region_ref_to_named_datatype.h5
+    - h5policy/tests/policy/attr_dsetreg_ref_to_group.h5
+    - h5policy/tests/policy/attr_dsetreg_ref_to_named_datatype.h5
+  expectations:
+    - h5policy/tests/expected/policy-attr_region_ref_to_group.yml
+    - h5policy/tests/expected/policy-attr_region_ref_to_named_datatype.yml
+    - h5policy/tests/expected/policy-attr_dsetreg_ref_to_group.yml
+    - h5policy/tests/expected/policy-attr_dsetreg_ref_to_named_datatype.yml
+  exact_build_command: >-
+    h5dump -A <fixture>, against each of the four and against
+    h5policy/tests/valid/dense_attribute.h5 as the control.
+
+sibling_audit: >-
+  NOT AUDITED, and named so it is not mistaken for covered:
+  (1) H5R__open_attr_api_common (src/H5R.c) resolves a token the same way for
+  attribute references; whether it reconciles `opened_type` before dispatching
+  has not been read.
+  (2) The legacy DSETREG path completes here, but "does not crash on these two
+  fixtures" is not the same as "validates the target type"; what that path does
+  with a group-targeted legacy reference was not traced.
+  (3) i386 is unmeasured for this case -- see measured.width.
+
+coverage_manifest_change: >-
+  None.  H5_ADVISORY_REGION_REFERENCE_TARGET_NOT_DATASET,
+  attribute.region_reference_target and all four fixtures pre-date this record;
+  it adds the libhdf5 half, the legacy/revised split, and the severity
+  rationale, none of which were written down anywhere.
+
+provenance:
+  found_by: >-
+    Pre-existing h5policy coverage, promoted to a tracked case record while
+    triaging an upstream report in the local advisory working set that named
+    H5D__get_space and the unchecked `opened_type`.  The report's claim was
+    confirmed against the source and the fixtures; its specimen was not used.
+  hdf5_build: >-
+    HDF5 2.3.0, source develop 78c25cf819f5a214d1a765a7e7e198dfc4fac75c.
+    baseline = Release-style RelWithDebInfo, -DNDEBUG, no sanitizers;
+    candidate = RelWithDebInfo -fsanitize=address with -DNDEBUG.
+    Both workstation-local installs; paths not recorded.

@@ -900,6 +900,12 @@ def _gen_policy(root):
     _vds_rewrite_virtual_selection(
         f"{root}/policy/vds_selection_v1.h5",
         f"{root}/policy/vds_hyperslab.h5", _vds_selection_v3_to_v1)
+    # The mapping's virtual selection widened by one degenerate dimension, so
+    # the stored rank disagrees with the dataspace message.  A policy/ fixture,
+    # not malformed/: the finding is a warning and libhdf5 still opens the file.
+    _vds_rewrite_virtual_selection(
+        f"{root}/policy/vds_virtual_rank_wider.h5",
+        f"{root}/policy/vds_hyperslab.h5", _vds_selection_widen_rank)
     _make_vds_selection_v2_rank_zero(
         f"{root}/malformed/vds_selection_v2_rank_zero.h5",
         f"{root}/policy/vds_hyperslab.h5")
@@ -2270,6 +2276,9 @@ def _gen_malformed(root):
         f"{root}/valid/sohm_list.h5")
     _make_bad_frhp_indirect_section_row(
         f"{root}/malformed/bad_frhp_indirect_section_row.h5",
+        f"{root}/valid/sohm_list.h5")
+    _make_bad_frhp_section_class(
+        f"{root}/malformed/bad_frhp_section_class.h5",
         f"{root}/valid/sohm_list.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
@@ -4837,6 +4846,51 @@ def _vds_selection_v3_to_v1(sel):
             + payload)
 
 
+def _vds_selection_widen_rank(sel):
+    """Append one degenerate dimension to a version-3 REGULAR hyperslab.
+
+    The mapping's VIRTUAL selection selects inside the virtual dataset, so its
+    rank is a claim about that dataset's dataspace rank.  Widening it by one
+    makes the stored selection disagree with the dataspace message while
+    changing nothing else: the extra dimension is (start 0, stride 1, count 1,
+    block 1), so the selection still covers the same elements and the element
+    count libhdf5's mapping pre-check compares is untouched.
+
+      v3  [type:4][version:4][flags:1][enc:1][rank:4] then 4*rank fields of enc
+
+    This cannot be produced through the API.  H5Pset_virtual accepts a wider
+    vspace, but H5D__virtual_init patches every mapping's virtual_select extent
+    to the dataset's own space (src/H5Dvirtual.c:2740) before the layout is
+    written, so the file that comes back always carries the dataset's rank --
+    measured: a rank-3 vspace on a rank-2 dataset reads back as rank 2 through
+    H5Pget_virtual_vspace.  Byte surgery is the only way to build the regime.
+
+    Regime asserts: the base must be a REGULAR v3 hyperslab (the block-list form
+    has a different payload shape), and the widened rank must stay within
+    H5S_MAX_RANK so the fixture tests the dataspace-agreement rule rather than
+    the format range rule vds.selection_rank already covers.
+    """
+    sel_type, version = struct.unpack_from("<II", sel, 0)
+    flags, enc = sel[8], sel[9]
+    rank = struct.unpack_from("<I", sel, 10)[0]
+    if (sel_type, version) != (2, 3):
+        raise RuntimeError(f"expected hyperslab v3, got type={sel_type} "
+                           f"version={version}")
+    if not flags & 0x01:
+        raise RuntimeError("only REGULAR hyperslabs can be widened this way")
+    if len(sel) != 14 + 4 * rank * enc:
+        raise RuntimeError(f"v3 selection is {len(sel)} bytes, expected "
+                           f"{14 + 4 * rank * enc}")
+    if rank + 1 > 32:                       # H5S_MAX_RANK
+        raise RuntimeError("widening would leave the format range, which is a "
+                           "different invariant (vds.selection_rank)")
+    out = bytearray(sel)
+    struct.pack_into("<I", out, 10, rank + 1)
+    for value in (0, 1, 1, 1):              # start, stride, count, block
+        out += value.to_bytes(enc, "little")
+    return bytes(out)
+
+
 def _vds_rewrite_virtual_selection(path, base_path, rewrite):
     """Replace a VDS mapping's virtual selection with bytes of a DIFFERENT
     length, repairing everything the length change invalidates.
@@ -6052,6 +6106,64 @@ def _frhp_fsm_sinfo(raw):
                 frhp = raw.find(b"FRHP", frhp + 4)
         i = raw.find(b"FSHD", i + 4)
     raise RuntimeError("no fractal-heap free-space manager with a section list")
+
+
+def _make_bad_frhp_section_class(path, base_path):
+    """Type a fractal-heap free section as a class the client registers but
+    never serializes.
+
+    H5HFspace.c:84 registers four section classes -- SINGLE(0), FIRST_ROW(1),
+    NORMAL_ROW(2), INDIRECT(3).  H5FScache.c:1019 rejects only a type byte
+    `>= fspace->nclasses`, so 2 and 3 pass that gate; but both classes' entries
+    in H5HFsection.c carry a NULL `deserialize` slot by design (neither is ever
+    written into a section list), and the only thing left is
+    `assert(fspace->sect_cls[sect_type].deserialize)` at H5FScache.c:1024, which
+    -DNDEBUG strips from every shipped build.  The next line calls through that
+    NULL pointer.
+
+    One byte: the base's single SINGLE section becomes INDIRECT.  Neither class
+    serializes a payload, so the record keeps its width and only the FSSE
+    checksum has to be repaired -- the class value is the sole fault.
+
+    Regime asserts (an untested REGIME, not an untested value): the base's one
+    section must be SINGLE, so the fixture genuinely moves the class byte; and
+    the written value must be strictly below the header's declared class count,
+    so the fixture exercises the in-range/NULL-callback regime rather than the
+    out-of-range one libhdf5 already rejects (and which
+    malformed/bad_fsm_section_type.h5 already covers for the file client).
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    fsm = _frhp_fsm_sinfo(raw)
+    l = raw[10]
+    t = fsm["first_section"] + fsm["off_size"]
+    if raw[t] != 0:
+        raise RuntimeError(
+            f"base section is class {raw[t]}, expected SINGLE (0); "
+            "fixture would not move the class byte")
+
+    # The owning client-0 FSHD, so the regime assert can read nclasses.
+    hdr = -1
+    i = raw.find(b"FSHD")
+    while i >= 0:
+        if raw[i + 5] == 0 and int.from_bytes(
+                raw[i + 14 + 5*l:i + 14 + 5*l + raw[9]], "little") == fsm["sect_addr"]:
+            hdr = i
+            break
+        i = raw.find(b"FSHD", i + 4)
+    if hdr < 0:
+        raise RuntimeError("fractal-heap client-0 FSHD not found")
+    nclasses = struct.unpack_from("<H", raw, hdr + 6 + 4*l)[0]
+
+    indirect = 3                      # H5HF_FSPACE_SECT_INDIRECT
+    if not indirect < nclasses:
+        raise RuntimeError(
+            f"class {indirect} is not in range for a {nclasses}-class header; "
+            "fixture would test the out-of-range regime instead")
+    raw[t] = indirect
+    struct.pack_into("<I", raw, fsm["sect_checksum"],
+                     _jenkins_lookup3()(
+                         bytes(raw[fsm["sect_addr"]:fsm["sect_checksum"]])))
+    _patch(path, bytes(raw))
 
 
 def _make_bad_frhp_fsm_section_extent(path, base_path):
