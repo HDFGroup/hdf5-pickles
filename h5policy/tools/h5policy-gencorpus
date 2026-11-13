@@ -900,6 +900,12 @@ def _gen_policy(root):
     _vds_rewrite_virtual_selection(
         f"{root}/policy/vds_selection_v1.h5",
         f"{root}/policy/vds_hyperslab.h5", _vds_selection_v3_to_v1)
+    # The mapping's virtual selection widened by one degenerate dimension, so
+    # the stored rank disagrees with the dataspace message.  A policy/ fixture,
+    # not malformed/: the finding is a warning and libhdf5 still opens the file.
+    _vds_rewrite_virtual_selection(
+        f"{root}/policy/vds_virtual_rank_wider.h5",
+        f"{root}/policy/vds_hyperslab.h5", _vds_selection_widen_rank)
     _make_vds_selection_v2_rank_zero(
         f"{root}/malformed/vds_selection_v2_rank_zero.h5",
         f"{root}/policy/vds_hyperslab.h5")
@@ -1968,8 +1974,12 @@ def _gen_malformed(root):
         f"{root}/malformed/scaleoffset_fill_unavailable.h5")
     _make_scaleoffset_fill_avail_undefined(
         f"{root}/malformed/scaleoffset_fill_avail_undefined.h5")
+    _make_nbit_array_base_size_zero(
+        f"{root}/malformed/nbit_array_base_size_zero.h5")
     _make_nbit_byte_order_mismatch(
         f"{root}/malformed/nbit_byte_order_mismatch.h5")
+    _make_nbit_chunk_stored_short(
+        f"{root}/malformed/nbit_chunk_stored_short.h5")
     _make_nbit_precision_mismatch(
         f"{root}/malformed/nbit_precision_mismatch.h5")
     _make_nbit_bit_offset_mismatch(
@@ -2267,6 +2277,9 @@ def _gen_malformed(root):
     _make_bad_frhp_indirect_section_row(
         f"{root}/malformed/bad_frhp_indirect_section_row.h5",
         f"{root}/valid/sohm_list.h5")
+    _make_bad_frhp_section_class(
+        f"{root}/malformed/bad_frhp_section_class.h5",
+        f"{root}/valid/sohm_list.h5")
     _make_bad_contiguous_layout_size(
         f"{root}/malformed/bad_contiguous_layout_size.h5")
     _make_contiguous_data_past_eof(
@@ -2335,6 +2348,10 @@ def _gen_malformed(root):
     _make_btree_v1_child_level(
         f"{root}/malformed/bad_btree_v1_child_level.h5",
         f"{root}/valid/chunked_v1_btree_deep.h5")
+    _make_group_btree_back_edge(
+        f"{root}/malformed/group_btree_back_edge.h5")
+    _make_chunk_btree_back_edge(
+        f"{root}/malformed/chunk_btree_back_edge.h5")
     _make_bad_group_btree_declared_size(
         f"{root}/malformed/bad_group_btree_declared_size.h5",
         f"{root}/valid/compact_layout.h5")
@@ -2710,6 +2727,223 @@ def _make_bad_group_btree_child_address(path, base_path):
     len_size = raw[14]
     child0 = tree + 8 + (2 * off_size) + len_size
     struct.pack_into("<Q", raw, child0, 0x2000_0000_0000_0430)
+    _patch(path, bytes(raw))
+
+
+def _type0_btree_nodes(raw, off_size, len_size):
+    """Every type-0 (group) v1 B-tree node: address -> (level, child addresses).
+
+    A type-0 node is signature(4) + type(1) + level(1) + entries(2) + two
+    sibling addresses, then `entries` repetitions of key(len_size) and
+    child(off_size).  Scanning for the signature finds the nodes without
+    walking object headers, and the node type byte keeps chunk (type 1) trees
+    out.
+    """
+    hdr = 8 + 2 * off_size
+    pair = len_size + off_size
+    out = {}
+    i = raw.find(b"TREE")
+    while i >= 0:
+        if raw[i + 4] == 0:
+            used = struct.unpack_from("<H", raw, i + 6)[0]
+            out[i] = (raw[i + 5],
+                      [struct.unpack_from("<Q", raw, i + hdr + k * pair + len_size)[0]
+                       for k in range(used)])
+        i = raw.find(b"TREE", i + 1)
+    return out
+
+
+def _type1_btree_nodes(raw, off_size, rank):
+    """Every type-1 (chunk) v1 B-tree node: address -> (level, child addresses).
+
+    A type-1 node interleaves nrec+1 keys with nrec children, and a chunk key is
+    chunk size(4) + filter mask(4) + (rank+1) eight-byte offsets -- the extra
+    offset is the element-size dimension libhdf5 appends to the chunk rank.  The
+    caller passes the dataset rank because the stride cannot be recovered from
+    the node itself.
+    """
+    key = 4 + 4 + (rank + 1) * 8
+    hdr = 8 + 2 * off_size
+    out = {}
+    i = raw.find(b"TREE")
+    while i >= 0:
+        if raw[i + 4] == 1:
+            used = struct.unpack_from("<H", raw, i + 6)[0]
+            out[i] = (raw[i + 5],
+                      [struct.unpack_from("<Q", raw, i + hdr + key + k * (key + off_size))[0]
+                       for k in range(used)])
+        i = raw.find(b"TREE", i + 1)
+    return out
+
+
+def _make_chunk_btree_back_edge(path, chunks=4200, chunk_elems=4096):
+    """A chunked dataset whose version-1 chunk index has a two-node CYCLE.
+
+    The chunk-index twin of group_btree_back_edge.h5, and it exists because the
+    same H5B_find_helper serves both: one rule, two roles, and a role with no
+    fixture is a rule nothing exercises.
+
+    THREE CONSTRAINTS FIX THE SHAPE, and they very nearly exclude each other:
+
+      depth     A back edge must leave a node above level 0, because a level-0
+                chunk node holds chunk RECORDS, not child pointers.  With a
+                level-1 root the only node above leaf level is the root, so
+                every back edge degenerates into the self-pointer libhdf5
+                already rejects (src/H5B.c:386).  Reaching level 2 takes more
+                than ~4096 chunks.
+      resource  untrusted-strict refuses a dataset with more than 4096 chunks
+                whose logical chunk is under 4 KiB (H5_RESOURCE_CHUNK_TOO_SMALL,
+                profile heuristics min_logical_chunk_bytes).  So the chunks must
+                be at least 4 KiB each -- and 4096+ chunks of 4 KiB is 16 MiB of
+                logical data.
+      size      which deflate removes: the data is all zeros, so each chunk
+                stores ~30 bytes and the fixture is ~330 KiB.
+
+    The back edge goes on the FIRST child of the first level-1 node, i.e. the
+    leftmost descent.  That is deliberate: a chunk lookup descends by offset, so
+    where the defect sits decides which reads reach it, and the leftmost descent
+    is the one a last-coordinate read never takes.
+
+    Measured on libhdf5 2.3.0 (develop 78c25cf819f): `h5dump -H` exits 0 --
+    the header path never walks the index -- while `h5dump -d /d` takes SIGSEGV.
+    """
+    fd, base = tempfile.mkstemp(suffix=".h5")
+    os.close(fd)
+    try:
+        with h5py.File(base, "w", libver="earliest") as h:
+            h.create_dataset("d", shape=(chunks * chunk_elems,),
+                             chunks=(chunk_elems,), dtype="u1",
+                             compression="gzip", compression_opts=1,
+                             data=np.zeros(chunks * chunk_elems, dtype="u1"),
+                             track_times=False)
+        raw = bytearray(open(base, "rb").read())
+    finally:
+        os.unlink(base)
+
+    if raw[8] != 0:
+        raise RuntimeError("expected a v0 superblock")
+    off_size, rank = raw[13], 1
+    nodes = _type1_btree_nodes(raw, off_size, rank)
+
+    # Regime assertions: without a level-2 node there is no non-degenerate back
+    # edge to write, and a base-file change that flattens the index must fail
+    # loudly rather than emit a fixture that tests nothing.
+    deep = sorted(a for a, (level, kids) in nodes.items() if level >= 2 and kids)
+    if not deep:
+        raise RuntimeError(
+            "regime: no populated type-1 B-tree node at level 2 or above; "
+            f"levels present: {sorted({lv for lv, _ in nodes.values()})} "
+            f"({chunks} chunks of {chunk_elems} elements)")
+    ancestor = deep[0]
+    anc_level = nodes[ancestor][0]
+    node = next((c for c in nodes[ancestor][1]
+                 if nodes.get(c, (None, []))[0] == anc_level - 1 and nodes[c][1]), None)
+    if node is None:
+        raise RuntimeError("regime: the level-%d node has no populated child one "
+                           "level below it" % anc_level)
+    if node == ancestor:
+        raise RuntimeError("regime: a two-node cycle, not the self-pointer shape "
+                           "libhdf5 already rejects")
+    # Every internal child must itself be a node, or the key stride is wrong and
+    # the "child pointer" being patched is really key bytes.
+    for addr, (level, kids) in nodes.items():
+        if level > 0:
+            for c in kids:
+                if raw[c:c + 4] != b"TREE":
+                    raise RuntimeError(
+                        f"regime: child {c} of node {addr} is not a B-tree node; "
+                        "the type-1 key stride does not match this file")
+
+    key = 4 + 4 + (rank + 1) * 8
+    child0 = node + 8 + 2 * off_size + key
+    if struct.unpack_from("<Q", raw, child0)[0] != nodes[node][1][0]:
+        raise RuntimeError("regime: node layout does not match the parsed child list")
+    struct.pack_into("<Q", raw, child0, ancestor)
+    _patch(path, bytes(raw))
+
+
+def _make_group_btree_back_edge(path, links=4096):
+    """An old-style group whose v1 B-tree has a two-node CYCLE: an internal node
+    points back at its own ancestor.
+
+    THE REGIME IS THE POINT, which is why this generator builds its own base
+    instead of patching a small one.  A cycle in a version-1 B-tree needs a tree
+    at least three levels deep: the back edge has to leave a node whose level is
+    above 0 (so the child slot is read as a node pointer and not as a symbol
+    table) and land on a node that is not its own parent (a self-pointer is the
+    one shape libhdf5 already catches, at src/H5B.c:386).  A shallow group tree
+    cannot express that at all -- with a level-1 root the only node above leaf
+    level IS the root, so every back edge degenerates into a self-pointer.  The
+    links are hard links to one dataset, which cost a heap name and a symbol
+    table entry each rather than an object header, so the depth is reached in
+    ~400 KiB.
+
+    EVERY STORED LEVEL STAYS SELF-CONSISTENT.  Nothing is forged: the ancestor
+    still declares its own level, the node still declares one below it, and the
+    only thing wrong with the file is that one child address names a node
+    already on the path.  That is what separates this fixture from
+    bad_btree_v1_child_level.h5, where a level byte is rewritten and the
+    parent/child relation is visibly broken at the first decode.  Here the
+    relation is broken only on the ARRIVAL THAT IS NEVER DECODED -- the target
+    is already in the reader's cache -- so a level check cannot see it and only
+    a repeated-address rule can.
+
+    Measured on libhdf5 2.3.0 (develop 78c25cf819f): H5Fopen succeeds, and a
+    by-name open of a link under the affected subtree recurses between the two
+    nodes until the stack is exhausted (SIGSEGV; AddressSanitizer reports
+    stack-overflow with alternating H5B_find_helper frames).  h5stat crashes the
+    same way through H5B__get_info_helper, h5dump -H rejects the file on the
+    iterate path, and h5ls -r exits 0 while silently omitting the subtree.
+    """
+    fd, base = tempfile.mkstemp(suffix=".h5")
+    os.close(fd)
+    try:
+        with h5py.File(base, "w", libver="earliest") as h:
+            g = h.create_group("g")
+            # track_times=False keeps the fixture byte-reproducible; old-style
+            # group headers carry no modification time of their own.
+            g.create_dataset("d", data=np.arange(2, dtype="i4"), track_times=False)
+            target = g["d"]
+            for i in range(links):
+                g["m%x" % i] = target
+        raw = bytearray(open(base, "rb").read())
+    finally:
+        os.unlink(base)
+
+    if raw[8] != 0:
+        raise RuntimeError("expected a v0 superblock")
+    off_size, len_size = raw[13], raw[14]
+    nodes = _type0_btree_nodes(raw, off_size, len_size)
+
+    # Regime assertions.  A base-file or h5py change that makes the tree
+    # shallower must fail loudly here rather than quietly produce a fixture that
+    # tests nothing: with no node above level 1 there is no non-degenerate back
+    # edge to write.
+    deep = sorted(a for a, (level, kids) in nodes.items() if level >= 2 and kids)
+    if not deep:
+        raise RuntimeError(
+            "regime: no populated type-0 B-tree node at level 2 or above; "
+            f"levels present: {sorted({lv for lv, _ in nodes.values()})} "
+            f"({links} links)")
+    ancestor = deep[0]
+    anc_level = nodes[ancestor][0]
+    node = next((c for c in nodes[ancestor][1]
+                 if nodes.get(c, (None, []))[0] == anc_level - 1 and nodes[c][1]), None)
+    if node is None:
+        raise RuntimeError("regime: the level-%d node has no populated child one "
+                           "level below it" % anc_level)
+    if nodes[node][0] < 1:
+        raise RuntimeError("regime: the back edge must leave a node above leaf "
+                           "level, or its child slot is a symbol table and not a "
+                           "node pointer")
+    if node == ancestor:
+        raise RuntimeError("regime: a two-node cycle, not the self-pointer shape "
+                           "libhdf5 already rejects")
+
+    child0 = node + 8 + (2 * off_size) + len_size
+    if struct.unpack_from("<Q", raw, child0)[0] != nodes[node][1][0]:
+        raise RuntimeError("regime: node layout does not match the parsed child list")
+    struct.pack_into("<Q", raw, child0, ancestor)
     _patch(path, bytes(raw))
 
 
@@ -3253,6 +3487,131 @@ def _nbit_cd_patch(path, cd_index, value, expect):
             f"file changed and this fixture would patch a value it was not "
             f"written for")
     struct.pack_into("<I", raw, at, value)
+    _patch(path, bytes(raw))
+
+
+def _make_nbit_chunk_stored_short(path):
+    """An n-bit chunk whose stored record is far smaller than the packed bits
+    the filter will read out of it.
+
+    n-bit packs `precision` significant bits per element end to end, so a
+    chunk's compressed stream is exactly ceil(d_nelmts * bits / 8) bytes.  The
+    reduced-precision base stores 25 elements of 20 bits per chunk: 500 bits,
+    63 bytes.  Dropping one record's stored size to 1 leaves the decompressor
+    reading 62 bytes it was never given.
+
+    THE PARAMETERS STAY CONSISTENT, which is what makes this a distinct defect
+    from the element-count fixtures next to it.  cd_values still agree with the
+    chunk shape, the precision and offset are still in range, and the type tree
+    still parses; only the stored extent is short.  An inflated element count is
+    already caught by H5_CORRUPT_FILTER_NELMTS_MISMATCH, and that rule cannot
+    see this file.
+
+    Measured on the stored bytes: released libhdf5 returns what it finds past
+    the buffer as element values -- through h5py's bundled 1.14.5, uninitialized
+    heap arrives as data with exit 0 and no error -- while develop refuses since
+    a3cf1ea82cc (#6497, in no tag), which bounds the read index against the
+    buffer length.  So this fixture describes what every RELEASE still reads.
+
+    The record is located through the chunk index rather than by scanning for a
+    byte pattern: a v1 B-tree interleaves nrec+1 keys with nrec children, and a
+    hand scan that mistakes a key for a record patches the wrong four bytes.
+    """
+    raw = _base_bytes(_build_nbit_reduced, libver="earliest")
+    off_size = raw[9] if raw[8] >= 2 else raw[13]
+    rank = 2                                    # the reduced base is (10, 10)
+    key = 4 + 4 + (rank + 1) * 8
+    hdr = 8 + 2 * off_size
+    node = raw.find(b"TREE")
+    while node >= 0 and raw[node + 4] != 1:
+        node = raw.find(b"TREE", node + 1)
+    if node < 0:
+        raise RuntimeError("could not locate the chunk v1 B-tree node")
+    if raw[node + 5] != 0:
+        raise RuntimeError("regime: expected a single-level chunk index, so the "
+                           "first node holds records rather than child pointers")
+    used = struct.unpack_from("<H", raw, node + 6)[0]
+    if used == 0:
+        raise RuntimeError("regime: the chunk index holds no records")
+    stored = struct.unpack_from("<I", raw, node + hdr)[0]
+    if stored != 63:
+        raise RuntimeError(
+            f"regime: first chunk record stores {stored} bytes, expected 63 "
+            "(25 elements x 20 bits); the base file's precision or chunk shape "
+            "changed and the floor this fixture violates is no longer 63")
+    struct.pack_into("<I", raw, node + hdr, 1)
+    _patch(path, bytes(raw))
+
+
+def _build_nbit_array(h):
+    """A chunked n-bit dataset whose datatype is an ARRAY of reduced-precision
+    int32, which is the regime the atomic bases above cannot express.
+
+    H5Z__nbit_decompress dispatches on the TOP-LEVEL class word, and only the
+    ARRAY and COMPOUND arms enter H5Z__nbit_decompress_one_array -- the arm that
+    divides.  A dataset of plain atomics never reaches the division at all,
+    which is why the existing n-bit fixtures, all atomic, cannot carry this
+    defect.  The base keeps the 20-bit precision at offset 4 that makes the
+    filter do real work, so the pipeline is not a pass-through.
+
+    h5py has no high-level spelling for n-bit, an array datatype with a
+    reduced-precision base, or a write through one, so the datatype, the
+    pipeline and the memory type all go through the low-level API."""
+    base = h5py.h5t.STD_I32LE.copy()
+    base.set_precision(20)
+    base.set_offset(4)
+    atype = h5py.h5t.array_create(base, (3,))
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_chunk((5,))
+    dcpl.set_filter(5, 0, ())                    # 5 == H5Z_FILTER_NBIT
+    # The low-level creation path has no `track_times=False`, and _pin_ohdr_times
+    # only repairs VERSION 2 headers -- this file is libver="earliest", so its v1
+    # header carries an unsigned modification-time message with no signature to
+    # find it by.  Measured: without this the fixture drifted by one byte at
+    # offset 1020 between two regenerations in the same minute.
+    dcpl.set_obj_track_times(False)
+    sid = h5py.h5s.create_simple((20,))
+    d = h5py.h5d.create(h.id, b"d", atype, sid, dcpl=dcpl)
+    mtype = h5py.h5t.array_create(h5py.h5t.NATIVE_INT32, (3,))
+    d.write(h5py.h5s.ALL, h5py.h5s.ALL,
+            np.arange(60, dtype="i4").reshape(20, 3), mtype=mtype)
+
+
+def _make_nbit_array_base_size_zero(path):
+    """Zero the base-element size of an n-bit ARRAY node: a divide by zero on
+    libhdf5's read path, and on its write path too.
+
+    H5Z__nbit_decompress_one_array reads total_size and base_class, then takes
+    the next word as the base's size and computes `n = total_size / size`
+    (H5Znbit.c:1229 for an ATOMIC base, :1242 and :1259 for ARRAY and COMPOUND
+    bases).  Only the ATOMIC arm guards anything, and the guard it has --
+    `p.precision > p.size * 8 || (p.precision + p.offset) > p.size * 8` -- reads
+    `0 > 0` once the size is zero, so zeroing the precision and offset with it
+    walks straight past.  MEASURED on develop 2.3.0 (78c25cf819f): h5dump -d
+    dies with SIGFPE, exit 136.
+
+    The regime assertion below is the point of this fixture: it pins the whole
+    client-data array, so a change to the base's shape, precision or chunking
+    fails loudly instead of emitting a file whose patched word is no longer the
+    divisor the comment names."""
+    raw = _base_bytes(_build_nbit_array, libver="earliest")
+    off = _pipeline_cd_nelmts_offset(raw, 5)
+    nelmts = struct.unpack_from("<H", raw, off)[0]
+    name_len = struct.unpack_from("<H", raw, off - 4)[0]
+    cd = off + 2 + name_len
+    have = list(struct.unpack_from("<%dI" % nelmts, raw, cd))
+    #        nparms  need_not_compress  d_nelmts  class=ARRAY  total  base=ATOMIC
+    #        size    order              precision offset
+    want = [10,      0,                 5,        2,           12,    1,
+            4,       0,                 20,       4]
+    if have != want:
+        raise RuntimeError(
+            f"n-bit array base file changed: cd_values are {have}, expected "
+            f"{want}; this fixture would patch a word it was not written for")
+    for index, value in ((6, 0),      # base element size -> the zero divisor
+                         (8, 0),      # precision, so the one guard reads 0 > 0
+                         (9, 0)):     # offset, likewise
+        struct.pack_into("<I", raw, cd + 4 * index, value)
     _patch(path, bytes(raw))
 
 
@@ -4487,6 +4846,51 @@ def _vds_selection_v3_to_v1(sel):
             + payload)
 
 
+def _vds_selection_widen_rank(sel):
+    """Append one degenerate dimension to a version-3 REGULAR hyperslab.
+
+    The mapping's VIRTUAL selection selects inside the virtual dataset, so its
+    rank is a claim about that dataset's dataspace rank.  Widening it by one
+    makes the stored selection disagree with the dataspace message while
+    changing nothing else: the extra dimension is (start 0, stride 1, count 1,
+    block 1), so the selection still covers the same elements and the element
+    count libhdf5's mapping pre-check compares is untouched.
+
+      v3  [type:4][version:4][flags:1][enc:1][rank:4] then 4*rank fields of enc
+
+    This cannot be produced through the API.  H5Pset_virtual accepts a wider
+    vspace, but H5D__virtual_init patches every mapping's virtual_select extent
+    to the dataset's own space (src/H5Dvirtual.c:2740) before the layout is
+    written, so the file that comes back always carries the dataset's rank --
+    measured: a rank-3 vspace on a rank-2 dataset reads back as rank 2 through
+    H5Pget_virtual_vspace.  Byte surgery is the only way to build the regime.
+
+    Regime asserts: the base must be a REGULAR v3 hyperslab (the block-list form
+    has a different payload shape), and the widened rank must stay within
+    H5S_MAX_RANK so the fixture tests the dataspace-agreement rule rather than
+    the format range rule vds.selection_rank already covers.
+    """
+    sel_type, version = struct.unpack_from("<II", sel, 0)
+    flags, enc = sel[8], sel[9]
+    rank = struct.unpack_from("<I", sel, 10)[0]
+    if (sel_type, version) != (2, 3):
+        raise RuntimeError(f"expected hyperslab v3, got type={sel_type} "
+                           f"version={version}")
+    if not flags & 0x01:
+        raise RuntimeError("only REGULAR hyperslabs can be widened this way")
+    if len(sel) != 14 + 4 * rank * enc:
+        raise RuntimeError(f"v3 selection is {len(sel)} bytes, expected "
+                           f"{14 + 4 * rank * enc}")
+    if rank + 1 > 32:                       # H5S_MAX_RANK
+        raise RuntimeError("widening would leave the format range, which is a "
+                           "different invariant (vds.selection_rank)")
+    out = bytearray(sel)
+    struct.pack_into("<I", out, 10, rank + 1)
+    for value in (0, 1, 1, 1):              # start, stride, count, block
+        out += value.to_bytes(enc, "little")
+    return bytes(out)
+
+
 def _vds_rewrite_virtual_selection(path, base_path, rewrite):
     """Replace a VDS mapping's virtual selection with bytes of a DIFFERENT
     length, repairing everything the length change invalidates.
@@ -5702,6 +6106,64 @@ def _frhp_fsm_sinfo(raw):
                 frhp = raw.find(b"FRHP", frhp + 4)
         i = raw.find(b"FSHD", i + 4)
     raise RuntimeError("no fractal-heap free-space manager with a section list")
+
+
+def _make_bad_frhp_section_class(path, base_path):
+    """Type a fractal-heap free section as a class the client registers but
+    never serializes.
+
+    H5HFspace.c:84 registers four section classes -- SINGLE(0), FIRST_ROW(1),
+    NORMAL_ROW(2), INDIRECT(3).  H5FScache.c:1019 rejects only a type byte
+    `>= fspace->nclasses`, so 2 and 3 pass that gate; but both classes' entries
+    in H5HFsection.c carry a NULL `deserialize` slot by design (neither is ever
+    written into a section list), and the only thing left is
+    `assert(fspace->sect_cls[sect_type].deserialize)` at H5FScache.c:1024, which
+    -DNDEBUG strips from every shipped build.  The next line calls through that
+    NULL pointer.
+
+    One byte: the base's single SINGLE section becomes INDIRECT.  Neither class
+    serializes a payload, so the record keeps its width and only the FSSE
+    checksum has to be repaired -- the class value is the sole fault.
+
+    Regime asserts (an untested REGIME, not an untested value): the base's one
+    section must be SINGLE, so the fixture genuinely moves the class byte; and
+    the written value must be strictly below the header's declared class count,
+    so the fixture exercises the in-range/NULL-callback regime rather than the
+    out-of-range one libhdf5 already rejects (and which
+    malformed/bad_fsm_section_type.h5 already covers for the file client).
+    """
+    raw = bytearray(open(base_path, "rb").read())
+    fsm = _frhp_fsm_sinfo(raw)
+    l = raw[10]
+    t = fsm["first_section"] + fsm["off_size"]
+    if raw[t] != 0:
+        raise RuntimeError(
+            f"base section is class {raw[t]}, expected SINGLE (0); "
+            "fixture would not move the class byte")
+
+    # The owning client-0 FSHD, so the regime assert can read nclasses.
+    hdr = -1
+    i = raw.find(b"FSHD")
+    while i >= 0:
+        if raw[i + 5] == 0 and int.from_bytes(
+                raw[i + 14 + 5*l:i + 14 + 5*l + raw[9]], "little") == fsm["sect_addr"]:
+            hdr = i
+            break
+        i = raw.find(b"FSHD", i + 4)
+    if hdr < 0:
+        raise RuntimeError("fractal-heap client-0 FSHD not found")
+    nclasses = struct.unpack_from("<H", raw, hdr + 6 + 4*l)[0]
+
+    indirect = 3                      # H5HF_FSPACE_SECT_INDIRECT
+    if not indirect < nclasses:
+        raise RuntimeError(
+            f"class {indirect} is not in range for a {nclasses}-class header; "
+            "fixture would test the out-of-range regime instead")
+    raw[t] = indirect
+    struct.pack_into("<I", raw, fsm["sect_checksum"],
+                     _jenkins_lookup3()(
+                         bytes(raw[fsm["sect_addr"]:fsm["sect_checksum"]])))
+    _patch(path, bytes(raw))
 
 
 def _make_bad_frhp_fsm_section_extent(path, base_path):

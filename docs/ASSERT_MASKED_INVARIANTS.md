@@ -130,7 +130,7 @@ by a loop that writes every slot.
 
 **Measured:** one byte changed in a 2208-byte valid seed file
 (`max_nelmts_bits` 32→1). `h5policy --profile untrusted-strict` rejects it
-instantly, zero memory (`H5_CORRUPT_EXTENSIBLE_ARRAY_GEOMETRY`, `h5_chunkindex.pk:1456-1463 (max_nelmts_bits > 64UL)`, a
+instantly, zero memory (`H5_CORRUPT_EXTENSIBLE_ARRAY_GEOMETRY`, `h5_chunkindex.pk:1465-1472 (max_nelmts_bits > 64UL)`, a
 deliberate, comprehensive geometry check covering all six fields and their
 cross-relationships). A real build (h5py 3.14.0 / HDF5 1.14.6, arm64 macOS)
 opens the file fine, then an *ordinary* `dataset[...]` read causes:
@@ -531,7 +531,7 @@ write-path lifecycle management. `H5HFman.c` holds row 4.
 
 | # | Invariant | Root cause | Guard site(s) | Consequence | `h5policy` |
 |---|---|---|---|---|---|
-| 1 | A free-space section's class actually has a `deserialize` callback before it's called | `H5FScache.c:1013` — a section's on-disk type byte decoded raw; the real check that follows (`:1019-1020`) only confirms the value is *in-bounds*, not that the resulting class has a callback | `H5FScache.c:1024` (`assert(fspace->sect_cls[sect_type].deserialize)`) | **Measured: real crash, isolated to a single byte.** Fractal heap's `INDIRECT` free-space-section class is a valid, in-bounds registered class (index 3) whose `.deserialize` is `NULL` by design — its own comment states objects of this class "should never be in section manager." Nothing stops a corrupted file's section-type byte from claiming to be 3 anyway. One byte flipped (an existing section's type, `0→3`) on an otherwise-untouched real file: stock build `SIGSEGV`; the reused ASan build confirms a direct call through address 0 (pinned down without a debugger — attach is blocked at the OS level in this environment — by computing the address offset between the built binary and the running process from known symbols, then applying that offset to the crash's return-address register). Reachable via an ordinary write to the group (e.g. `H5Gcreate2`/`H5Lcreate` adding a link), when the heap's free-space manager is consulted for space and loads the on-disk section list — *not* via read/iterate (a read-only `H5Literate2`/`Group.keys()` over the same corrupted file completes cleanly, and `h5stat -s` never loads these sections; this corrects an earlier "reachable via read" phrasing). The sibling `NORMAL_ROW` class (index 2) has an equally `NULL` `.deserialize` slot, and the shared dispatch gives it no guard beyond the same in-bounds check, so a type byte of `2` reaches the identical masked `assert`. **Confirmed empirically (2026-10-06):** a one-byte fixture (an existing `SINGLE` section's type `0→2`, section-list checksum resealed) makes an asserts-live build abort at exactly `H5FScache.c:1024` (`H5FS__cache_sinfo_deserialize`, `Assertion 'fspace->sect_cls[sect_type].deserialize' failed`) on a link insert, while the same insert on the untouched seed exits 0; the type-`3` SIGSEGV above is the release-mode (`-DNDEBUG`) face of that same line, which type `2` reaches identically | **Confirmed gap.** The minimal, single-byte fixture is accepted with zero findings. Earlier rejections seen on more elaborate byte-surgery fixtures were confirmed *incidental* — an unrelated construction artifact, not real coverage — via a controlled isolation test (the identical recipe with a non-zero, still-nonsensical payload crashed identically). Still open when re-measured on 2026-10-30: types 2 and 3 are accepted |
+| 1 | A free-space section's class actually has a `deserialize` callback before it's called | `H5FScache.c:1013` — a section's on-disk type byte decoded raw; the real check that follows (`:1019-1020`) only confirms the value is *in-bounds*, not that the resulting class has a callback | `H5FScache.c:1024` (`assert(fspace->sect_cls[sect_type].deserialize)`) | **Measured: real crash, isolated to a single byte.** Fractal heap's `INDIRECT` free-space-section class is a valid, in-bounds registered class (index 3) whose `.deserialize` is `NULL` by design — its own comment states objects of this class "should never be in section manager." Nothing stops a corrupted file's section-type byte from claiming to be 3 anyway. One byte flipped (an existing section's type, `0→3`) on an otherwise-untouched real file: stock build `SIGSEGV`; the reused ASan build confirms a direct call through address 0 (pinned down without a debugger — attach is blocked at the OS level in this environment — by computing the address offset between the built binary and the running process from known symbols, then applying that offset to the crash's return-address register). Reachable via an ordinary write to the group (e.g. `H5Gcreate2`/`H5Lcreate` adding a link), when the heap's free-space manager is consulted for space and loads the on-disk section list — *not* via read/iterate (a read-only `H5Literate2`/`Group.keys()` over the same corrupted file completes cleanly, and `h5stat -s` never loads these sections; this corrects an earlier "reachable via read" phrasing). The sibling `NORMAL_ROW` class (index 2) has an equally `NULL` `.deserialize` slot, and the shared dispatch gives it no guard beyond the same in-bounds check, so a type byte of `2` reaches the identical masked `assert`. **Confirmed empirically (2026-10-06):** a one-byte fixture (an existing `SINGLE` section's type `0→2`, section-list checksum resealed) makes an asserts-live build abort at exactly `H5FScache.c:1024` (`H5FS__cache_sinfo_deserialize`, `Assertion 'fspace->sect_cls[sect_type].deserialize' failed`) on a link insert, while the same insert on the untouched seed exits 0; the type-`3` SIGSEGV above is the release-mode (`-DNDEBUG`) face of that same line, which type `2` reaches identically | **Closed** 2026-11-12: `H5_CORRUPT_FSM_SECTION_TYPE` now rejects any fractal-heap section class above `FIRST_ROW` (`h5_frhp_fspace.pk`), guarded by `malformed/bad_frhp_section_class.h5`. Reverting *that check alone* makes the fixture accepted again, so the guard is not standing in for an earlier one — which matters here, because the earlier rejections on more elaborate byte-surgery fixtures were confirmed *incidental* via a controlled isolation test (the identical recipe with a non-zero, still-nonsensical payload crashed identically), and this row sat at "confirmed gap" when re-measured on 2026-10-30. `registry/cases/fsm-section-class-not-serialized.yml` |
 | 2 | An indirect free-space section's `nentries` must be positive before it drives a span-size computation | `H5HFsection.c:3730-3731` — `nentries` decoded raw via `UINT16DECODE`, zero validation at the decode site, not even an assert | `H5HFdtable.c:278` (`assert(num_entries > 0)`, inside `H5HF__dtable_span_size`) | **Measured: real heap-buffer-overflow.** `nentries=0` underflows `end_entry = (start_entry+nentries)-1` (unsigned) to `0xFFFFFFFF`; `H5HF__dtable_span_size`'s row-accumulation loop then reads `row_block_size[row]` far past the real, `max_root_rows`-sized array. ASan: `heap-buffer-overflow READ of size 8, 0 bytes after a 176-byte region`, `H5HFdtable.c:303`. Reachable via an ordinary write (`H5Dcreate2` adding a link) — but only when the corrupted section is typed `FIRST_ROW`; the identical payload under type `INDIRECT` hits finding 1's null-callback crash first, before this arithmetic is ever reached | **Closed** by `666faff` (2026-10-04), which rejects it as `H5_CORRUPT_FHEAP_INDIRECT_SECTION_ROW`. When this row was written, a controlled A/B test showed the gap: the identical recipe with a valid `nentries=4` was rejected *identically*, so that rejection had nothing to do with `nentries`. Re-measured 2026-10-30: `nentries=0` is rejected and the `nentries=1` control is accepted |
 | 3 | The header's doubling-table geometry is legal: `width` nonzero and a power of two, block sizes nonzero and powers of two, maximum heap size nonzero | `H5HFcache.c:246` — `width` and the other geometry fields decoded raw, no check at the decode site itself | `H5HFhdr.c:314-337` — the rules exist only in `H5HF__hdr_create`, inside `#ifndef NDEBUG`, and are never applied on read | **Measured: crash (`SIGSEGV`), read path.** `width` set to 0, one field, on a dense-link heap and a dense-attribute heap: an ordinary `H5Literate2` / `H5Aiterate2` crashes, as does `h5dump -H`. With `width` 0 the free-space loop in `H5HF__hdr_compute_free_space` (`H5HFhdr.c:157-160`) can never reach its target, so it walks off the end of its row arrays until it faults. An asserts-enabled build stops earlier, at a different assert-only guard: `assert(POWER_OF_TWO(n))` in `H5VM_log2_of2`. Same shape as Extensible arrays' create-path-only geometry checks, above. Full history in `registry/cases/fractal-heap-doubling-table.yml` | Confirmed: dedicated checks (`H5_CORRUPT_FRACTAL_HEAP_DOUBLING_TABLE`, `h5_dense_links.pk:691 (table_width == 0UL)`) mirror the create-time zero and power-of-two rules — not a gap |
 | 4 | A direct block's stored heap offset (`block_off`) matches where the block actually sits, so every object it holds lies at or after it | `H5HFcache.c:1792` — `block_off` decoded raw in the direct-block deserializer and never compared with the block's real position | `H5HFman.c:387` (`assert((obj_off - dblock->block_off) < (hsize_t)dblock_size)`); the two real checks that follow are defeated when the subtraction wraps | **Measured: heap under-read, then an error.** One field changed, the first direct block's stored `block_off` inflated by `d`, checksum resealed: for some `d` (28 and 56 here) the link decoder reads 7 bytes *before* the direct-block buffer — a guard page placed before the buffer faults at `H5Olink.c:121` — and a Release build then rejects the garbage version byte. Every other inflation fails with an ordinary error. In every case the group's links become unreadable | **None — confirmed coverage gap.** Accepts every inflated file: it computes block offsets from the heap geometry (`h5_dense_links.pk:1028 (cur_block_off)`) and never checks the stored one |
@@ -542,16 +542,31 @@ could be promoted to a real, always-on check that rejects the file rather
 than calling through a `NULL` callback — safe unconditionally, since no
 legitimate writer ever serializes an `INDIRECT`-class section into a
 section list in the first place. On the `h5policy` side, the section-record
-loop in `h5policy_walk_frhp_fspace_sections` now decodes the per-record type
-byte (`h5policy/pickles/h5_frhp_fspace.pk:158 (var sect_type)`), but it
-validates only `FIRST_ROW` (`h5_frhp_fspace.pk:166 (sect_type == 1UL)`). Its
-own comment says `NORMAL_ROW`/`INDIRECT` are never serialized, yet any other
-value is skipped without a finding. Re-measured 2026-10-30: the
-`bad_frhp_indirect_section_row` surgery with the section typed 2 or 3 (with or
-without a payload) is still accepted. Closing this gap needs rejecting a value
-of 2 (`NORMAL_ROW`) or 3 (`INDIRECT`) outright, mirroring what real libhdf5's
-own class table already knows: both classes' `deserialize` is intentionally
-unreachable.
+loop in `h5policy_walk_frhp_fspace_sections` decodes the per-record type byte
+(`h5policy/pickles/h5_frhp_fspace.pk:162 (var sect_type)`) and, when this row
+was first written, used it only to recognise `FIRST_ROW`
+(`h5_frhp_fspace.pk:203 (sect_type == 1UL)`); any other value was skipped
+without a finding although the pickle's own comment said
+`NORMAL_ROW`/`INDIRECT` are never serialized. Measured open on 2026-10-30.
+
+**CLOSED on the `h5policy` side, 2026-11-12.** The section-record loop now
+rejects any class above `FIRST_ROW` outright
+(`h5_frhp_fspace.pk:182 (sect_type > 1UL)`) as `H5_CORRUPT_FSM_SECTION_TYPE`,
+mirroring what libhdf5's own class table already knows: both classes'
+`deserialize` is intentionally unreachable. The guard fixture is
+`malformed/bad_frhp_section_class.h5` (the base's one `SINGLE` section retyped
+to `INDIRECT`, one byte plus the FSSE checksum), and reverting *this check
+alone* makes it accepted again, so the fixture is not guarded by something
+else. Measured against 2.3.0 on the same `h5debug` section-list dump, fixture
+versus untouched base: baseline `-DNDEBUG` SIGSEGV vs exit 0; ASan **with
+asserts live** aborts on the assert itself at `H5FScache.c:1024`, masking the
+witness; ASan **with `-DNDEBUG`** reports `SEGV on unknown address 0x0
+(pc 0x0)`, the indirect call through the null slot; i386 `-DNDEBUG` SIGSEGVs
+too, so the defect is width-independent. Note also that the stale half of the
+original upstream claim is gone: `H5FScache.c:1019` *does* now reject
+`sect_type >= fspace->nclasses`, so what remains is only the in-range classes.
+Full record: `registry/cases/fsm-section-class-not-serialized.yml`. **The
+libhdf5 side remains undone** -- promoting the `:1024` assert to a real check.
 
 **Recommendation for finding 2, the `nentries=0` underflow (not implemented
 here):** on the libhdf5 side, `H5HF__sect_indirect_deserialize`
@@ -565,7 +580,7 @@ rather than only patching the `assert(num_entries > 0)` deeper inside
 gap is closed: commit `666faff` (2026-10-04) decodes the `FIRST_ROW` payload
 (`iblock_off`/`start_row`/`start_col`/`nentries`, the layout in
 `H5HFsection.c:3722-3731`) and rejects `nentries == 0` together with an
-out-of-range row span (`h5_frhp_fspace.pk:187 (nentries == 0UL)`), as
+out-of-range row span (`h5_frhp_fspace.pk:224 (nentries == 0UL)`), as
 `H5_CORRUPT_FHEAP_INDIRECT_SECTION_ROW`. Re-measured 2026-10-30: a `FIRST_ROW`
 section with `nentries = 0` is rejected with that finding, while the same
 surgery with `nentries = 1` is accepted, so the rejection is the `nentries`
@@ -755,7 +770,7 @@ turned up: for `page_bits == 0`, libhdf5 treats the array as paged
 (`nelmts > (1 << page_bits)` → `10 > 1`) and safely rejects the
 unpaged-on-disk data via a checksum mismatch, while `h5policy`'s
 `is_paged` test adds a `page_bits > 0` guard
-(`h5policy/pickles/h5_chunkindex.pk:786 (is_paged)`) and treats it as
+(`h5policy/pickles/h5_chunkindex.pk:795 (is_paged)`) and treats it as
 unpaged, accepting the file. Chased and ruled out as a coverage gap:
 `h5policy` is merely *more lenient* than libhdf5 here, which defends
 itself — no harmful file passes. It is an `h5policy` precision matter (the
@@ -1071,7 +1086,7 @@ object headers).
 **`h5policy` coverage: not a gap for either layer.** `--profile
 untrusted-strict` correctly rejects both mutants — the inner-entry
 corruption via `H5_CORRUPT_BAD_CHECKSUM`, "object-header checksum
-mismatch," at offset 48, `h5_validate.pk:1230 (checksum != stored_checksum)`; the outer-block corruption via the same code,
+mismatch," at offset 48, `h5_validate.pk:1283-1287 (checksum != stored_checksum)`; the outer-block corruption via the same code,
 "metadata cache image checksum mismatch," at offset 2766, `h5_messages.pk:2089 (image_checksum != stored_checksum)` — because
 `h5policy`'s own cache-image handling independently computes and verifies
 both the block's own checksum and each replayed entry's checksum against
@@ -1411,7 +1426,7 @@ dimension (10 → 867,583,393,802), leaving the Fixed Array's capacity at 4.
 **`h5policy` coverage: not a gap.** It rejects the file by comparing the
 stored capacity with the one the extent implies
 (`H5_CORRUPT_FIXED_ARRAY_EXTENT_MISMATCH`,
-`h5_validate.pk:955 (expected_nelmts != h5policy_fixed_array_nelmts)`). Full
+`h5_validate.pk:1009 (expected_nelmts != h5policy_fixed_array_nelmts)`). Full
 history in `registry/cases/fixed-array-extent-mismatch.yml`.
 
 **Why this sits here and not in the main table:** the relationship that

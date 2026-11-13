@@ -385,6 +385,24 @@ fun h5policy_find_gheap_object = (int ios, H5PolicyProfile profile,
    each call.  */
 var h5policy_selection_reported = 0;
 
+/* The RANK the sizer last decoded, or 0 when the selection type carries none
+   (H5S_SEL_NONE and H5S_SEL_ALL have no rank field, and libhdf5's own
+   H5D_virtual_update_min_dims skips exactly those two for the same reason).
+   Set by h5policy_selection_size on every arm, so the one place that knows each
+   version's rank OFFSET is also the only place that reports the rank -- the
+   alternative, a second decoder that re-derives those offsets, is what
+   registry/cases/vds-selection-rank-oracle-false-positive.yml records going
+   wrong once already.  */
+var h5policy_selection_last_rank = 0UL;
+
+/* The widest VIRTUAL-selection rank seen across a VDS mapping block, and the
+   offset of the rank field that supplied it.  The widest one is what matters:
+   it is the largest index any mapping can later present to libhdf5's
+   dataset-rank-sized arrays.  Reset per layout message, read by the layout
+   walker into the walk context.  */
+var h5policy_vds_virtual_rank = 0UL;
+var h5policy_vds_virtual_rank_off = 0UL#B;
+
 /* enc_size legality.  libhdf5 filters it TWICE and the two filters disagree,
    which is why this is set membership rather than the mask or the range it
    looks like:
@@ -436,10 +454,13 @@ fun h5policy_selection_size = (int ios, H5PolicyProfile profile,
                                string object, string role,
                                string field_ns) uint<64>:
 {
+    h5policy_selection_last_rank = 0UL;
     if (available < 8UL)
         return 0UL;
     var st = h5policy_msg_u64_at(ios, profile, off, 4UL);
     var ver = h5policy_msg_u64_at(ios, profile, off + 4#B, 4UL);
+    /* H5S_SEL_NONE (0) and H5S_SEL_ALL (3) carry no rank field at all, so
+       last_rank stays 0 and no rank comparison is attempted for them. */
     if (st == 0UL || st == 3UL)
         return available >= 16UL ? 16UL : 0UL;
     if ((st == 1UL || st == 2UL) && ver == 1UL)
@@ -485,6 +506,7 @@ fun h5policy_selection_size = (int ios, H5PolicyProfile profile,
                     h5policy_selection_reported = 1;
                     return 0UL;
                 }
+            h5policy_selection_last_rank = rank1;
             var count1 = h5policy_msg_u64_at(ios, profile, off + 20#B, 4UL);
             /* A hyperslab BLOCK carries a start and an end coordinate per
                dimension; a POINT carries one.  Version 1 has no flags byte, so
@@ -553,6 +575,7 @@ fun h5policy_selection_size = (int ios, H5PolicyProfile profile,
                     h5policy_selection_reported = 1;
                     return 0UL;
                 }
+            h5policy_selection_last_rank = rank2;
             if ((flags2 & 1UL) != 0UL)
                 {
                     var payload2 = h5policy_checked_mul_u64(4UL * rank2, 8UL,
@@ -633,6 +656,7 @@ fun h5policy_selection_size = (int ios, H5PolicyProfile profile,
                     h5policy_selection_reported = 1;
                     return 0UL;
                 }
+            h5policy_selection_last_rank = ndims;
             if ((flags & 1UL) != 0UL)
                 {
                     var payload = h5policy_checked_mul_u64(4UL * ndims, enc,
@@ -696,6 +720,7 @@ fun h5policy_selection_size = (int ios, H5PolicyProfile profile,
                     h5policy_selection_reported = 1;
                     return 0UL;
                 }
+            h5policy_selection_last_rank = ndimsp;
             if (encp > available - 13UL) return 0UL;
             var points = h5policy_msg_u64_at(ios, profile, off + 13#B, encp);
             var point_unit = h5policy_checked_mul_u64(ndimsp, encp,
@@ -775,6 +800,8 @@ fun h5policy_validate_vds_layout = (int ios, H5PolicyProfile profile,
                                     offset<uint<64>,B> payload_off,
                                     uint<64> msg_size, string object) void:
 {
+    h5policy_vds_virtual_rank = 0UL;
+    h5policy_vds_virtual_rank_off = 0UL#B;
     var o = global_sizeof_offsets as uint<64>;
     var l = global_sizeof_lengths as uint<64>;
     if (!h5policy_payload_range_ok(msg_size, 2UL, o + 4UL,
@@ -905,6 +932,19 @@ fun h5policy_validate_vds_layout = (int ios, H5PolicyProfile profile,
                                             ref.data_off + cur#B, object,
                                             "VDS virtual selection is malformed or overruns the mapping block");
                     return;
+                }
+            /* The VIRTUAL selection is a selection WITHIN the virtual
+               dataset, so its rank is a claim about that dataset's dataspace.
+               Nothing in this message can settle it -- the dataspace is a
+               different message -- so the widest rank is carried out to the
+               walk context and judged there, once both messages have been
+               seen.  Widest rather than first: every mapping's rank indexes
+               the same dataset-rank-sized arrays in libhdf5, so the largest is
+               the one that bounds the worst index.  */
+            if (h5policy_selection_last_rank > h5policy_vds_virtual_rank)
+                {
+                    h5policy_vds_virtual_rank = h5policy_selection_last_rank;
+                    h5policy_vds_virtual_rank_off = ref.data_off + cur#B;
                 }
             cur = cur + vs;
             m = m + 1UL;

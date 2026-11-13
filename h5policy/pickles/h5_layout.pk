@@ -1056,6 +1056,16 @@ fun h5policy_validate_layout_payload = (int ios,
                                             "virtual dataset layout encountered; profile denies VDS");
                     h5policy_validate_vds_layout(ios, profile, payload_off,
                                                  msg_size, object);
+                    /* The mapping block is decoded by h5_vds.pk, which has no
+                       walk context; it leaves the widest virtual-selection rank
+                       in a module global for exactly this hand-off. */
+                    if (h5policy_vds_virtual_rank != 0UL)
+                        {
+                            ctx.vds_virtual_rank = h5policy_vds_virtual_rank;
+                            ctx.vds_virtual_rank_offset =
+                                h5policy_vds_virtual_rank_off/#B;
+                        }
+                    ctx = h5policy_update_vds_virtual_rank(ctx, object);
                 }
 
             if (layout_class == CHUNKED as uint<64>
@@ -1213,6 +1223,10 @@ fun h5policy_nbit_walk_params = (int ios, H5PolicyProfile profile,
                                            });
                     return poison;
                 }
+            /* An atomic node contributes exactly its precision: the packer
+               writes `precision` significant bits per element and nothing else
+               (H5Z__nbit_compress_one_atomic / _one_byte). */
+            h5policy_nbit_bits_scratch = h5policy_nbit_bits_scratch + a_prec;
             return idx + 5UL;
         }
     if (cls == 4UL)          /* NOOPTYPE: class, size */
@@ -1223,6 +1237,11 @@ fun h5policy_nbit_walk_params = (int ios, H5PolicyProfile profile,
                                         "n-bit filter parameter tree reads past the client-data array");
                     return poison;
                 }
+            /* A no-op node is copied verbatim, so it costs its full width
+               (H5Z__nbit_decompress_one_nooptype copies `size` bytes). */
+            var n_size = h5policy_msg_u64_at(ios, profile,
+                                             cd_base + ((idx + 1UL) * 4UL)#B, 4UL);
+            h5policy_nbit_bits_scratch = h5policy_nbit_bits_scratch + (n_size * 8UL);
             return idx + 2UL;
         }
     if (cls == 2UL)          /* ARRAY: class, size, then base type */
@@ -1233,8 +1252,67 @@ fun h5policy_nbit_walk_params = (int ios, H5PolicyProfile profile,
                                         "n-bit filter parameter tree reads past the client-data array");
                     return poison;
                 }
-            return h5policy_nbit_walk_params(ios, profile, cd_base, cd_nelmts,
-                                             idx + 2UL, depth + 1UL, loc, object);
+            /* An ARRAY repeats its base type total_size/base_size times.
+               libhdf5 derives the count exactly that way and resets its
+               parameter index on every iteration, so the tree is walked ONCE
+               for indices and the width is multiplied instead
+               (H5Znbit.c, H5Z__nbit_decompress_one_array: `n = total_size /
+               base_size`, then `*parms_index = begin_index` per element).
+               The base's own width is isolated here rather than read from the
+               running total, which already holds this element's earlier
+               members.
+
+               A ZERO BASE SIZE IS A DIVIDE BY ZERO IN libhdf5, not merely a
+               width this walk cannot derive.  All three arms of
+               H5Z__nbit_decompress_one_array divide total_size by the word read
+               at this index -- `n = total_size / p.size` for an ATOMIC base
+               (H5Znbit.c:1229) and `n = total_size / base_size` for an ARRAY or
+               COMPOUND base (:1242, :1259) -- and only the ATOMIC arm carries
+               any guard at all, the precision/offset test, which a zero size
+               passes trivially because it then reads `0 > 0`.  The ARRAY and
+               COMPOUND arms are unguarded.  MEASURED on develop 2.3.0
+               (78c25cf819f, the newest build here): h5dump -d on a top-level
+               n-bit array dataset whose base size word is patched to zero dies
+               with SIGFPE, exit 136.  The bound is checked on the PARAMETERS
+               rather than on the read path because the same three divisions
+               appear in H5Z__nbit_compress with no guard either. */
+            var arr_total = h5policy_msg_u64_at(ios, profile,
+                                                cd_base + ((idx + 1UL) * 4UL)#B, 4UL);
+            var arr_base_size = 0UL;
+            if (idx + 3UL <= cd_nelmts)
+                {
+                    arr_base_size = h5policy_msg_u64_at(ios, profile,
+                                                        cd_base + ((idx + 3UL) * 4UL)#B, 4UL);
+                    if (arr_base_size == 0UL)
+                        {
+                            h5policy_emit_error_ev("H5_CORRUPT_NBIT_ZERO_BASE_SIZE", "corrupt",
+                                                   loc, object,
+                                                   "n-bit array base element size is zero",
+                                                   H5Evidence {
+                                                       field = "layout.nbit_array_base_size",
+                                                       actual = 0UL,
+                                                       expected = 1UL,
+                                                       comparison = "at_least",
+                                                       has_loc1 = 1, loc1_role = "actual",
+                                                       loc1 = cd_base + ((idx + 3UL) * 4UL)#B,
+                                                       loc1_len = 4UL,
+                                                   });
+                            return poison;
+                        }
+                }
+            var outer_bits = h5policy_nbit_bits_scratch;
+            h5policy_nbit_bits_scratch = 0UL;
+            var next = h5policy_nbit_walk_params(ios, profile, cd_base, cd_nelmts,
+                                                 idx + 2UL, depth + 1UL, loc, object);
+            var base_bits = h5policy_nbit_bits_scratch;
+            h5policy_nbit_bits_scratch = outer_bits;
+            if (arr_base_size == 0UL)
+                h5policy_nbit_bits_valid = 0UB;
+            else
+                h5policy_nbit_bits_scratch =
+                    h5policy_nbit_bits_scratch
+                    + ((arr_total / arr_base_size) * base_bits);
+            return next;
         }
     if (cls == 3UL)          /* COMPOUND: class, size, nmembers, then per member off+type */
         {
@@ -1875,10 +1953,56 @@ fun h5policy_validate_filter_pipeline_payload = (int ios,
                structural property of the descriptor, so it applies to any n-bit
                pipeline (a heap pipeline would never legitimately carry n-bit).  */
             if (filter_id == 5UL)
-                h5policy_nbit_walk_params(ios, profile,
-                                          payload_off + (cur + desc_header + name_len)#B,
-                                          cd_nelmts, 3UL, 0UL,
-                                          payload_off + cur#B, object);
+                {
+                    h5policy_nbit_bits_scratch = 0UL;
+                    h5policy_nbit_bits_valid = 1UB;
+                    var nbit_end = h5policy_nbit_walk_params(
+                        ios, profile,
+                        payload_off + (cur + desc_header + name_len)#B,
+                        cd_nelmts, 3UL, 0UL,
+                        payload_off + cur#B, object);
+                    /* A poisoned walk already reported why; its running width
+                       describes a tree that does not parse, so it is discarded
+                       rather than carried to the stored-size floor. */
+                    if (nbit_end > cd_nelmts)
+                        h5policy_nbit_bits_valid = 0UB;
+                    /* TWO CONDITIONS DECIDE WHETHER THE PACKED WIDTH DESCRIBES
+                       THE STORED BYTES AT ALL, and both were learned from a
+                       false positive: the floor fired on the real specimen
+                       cvefiles/cve-2024-29162.h5, which is not short at all.
+
+                       cd_values[1] is need_not_compress.  When it is set
+                       H5Z__filter_nbit returns at its second statement --
+                       `if (cd_values[1]) HGOTO_DONE(nbytes);` (H5Znbit.c) --
+                       without reading one byte of the buffer, so no extent it
+                       describes is consumed.  That specimen sets it.
+
+                       AND n-bit must be the filter that receives the stored
+                       bytes.  The read path applies the pipeline in reverse, so
+                       only the LAST descriptor runs first and sees the chunk as
+                       stored; an n-bit anywhere earlier is handed whatever the
+                       filters after it expanded, which has no relation to the
+                       stored size.  That specimen chains five filters.
+                       Single-filter calibration could not have shown either
+                       condition, which is what the external corpus caught.  */
+                    var nbit_need_not_compress = 0UL;
+                    if (cd_nelmts >= 2UL)
+                        nbit_need_not_compress = h5policy_msg_u64_at(
+                            ios, profile,
+                            payload_off + (cur + desc_header + name_len + 4UL)#B,
+                            4UL);
+                    if (record_decode_nelmts == 1
+                        && nbit_need_not_compress == 0UL
+                        && idx + 1UL == nfilters
+                        && h5policy_nbit_bits_valid != 0UB
+                        && h5policy_nbit_bits_scratch != 0UL)
+                        {
+                            h5policy_pipeline_nbit_bits = h5policy_nbit_bits_scratch;
+                            h5policy_pipeline_has_nbit_bits = 1UB;
+                            h5policy_pipeline_nbit_offset =
+                                (payload_off + cur#B)/#B;
+                        }
+                }
 
             /* Advance by the computed descriptor size rather than by fields read
                so malformed names or client-data lengths cannot desynchronize

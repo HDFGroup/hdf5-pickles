@@ -1,0 +1,153 @@
+# A NEGATIVE RESULT, recorded so it is not re-derived.
+#
+# Four upstream reports in the local advisory working set describe real,
+# source-confirmed memory-safety defects that this oracle can never express.
+# They share one shape: the INPUT IS WELL-FORMED.  Nothing in the file violates
+# the HDF5 format; the defect is in what a consumer -- a language binding, a
+# property-list decoder, a tool's output buffer -- does with correct data.  A
+# metadata-only file-format oracle has no predicate to write, because there is
+# no field whose value is wrong.
+#
+# Each was verified in the source tree rather than taken from its report, and
+# each is listed with the reason it is out of jurisdiction.  "Out of
+# jurisdiction" means "not an h5policy rule", NOT "not a defect": all four are
+# live upstream and three carry a write or an unbounded read.
+schema_version: 1
+
+id: consumer-contract-defects-out-of-jurisdiction
+title: four consumer-side defects (JNI binary export, H5Pdecode, h5diff output
+  buffer) that are real upstream and have no sound file-format invariant
+status: no-oracle-change   # measured, triaged, deliberately not enforced
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The upstream reports
+  that led here are provenance, not classification.
+
+record: message_envelope          # nearest family; no invariant is claimed
+root_cause_classification: out_of_jurisdiction
+violated_invariant: []            # none: no file-format invariant is violated
+
+# -- Why no rule exists ------------------------------------------------------
+rejected_rule: >-
+  THE RULE THAT LOOKS AVAILABLE AND IS NOT: "reject files that trigger these".
+  There is nothing to reject.  Each defect fires on a file libhdf5 itself would
+  write, with every field in range and every extent inside its container:
+    - a dataset of two or more variable-length strings (ordinary),
+    - a dataset of legacy H5T_STD_REF_OBJ elements (ordinary),
+    - a compound attribute whose fixed-length string member uses all its bytes
+      (ordinary, and explicitly legal -- H5T_STR_NULLPAD exists for it),
+    - an attribute whose element count exceeds a Java array the CALLER sized,
+    - an encoded property-list blob, which is not an HDF5 file at all,
+    - object and attribute names long enough to fill a tool's output buffer.
+  A predicate over any of these would reject valid files, which is the failure
+  mode registry/cases/vds-selection-rank-oracle-false-positive.yml records as
+  the most damaging kind an oracle can have.
+
+# -- The four, verified in source (HDF5 2.3.0 @78c25cf819f) ------------------
+items:
+  - id: jni-export-vlen-string-stride
+    site: java/src-jni/jni/h5util.c, h5str_render_bin_output
+    confirmed: >-
+      Inside `for (block_index = 0; block_index < block_nelmts; block_index++)`
+      the element address is recomputed as `mem = _mem + block_index * size`,
+      and the variable-length-string branch then does `size = strlen(s)` on the
+      element it just read.  The loop's own STRIDE is overwritten with the first
+      string's length, so every element after the first is addressed from the
+      wrong offset.  Live at the pinned revision.
+    why_out_of_jurisdiction: >-
+      A dataset of two or more vlen strings is ordinary and well-formed.  The
+      defect is that the loop reuses one variable for two purposes.
+    severity_note: out-of-bounds read / wild pointer; binding-only
+
+  - id: jni-export-legacy-reference-stride
+    site: java/src-jni/jni/h5util.c, h5str_render_bin_output, H5T_REFERENCE branch
+    confirmed: >-
+      `memcpy(&loc_ref, ((unsigned char *)_mem) + block_index * size,
+      sizeof(H5R_ref_t))` copies a fixed 64 bytes per element regardless of
+      `size`.  For H5T_STD_REF_OBJ, `size` is 8, so each element over-reads 56
+      bytes past itself and the last one past the buffer.  Live at the pinned
+      revision.
+    why_out_of_jurisdiction: >-
+      A legacy object-reference dataset is a valid, still-supported encoding.
+      The defect is a hard-coded destination size in the binding.
+    severity_note: out-of-bounds read; binding-only
+
+  - id: jni-fixed-string-not-nul-terminated
+    site: java/src-jni/jni/h5util.c, the compound/atomic translation path
+    confirmed: >-
+      A fixed-length string member that uses all `size` bytes carries no
+      terminator, and the member buffer is handed to `NewStringUTF`, which
+      reads to the first NUL.  Source-derived at the pinned revision; not
+      exercised, because this repository has no JVM in the loop.
+    why_out_of_jurisdiction: >-
+      H5T_STR_NULLPAD and H5T_STR_SPACEPAD exist precisely so a fixed-length
+      string may fill its field.  A file doing so is correct by the format
+      specification; the binding's assumption is what is wrong.
+    severity_note: out-of-bounds read into a returned Java String; binding-only
+
+  - id: property-list-decode-unbounded-strlen
+    site: src/H5Pencdec.c, H5P__decode
+    confirmed: >-
+      `name = (const char *)p; p += strlen(name) + 1;` over the caller-supplied
+      encoded buffer, with no length carried alongside it.  Live at the pinned
+      revision.
+    why_out_of_jurisdiction: >-
+      The input is an H5Pencode blob passed to H5Pdecode by the application.
+      It is not an HDF5 file and never reaches this oracle, which validates
+      file metadata and nothing else.
+    severity_note: >-
+      unbounded read, and the reports pair it with an unbounded strcpy into a
+      cache-config struct on the same path; API-input defect
+
+  - id: tools-output-buffer-off-by-one
+    site: tools/lib/h5tools_utils.c, parallel_print
+    confirmed: >-
+      `outBuff` is `char outBuff[OUTBUFF_SIZE]`.  When `outBuffOffset` has
+      reached `OUTBUFF_SIZE` the vsnprintf size argument is 0, the overflow
+      branch is taken, and `outBuff[outBuffOffset] = '\0'` writes one byte past
+      the array.  Live at the pinned revision.
+    why_out_of_jurisdiction: >-
+      The content that fills the buffer is object and attribute NAMES, which are
+      valid at any length the format permits.  A length rule here would reject
+      well-formed files to protect one tool's fixed buffer.  It is also a TOOL
+      defect, not a library one -- the same boundary recorded in
+      registry/cases/ for other tool-side findings.
+    severity_note: one-byte out-of-bounds write; tools-only
+
+oracle_before: accept
+oracle_after: accept -- unchanged, deliberately
+
+# -- What would change this verdict ------------------------------------------
+reopen_if: >-
+  Any of these acquires a FILE-SIDE precondition that is itself malformed --
+  for example a compound member whose declared string size disagrees with its
+  parent's extent, which would be caught by the existing datatype rules rather
+  than by a new one.  The test is not "can a crafted file reach it" (all of them
+  can, with correct metadata) but "is there a field whose value the format
+  forbids".  Today there is not.
+
+coverage_gaps:
+  - >-
+    The JNI layer has NO coverage anywhere in this repository -- no fixture, no
+    differential arm, no probe canary -- and this record does not add any.  That
+    is a deliberate scope statement, not an oversight: the oracle's subject is
+    the file, and the Java bindings are a consumer of it.  If a JNI differential
+    arm is ever built, these three are its first cases.
+  - >-
+    H5Pencode/H5Pdecode blobs are a second untouched input surface with the same
+    character: self-described, attacker-suppliable, decoded by libhdf5, and not
+    a file.
+
+coverage_manifest_change: >-
+  None.  No finding, no invariant, no fixture, no registry row.
+
+provenance:
+  found_by: >-
+    Triage of upstream reports held in the local advisory working set, reviewed
+    2026-11-12.  Every "confirmed" line above was read out of the source tree at
+    the pinned revision; no report text was relied on for a technical claim, and
+    no specimen was used.
+  hdf5_build: >-
+    Source read at HDF5 2.3.0, develop 78c25cf819f5a214d1a765a7e7e198dfc4fac75c.
+    No build was exercised for this record -- it records the absence of a rule,
+    which needs source evidence and not a measurement.

@@ -99,9 +99,13 @@ fun h5policy_walk_frhp_fspace_sections = (
     if (metadata_over)
         return ctx;
 
-    /* H5HF records have no serialized class byte.  The header's class count
-       configures libhdf5's in-memory free-space client, while the on-disk
-       record form is solely a logical heap offset; the node supplies its size. */
+    /* Each H5HF record is [heap_offset:off_size][sect_type:1][class payload].
+       The header's class count configures libhdf5's in-memory free-space
+       client; the node supplies the size, so the record itself carries only a
+       logical heap offset, the class byte, and whatever that class serializes.
+       (An earlier revision of this comment said the record had no class byte at
+       all.  It does -- the loop below has always decoded one -- and the wrong
+       comment is why the class VALUE went unchecked for so long.) */
     var cnt_size = h5policy_fspace_bytes_for_limit(serial_sect);
     var len_size = h5policy_fspace_bytes_for_limit(max_sect_size);
     var off_size = h5policy_fspace_bytes_for_bits(max_addr_bits);
@@ -158,6 +162,39 @@ fun h5policy_walk_frhp_fspace_sections = (
                     var sect_type = h5policy_msg_u64_at(ios, profile,
                                                         (cur + off_size)#B, 1UL);
                     cur = cur + off_size + 1UL;
+                    /* The class byte must name a class the fractal-heap client
+                       actually SERIALIZES, which is a stricter rule than the
+                       in-range one libhdf5 applies.  H5HFspace.c:84 registers
+                       four classes -- SINGLE(0), FIRST_ROW(1), NORMAL_ROW(2),
+                       INDIRECT(3) -- and H5FScache.c:1019 rejects only
+                       `sect_type >= fspace->nclasses`.  But NORMAL_ROW's and
+                       INDIRECT's `deserialize` slots are NULL BY DESIGN
+                       (H5HFsection.c), because neither class is ever written
+                       into a section list; the only thing standing between an
+                       in-range 2 or 3 and an indirect call through NULL is
+                       `assert(fspace->sect_cls[sect_type].deserialize)` at
+                       H5FScache.c:1024, which every -DNDEBUG build compiles out.
+                       Stop the walk rather than continue: classes 2 and 3
+                       serialize nothing, so there is no payload width to skip
+                       and every later record would be read at the wrong offset.
+                       See docs/ASSERT_MASKED_INVARIANTS.md, free-space finding 1,
+                       and registry/cases/fsm-section-class-not-serialized.yml. */
+                    if (sect_type > 1UL)
+                        {
+                            h5policy_emit_error_ev(
+                                "H5_CORRUPT_FSM_SECTION_TYPE", "corrupt",
+                                (cur - 1UL)#B, object,
+                                "fractal-heap free-space section type names a class libhdf5 never serializes",
+                                H5Evidence {
+                                    field = "fsm.section_type",
+                                    actual = sect_type,
+                                    expected = 1UL,
+                                    comparison = "at_most",
+                                    has_loc1 = 1, loc1_role = "actual",
+                                    loc1 = (cur - 1UL)#B, loc1_len = 1UL,
+                                });
+                            return ctx;
+                        }
                     if (heap_off > managed_space
                         || sect_size > managed_space - heap_off)
                         h5policy_emit_error("H5_CORRUPT_FSM_SECTION_EXTENT", "corrupt",

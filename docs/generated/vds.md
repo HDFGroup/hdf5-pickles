@@ -15,8 +15,15 @@ one entry per source→virtual mapping. Each entry names a source file and
 source dataset (either inline as NUL-terminated strings, shared by index
 from an earlier entry, or implicitly "." for the same file) and carries
 a serialized source-dataspace selection and virtual-dataspace selection
-(see `dspace_enc`). A Jenkins lookup3 checksum over all preceding bytes
-closes the block.
+(see `dspace_enc`), in that order. A Jenkins lookup3 checksum over all
+preceding bytes closes the block.
+
+The virtual-dataspace selection selects inside the virtual dataset, so its
+rank is a claim about that dataset's own dataspace message and should equal
+it. libhdf5 does not check this: on every open it OVERWRITES the stored
+extent with the dataset's (`H5S_extent_copy` in `H5D__virtual_init`), so a
+file storing a different rank is read back as the dataset's rank with no
+diagnostic. The stored value is therefore not what the library acts on.
 
 This pickle types only the fixed-size prefix (`version` and
 `num_mappings`); the variable-length entry list and trailing checksum are

@@ -1,0 +1,78 @@
+# A group v1 B-tree whose internal node points back at its own ancestor.
+#
+# THE CYCLE IS THE ONLY DEFECT, and it is invisible to every per-node rule.
+# Each node's stored level is self-consistent -- the level-2 ancestor says 2,
+# the level-1 node says 1, every leaf-level node says 0 -- and the entry counts,
+# keys and sibling pointers are all the ones libhdf5 wrote.  One child address
+# names a node already on the path, and that is all.
+#
+# WHY THE EXISTING LEVEL RULE DOES NOT COVER IT.  A back edge always breaks the
+# "child is exactly one level below its parent" relation, but only on an
+# arrival that is never decoded a second time.  libhdf5 checks the level in the
+# metadata-cache DESERIALIZER (src/H5Bcache.c:174-176), which runs on a cache
+# miss; the target of a back edge is by construction already resident, so the
+# check does not execute.  h5policy had the same ordering problem from the other
+# direction: h5_group.pk returned at the visited-B-tree set before reaching its
+# own level comparison, so the walk terminated and reported nothing.  The
+# repeated-address rule is what survives in both designs, which is why this
+# fixture asserts H5_CORRUPT_BTREE_CYCLE and not H5_CORRUPT_BTREE_NODE_LEVEL.
+# Contrast malformed/bad_btree_v1_child_level.h5, where a level byte IS forged
+# and the first decode of the node catches it.
+#
+# NON-VACUOUS, MEASURED.  On the same fixture bytes before the emit was added to
+# h5policy/pickles/h5_group.pk:466 (h5policy_mark_visited_btree), h5policy
+# returned `accept` with zero findings
+# in untrusted-strict, in forensic, and with --continue-after-rejection.  There
+# is one fix here and reverting it alone restores that acceptance.
+#
+# WHAT libhdf5 DOES, measured on 2.3.0 (develop 78c25cf819f), baseline build:
+#   H5Fopen + H5Gopen2 on a link below the subtree  SIGSEGV (stack exhaustion,
+#                                                   alternating H5B_find_helper
+#                                                   frames; ASan reports
+#                                                   stack-overflow)
+#   h5stat                                          SIGSEGV (H5B__get_info_helper)
+#   h5dump -H                                       rc=1, rejected -- the ONE
+#                                                   guarded path (src/H5B.c:1153,
+#                                                   develop-only, in no tag)
+#   h5ls -r                                         rc=0 with the whole subtree
+#                                                   silently absent
+#   h5py's bundled 1.14.5                           SIGSEGV on every access mode,
+#                                                   including iteration: it
+#                                                   predates all three guards
+# So the differential records this as libhdf5 rejecting (introspect_isolated
+# forks a child and reads a crash as opens=False), and A' holds with no
+# tolerance -- but the "rejection" is a SIGSEGV, not a refusal, and that is the
+# point of the case record rather than of this expectation.
+file: malformed/group_btree_back_edge.h5
+profile: untrusted-strict
+expected_decision: reject_corrupt
+expected_exit: 2
+required_findings: [H5_CORRUPT_BTREE_CYCLE]
+expected_analysis:
+  # The walk stops at the rejection, so it is neither complete nor completed --
+  # the same shape as every other fixture this family rejects during traversal.
+  complete: false
+  walk_started: true
+  walk_completed: false
+  stop_reason: rejection
+  continue_after_rejection: false
+  findings_truncated: false
+# MEASURED 2026-11-11 with `--exercise btree`: outcome=crashed, signal=11,
+# violations=[crash] -> `violation`.
+#
+# THIS IS THE CANARY PROVING THE CRASH, and it only became visible once the
+# probe learned to look up a name.  Until then the btree exercise entered
+# through H5Lvisit2 alone -- the iterate path, the one path upstream hardened --
+# which refuses this file at src/H5B.c:1153 and so reported a clean
+# `rejected_in_traversal` with the status `unexercised`.  The by-name pass
+# (h5probe.c, probe_lookup_misses) issues a lookup that cannot match, which
+# still descends the tree through H5B_find_helper, and the process dies there.
+#
+# Declared as exactly [violation] so BOTH drifts surface: an `unexercised` would
+# mean the probe stopped reaching the find path, and `verified` would mean
+# libhdf5 started accepting a cycle.
+h5cve: {family: btree_heap_index, allowed_statuses: [violation]}
+verification:
+  # A node address reachable twice from one tree root.
+  reference_semantics_cases: [cycle]
+forbidden: [crash, timeout, external_open, plugin_load, write]

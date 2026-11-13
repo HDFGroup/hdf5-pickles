@@ -1,0 +1,215 @@
+# A fractal-heap free-space section typed as a class the client registers but
+# never serializes.  libhdf5's own bound passes it; the only thing behind that
+# bound is an assert, and -DNDEBUG removes it.
+#
+# This is the h5policy half of free-space finding 1 in
+# docs/ASSERT_MASKED_INVARIANTS.md, which recorded the gap as confirmed and open
+# (re-measured 2026-10-30: "types 2 and 3 are accepted").  It is now closed.
+# The libhdf5 half -- promoting H5FScache.c:1024 from an assert to a real check
+# -- remains unproposed upstream.
+schema_version: 1
+
+id: fsm-section-class-not-serialized
+title: a free-space section's class byte is bounded against the class COUNT but
+  not against the classes the client actually serializes, so an in-range value
+  reaches an indirect call through a NULL deserialize slot
+status: oracle-hardened   # h5policy rejects as of 2026-11-12; libhdf5 unfixed
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  An upstream report
+  claiming that `sect_type` is unchecked altogether was the provenance for
+  looking here; that claim is STALE (see libhdf5_partially_fixed), and the live
+  defect is the narrower one recorded below.
+
+record: validation_controls
+versions: [1, 2]
+root_cause_classification: local_decode
+violated_invariant:
+  - control.fsm_section_type
+validation_closure: >-
+  one free-space section record -- [heap_offset][class byte][class payload] --
+  inside an FSSE section list whose checksum has already been verified, judged
+  against the set of classes the OWNING CLIENT serializes.  The bound is not
+  relational to any other message: the client is fixed by which manager the
+  record sits in, so the rule is local to the record once the walker knows it is
+  reading a fractal-heap manager.
+activation_before_validation:
+  - native_construction   # the callback is dispatched before anything re-checks it
+entry_points:
+  - h5policy (oracle) -- untrusted-strict, now rejects
+  - "libhdf5 H5FS__cache_sinfo_deserialize (src/H5FScache.c:1013-1026) reached
+     from any consumer that loads a fractal heap's own free-space section list"
+  - "shipped tools: h5debug <file> <FSSE addr> <FSHD addr> <FRHP addr> --
+     measured.  NOT reached by H5Fopen, an object walk, H5Fget_free_sections,
+     h5dump, or by H5Dcreate2/H5Acreate2/H5Ldelete on this base -- all measured
+     below, and all of them complete cleanly."
+
+# -- The defect, read out of the source tree (HDF5 2.3.0 @78c25cf819f) --------
+defect: >-
+  H5HFspace.c:84 registers four section classes for the fractal-heap free-space
+  client: SINGLE(0), FIRST_ROW(1), NORMAL_ROW(2), INDIRECT(3).  Only the first
+  two are ever written into a section list; NORMAL_ROW's and INDIRECT's entries
+  in src/H5HFsection.c carry a NULL `deserialize` slot BY DESIGN, and INDIRECT's
+  own comment says objects of its class "should never be in section manager".
+  H5FS__cache_sinfo_deserialize decodes the class byte raw (H5FScache.c:1013)
+  and applies exactly one bound:
+      if (sect_type >= fspace->nclasses)                   /* H5FScache.c:1019 */
+          HGOTO_ERROR(..., "invalid free space section type");
+  That bound is against the class COUNT, so 2 and 3 pass it.  The next two
+  statements are
+      assert(fspace->sect_cls[sect_type].deserialize);     /* :1024 */
+      if (NULL == (new_sect = (*fspace->sect_cls[sect_type].deserialize)(...)))
+  -- an assert, which every -DNDEBUG build strips, followed immediately by the
+  call through the slot the assert was guarding.
+  The distinction this record exists to carry: the in-range bound at :1019 is
+  REAL and was added upstream, so the type byte is not unchecked.  What is
+  unchecked is whether the in-range class is one the client serializes, and that
+  is the half an assert covers.
+
+libhdf5_partially_fixed: >-
+  The out-of-range half is FIXED and verified in source at promotion rather than
+  taken from a report: H5FScache.c:1019-1020 carries the `sect_type >=
+  fspace->nclasses` rejection, with a comment naming the out-of-bounds read and
+  the bogus function pointer it prevents.  h5policy already covered that half
+  for the FILE client (h5_messages.pk, fixture
+  malformed/bad_fsm_section_type.h5), which is why the remaining half went
+  unnoticed: the two look like the same rule and are not.
+
+# -- Measured behaviour ------------------------------------------------------
+measured:
+  measured_on: >-
+    2026-11-12, repository worktree clean at the commit this record lands on.
+    libhdf5 2.3.0, source tree at develop 78c25cf819f5a214d1a765a7e7e198dfc4fac75c
+    -- the newest build available here.  Builds named by role and pinned by
+    build_mode/sanitizers below; workstation-local installs, paths not recorded.
+  oracle_before: >-
+    ACCEPTED the fixture with zero findings.  Proven by reverting the new check
+    ALONE (not the whole change) and re-running: decision `accept`, findings [].
+    So the fixture guards this check and nothing else -- no earlier check returns
+    before it and no incidental rejection masks it.
+  oracle_after: >-
+    reject_corrupt with H5_CORRUPT_FSM_SECTION_TYPE at offset 2248, the class
+    byte itself, evidence field fsm.section_type actual 3 expected 1 (at_most).
+    The untouched base valid/sohm_list.h5 is still ACCEPTED with zero findings.
+  libhdf5_baseline: >-
+    SIGSEGV (exit 139).  `h5debug <file> 2226 1297 1082` -- the FSSE, its FSHD,
+    and the FRHP that owns it -- on the Release/-DNDEBUG build.  The identical
+    command on the untouched base exits 0 and prints "Section type: single".
+  libhdf5_asan_asserts_live: >-
+    ABORTS at the assert, not at the defect: "h5debug: src/H5FScache.c:1024:
+    H5FS__cache_sinfo_deserialize: Assertion `fspace->sect_cls[sect_type]
+    .deserialize' failed" (exit 134).  Recorded because this build is the
+    wrong instrument here -- the live assert masks the memory-safety witness,
+    the same trap recorded in registry/cases/fsm-section-bin-range.yml.
+  libhdf5_asan_ndebug: >-
+    The shipped-configuration witness.  "AddressSanitizer: SEGV on unknown
+    address 0x000000000000 (pc 0x000000000000)" -- pc 0, i.e. an indirect CALL
+    through a null function pointer, which is the mechanism this record claims
+    rather than an inferred one.  The base exits 0 on the same command.
+  width: >-
+    MEASURED on both widths, not argued.  The i386 -DNDEBUG build SIGSEGVs on
+    the fixture (139) and exits 0 on the base, identically to LP64.  Expected:
+    the defect is a null function-pointer dispatch, with no attacker-controlled
+    arithmetic in the path, so nothing in it scales with pointer width.
+  reachability_negatives: >-
+    Recorded because they bound the severity.  All measured on the baseline
+    build, fixture and base alike, all completing cleanly (rc 0):
+    H5Fopen(RDONLY) + H5Fget_free_sections(H5FD_MEM_DEFAULT); H5Fopen(RDWR) +
+    H5Dcreate2 + H5Acreate2 + H5Fclose; H5Fopen(RDWR) + H5Ldelete("/a");
+    h5dump.  The FILE-level free-space manager is a different manager, and none
+    of these writes made the SOHM heap consult its own.  So the reachable
+    surface measured here is h5debug's explicit section-list dump; whether an
+    ordinary write can be driven to load this manager is NOT established, and
+    the severity should be read with that limit in view.
+  probe_canary: >-
+    MEASURED, not declared by analogy: `h5policy-probe --exercise free_space`
+    reports outcome "accepted" on the fixture.  The free_space canary calls
+    H5Fget_free_sections, which is the FILE client's manager, so the canary
+    cannot judge this family -- the same conclusion the same-base siblings
+    bad_frhp_fsm_section_extent and bad_frhp_indirect_section_row reach.  The
+    fixture therefore carries no h5cve.allowed_statuses block and the matrix
+    reports it as a coverage gap, which is the honest outcome rather than a
+    passing one.
+
+# -- Divergence from the selected build --------------------------------------
+divergence:
+  oracle: reject_corrupt
+  libhdf5: >-
+    accepts on every path that does not load this manager, and faults on the one
+    that does
+  libhdf5_version: 2.3.0
+  classification: >-
+    genuine -- libhdf5 never validates the class against the serialized set on
+    any path; the assert is not validation in a shipped build
+  note: >-
+    No differential tolerance is needed: the fixture is malformed and both sides
+    refuse it on the path that reaches it.
+
+# -- Containment vs systemic remediation (strategy doc §11.5) ----------------
+containment:
+  status: planned
+  description: >-
+    Promote the assert at H5FScache.c:1024 to an always-on HGOTO_ERROR.  Safe
+    unconditionally: no legitimate writer serializes a NORMAL_ROW or INDIRECT
+    section, so no well-formed file can reach the new error path.  Backportable
+    to every release line that has fractal heaps.
+  libhdf5: not proposed upstream
+systemic:
+  semantic_boundary: >-
+    the free-space manager aggregate -- the FSHD header plus its whole FSSE
+    section list validated as one object, against the owning CLIENT's class
+    table, before any section is dispatched to a callback.  The class table is
+    client state, not file state, which is what makes "in range" and
+    "serializable" two different questions.
+  status: planned
+  owner: n/a
+
+# -- Reproducers -------------------------------------------------------------
+reproducers:
+  direct_fixture: h5policy/tests/malformed/bad_frhp_section_class.h5
+  generator: >-
+    h5policy-gencorpus _make_bad_frhp_section_class -- retypes the base's single
+    SINGLE section to INDIRECT(3) and repairs the FSSE checksum.  One byte plus
+    the hash; `cmp -l` against the base shows offsets 2249-2253 (1-based) and
+    nothing else.  Two regime asserts guard it: the base section must be class 0
+    (so the fixture genuinely moves the class byte) and the written class must be
+    strictly below the header's declared class count (so the fixture exercises
+    the in-range/NULL-callback regime and not the out-of-range one libhdf5
+    already rejects).
+  expectation: h5policy/tests/expected/malformed-bad_frhp_section_class.yml
+  exact_build_command: >-
+    h5debug <file> 2226 1297 1082  (FSSE address, its FSHD, the owning FRHP),
+    run against the fixture and against h5policy/tests/valid/sohm_list.h5 as the
+    control.
+
+sibling_audit: >-
+  TWO shapes share the pattern, and only one is closed here.
+  (1) The FILE client (H5MF.c) registers SIMPLE/SMALL/LARGE; all three have
+  deserialize slots, so there is no unserialized in-range class and the existing
+  `s_type >= nclasses` rule in h5_messages.pk is the whole rule for that client.
+  Nothing to add.
+  (2) The fractal-heap client is this record.  NOT AUDITED: whether any ordinary
+  write path can be driven to load a fractal heap's own free-space section list.
+  The three write paths measured above do not, which is why the reachable
+  surface recorded here is h5debug alone.  If one exists, the severity rises and
+  this record should be revisited, not rewritten.
+
+coverage_manifest_change: >-
+  No new finding code.  H5_CORRUPT_FSM_SECTION_TYPE gains a second emitter
+  (h5policy/pickles/h5_frhp_fspace.pk) and control.fsm_section_type gains a
+  second fixture, covering the in-range regime the first fixture cannot express.
+
+provenance:
+  found_by: >-
+    docs/ASSERT_MASKED_INVARIANTS.md free-space finding 1, which recorded the
+    gap, named the two classes, and measured it open on 2026-10-30.  An upstream
+    report in the local advisory working set pointed at the same code and
+    claimed the broader (stale) version of the defect.
+  hdf5_build: >-
+    HDF5 2.3.0, source develop 78c25cf819f5a214d1a765a7e7e198dfc4fac75c.
+    baseline = Release-style RelWithDebInfo, -DNDEBUG, no sanitizers;
+    candidate = RelWithDebInfo -fsanitize=address with -DNDEBUG (asserts
+    stripped, the shipped configuration) and, separately, the same with asserts
+    LIVE, which is the build that masks this defect;
+    i386 = RelWithDebInfo -m32 -DNDEBUG.
+    All workstation-local installs; paths not recorded.

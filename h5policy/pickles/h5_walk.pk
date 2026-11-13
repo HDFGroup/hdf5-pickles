@@ -82,6 +82,13 @@ type H5WalkContext = struct
     uint<64> contiguous_layout_addr_offset;
     uint<64> legacy_chunked_layout_ndims;
     uint<64> legacy_chunked_layout_ndims_offset;
+    /* The widest rank any VDS mapping's VIRTUAL selection declared, and the
+       offset of that rank field.  A selection within the virtual dataset must
+       have the dataset's own rank; libhdf5 never checks it, and the mapping
+       and the dataspace are different messages, so like the legacy chunked
+       rank this can only be judged once both have been seen.  */
+    uint<64> vds_virtual_rank;
+    uint<64> vds_virtual_rank_offset;
     uint<64> chunk_dataset_element_count;
     uint<64> chunk_logical_bytes;
     uint<64> logical_dataset_bytes;
@@ -488,6 +495,24 @@ var h5policy_pipeline_framing_offset = 0UL;
    place.  The mask and the stored size are recorded TOGETHER because the rule
    compares them against each other -- taking them from different records would
    compare a mask to a size it does not describe.  */
+/* The packed width, in bits, of ONE element as the n-bit parameter tree
+   describes it, accumulated while that tree is walked.  n-bit is a packing
+   filter: it writes exactly the significant bits of every element end to end,
+   so the compressed stream for a chunk is ceil(d_nelmts * bits / 8) bytes and
+   not an estimate.  That makes the stored size checkable from metadata alone,
+   which is the only reason this is in h5policy's reach -- nothing is
+   decompressed to compute it.
+
+   `scratch` is the live accumulator the recursive walk adds to; the ARRAY arm
+   isolates it to multiply a base type's width by the element count, so it is
+   saved and restored around that recursion rather than read directly.
+   `valid` drops to 0 on any poisoned walk, because a width derived from a tree
+   that failed to parse describes nothing.  */
+var h5policy_nbit_bits_scratch = 0UL;
+var h5policy_nbit_bits_valid = 0UB;
+var h5policy_pipeline_nbit_bits = 0UL;
+var h5policy_pipeline_has_nbit_bits = 0UB;
+var h5policy_pipeline_nbit_offset = 0UL;
 var h5policy_pipeline_nfilters = 0UL;
 var h5policy_pipeline_has_nfilters = 0UB;
 var h5policy_chunk_mask_value = 0UL;
@@ -990,6 +1015,8 @@ fun h5policy_new_walk_context = H5WalkContext:
         contiguous_layout_addr_offset = 0UL,
         legacy_chunked_layout_ndims = 0UL,
         legacy_chunked_layout_ndims_offset = 0UL,
+        vds_virtual_rank = 0UL,
+        vds_virtual_rank_offset = 0UL,
         chunk_dataset_element_count = 0UL,
         chunk_logical_bytes = 0UL,
         logical_dataset_bytes = 0UL,
@@ -1752,6 +1779,47 @@ fun h5policy_update_legacy_chunked_layout_rank = (H5WalkContext ctx,
                 expected = ctx.dataspace_rank + 1UL,
                 comparison = "equal",
                 has_loc1 = 1, loc1_role = "actual", loc1 = loc, loc1_len = 1UL,
+            });
+
+    return ctx;
+}
+
+/* A VDS mapping's VIRTUAL selection selects inside the virtual dataset, so its
+   rank must be the dataset's own.  libhdf5 does not require it anywhere:
+   H5D__virtual_load_layout decodes the selection without consulting the
+   dataspace; H5D_virtual_check_mapping_pre compares element COUNTS and
+   selection types, never ranks; and H5D_virtual_check_min_dims iterates only to
+   the DATASET's rank, so a wider mapping's surplus min_dims entries are never
+   examined.  The consequence is in H5D__virtual_init_all (src/H5Dvirtual.c),
+   which fills `hsize_t virtual_dims[H5S_MAX_RANK]` to the dataset's rank and
+   then indexes it with `unlim_dim_virtual` -- a dimension index derived from
+   the MAPPING's selection.  A mapping rank above the dataset's can therefore
+   select an element of that array which was never written, so the clip-size
+   arithmetic runs on uninitialized stack.
+
+   WARNING, not corruption, and deliberately: H5Pset_virtual accepts a virtual
+   dataspace of any rank and H5Dcreate2 never reconciles it, so libhdf5's own
+   documented API can write such a file.  Rejecting it would be a false positive
+   on valid input -- the failure mode
+   registry/cases/vds-selection-rank-oracle-false-positive.yml calls the most
+   damaging kind an oracle can have.  See
+   registry/cases/vds-virtual-selection-rank-vs-dataspace.yml.  */
+fun h5policy_update_vds_virtual_rank = (H5WalkContext ctx,
+                                        string object) H5WalkContext:
+{
+    if (ctx.has_dataspace != 0UB && ctx.vds_virtual_rank != 0UL
+        && ctx.vds_virtual_rank != ctx.dataspace_rank)
+        h5policy_emit_warning_ev(
+            "H5_ADVISORY_VDS_VIRTUAL_SELECTION_RANK",
+            ctx.vds_virtual_rank_offset#B, object,
+            "VDS mapping virtual selection rank does not match the dataset dataspace rank",
+            H5Evidence {
+                field = "vds.virtual_selection_rank",
+                actual = ctx.vds_virtual_rank,
+                expected = ctx.dataspace_rank,
+                comparison = "equal",
+                has_loc1 = 1, loc1_role = "actual",
+                loc1 = ctx.vds_virtual_rank_offset#B, loc1_len = 4UL,
             });
 
     return ctx;

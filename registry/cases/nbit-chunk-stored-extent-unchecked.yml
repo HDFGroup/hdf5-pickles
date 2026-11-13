@@ -1,0 +1,228 @@
+# n-bit packs significant bits end to end, so a chunk's compressed stream has an
+# EXACT size that metadata alone determines -- and nothing compared the stored
+# record against it.  A short record leaves the decompressor reading past its
+# input, and released libhdf5 returns what it finds there as element values.
+#
+# Fixed upstream on develop only; the oracle side is new here.
+schema_version: 1
+
+id: nbit-chunk-stored-extent-unchecked
+title: an n-bit chunk's stored size was never compared with the packed extent
+  its own filter parameters describe, so the decompressor reads past the chunk
+  and released libhdf5 returns the bytes it finds as data
+status: oracle-hardened          # h5policy now rejects; fixed on develop, live in every release
+disclosure: >-
+  n/a -- local analysis only.  No advisory database was consulted, no advisory
+  text was retrieved, and no identifier was looked up.  The triage that prompted
+  this case came from a locally saved third-party report; none of its version or
+  disclosure statements is reproduced here as a claim.  The upstream commit and
+  tag facts below were read from the local source tree with git, not from any
+  advisory.
+
+# -- Triage -------------------------------------------------------------------
+record: chunk_index
+versions: [1, 2, 3]              # chunk index versions carrying stored sizes
+root_cause_classification: aggregate_object
+violated_invariant:
+  - chunk.stored_size
+validation_closure: >-
+  the n-bit descriptor's client-data array -- the element count at cd_values[2]
+  and the type tree from cd_values[3] on -- together with the stored size of
+  each chunk record in the index that the same dataset's layout message names.
+  Neither closes it alone: the pipeline knows how many bits an element costs and
+  not how many bytes were stored, the chunk record knows the converse, and the
+  two messages arrive in either order.  That is why the comparison lives in
+  object finalization beside the fixed-framing floor, not at either record.
+activation_before_validation:
+  - decompression
+
+entry_points:
+  - h5policy (oracle) -- accept_with_warnings before this change, reject_corrupt now
+  - "libhdf5 H5Dread -> H5D__chunk_lock -> H5Z_pipeline -> H5Z__filter_nbit -> H5Z__nbit_decompress"
+  - "shipped tools: h5dump with data, h5ls with data; NOT h5dump -H / h5stat / h5debug"
+  - h5policy-probe --exercise chunk_index -- rejected_in_traversal on the LOCAL
+    build, which is the fixed one; see upstream_state
+
+# -- The defect ---------------------------------------------------------------
+defect: >-
+  H5Z__filter_nbit sizes its OUTPUT from the element count
+  (size_out = d_nelmts * cd_values[4], H5Znbit.c:1005) and then calls
+  H5Z__nbit_decompress to fill it from the chunk's stored bytes.  The input is
+  consumed bit by bit: H5Z__nbit_decompress_one_byte advances an index `*j`
+  through the compressed buffer, one byte at a time, for as many elements as
+  d_nelmts says.  Nothing in the FILE relates those two quantities, and nothing
+  on the read path checked that the stored record is long enough to supply
+  them, so a chunk whose record claims one byte is read as if it held the whole
+  packed stream.
+  The arithmetic is exact rather than approximate, which is what makes it
+  checkable without decompressing: n-bit writes `precision` significant bits per
+  atomic element and no padding, so a chunk occupies
+  ceil(d_nelmts * bits_per_element / 8) bytes, where bits_per_element is the sum
+  over the type tree -- precision for an atomic node, size*8 for a no-op node,
+  (total_size / base_size) * base bits for an array, and the sum of its members
+  for a compound.
+  Measured against libhdf5's own writer on eight regimes, every compressing case
+  stored exactly floor+1 (libhdf5 ends the stream with
+  `*buffer_size = new_size + 1`), and the full-precision pass-through case stored
+  exactly the floor -- which is why the oracle's floor is not tightened by that
+  byte.  See measured.floor_calibration.
+
+upstream_state: >-
+  FIXED ON DEVELOP, LIVE IN EVERY RELEASE.  a3cf1ea82cc ("Fix CVE issues related
+  to Nbit/Fletcher32 decode paths", #6497, 2026-09-25) threads a `buffer_size`
+  argument through the decompress helpers and guards both reads in
+  H5Z__nbit_decompress_one_byte with
+    /* Ensure the byte to be read is within the bounds of the compressed buffer */
+    if (*j >= buffer_size)
+        return FAIL;
+  `git tag --contains a3cf1ea82cc` reports NO TAG, so the bound is develop-only.
+  Every released version -- including the 1.14.5 that h5py bundles -- still
+  reads past the buffer.  No new upstream report is warranted for the read path;
+  the write path is a separate question and is NOT part of this record.
+
+# -- Measurement --------------------------------------------------------------
+measured:
+  date: 2026-11-11
+  libhdf5: 2.3.0, develop 78c25cf819f       # newest build available here
+  baseline_settings_sha256: ab4429a32a5fc47719a0539f9e1fd58a9469393f29ecff0e0eb7fc1393b1c58e
+  # Workstation-local install; path not recorded.  RelWithDebInfo, asserts off.
+  oracle_before: accept_with_warnings (H5_ADVISORY_DECODE_FILTER only)
+  oracle_after: reject_corrupt, H5_CORRUPT_CHUNK_STORED_SIZE
+  develop_2_3_0: h5dump -d exits 1 -- the #6497 bound refuses the short buffer
+  h5py_bundled_1_14_5: >-
+    returns 91 distinct values for a 100-element dataset whose true content is
+    0..99, among them -522358 and -323744 -- bytes from past the chunk buffer,
+    delivered as element values with exit 0 and no error.  A silent read of
+    adjacent process memory into application data.
+  floor_calibration: >-
+    Eight regimes built with libhdf5's own writer and compared against the
+    oracle's floor: atomic precision 16, 20, 24 (floor 8/10/12, stored 9/11/13),
+    atomic precision 32 (floor 16, stored 16 -- need_not_compress makes the
+    filter a pass-through, so the rule now excludes it), a two-member compound
+    (floor 16, stored 17), and compounds carrying arrays of 2, 3 and 5 elements
+    (floors 26/36/56, stored 27/37/57).  ZERO over-estimates: the floor is never
+    above what libhdf5 stores, which is the property that matters, since an
+    over-estimate would reject valid files.
+    CALIBRATION WAS NOT ENOUGH.  All eight carried n-bit as their only filter,
+    and that regime cannot show either condition under `gating` below.  The
+    external CVE corpus caught what the calibration could not -- see
+    false_positive_found.
+
+platform: >-
+  Width-independent.  The defect is a missing comparison between two file
+  fields, not an arithmetic wrap; the read runs off the end of the buffer by the
+  same number of bytes on ILP32 and LP64.  Not separately measured at -m32, and
+  no claim is made that it differs.
+
+# -- Containment --------------------------------------------------------------
+containment:
+  status: implemented
+  description: >-
+    The n-bit parameter walk (h5policy/pickles/h5_layout.pk,
+    h5policy_nbit_walk_params) now accumulates the packed width of one element
+    while it walks the type tree it already traverses for the precision/offset
+    bound, so the accounting costs no new pass.  The width is latched for
+    DATASET pipelines only -- a filtered heap's pipeline describes heap blocks,
+    not chunks -- and compared at object finalization in h5_validate.pk against
+    the smallest stored size the chunk index reported, beside the existing
+    fixed-framing floor.  The product is guarded by h5policy_checked_mul_u64:
+    both operands are file fields.
+  gating: >-
+    The floor is evaluated only when BOTH hold, and neither was in the first
+    implementation.  cd_values[1] (need_not_compress) must be clear: when it is
+    set H5Z__filter_nbit returns at `if (cd_values[1]) HGOTO_DONE(nbytes);`
+    without reading the buffer, so no extent it describes is consumed.  And the
+    n-bit descriptor must be LAST in the pipeline: the read path applies filters
+    in reverse, so only the last one receives the chunk as stored, while an
+    earlier n-bit is handed whatever the filters after it expanded.
+  false_positive_found: >-
+    MEASURED, and the reason the gating exists.  The first implementation moved
+    cvefiles/cve-2024-29162.h5 from reject_policy to reject_corrupt in the
+    external CVE specimen corpus.  That file is not short: its n-bit descriptor
+    sets need_not_compress and sits last behind shuffle, szip, deflate and
+    fletcher32, so its 103-byte chunks are those filters' output and n-bit never
+    reads them.  With both conditions in place the specimen returns to
+    reject_policy, the fixture still rejects, and both valid n-bit fixtures
+    still accept.  A rule calibrated only against fixtures it was designed from
+    will pass its own calibration.
+  not_tightened: >-
+    The floor understates by one byte for every chunk it evaluates,
+    deliberately.  libhdf5 ends the stream with `*buffer_size = new_size + 1`,
+    but that byte is an artifact of one writer's loop rather than a format
+    requirement, so requiring it would fit the rule to libhdf5 instead of to the
+    format.  The defect this catches understates by the whole stream, so one
+    byte of slack costs nothing.
+
+systemic:
+  semantic_boundary: >-
+    a filtered chunk's stored record must be large enough to supply every byte
+    its own pipeline will consume.  Fletcher32 and szip state that as a fixed
+    framing floor; n-bit states it as a computed one.  Both are the same rule.
+  status: closed
+  owner: unassigned
+
+# -- Reproducers --------------------------------------------------------------
+reproducers:
+  tracked_fixture: h5policy/tests/malformed/nbit_chunk_stored_short.h5
+  generator: _make_nbit_chunk_stored_short, h5policy/tools/h5policy-gencorpus
+  expectation: h5policy/tests/expected/malformed-nbit_chunk_stored_short.yml
+  regime_assertions: >-
+    The generator refuses to emit unless the base file's first chunk record
+    stores 63 bytes -- 25 elements of 20 bits -- so a change to the base's
+    precision or chunk shape fails loudly instead of producing a fixture whose
+    floor is no longer the one the comment claims.  It locates the record
+    through the chunk index rather than by scanning, because a v1 B-tree
+    interleaves nrec+1 keys with nrec children and a hand scan that mistakes a
+    key for a record patches the wrong four bytes.
+  non_vacuous: >-
+    MEASURED: on the same fixture bytes before the floor existed, h5policy
+    returned accept_with_warnings with only the filter advisory.  The parameters
+    in this file are all consistent, so no neighbouring rule fires on it -- the
+    floor is the only thing that rejects it.
+  assertions:
+    stable_finding: true
+    fails_before_materialization: true
+    no_plugin_load: true
+    no_decompression: true
+    no_external_open: true
+
+sibling_audit: >-
+  SCALE-OFFSET is the obvious neighbour and is NOT covered by this rule.  Its
+  stream is not a pure packing -- it carries a parameter prefix and its own
+  per-element minbits -- so the exact floor this record relies on does not
+  transfer, and registry/cases/scaleoffset-fastpath-memcpy-oob.yml covers the
+  over-read on its side from a different direction.  Not audited here.
+  THE WRITE PATH (H5Z__nbit_compress) is a separate question with its own
+  third-party report and is deliberately out of scope for this record.
+  A POSSIBLE SIBLING, NOT INVESTIGATED: H5Z__nbit_decompress_one_array derives
+  its element count as `total_size / base_size` and
+  H5Z__nbit_decompress_one_atomic's array arm as `total_size / p.size`, both
+  from file fields.  A zero divisor would be a division by zero on the read
+  path.  The oracle's walk now notices a zero array base size (it declines to
+  derive a width), but no fixture was built and libhdf5's behaviour was not
+  measured.
+
+not_this_record: >-
+  AN INFLATED ELEMENT COUNT is a different defect with its own rule:
+  H5_CORRUPT_FILTER_NELMTS_MISMATCH compares cd_values[2] between filters and,
+  at finalization, against the chunk shape.  That rule cannot see this file --
+  every count here agrees with every other -- and this rule cannot see an
+  inflated count whose stored bytes happen to be long enough.  They are
+  complementary.
+
+coverage_manifest_change: >-
+  one new malformed fixture; no new finding code (H5_CORRUPT_CHUNK_STORED_SIZE
+  gains a second message, routed in its existing shard) and no accept-side
+  fixture changes verdict -- measured by rerunning the corpus, including the two
+  valid n-bit fixtures whose stored sizes sit exactly at or one byte above the
+  floor.
+
+compatibility_backport_risks: >-
+  low, and calibrated rather than assumed: the floor was compared against
+  libhdf5's own writer across eight type regimes before it was trusted, and the
+  tight cases (reduced precision at exactly 63 bytes, full precision at exactly
+  the floor) are both in the accept-side corpus.
+
+provenance:
+  h5policy_commit: 9d1c1b4
+  poke_version: GNU poke 4.3

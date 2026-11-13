@@ -1,0 +1,77 @@
+# An n-bit chunk whose stored record is far smaller than the packed bits the
+# filter reads out of it.
+#
+# n-bit is a PACKING filter: it writes the significant bits of every element end
+# to end, so a chunk's compressed stream is exactly
+# ceil(d_nelmts * bits_per_element / 8) bytes -- derived, not estimated.  That
+# is what puts this inside a metadata-only oracle's reach: the element count and
+# every element's width come from the filter's own cd_values, and nothing has to
+# be decompressed to compute the floor.  The reduced-precision base stores 25
+# elements of 20 bits per chunk (500 bits, 63 bytes); one record's stored size
+# is dropped to 1.
+#
+# THE PARAMETERS STAY CONSISTENT, which is what separates this from the
+# element-count fixtures beside it.  cd_values still agree with the chunk shape,
+# precision and offset are still in range, and the type tree still parses -- only
+# the stored extent is short.  H5_CORRUPT_FILTER_NELMTS_MISMATCH catches an
+# INFLATED count and is blind to this file; measured before the floor existed,
+# h5policy returned accept_with_warnings.
+#
+# WHAT THE LIBRARY DOES, and why the floor is worth having even though develop
+# is fixed:
+#   develop 2.3.0        h5dump -d exits 1.  a3cf1ea82cc (#6497, 2026-09-25)
+#                        bounds the read index against the buffer length in
+#                        H5Z__nbit_decompress_one_byte.  `git tag --contains`
+#                        reports NO TAG, so it is develop-only.
+#   h5py's 1.14.5        returns 91 distinct values for a 100-element dataset
+#                        whose true content is 0..99, among them -522358 and
+#                        -323744: bytes from past the buffer, handed back as
+#                        element values with exit 0 and no error.
+# So every RELEASE still reads this file, and silently.
+#
+# TWO CONDITIONS GATE THE FLOOR, both learned from a false positive rather than
+# from reading the code first.  The rule fired on the real specimen
+# cvefiles/cve-2024-29162.h5, which is not short at all:
+#   need_not_compress   cd_values[1] set makes H5Z__filter_nbit return at its
+#                       second statement without reading the buffer, so nothing
+#                       it describes is consumed.  That specimen sets it.
+#   last in the chain   the read path applies filters in reverse, so only the
+#                       LAST descriptor receives the chunk as stored.  An n-bit
+#                       earlier in the pipeline is handed what the filters after
+#                       it expanded, which has no relation to the stored size.
+#                       That specimen chains five filters.
+# Single-filter calibration could not have shown either; the external CVE corpus
+# is what caught it.
+#
+# THE FLOOR IS DELIBERATELY ONE BYTE LOW.  libhdf5 ends the stream with
+# `*buffer_size = new_size + 1`, so every chunk this rule evaluates stores
+# floor+1 -- measured on seven compressing regimes (atomic at precision 16/20/24,
+# a two-member compound, and compounds carrying arrays of 2, 3 and 5 elements).
+# That byte is an artifact of one writer's loop rather than a format
+# requirement, so requiring it would fit the rule to libhdf5 instead of to the
+# format.  Understating by one byte costs nothing here -- this defect
+# understates by the whole stream.
+file: malformed/nbit_chunk_stored_short.h5
+profile: untrusted-strict
+expected_decision: reject_corrupt
+expected_exit: 2
+required_findings: [H5_CORRUPT_CHUNK_STORED_SIZE]
+expected_analysis:
+  # The floor is evaluated at object finalization, after the walk has finished
+  # collecting the pipeline and the chunk records, so the walk completes.
+  complete: true
+  walk_started: true
+  walk_completed: true
+  stop_reason: ''
+  continue_after_rejection: false
+  findings_truncated: false
+# MEASURED 2026-11-11 with `--exercise chunk_index`: outcome=rejected_in_traversal,
+# violations=[], data_reads=0 -> unexercised.  The local build is the FIXED one,
+# so its refusal is the #6497 bound doing its job, not evidence that releases
+# refuse.  A drift to `verified` would mean the bound stopped holding.
+h5cve: {family: chunk_index, allowed_statuses: [unexercised]}
+verification:
+  # A stored size under the floor the dataset's own pipeline implies -- the
+  # computed counterpart of fletcher32's fixed framing floor.
+  count_and_extent_boundaries: [below_minimum]
+forbidden: [crash, timeout, external_open, plugin_load, write]

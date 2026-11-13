@@ -144,6 +144,21 @@ statuses each fixture may report; the matrix exits non-zero on anything else. A
 fixture must state its family and permitted statuses explicitly, so a new canary
 or a changed traversal surface cannot silently inherit a passing outcome.
 
+**`unexercised` is not a safety claim.** It says the exercise did not complete,
+and "libhdf5 rejected the file" is only one reason for that; "the exercise never
+reached the defect" is another, and the two are indistinguishable in the status
+alone. Measured on `malformed/group_btree_back_edge.h5`: the `btree` exercise
+entered through `H5Lvisit2`, which is the iterate path and the one path upstream
+hardened, so it reported `rejected_in_traversal` and `unexercised` for a file on
+which an ordinary by-name open takes SIGSEGV. The probe therefore also issues a
+**lookup miss** — a name that cannot match, which still descends the B-tree
+through `H5B_find_helper` without enumerating anything, since enumeration is
+what a corrupt tree defeats. Two names are tried, one sorting below any ordinary
+name and one above, because the descent depends on where the name sorts; on that
+fixture the low one crashes and the high one returns cleanly. Re-measuring every
+family with the pass active moved exactly one row, so read `unexercised` as "ask
+what the exercise actually touched", not as a verdict about the library.
+
 Only `reject_corrupt` is compared against the build for alignment.
 `reject_resource` and `reject_policy` are decisions about the selected *profile*
 — a traversal budget or a denied feature — which libhdf5 has no equivalent of,

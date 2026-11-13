@@ -89,6 +89,7 @@ enum entry_point_id {
     EP_H5FGET_MDC_SIZE,
     EP_H5GGET_CREATE_PLIST,
     EP_H5FGET_FREE_SECTIONS,
+    EP_H5LEXISTS,
     EP_COUNT
 };
 
@@ -113,6 +114,7 @@ struct probe_stats {
     unsigned long chunk_sweep_skipped; /* datasets where the sweep was not applicable */
     unsigned long free_sections;     /* sections reported by the free_space canary */
     unsigned long free_sections_oob; /* ...of those, extents not inside the file */
+    unsigned long lookup_misses;     /* by-name lookups the find path answered */
     /* Durability of a refusal.  -1 not attempted, 0 the refusal held, 1 the
      * SAME call succeeded the second time -- see the durability pass below. */
     int rejection_durable;
@@ -146,7 +148,8 @@ static void init_stats(struct probe_stats *st)
         "H5Rget_region", "H5Ropen_region",
         "H5Fget_info2", "H5Gget_info", "H5Fget_create_plist", "H5Pget_userblock",
         "H5Fget_eoa", "H5Fget_filesize", "H5Fget_mdc_image_info",
-        "H5Fget_mdc_size", "H5Gget_create_plist", "H5Fget_free_sections"
+        "H5Fget_mdc_size", "H5Gget_create_plist", "H5Fget_free_sections",
+        "H5Lexists"
     };
     memset(st, 0, sizeof *st);
     st->rejection_durable = -1;      /* -1 = the durability pass found nothing to judge */
@@ -296,6 +299,8 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
     if (rank < 0) { st->call_errors++; goto done; }
     hsize_t nsel = 1;          /* elements in the selection (and in the buffer) */
     int swept = 0;             /* the selection covers every chunk */
+    int fallback_rank = 0;     /* >0: a single-element fallback ran, so
+                                * the origin still needs its own read */
     if (rank > 0) {
         hsize_t dims[H5S_MAX_RANK];
         if (rank > H5S_MAX_RANK ||
@@ -308,21 +313,41 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
             swept = nsel > 0;
         }
         if (!swept) {
-            /* One element, at the LAST coordinate rather than the origin.
+            /* BOTH ENDS: the origin and the last coordinate.
              *
-             * A calloc'd coordinate array selects element (0,...,0), whose byte
-             * offset within its chunk -- and within any record the element sits
-             * in -- is zero.  That is the one element an offset arithmetic
-             * defect cannot reach past: measured on a chunked dataset whose
-             * dimension product wraps to zero, reading the origin lands inside
-             * the (8-byte) allocation and returns cleanly, while reading
-             * element (1,0) segfaults, so the canary reported outcome=accepted
-             * on a specimen that segfaults h5dump.  See
-             * registry/cases/chunk-dim-product-64bit-overflow.yml.
+             * The last coordinate alone is not enough, and neither is the
+             * origin alone -- each misses what the other finds, so the
+             * selection carries both.
              *
-             * The last coordinate reaches the same code with a nonzero offset
-             * and costs nothing: the selection is still a single element, so
-             * the memory and file bounds are unchanged.
+             * WHY NOT THE ORIGIN ALONE.  A calloc'd coordinate array selects
+             * element (0,...,0), whose byte offset within its chunk -- and
+             * within any record the element sits in -- is zero.  That is the
+             * one element an offset arithmetic defect cannot reach past:
+             * measured on a chunked dataset whose dimension product wraps to
+             * zero, reading the origin lands inside the (8-byte) allocation and
+             * returns cleanly, while reading element (1,0) segfaults, so the
+             * canary reported outcome=accepted on a specimen that segfaults
+             * h5dump.  See registry/cases/chunk-dim-product-64bit-overflow.yml.
+             *
+             * WHY NOT THE LAST ALONE.  A chunk lookup descends the index by
+             * offset, so the element chosen decides which branch is walked: the
+             * last coordinate takes the RIGHTMOST descent and never sees a
+             * defect on the leftmost one.  This matters most exactly where the
+             * sweep gives up, because the two thresholds collide -- a version-1
+             * chunk B-tree needs MORE than PROBE_MAX_CHUNK_SAMPLES chunks
+             * before its tree is deep enough to hold a non-degenerate cycle, so
+             * every deep-tree defect lands in this branch by construction.
+             * Measured on malformed/chunk_btree_back_edge.h5: h5dump -d
+             * segfaults, while a last-coordinate read returns cleanly.
+             *
+             * TWO SEPARATE READS, not one two-point selection.  A selection
+             * spanning both ends couples them: one unreadable element fails the
+             * whole H5Dread, and the other end is never reached.  Measured when
+             * this was first written as a single 2-point selection:
+             * malformed/overflowing_efl_segment.h5 stopped recording its
+             * external_open activation entirely, because the origin read failed
+             * and took the last-coordinate read down with it.  The second read
+             * is issued separately, below, so each end stands on its own.
              */
             nsel = 1;
             coord = (hsize_t *)calloc((size_t)rank, sizeof *coord);
@@ -331,6 +356,7 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
                 st->chunk_sweep_skipped++;
             for (int i = 0; i < rank; i++)
                 coord[i] = dims[i] ? dims[i] - 1 : 0;
+            fallback_rank = rank;          /* the origin pass below is enabled */
         }
         if (H5Sselect_elements(space, H5S_SELECT_SET, (size_t)nsel, coord) < 0) {
             entry_point_result(st, EP_H5SSELECT_ELEMENTS, 0);
@@ -360,6 +386,31 @@ static void exercise_dataset_io(hid_t dset, struct probe_stats *st)
      * coverage. */
     if (io >= 0 && st->exercise_chunk_index && chunked && swept)
         st->family_completed++;
+
+    /* THE OTHER END.  The fallback above read the last coordinate; this reads
+     * the origin, as its own selection and its own H5Dread so that neither end
+     * can suppress the other.  A chunk lookup descends by offset, so the two
+     * ends take different branches of the index -- and the branch that matters
+     * is the one the sweep cannot cover, because a version-1 chunk B-tree only
+     * grows deep enough to hold a cycle ABOVE PROBE_MAX_CHUNK_SAMPLES chunks.
+     * Measured on malformed/chunk_btree_back_edge.h5: the last coordinate reads
+     * cleanly while the origin segfaults. */
+    if (fallback_rank > 0) {
+        int origin_differs = 0;
+        for (int i = 0; i < fallback_rank; i++)
+            if (coord[i] != 0) { origin_differs = 1; break; }
+        if (origin_differs) {
+            memset(coord, 0, (size_t)fallback_rank * sizeof *coord);
+            if (H5Sselect_elements(space, H5S_SELECT_SET, 1, coord) >= 0) {
+                herr_t io0 = H5Dread(dset, dtype, memspace, space, H5P_DEFAULT, buf);
+                entry_point_result(st, EP_H5DREAD, io0 >= 0);
+                if (io0 < 0)
+                    st->call_errors++;
+                else
+                    st->data_reads++;
+            }
+        }
+    }
 
     /* Datatype canary: the read above uses the file's own type as the memory
      * type, so no datatype conversion runs.  A type the decoder accepts but
@@ -691,6 +742,97 @@ static herr_t btree_link_cb(hid_t root, const char *name,
     return 0;
 }
 
+/* --- the by-name LOOKUP path -------------------------------------------- *
+ *
+ * Every link-walking exercise used to enter through H5Lvisit2 alone, and that
+ * is the ITERATE path -- H5B__iterate_helper for a version-1 B-tree.  Iterate
+ * is the one path upstream hardened (src/H5B.c:1153 repeats the node-level
+ * check after the protect, where a metadata-cache hit cannot bypass it), so a
+ * file that makes iterate refuse was recorded as "libhdf5 enforces" while an
+ * ordinary by-name open of the same file walked H5B_find_helper into a cycle
+ * and died.  Measured on malformed/group_btree_back_edge.h5: h5dump -H exits 1
+ * while H5Gopen2 on a name under the affected subtree takes SIGSEGV.
+ *
+ * A LOOKUP MISS is what reaches that path without enumerating anything, which
+ * matters because enumeration is precisely what a corrupt tree breaks.  The
+ * search still descends the tree comparing keys before it can report "no such
+ * name", so a name that cannot exist exercises the descent and nothing else.
+ *
+ * TWO names, not one.  The descent a miss takes depends on where the name
+ * sorts: measured on the same fixture, a low-sorting miss (`!`) takes the
+ * leftmost path and SIGSEGVs, while a high-sorting one (`~`) takes the
+ * rightmost path and returns 0.  Probing one end only would have reported that
+ * file clean.  This is the same shape as the origin-element blind spot in the
+ * chunk sweep: sampling one position measures one position.
+ *
+ * WHAT THIS STILL DOES NOT SEE: a defect on an interior branch that neither
+ * extreme reaches, and anything below the first level of groups -- the group
+ * list comes from a shallow H5Literate2 on the root, because a deep walk is
+ * the very call a corrupt tree defeats.  It is a probe, not a prover.
+ */
+#define PROBE_MAX_LOOKUP_GROUPS 32
+#define PROBE_MISS_LOW  "!h5probe-absent"
+#define PROBE_MISS_HIGH "~h5probe-absent"
+
+struct lookup_group_list {
+    char *name[PROBE_MAX_LOOKUP_GROUPS];
+    size_t count;
+};
+
+static herr_t collect_group_cb(hid_t loc, const char *name,
+                               const H5L_info2_t *info, void *op)
+{
+    struct lookup_group_list *gl = (struct lookup_group_list *)op;
+    H5O_info2_t oi;
+    (void)info;
+    if (gl->count >= PROBE_MAX_LOOKUP_GROUPS)
+        return 1;                       /* stop iterating: the cap is the budget */
+    if (H5Oget_info_by_name3(loc, name, &oi, H5O_INFO_BASIC, H5P_DEFAULT) < 0)
+        return 0;                       /* unreadable link: not this canary's business */
+    if (oi.type != H5O_TYPE_GROUP)
+        return 0;
+    gl->name[gl->count] = strdup(name);
+    if (gl->name[gl->count])
+        gl->count++;
+    return 0;
+}
+
+/* One miss against `loc`; records the call and whether libhdf5 answered it. */
+static void lookup_miss(struct probe_stats *st, hid_t loc, const char *name)
+{
+    htri_t e = H5Lexists(loc, name, H5P_DEFAULT);
+    entry_point_result(st, EP_H5LEXISTS, e >= 0);
+    if (e < 0)
+        st->call_errors++;
+    else
+        st->lookup_misses++;
+}
+
+static void probe_lookup_misses(struct probe_stats *st, hid_t f)
+{
+    struct lookup_group_list gl;
+    memset(&gl, 0, sizeof gl);
+
+    /* The root group first: its own B-tree is the one every file has. */
+    lookup_miss(st, f, PROBE_MISS_LOW);
+    lookup_miss(st, f, PROBE_MISS_HIGH);
+
+    /* Then one level down.  H5Literate2 on the root is shallow by construction;
+     * it does not recurse, so a corrupt subtree cannot make it fail the way
+     * H5Lvisit2 does. */
+    if (H5Literate2(f, H5_INDEX_NAME, H5_ITER_INC, NULL, collect_group_cb, &gl) < 0)
+        return;                         /* nothing enumerable: the root misses stand */
+    for (size_t i = 0; i < gl.count; i++) {
+        hid_t g = H5Gopen2(f, gl.name[i], H5P_DEFAULT);
+        if (g >= 0) {
+            lookup_miss(st, g, PROBE_MISS_LOW);
+            lookup_miss(st, g, PROBE_MISS_HIGH);
+            H5Gclose(g);
+        }
+        free(gl.name[i]);
+    }
+}
+
 static const char *linked_lib_path(void)
 {
     Dl_info info;
@@ -871,6 +1013,8 @@ int main(int argc, char **argv)
                      cur_size > 0 && cur_entries > 0)
                 st.family_completed++;
         }
+        if (link_walk)
+            probe_lookup_misses(&st, f);
         if (external_link || link_walk) {
             H5L_iterate2_t cb = st.exercise_dense_index ? dense_link_cb :
                                  st.exercise_btree ? btree_link_cb : external_link_cb;
@@ -983,6 +1127,7 @@ int main(int argc, char **argv)
     printf("    \"chunk_sweep_skipped\": %lu,\n", st.chunk_sweep_skipped);
     printf("    \"free_sections\": %lu,\n", st.free_sections);
     printf("    \"free_sections_out_of_bounds\": %lu,\n", st.free_sections_oob);
+    printf("    \"lookup_misses\": %lu,\n", st.lookup_misses);
     printf("    \"call_errors\": %lu\n", st.call_errors);
     printf("  },\n");
     printf("  \"durability\": {\n");
