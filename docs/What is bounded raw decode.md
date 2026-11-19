@@ -504,6 +504,34 @@ decode_cache_image(addr, declared_size, p, g) {
 
 The raw decoder records entries. It does not instantiate cache objects, attach them to global state, or let them override separately decoded metadata.
 
+## When the file is valid but the operation is not
+
+Bounded raw decode judges the *file*: the envelope, the declared shapes, the
+child slices and references. It does not judge what an application later *does*
+with a structurally valid file. A datatype **conversion** is the clearest case.
+The datatype message above (§3) is decoded and its structure validated; but when
+an application reads or writes a dataset through a different in-memory type,
+libhdf5 runs a conversion the file's bytes never had to be valid *for*.
+
+Enum-to-enum conversion is the worked example. A file may hold a perfectly valid
+enum dataset whose member set is a superset — or a reordering — of the in-memory
+enum an application reads it into. Every structural check accepts it, because
+nothing structural is wrong; the defect lives in the conversion, where libhdf5's
+`H5T__conv_enum` path may map members by position instead of by name (silent
+wrong values) or, for a source that is not a subset of the destination, index
+the destination value table out of bounds. The oracle is silent here by
+construction: no envelope invariant is violated, so the raw decoder has nothing
+to reject, and the policy validator — which decides whether the *evidence* is
+acceptable — is never handed evidence that the conversion will be unsafe.
+
+This is a scope boundary, not a coverage gap. Closing it would mean modelling an
+*operation* (the conversion) against a second type the file does not contain
+(the reader's in-memory type), not a structure. Conversion-path defects are
+tracked as libhdf5 findings in their own right and are out of reach of the
+structural oracle — in the same way a free-space-manager mutant is out of reach
+of a differential oracle that cannot decode FSM records (`docs/TOOLS.md`,
+`free_space`).
+
 ## Useful rule of thumb
 
 A raw decoder may answer:
