@@ -507,13 +507,14 @@ if(POKE_EXECUTABLE AND H5POLICY_H5PY_RC EQUAL 0)
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5patch/tests/run.sh"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
-    set_tests_properties(h5patch_regression PROPERTIES TIMEOUT 120)
     add_test(
         NAME h5explain_regression
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/h5explain/tests/run.sh"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
-    set_tests_properties(h5explain_regression PROPERTIES TIMEOUT 180)
+    # On Debian trixie these suites took 131s and 158s respectively. Each
+    # starts many poke processes. Allow for contention on shared CI runners.
+    set_tests_properties(h5patch_regression h5explain_regression PROPERTIES TIMEOUT 360)
     message(STATUS "h5policy/h5patch/h5explain regression tests enabled (poke: ${POKE_EXECUTABLE})")
 else()
     message(STATUS "h5policy/h5patch/h5explain regression tests skipped (needs poke and python3 h5py)")

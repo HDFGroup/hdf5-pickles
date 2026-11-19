@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    # Exercise CI changes in the fork before the workflow lands on main.
+    branches: [main, enhancement/ci]
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    # These names are the check contexts seen by branch rules.
+    name: ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+      # The multi-VFD CTest writes a sparse file just below 256 TiB. tmpfs
+      # supports that logical size with only a few pages allocated.
+      options: --tmpfs /ci-build:exec,size=256m
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [checks, full-regression]
+    defaults:
+      run:
+        shell: bash
+        working-directory: hdf5-pickles
+    steps:
+      - name: Install the Debian toolchain
+        working-directory: .
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates cmake emacs-nox git hdf5-tools pkgconf \
+            poke python3 python3-h5py python3-numpy python3-yaml zlib1g-dev
+
+      - name: Check out H5Lens with registry history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: hdf5-pickles
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out HDF5 for the C fixture writers
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: HDFGroup/hdf5
+          ref: 49df1b4e5ca4108d56e80f06321a749da1535268 # 2.2.0
+          path: hdf5-source
+          persist-credentials: false
+
+      - name: Check out the SSP consumer contract
+        if: matrix.suite == 'full-regression'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: HDFGroup/hdf5-ssp-sig
+          ref: e042359dacc75318ec4c40cdff837bccf25648a7
+          path: hdf5-ssp-sig
+          persist-credentials: false
+
+      - name: Build the C fixture writer toolchain
+        run: |
+          bash .github/scripts/install-h5cc.sh ../hdf5-source "$RUNNER_TEMP/hdf5-helper"
+          echo "$RUNNER_TEMP/hdf5-helper/bin" >> "$GITHUB_PATH"
+          echo "POKE_LOAD_PATH=$PWD/pickles" >> "$GITHUB_ENV"
+
+      - name: Regenerate fixtures and verify the tracked bytes
+        run: |
+          git config --global --add safe.directory "$PWD"
+          test "$(git rev-parse --is-shallow-repository)" = false
+          h5cc -showconfig | grep 'HDF5 Version'
+          h5dump --version
+          poke --version
+          python3 -c 'import h5py; print("h5py", h5py.__version__, "libhdf5", h5py.version.hdf5_version)'
+          h5policy/tools/h5policy-gencorpus h5policy/tests
+          git diff --exit-code HEAD -- h5policy/tests/CORPUS-WRITER.txt h5policy/tests/cve
+
+      - name: Build and check the registry, documentation and CTest suites
+        if: matrix.suite == 'checks'
+        run: |
+          cmake -S . -B /ci-build
+          cmake --build /ci-build --parallel "$(nproc)"
+          python3 tools/check_registry.py
+          cmake --build /ci-build --target docs-check
+          ctest --test-dir /ci-build --output-on-failure --no-tests=error \
+            --parallel "$(nproc)" --exclude-regex '^h5policy_regression$'
+
+      - name: Check the SSP consumer and every policy corpus expectation
+        if: matrix.suite == 'full-regression'
+        run: |
+          test -f ../hdf5-ssp-sig/audit/registry/h5policy-control-evidence.json
+          python3 tools/check_ssp_control_evidence.py
+          TOOL="$PWD/h5policy/tools/h5policy" python3 h5policy/tests/_check.py

@@ -46,6 +46,11 @@ ctest --test-dir build --output-on-failure
 cmake --build build --target docs-check
 ```
 
+On pull requests to `main`, the [CI workflow](.github/workflows/ci.yml)
+runs `checks` for the build, tracked fixture reproducibility, registry,
+documentation, and CTest. Its separate `full-regression` job checks every
+policy corpus expectation and compares the SSP producer and consumer contracts.
+
 Continue with [H5Lens in 10 Minutes](docs/FIRST_10_MINUTES.md), the guided
 [H5Lens tutorial](docs/TUTORIAL.md), or see the
 [`h5policy`](h5policy/README.md), [`h5patch`](h5patch/README.md), and
